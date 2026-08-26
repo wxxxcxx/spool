@@ -77,12 +77,25 @@ pub struct QueryState {
     pub version: u32,
     pub timestamp: u64,
     pub active: ActiveState,
+    #[serde(default)]
+    pub displays: Vec<DisplayState>,
     pub virtual_workspaces: Vec<VirtualWorkspaceState>,
+}
+
+/// The native Space and Paneru row currently visible on one physical display.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisplayState {
+    pub display_id: u32,
+    /// Whether this is the display Paneru currently considers active.
+    pub active: bool,
+    pub native_workspace_id: Option<u64>,
+    pub virtual_workspace_number: Option<u32>,
 }
 
 /// The active display, workspace and focused window.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ActiveState {
+    #[serde(default)]
     pub display_id: Option<u32>,
     pub native_workspace_id: Option<u64>,
     pub virtual_workspace_number: Option<u32>,
@@ -97,6 +110,14 @@ pub struct ActiveState {
 pub struct VirtualWorkspaceState {
     pub number: u32,
     pub native_workspace_id: u64,
+    /// Physical display that owns this row. `None` only represents an
+    /// inconsistent or partially restored ECS hierarchy.
+    pub display_id: Option<u32>,
+    /// The remembered Paneru row for this native Space. Consumers should pair
+    /// this with `QueryState.displays[].native_workspace_id` to find the row
+    /// currently visible on each display.
+    #[serde(default)]
+    pub selected: bool,
     pub active: bool,
     pub windows: Vec<WindowState>,
 }
@@ -325,12 +346,20 @@ mod tests {
         };
 
         let state = QueryState {
-            version: 1,
+            version: 2,
             timestamp: 0,
             active: ActiveState::default(),
+            displays: vec![DisplayState {
+                display_id: 1,
+                active: true,
+                native_workspace_id: Some(1),
+                virtual_workspace_number: Some(1),
+            }],
             virtual_workspaces: vec![VirtualWorkspaceState {
                 number: 1,
                 native_workspace_id: 1,
+                display_id: Some(1),
+                selected: true,
                 active: true,
                 windows: vec![
                     window(1, 500, true),

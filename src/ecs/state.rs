@@ -98,9 +98,9 @@ pub struct SavedWindow {
 // These wire-format types live in the shared `paneru_shared_types` crate;
 // aliased here to the names the rest of the daemon already uses.
 pub use paneru_shared_types::state::{
-    ActiveState as PaneruActiveState, Frame, QueryState as PaneruQueryState, StateEvent,
-    StateQueryKind, VirtualWorkspaceState as PaneruVirtualWorkspaceState,
-    WindowState as PaneruWindowState,
+    ActiveState as PaneruActiveState, DisplayState as PaneruDisplayState, Frame,
+    QueryState as PaneruQueryState, StateEvent, StateQueryKind,
+    VirtualWorkspaceState as PaneruVirtualWorkspaceState, WindowState as PaneruWindowState,
 };
 
 /// Resolves which display a window frame is on and whether more than a sliver of
@@ -668,12 +668,21 @@ impl QueryState for PaneruQueryState {
 
         let mut virtual_workspaces = Vec::new();
         let mut workspace_max_numbers: HashMap<WorkspaceId, u32> = HashMap::new();
+        let mut workspace_display_ids: HashMap<WorkspaceId, Option<CGDirectDisplayID>> =
+            HashMap::new();
+        let display_ids = displays
+            .iter()
+            .map(|(display, entity, active)| (entity, (display.id(), active)))
+            .collect::<HashMap<_, _>>();
         let mut active = PaneruActiveState {
             display_id: active_display.map(|(display_id, _)| display_id),
             ..PaneruActiveState::default()
         };
 
         for (child, strip, active_workspace, selected_workspace) in workspaces {
+            let display_id = display_ids
+                .get(&child.parent())
+                .map(|(display_id, _)| *display_id);
             let floating = if active_workspace
                 || selected_workspace && active_workspace_id != Some(strip.id())
             {
@@ -731,6 +740,9 @@ impl QueryState for PaneruQueryState {
                 .entry(strip.id())
                 .and_modify(|max| *max = (*max).max(number))
                 .or_insert(number);
+            workspace_display_ids
+                .entry(strip.id())
+                .or_insert(display_id);
             if active_workspace {
                 active.native_workspace_id = Some(strip.id());
                 active.virtual_workspace_number = Some(number);
@@ -748,6 +760,8 @@ impl QueryState for PaneruQueryState {
             virtual_workspaces.push(PaneruVirtualWorkspaceState {
                 number,
                 native_workspace_id: strip.id(),
+                display_id,
+                selected: selected_workspace,
                 active: active_workspace,
                 windows: row_windows,
             });
@@ -770,6 +784,8 @@ impl QueryState for PaneruQueryState {
                     virtual_workspaces.push(PaneruVirtualWorkspaceState {
                         number,
                         native_workspace_id: workspace_id,
+                        display_id: workspace_display_ids.get(&workspace_id).copied().flatten(),
+                        selected: false,
                         active: false,
                         windows: Vec::new(),
                     });
@@ -777,13 +793,35 @@ impl QueryState for PaneruQueryState {
             }
         }
 
-        virtual_workspaces
-            .sort_by_key(|workspace| (workspace.native_workspace_id, workspace.number));
+        virtual_workspaces.sort_by_key(|workspace| {
+            (
+                workspace.display_id,
+                workspace.native_workspace_id,
+                workspace.number,
+            )
+        });
+
+        let mut display_states = display_ids
+            .into_values()
+            .map(|(display_id, display_active)| {
+                let selected = virtual_workspaces.iter().find(|workspace| {
+                    workspace.display_id == Some(display_id) && workspace.selected
+                });
+                PaneruDisplayState {
+                    display_id,
+                    active: display_active,
+                    native_workspace_id: selected.map(|workspace| workspace.native_workspace_id),
+                    virtual_workspace_number: selected.map(|workspace| workspace.number),
+                }
+            })
+            .collect::<Vec<_>>();
+        display_states.sort_by_key(|display| display.display_id);
 
         Ok(PaneruQueryState {
-            version: 1,
+            version: 2,
             timestamp: now_timestamp(),
             active,
+            displays: display_states,
             virtual_workspaces,
         })
     }

@@ -16,7 +16,7 @@ use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
-use crate::commands::{Direction, MoveFocus, Operation, filter_window_operations};
+use crate::commands::{Command, Direction, MoveFocus, Operation, filter_window_operations};
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::LayoutStrip;
@@ -87,7 +87,11 @@ impl Plugin for WorkspaceEventsPlugin {
 
         app.add_systems(
             PreUpdate,
-            (switch_virtual_workspace_bind, move_virtual_workspace_bind),
+            (
+                handle_targeted_workspace_commands,
+                switch_virtual_workspace_bind,
+                move_virtual_workspace_bind,
+            ),
         );
         app.add_systems(
             Update,
@@ -112,6 +116,215 @@ impl Plugin for WorkspaceEventsPlugin {
         app.add_systems(PostUpdate, workspace_destroyed_handler);
         app.add_observer(cleanup_active_workspace_marker)
             .add_observer(cleanup_selected_space_marker);
+    }
+}
+
+/// Commands used by external UI clients carry their targets explicitly instead
+/// of borrowing Paneru's current focus/display. They still mutate the same ECS
+/// markers and strips as keyboard commands, so there is only one workspace
+/// implementation to keep consistent.
+#[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_lines, clippy::type_complexity)]
+fn handle_targeted_workspace_commands(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    mut workspaces: Query<(
+        Entity,
+        &mut LayoutStrip,
+        &ChildOf,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+    )>,
+    displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    let targeted = messages
+        .read()
+        .filter_map(|event| match event {
+            Event::Command { command } => match command {
+                Command::FocusWindow { .. }
+                | Command::SelectVirtualWorkspace { .. }
+                | Command::MoveWindowToVirtualWorkspace { .. } => Some(command.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    for command in targeted {
+        match command {
+            Command::FocusWindow { window_id } => {
+                let Some((_, window_entity)) = windows.find(window_id) else {
+                    warn!(window_id, "targeted focus window is no longer known");
+                    continue;
+                };
+                if let Some((strip_entity, display_entity)) =
+                    workspaces
+                        .iter()
+                        .find_map(|(strip_entity, strip, child, _, _)| {
+                            strip
+                                .contains(window_entity)
+                                .then_some((strip_entity, child.parent()))
+                        })
+                {
+                    if let Ok(mut display_commands) = commands.get_entity(display_entity) {
+                        display_commands.try_insert(ActiveDisplayMarker);
+                    }
+                    if let Ok(mut strip_commands) = commands.get_entity(strip_entity) {
+                        strip_commands.try_insert(ActiveWorkspaceMarker);
+                    }
+                }
+                commands.focus_entity(window_entity, true);
+            }
+            Command::SelectVirtualWorkspace {
+                display_id,
+                virtual_index,
+            } => {
+                let Some((display, display_entity, _)) = displays
+                    .iter()
+                    .find(|(display, _, _)| display.id() == display_id)
+                else {
+                    warn!(display_id, "targeted workspace display is no longer known");
+                    continue;
+                };
+                let Ok(workspace_id) = window_manager.active_display_space(display_id) else {
+                    warn!(
+                        display_id,
+                        "unable to resolve display's active native workspace"
+                    );
+                    continue;
+                };
+                let target = workspaces.iter().find_map(|(entity, strip, child, _, _)| {
+                    (child.parent() == display_entity
+                        && strip.id() == workspace_id
+                        && strip.virtual_index == virtual_index)
+                        .then_some(entity)
+                });
+
+                if let Ok(mut display_commands) = commands.get_entity(display_entity) {
+                    display_commands.try_insert(ActiveDisplayMarker);
+                }
+                if let Some(target) = target {
+                    if let Ok(mut strip_commands) = commands.get_entity(target) {
+                        strip_commands.try_insert(ActiveWorkspaceMarker);
+                    }
+                } else {
+                    commands.spawn_layout_strip(
+                        LayoutStrip::new(workspace_id, virtual_index),
+                        display.bounds().min,
+                        display_entity,
+                        true,
+                    );
+                }
+            }
+            Command::MoveWindowToVirtualWorkspace {
+                window_id,
+                display_id,
+                virtual_index,
+                move_focus,
+            } => {
+                let Some((_, window_entity)) = windows.find(window_id) else {
+                    warn!(window_id, "targeted move window is no longer known");
+                    continue;
+                };
+                let Some((display, display_entity, _)) = displays
+                    .iter()
+                    .find(|(display, _, _)| display.id() == display_id)
+                else {
+                    warn!(display_id, "targeted move display is no longer known");
+                    continue;
+                };
+                let Ok(workspace_id) = window_manager.active_display_space(display_id) else {
+                    warn!(
+                        display_id,
+                        "unable to resolve display's active native workspace"
+                    );
+                    continue;
+                };
+
+                let Some((source_entity, moving_entities, source_neighbour)) =
+                    workspaces.iter().find_map(|(entity, strip, _, _, _)| {
+                        strip.contains(window_entity).then(|| {
+                            (
+                                entity,
+                                strip
+                                    .tab_group(window_entity)
+                                    .unwrap_or_else(|| vec![window_entity]),
+                                strip
+                                    .left_neighbour(window_entity)
+                                    .or_else(|| strip.right_neighbour(window_entity)),
+                            )
+                        })
+                    })
+                else {
+                    warn!(window_id, "targeted move requires a tiled Paneru window");
+                    continue;
+                };
+
+                let target_entity = workspaces.iter().find_map(|(entity, strip, child, _, _)| {
+                    (child.parent() == display_entity
+                        && strip.id() == workspace_id
+                        && strip.virtual_index == virtual_index)
+                        .then_some(entity)
+                });
+
+                if target_entity == Some(source_entity) {
+                    if move_focus == MoveFocus::Follow {
+                        commands.focus_entity(window_entity, true);
+                    }
+                    continue;
+                }
+
+                if let Ok((_, mut source, _, _, _)) = workspaces.get_mut(source_entity) {
+                    for entity in &moving_entities {
+                        source.remove(*entity);
+                    }
+                }
+
+                let target_entity = if let Some(target_entity) = target_entity {
+                    if let Ok((_, mut target, _, _, _)) = workspaces.get_mut(target_entity) {
+                        target.append_tab_group(&moving_entities);
+                    }
+                    target_entity
+                } else {
+                    let mut target = LayoutStrip::new(workspace_id, virtual_index);
+                    target.append_tab_group(&moving_entities);
+                    let follow = move_focus == MoveFocus::Follow;
+                    let origin = if follow {
+                        display.bounds().min
+                    } else {
+                        display.bounds().max - 10
+                    };
+                    let mut spawned =
+                        commands.spawn_layout_strip(target, origin, display_entity, follow);
+                    if !follow {
+                        spawned.insert(PreviousStripPosition {
+                            origin: display.bounds().min,
+                            focus: Some(window_entity),
+                        });
+                    }
+                    spawned.id()
+                };
+
+                if let Ok(mut target_commands) = commands.get_entity(target_entity) {
+                    target_commands.try_insert(RefreshWindowSizes::default());
+                    if move_focus == MoveFocus::Follow {
+                        target_commands.try_insert(ActiveWorkspaceMarker);
+                    }
+                }
+
+                if move_focus == MoveFocus::Follow {
+                    if let Ok(mut display_commands) = commands.get_entity(display_entity) {
+                        display_commands.try_insert(ActiveDisplayMarker);
+                    }
+                    commands.focus_entity(window_entity, true);
+                } else if let Some(neighbour) = source_neighbour {
+                    commands.focus_entity(neighbour, false);
+                }
+            }
+            _ => {}
+        }
     }
 }
 

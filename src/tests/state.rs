@@ -560,13 +560,25 @@ fn test_query_state_contract_exposes_active_virtual_workspace_and_windows() {
 
     let state = extract_query_state(world).expect("query state extraction");
 
-    assert_eq!(state.version, 1);
+    assert_eq!(state.version, 2);
+    assert_eq!(state.displays.len(), 1);
+    assert_eq!(state.displays[0].display_id, TEST_DISPLAY_ID);
+    assert_eq!(
+        state.displays[0].native_workspace_id,
+        Some(TEST_WORKSPACE_ID)
+    );
+    assert_eq!(state.displays[0].virtual_workspace_number, Some(1));
     assert_eq!(state.active.virtual_workspace_number, Some(1));
     assert_eq!(state.active.native_workspace_id, Some(TEST_WORKSPACE_ID));
     assert_eq!(state.active.focused_window_id, Some(0));
     assert_eq!(state.active.focused_bundle_id.as_deref(), Some("test"));
     assert_eq!(state.virtual_workspaces.len(), 3);
     assert_eq!(state.virtual_workspaces[0].number, 1);
+    assert_eq!(
+        state.virtual_workspaces[0].display_id,
+        Some(TEST_DISPLAY_ID)
+    );
+    assert!(state.virtual_workspaces[0].selected);
     assert!(state.virtual_workspaces[0].active);
     assert_eq!(state.virtual_workspaces[0].windows.len(), 1);
     assert_eq!(state.virtual_workspaces[0].windows[0].window_id, 0);

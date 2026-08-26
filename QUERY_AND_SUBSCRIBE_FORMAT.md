@@ -34,7 +34,7 @@ Returns the complete state document.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "timestamp": 1777740000,
   "active": {
     "display_id": 1,
@@ -45,22 +45,36 @@ Returns the complete state document.
     "focused_app_name": "Terminal",
     "focused_window_title": "paneru"
   },
+  "displays": [
+    {
+      "display_id": 1,
+      "active": true,
+      "native_workspace_id": 4,
+      "virtual_workspace_number": 3
+    }
+  ],
   "virtual_workspaces": [
     {
       "number": 1,
       "native_workspace_id": 4,
+      "display_id": 1,
+      "selected": false,
       "active": false,
       "windows": []
     },
     {
       "number": 2,
       "native_workspace_id": 4,
+      "display_id": 1,
+      "selected": false,
       "active": false,
       "windows": []
     },
     {
       "number": 3,
       "native_workspace_id": 4,
+      "display_id": 1,
+      "selected": true,
       "active": true,
       "windows": [
         {
@@ -86,18 +100,24 @@ Returns only the `virtual_workspaces` array from the complete state document.
   {
     "number": 1,
     "native_workspace_id": 4,
+    "display_id": 1,
+    "selected": false,
     "active": false,
     "windows": []
   },
   {
     "number": 2,
     "native_workspace_id": 4,
+    "display_id": 1,
+    "selected": false,
     "active": false,
     "windows": []
   },
   {
     "number": 3,
     "native_workspace_id": 4,
+    "display_id": 1,
+    "selected": true,
     "active": true,
     "windows": [
       {
@@ -133,9 +153,10 @@ Returns only the active display, workspace, and focused-window state.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `version` | number | State document format version. Currently `1`. |
+| `version` | number | State document format version. Currently `2`. |
 | `timestamp` | number | Unix timestamp in seconds when the response was built. |
 | `active` | object | Current active display/native workspace/virtual workspace/focused window. |
+| `displays` | array | Current native Space and selected Paneru row for every physical display. |
 | `display_id` | number or null | CoreGraphics display id for the active display, when known. |
 | `native_workspace_id` | number or null | macOS Space id for the active native workspace, when known. |
 | `virtual_workspace_number` | number or null | One-based Paneru virtual workspace number, when known. |
@@ -145,7 +166,9 @@ Returns only the active display, workspace, and focused-window state.
 | `focused_window_title` | string or null | Title of the focused window, when known. |
 | `virtual_workspaces` | array | Virtual workspace rows known to Paneru. |
 | `number` | number | One-based virtual workspace number. |
-| `active` | boolean | Whether this virtual workspace is currently selected. |
+| `display_id` | number or null | Physical display that owns this virtual workspace row. |
+| `selected` | boolean | Whether this is the remembered Paneru row for its native Space. |
+| `active` | boolean | Whether this row is globally active on Paneru's active display. |
 | `windows` | array | Managed windows in this virtual workspace row. |
 | `window_id` | number | Window id. |
 | `bundle_id` | string | Bundle id for the owning application, or an empty string if unknown. |
@@ -234,4 +257,13 @@ The matching config binding names are:
 window_virtualnum_3 = "cmd + alt - 3"
 window_virtualmovenum_3 = "cmd + alt + ctrl - 3"
 window_virtualsendnum_3 = "cmd + alt + shift - 3"
+```
+
+External UI clients can address a window or display without changing Paneru's
+keyboard-command semantics:
+
+```shell
+paneru send-cmd window focusid 321
+paneru send-cmd workspace select 1 3
+paneru send-cmd window move-to-workspace 321 1 3 follow
 ```

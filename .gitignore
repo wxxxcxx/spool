@@ -1,4 +1,6 @@
 /target
+/.tools
+/bar/.build
 
 # Outputs from `nix build`
 /result
@@ -8,3 +10,7 @@ CLAUDE.md
 .direnv
 **/.DS_Store
 flamegraph.svg
+
+
+# APM dependencies
+apm_modules/

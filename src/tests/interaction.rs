@@ -2156,3 +2156,68 @@ fn test_virtual_directions_first_last_east_west() {
         .on_iteration(8, assert_active_vw(0))
         .run(commands);
 }
+
+#[test]
+fn targeted_window_focus_uses_window_id() {
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 1);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::FocusWindow { window_id: 1 },
+            },
+        ]);
+}
+
+#[test]
+fn targeted_workspace_selection_uses_display_and_virtual_index() {
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let active = query
+                .iter(world)
+                .find_map(|(strip, active)| active.then_some(strip.virtual_index))
+                .expect("an active virtual strip");
+            assert_eq!(active, 2);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::SelectVirtualWorkspace {
+                    display_id: TEST_DISPLAY_ID,
+                    virtual_index: 2,
+                },
+            },
+        ]);
+}
+
+#[test]
+fn targeted_window_move_uses_window_and_destination_ids() {
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            let moved = find_window_entity(1, world);
+            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let target = query
+                .iter(world)
+                .find_map(|(strip, active)| (active && strip.virtual_index == 2).then_some(strip))
+                .expect("the destination virtual strip is active");
+            assert!(target.contains(moved));
+            assert_focused!(world, 1);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::MoveWindowToVirtualWorkspace {
+                    window_id: 1,
+                    display_id: TEST_DISPLAY_ID,
+                    virtual_index: 2,
+                    move_focus: MoveFocus::Follow,
+                },
+            },
+        ]);
+}

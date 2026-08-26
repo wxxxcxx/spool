@@ -1109,7 +1109,7 @@ pub struct MainOptions {
     pub window_resize_cycle: Option<bool>,
 
     /// If enabled, an empty virtual workspace will be removed.
-    /// Default: true.
+    /// Default: false.
     pub reap_empty_workspaces: Option<bool>,
 
     /// Disable detection of native macOS tabs. When set, newly-spawned windows are

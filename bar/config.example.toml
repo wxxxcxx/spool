@@ -1,0 +1,34 @@
+# PaneruBar reloads this file automatically.
+height = 28
+# Icon size is derived from height and vertical padding.
+vertical_padding = 3
+workspace_spacing = 5
+window_spacing = 3
+horizontal_padding = 7
+
+# Native material surface with an optional color tint.
+# Colors support #RRGGBB and #RRGGBBAA.
+background_color = "#1C1C1ED9"
+border_color = "#FFFFFF33"
+border_width = 0.5
+corner_radius = 8
+show_shadow = true
+
+# Focus indicator and selected workspace colors.
+# Values use #RRGGBB or #RRGGBBAA.
+selection_color = "#0A84FFFF"
+active_workspace_color = "#0A84FF47"
+
+# badge, raised, dimmed
+floating_icon_style = "badge"
+
+show_focus_ring = true
+focus_ring_width = 1.5
+
+# none, smooth, spring
+animation_style = "spring"
+animation_duration = 0.24
+
+[workspace_labels]
+# 1 = "work"
+# 2 = "chat"

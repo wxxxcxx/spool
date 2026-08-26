@@ -605,16 +605,19 @@ mod tests {
     /// A canned state document to answer round-trips with.
     fn test_state() -> PaneruQueryState {
         PaneruQueryState {
-            version: 1,
+            version: 2,
             timestamp: 0,
             active: PaneruActiveState {
                 focused_window_id: Some(7),
                 focused_app_name: Some("Test App".to_string()),
                 ..PaneruActiveState::default()
             },
+            displays: Vec::new(),
             virtual_workspaces: vec![PaneruVirtualWorkspaceState {
                 number: 1,
                 native_workspace_id: 10,
+                display_id: Some(1),
+                selected: true,
                 active: true,
                 windows: vec![PaneruWindowState {
                     window_id: 7,

@@ -309,6 +309,12 @@ $ paneru send-cmd window virtualnum 3
 
 # Send the focused window to virtual workspace 3 without following it.
 $ paneru send-cmd window virtualsendnum 3
+
+# Focus an exact Paneru-known window id.
+$ paneru send-cmd window focusid 321
+
+# Select virtual workspace 3 on display 1.
+$ paneru send-cmd workspace select 1 3
 ```
 
 ### Querying and Subscribing to State

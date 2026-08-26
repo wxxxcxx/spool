@@ -282,6 +282,26 @@ pub enum Command {
     Window(Operation),
     /// A command targeting the mouse with a specific `MouseOperation`.
     Mouse(MouseMove),
+    /// Focuses the exact Paneru-known window. If it belongs to a parked virtual
+    /// workspace, that row is selected first.
+    FocusWindow {
+        window_id: i32,
+    },
+    /// Selects a numbered virtual workspace on a specific physical display.
+    SelectVirtualWorkspace {
+        display_id: u32,
+        /// Zero-based internally; CLI input remains one-based.
+        virtual_index: u32,
+    },
+    /// Moves an exact Paneru-known window to a numbered virtual workspace on a
+    /// specific physical display.
+    MoveWindowToVirtualWorkspace {
+        window_id: i32,
+        display_id: u32,
+        /// Zero-based internally; CLI input remains one-based.
+        virtual_index: u32,
+        move_focus: MoveFocus,
+    },
     /// A command to quit the window manager application.
     Quit,
     /// A command to restart the window manager service.

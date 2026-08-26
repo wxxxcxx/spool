@@ -44,11 +44,60 @@ pub fn parse_command(argv: &[&str]) -> Result<Command> {
     let command = *argv.first().unwrap_or(&"");
     Ok(match command {
         "printstate" => Command::PrintState,
-        "window" => Command::Window(parse_operation(&argv[1..])?),
+        "window" => parse_window_command(&argv[1..])?,
+        "workspace" => parse_workspace_command(&argv[1..])?,
         "mouse" => Command::Mouse(parse_mouse_move(&argv[1..])?),
         "quit" => Command::Quit,
         "restart" => Command::Restart,
         _ => return Err(ParseError::new(format!("unhandled command '{argv:?}'"))),
+    })
+}
+
+fn parse_i32(input: &str, what: &str) -> Result<i32> {
+    input
+        .parse()
+        .map_err(|_| ParseError::new(format!("invalid {what} '{input}'")))
+}
+
+fn parse_u32(input: &str, what: &str) -> Result<u32> {
+    input
+        .parse()
+        .map_err(|_| ParseError::new(format!("invalid {what} '{input}'")))
+}
+
+fn parse_window_command(argv: &[&str]) -> Result<Command> {
+    match *argv.first().unwrap_or(&"") {
+        "focusid" if argv.len() == 2 => Ok(Command::FocusWindow {
+            window_id: parse_i32(argv[1], "window id")?,
+        }),
+        "move-to-workspace" if argv.len() == 5 => {
+            let move_focus = match argv[4] {
+                "follow" => MoveFocus::Follow,
+                "stay" => MoveFocus::Stay,
+                other => {
+                    return Err(ParseError::new(format!(
+                        "invalid move focus behavior '{other}'"
+                    )));
+                }
+            };
+            Ok(Command::MoveWindowToVirtualWorkspace {
+                window_id: parse_i32(argv[1], "window id")?,
+                display_id: parse_u32(argv[2], "display id")?,
+                virtual_index: parse_virtual_workspace_number(argv[3])?,
+                move_focus,
+            })
+        }
+        _ => Ok(Command::Window(parse_operation(argv)?)),
+    }
+}
+
+fn parse_workspace_command(argv: &[&str]) -> Result<Command> {
+    if argv.len() != 3 || argv[0] != "select" {
+        return Err(ParseError::invalid(argv));
+    }
+    Ok(Command::SelectVirtualWorkspace {
+        display_id: parse_u32(argv[1], "display id")?,
+        virtual_index: parse_virtual_workspace_number(argv[2])?,
     })
 }
 
@@ -152,6 +201,39 @@ impl Command {
             Command::Mouse(MouseMove::ToNextDisplay) => {
                 vec!["mouse".to_string(), "nextdisplay".to_string()]
             }
+            Command::FocusWindow { window_id } => {
+                vec![
+                    "window".to_string(),
+                    "focusid".to_string(),
+                    window_id.to_string(),
+                ]
+            }
+            Command::SelectVirtualWorkspace {
+                display_id,
+                virtual_index,
+            } => vec![
+                "workspace".to_string(),
+                "select".to_string(),
+                display_id.to_string(),
+                (virtual_index + 1).to_string(),
+            ],
+            Command::MoveWindowToVirtualWorkspace {
+                window_id,
+                display_id,
+                virtual_index,
+                move_focus,
+            } => vec![
+                "window".to_string(),
+                "move-to-workspace".to_string(),
+                window_id.to_string(),
+                display_id.to_string(),
+                (virtual_index + 1).to_string(),
+                match move_focus {
+                    MoveFocus::Follow => "follow",
+                    MoveFocus::Stay => "stay",
+                }
+                .to_string(),
+            ],
             Command::Quit => vec!["quit".to_string()],
             Command::Restart => vec!["restart".to_string()],
             Command::PrintState => vec!["printstate".to_string()],
@@ -263,6 +345,17 @@ mod tests {
             Command::Restart,
             Command::PrintState,
             Command::Mouse(MouseMove::ToNextDisplay),
+            Command::FocusWindow { window_id: 42 },
+            Command::SelectVirtualWorkspace {
+                display_id: 7,
+                virtual_index: 2,
+            },
+            Command::MoveWindowToVirtualWorkspace {
+                window_id: 42,
+                display_id: 7,
+                virtual_index: 2,
+                move_focus: MoveFocus::Follow,
+            },
         ] {
             assert_eq!(
                 format!("{:?}", round_trip(&command)),

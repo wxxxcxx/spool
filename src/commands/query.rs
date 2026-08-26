@@ -122,7 +122,8 @@ impl StateBroadcastIntent {
                             Operation::Virtual(_)
                             | Operation::VirtualNumber(_)
                             | Operation::VirtualAdd,
-                        ),
+                        )
+                        | Command::SelectVirtualWorkspace { .. },
                 } => intent.virtual_workspace_changed = true,
                 Event::WindowCreated { .. }
                 | Event::WindowSpawned { .. }
@@ -135,7 +136,8 @@ impl StateBroadcastIntent {
                             Operation::VirtualMove(_, _)
                             | Operation::VirtualMoveNumber(_, _)
                             | Operation::Swap(_),
-                        ),
+                        )
+                        | Command::MoveWindowToVirtualWorkspace { .. },
                 } => intent.windows_changed = true,
                 Event::WindowFocused { .. } => intent.window_focused = true,
                 // Geometry alone decides what's on screen, so plain moves and
@@ -454,7 +456,9 @@ fn state_event_broadcast_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecs::state::{Frame, PaneruVirtualWorkspaceState, PaneruWindowState};
+    use crate::ecs::state::{
+        Frame, PaneruDisplayState, PaneruVirtualWorkspaceState, PaneruWindowState,
+    };
     use crate::events::Event as PaneruEvent;
 
     fn query_state_with_active_window(
@@ -494,12 +498,20 @@ mod tests {
             .collect();
 
         PaneruQueryState {
-            version: 1,
+            version: 2,
             timestamp: 123,
             active,
+            displays: vec![PaneruDisplayState {
+                display_id: 1,
+                active: true,
+                native_workspace_id: Some(10),
+                virtual_workspace_number: Some(virtual_workspace_number),
+            }],
             virtual_workspaces: vec![PaneruVirtualWorkspaceState {
                 number: virtual_workspace_number,
                 native_workspace_id: 10,
+                display_id: Some(1),
+                selected: true,
                 active: true,
                 windows,
             }],
