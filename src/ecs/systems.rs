@@ -1062,6 +1062,7 @@ pub(super) fn update_overlays(
         dim_opacity,
         dim_color,
         focused_abs_cg,
+        Some(focused_window_id),
         border_params.as_ref(),
     );
 }
