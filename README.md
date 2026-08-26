@@ -111,6 +111,10 @@ $ cargo build --release
 $ cargo install --path .
 ```
 
+Cargo builds include the embedded Lua runtime with a vendored LuaJIT by
+default. Use `cargo build --release --no-default-features` for a build without
+Lua support.
+
 It can run directly from the command line or as a service.
 Note that you will need to grant accessibility privileges to the binary.
 

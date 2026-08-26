@@ -523,7 +523,7 @@ fn gesture_should_intercept(configured_fingers: Option<usize>, actual_fingers: u
 }
 
 fn get_modifiers(eventflags: CGEventFlags) -> Modifiers {
-    const MODIFIER_MASKS: [(Modifiers, u64); 8] = [
+    const SIDE_MASKS: [(Modifiers, u64); 8] = [
         (Modifiers::LALT, 0x0000_0020),
         (Modifiers::RALT, 0x0000_0040),
         (Modifiers::LSHIFT, 0x0000_0002),
@@ -533,6 +533,12 @@ fn get_modifiers(eventflags: CGEventFlags) -> Modifiers {
         (Modifiers::LCTRL, 0x0000_0001),
         (Modifiers::RCTRL, 0x0000_2000),
     ];
+    const GENERIC_MASKS: [(Modifiers, CGEventFlags); 4] = [
+        (Modifiers::ALT, CGEventFlags::MaskAlternate),
+        (Modifiers::SHIFT, CGEventFlags::MaskShift),
+        (Modifiers::CMD, CGEventFlags::MaskCommand),
+        (Modifiers::CTRL, CGEventFlags::MaskControl),
+    ];
 
     // Fn key should be checked for separately, because pressing
     // some keys (i.e. leftarrow) seems to inadvertently toggling it.
@@ -541,11 +547,22 @@ fn get_modifiers(eventflags: CGEventFlags) -> Modifiers {
         return Modifiers::FN;
     }
 
-    MODIFIER_MASKS
+    let side_modifiers =
+        SIDE_MASKS
+            .iter()
+            .fold(Modifiers::empty(), |modifiers, (modifier, mask)| {
+                if eventflags.0 & mask != 0 {
+                    modifiers | *modifier
+                } else {
+                    modifiers
+                }
+            });
+
+    GENERIC_MASKS
         .iter()
-        .fold(Modifiers::empty(), |modifiers, (modifier, mask)| {
-            if eventflags.0 & mask != 0 {
-                modifiers | *modifier
+        .fold(side_modifiers, |modifiers, (group, mask)| {
+            if (modifiers & *group).is_empty() && eventflags.contains(*mask) {
+                modifiers | *group
             } else {
                 modifiers
             }
@@ -643,9 +660,19 @@ mod tests {
     }
 
     #[test]
-    fn device_independent_flags_ignored() {
-        let generic_alt: u64 = 0x0008_0000;
-        assert_eq!(get_modifiers(CGEventFlags(generic_alt)), Modifiers::empty());
+    fn device_independent_flags_fill_missing_side_information() {
+        let generic =
+            CGEventFlags::MaskAlternate | CGEventFlags::MaskControl | CGEventFlags::MaskCommand;
+        assert_eq!(
+            get_modifiers(generic),
+            Modifiers::ALT | Modifiers::CTRL | Modifiers::CMD
+        );
+
+        let generic_and_left_alt = CGEventFlags(generic.0 | NX_DEVICELALTKEYMASK);
+        assert_eq!(
+            get_modifiers(generic_and_left_alt),
+            Modifiers::LALT | Modifiers::CTRL | Modifiers::CMD
+        );
     }
     #[test]
     fn secondary_fn_flag_is_not_ignored() {

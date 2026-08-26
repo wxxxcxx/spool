@@ -87,7 +87,7 @@
         commonArgs
         // {
           inherit pname;
-          cargoExtraArgs = "--features lua,${luaFeature defaultLua}";
+          cargoExtraArgs = "--no-default-features --features lua,${luaFeature defaultLua}";
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [
             pkgs.apple-sdk.privateFrameworksHook
@@ -100,9 +100,10 @@
       # Everything else is a function of the two knobs.
       #
       # Overrideable like a nixpkgs package (`spool.override { enableLua =
-      # true; lua = pkgs.lua5_4; }`). `enableLua` toggles the `lua` Cargo
+      # false; }` or `spool.override { lua = pkgs.lua5_4; }`). `enableLua`
+      # toggles the `lua` Cargo
       # feature, which builds in the `init.lua` scripting runtime
-      # (`spool.on`/`spool.bind`); it is off by default at the Cargo level
+      # (`spool.on`/`spool.bind`); it is on by default at the Cargo level
       # (see `Cargo.toml`) and here. `lua` resolves the whole Lua dependency
       # graph: the daemon's `mlua` ABI feature (`luajit`/`lua54`/..., via
       # `luaFeature`), the interpreter it links against, and the one the
@@ -112,7 +113,7 @@
       # `spool.luaModule.override { lua = ...; }`.
       mkSpool =
         {
-          enableLua ? false,
+          enableLua ? true,
           lua ? defaultLua,
         }:
         let
@@ -126,7 +127,11 @@
             buildInputs = lib.optional enableLua lua;
           };
 
-          cargoExtraArgs = lib.optionalString enableLua "--features lua,${luaFeature lua}";
+          # Nix supplies the selected interpreter, so never inherit Cargo's
+          # vendored LuaJIT default. This also keeps `enableLua = false` a
+          # genuinely Lua-free build.
+          cargoExtraArgs =
+            "--no-default-features" + lib.optionalString enableLua " --features lua,${luaFeature lua}";
 
           # --- Loadable Lua C module, as a function of the interpreter -------
           #
