@@ -37,7 +37,7 @@ pub mod padding;
 pub mod swipe;
 
 /// A `LazyLock` that determines the path to the application's configuration file.
-/// It checks the `PANERU_CONFIG` environment variable first, then standard XDG locations and user home directory.
+/// It checks the `SPOOL_CONFIG` environment variable first, then standard XDG locations and user home directory.
 /// If no configuration file is found, a minimal one is created in the user's
 /// XDG configuration directory so a fresh app installation can start with the
 /// built-in defaults.
@@ -65,7 +65,7 @@ pub static CONFIGURATION_FILE: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
     }))
 });
 
-const DEFAULT_CONFIGURATION: &str = "# Paneru configuration\n\n[options]\n\n[bindings]\n";
+const DEFAULT_CONFIGURATION: &str = "# Spool configuration\n\n[options]\n\n[bindings]\n";
 
 fn default_configuration_file() -> std::io::Result<PathBuf> {
     let config_home = env::var_os("XDG_CONFIG_HOME")
@@ -78,7 +78,7 @@ fn default_configuration_file() -> std::io::Result<PathBuf> {
             )
         })?;
 
-    Ok(config_home.join("paneru").join("paneru.toml"))
+    Ok(config_home.join("spool").join("spool.toml"))
 }
 
 fn create_default_configuration_file() -> std::io::Result<PathBuf> {
@@ -108,13 +108,13 @@ fn create_configuration_file_at(path: &Path) -> std::io::Result<bool> {
 /// Finds the first existing configuration file from supported locations.
 /// Unlike [`CONFIGURATION_FILE`], this does not panic when no file is found.
 pub fn discover_configuration_file() -> Option<PathBuf> {
-    if let Ok(path_str) = env::var("PANERU_CONFIG") {
+    if let Ok(path_str) = env::var("SPOOL_CONFIG") {
         let path = PathBuf::from(path_str);
         if path.exists() {
             return Some(path);
         }
         warn!(
-            "{}: $PANERU_CONFIG is set to {}, but the file does not exist. Falling back to default locations.",
+            "{}: $SPOOL_CONFIG is set to {}, but the file does not exist. Falling back to default locations.",
             function_name!(),
             path.display()
         );
@@ -123,14 +123,14 @@ pub fn discover_configuration_file() -> Option<PathBuf> {
     let standard_paths = [
         env::var("HOME")
             .ok()
-            .map(|h| PathBuf::from(h).join(".paneru")),
+            .map(|h| PathBuf::from(h).join(".spool")),
         env::var("HOME")
             .ok()
-            .map(|h| PathBuf::from(h).join(".paneru.toml")),
+            .map(|h| PathBuf::from(h).join(".spool.toml")),
     ];
 
-    let xdg_dirs = xdg::BaseDirectories::with_prefix("paneru");
-    let xdg_config_paths = xdg_dirs.find_config_files("paneru.toml");
+    let xdg_dirs = xdg::BaseDirectories::with_prefix("spool");
+    let xdg_config_paths = xdg_dirs.find_config_files("spool.toml");
 
     standard_paths
         .into_iter()
@@ -143,23 +143,23 @@ pub fn discover_configuration_file() -> Option<PathBuf> {
 /// file watcher always has a concrete path to observe for hot reloading.
 #[cfg(feature = "lua")]
 const DEFAULT_LUA_SCRIPT: &str = "\
--- Paneru Lua configuration (hot-reloaded on save).
+-- Spool Lua configuration (hot-reloaded on save).
 --
 -- Hook into window-manager events:
---   paneru.on(\"window_focused\", function(e) paneru.log(\"focused \" .. e.window_id) end)
+--   spool.on(\"window_focused\", function(e) spool.log(\"focused \" .. e.window_id) end)
 --
 -- Bind keys to commands (chord syntax matches [bindings]):
---   paneru.bind(\"alt - b\", \"window balance\")
+--   spool.bind(\"alt - b\", \"window balance\")
 --
 -- ...or to a function. Handlers are given the whole layout as a value they can
 -- transform; nothing moves until you return one, so computing a layout and
 -- discarding it costs nothing. See CONFIGURATION.md.
---   paneru.bind(\"alt - j\", function(ws)
+--   spool.bind(\"alt - j\", function(ws)
 --     return ws:focus(ws:east(ws:focused()))
 --   end)
 ";
 
-/// Returns the default location for the Lua init script (`<config>/paneru/init.lua`).
+/// Returns the default location for the Lua init script (`<config>/spool/init.lua`).
 #[cfg(feature = "lua")]
 fn default_lua_file() -> std::io::Result<PathBuf> {
     let config_home = env::var_os("XDG_CONFIG_HOME")
@@ -172,20 +172,20 @@ fn default_lua_file() -> std::io::Result<PathBuf> {
             )
         })?;
 
-    Ok(config_home.join("paneru").join("init.lua"))
+    Ok(config_home.join("spool").join("init.lua"))
 }
 
 /// Finds the first existing Lua init script from supported locations, mirroring
-/// [`discover_configuration_file`]. Honors `$PANERU_LUA` first.
+/// [`discover_configuration_file`]. Honors `$SPOOL_LUA` first.
 #[cfg(feature = "lua")]
 pub fn discover_lua_file() -> Option<PathBuf> {
-    if let Ok(path_str) = env::var("PANERU_LUA") {
+    if let Ok(path_str) = env::var("SPOOL_LUA") {
         let path = PathBuf::from(path_str);
         if path.exists() {
             return Some(path);
         }
         warn!(
-            "{}: $PANERU_LUA is set to {}, but the file does not exist. Falling back to default locations.",
+            "{}: $SPOOL_LUA is set to {}, but the file does not exist. Falling back to default locations.",
             function_name!(),
             path.display()
         );
@@ -193,9 +193,9 @@ pub fn discover_lua_file() -> Option<PathBuf> {
 
     let standard_paths = [env::var("HOME")
         .ok()
-        .map(|h| PathBuf::from(h).join(".paneru.lua"))];
+        .map(|h| PathBuf::from(h).join(".spool.lua"))];
 
-    let xdg_dirs = xdg::BaseDirectories::with_prefix("paneru");
+    let xdg_dirs = xdg::BaseDirectories::with_prefix("spool");
     let xdg_paths = xdg_dirs.find_config_files("init.lua");
 
     standard_paths
@@ -208,7 +208,7 @@ pub fn discover_lua_file() -> Option<PathBuf> {
 /// Returns the path to the Lua init script, creating a default one at the XDG
 /// location if none exists.
 ///
-/// Returns `Ok(None)` instead if a `paneru.toml` already exists: planting a
+/// Returns `Ok(None)` instead if a `spool.toml` already exists: planting a
 /// script beside an existing TOML would silently override it (see
 /// [`CONFIGURATION_FILE`]).
 #[cfg(feature = "lua")]
@@ -291,7 +291,7 @@ pub fn deprecated_options_in_file(path: &Path) -> Result<Vec<String>> {
 /// "focus", "east"]`), mapping the shared vocabulary crate's parse error into
 /// this crate's configuration error.
 pub fn parse_command(argv: &[&str]) -> Result<Command> {
-    paneru_shared_types::commands::parse_command(argv)
+    spool_shared_types::commands::parse_command(argv)
         .map_err(|err| Error::InvalidConfig(format!("{}: {err}", function_name!())))
 }
 
@@ -1214,7 +1214,7 @@ pub struct WindowParams {
     /// Per-window override for the active window border corner radius.
     pub border_radius: Option<f64>,
     /// Keyboard shortcuts that should be passed through to this app instead of
-    /// being intercepted by paneru. Uses the same `"modifier+modifier-key"`
+    /// being intercepted by spool. Uses the same `"modifier+modifier-key"`
     /// format as `[bindings]` (e.g. `"ctrl+alt-h"`).
     #[serde(default)]
     bindings_passthrough: Vec<String>,
@@ -1289,10 +1289,10 @@ where
         .map_err(|e: Error| serde::de::Error::custom(e.to_string()))
 }
 
-/// Builds a [`Config`] from the Lua table passed to `paneru.setup{...}`,
+/// Builds a [`Config`] from the Lua table passed to `spool.setup{...}`,
 /// reusing the same serde `Deserialize` that parses the TOML file. Keybindings
 /// are not read here — they go through the Lua keybind pipeline via
-/// `paneru.bind` — so any `bindings` field is cleared.
+/// `spool.bind` — so any `bindings` field is cleared.
 ///
 /// # Errors
 ///
@@ -1303,7 +1303,7 @@ pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Resu
 
     if !value.is_table() {
         return Err(mlua::Error::RuntimeError(
-            "paneru.setup: expected a table".to_string(),
+            "spool.setup: expected a table".to_string(),
         ));
     }
 
@@ -1326,7 +1326,7 @@ pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Resu
                 for chord in &params.bindings_passthrough {
                     match resolve_keybinding_str(chord, virtual_keys) {
                         Ok(pair) => params.parsed_passthrough.push(pair),
-                        Err(err) => error!("paneru.setup passthrough: {err}"),
+                        Err(err) => error!("spool.setup passthrough: {err}"),
                     }
                 }
             }
@@ -1341,7 +1341,7 @@ pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Resu
 /// Resolves a keybinding chord string like `"ctrl+alt-h"` into a `(keycode, Modifiers)`
 /// pair, generating the layout-aware virtual keymap on demand.
 ///
-/// This is the entry point used by the Lua runtime's `paneru.bind`, so scripted
+/// This is the entry point used by the Lua runtime's `spool.bind`, so scripted
 /// keybinds accept the exact same chord syntax as the TOML `[bindings]` table.
 #[cfg(feature = "lua")]
 pub(crate) fn resolve_chord(input: &str) -> Result<(u8, Modifiers)> {
@@ -1356,7 +1356,7 @@ pub(crate) fn resolve_chord(input: &str) -> Result<(u8, Modifiers)> {
 /// The layout-aware virtual keymap, computed once.
 ///
 /// `generate_virtual_keymap` goes through Carbon/TIS, which is main-thread/
-/// GUI-session sensitive, but `paneru.bind` runs on the Lua worker thread. So
+/// GUI-session sensitive, but `spool.bind` runs on the Lua worker thread. So
 /// the daemon primes this from the main thread at startup; the worker only
 /// ever reads what was left behind.
 #[cfg(feature = "lua")]
@@ -2098,7 +2098,7 @@ fn test_config_defaults() {
 #[test]
 fn test_first_launch_creates_parseable_config_without_overwriting_it() {
     let unique = format!(
-        "paneru-first-launch-{}-{}",
+        "spool-first-launch-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2106,7 +2106,7 @@ fn test_first_launch_creates_parseable_config_without_overwriting_it() {
             .as_nanos()
     );
     let directory = std::env::temp_dir().join(unique);
-    let path = directory.join("paneru.toml");
+    let path = directory.join("spool.toml");
 
     assert!(create_configuration_file_at(&path).unwrap());
     Config::new(&path).expect("generated configuration should parse");
@@ -2239,8 +2239,8 @@ mod lua_setup_tests {
     use super::*;
     use mlua::Lua;
 
-    /// Runs a `paneru.setup`-style table (as a Lua chunk that returns it) through
-    /// the same `config_from_lua` path `paneru.setup` uses.
+    /// Runs a `spool.setup`-style table (as a Lua chunk that returns it) through
+    /// the same `config_from_lua` path `spool.setup` uses.
     fn config_from_source(source: &str) -> Config {
         let lua = Lua::new();
         let value: mlua::Value = lua.load(source).eval().expect("lua chunk should evaluate");

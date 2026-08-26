@@ -21,7 +21,7 @@
         systems = lib.platforms.darwin;
         flake = {
           overlays.default = final: prev: {
-            paneru = self.packages.aarch64-darwin.default;
+            spool = self.packages.aarch64-darwin.default;
           };
         };
         perSystem =

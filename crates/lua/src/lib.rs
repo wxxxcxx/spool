@@ -1,45 +1,45 @@
-//! The `paneru` Lua API, in both the shapes it is used in.
+//! The `spool` Lua API, in both the shapes it is used in.
 //!
-//! [`install`] puts the typed, host-agnostic API onto a table — `paneru.run`,
-//! `paneru.window.*`, `paneru.workspace.*`, `paneru.mouse.*` — built on a
+//! [`install`] puts the typed, host-agnostic API onto a table — `spool.run`,
+//! `spool.window.*`, `spool.workspace.*`, `spool.mouse.*` — built on a
 //! caller-supplied dispatcher. The daemon's embedded runtime (`src/lua`) hands
 //! it one that queues the [`Command`] onto the command bus; [`client`] hands it
 //! one that writes the command to a running daemon's Unix socket, and adds the
 //! client-only `query_*` / `subscribe` helpers on top.
 //!
 //! With the `module` feature the crate additionally builds as a loadable Lua C
-//! extension (`paneru.so`) exposing that client table:
+//! extension (`spool.so`) exposing that client table:
 //!
 //! ```lua
-//! local paneru = require("paneru")
+//! local spool = require("spool")
 //!
-//! paneru.window.focus({ direction = "east" })   -- directional
-//! paneru.window.focus({ number = 3 })           -- by column number
-//! paneru.window.balance()
-//! paneru.workspace.select({ number = 2 })       -- switch virtual workspace
-//! paneru.workspace.move_window({ number = 2, follow = false })
-//! paneru.workspace.add()                        -- create + switch to a new virtual workspace
-//! paneru.quit()
+//! spool.window.focus({ direction = "east" })   -- directional
+//! spool.window.focus({ number = 3 })           -- by column number
+//! spool.window.balance()
+//! spool.workspace.select({ number = 2 })       -- switch virtual workspace
+//! spool.workspace.move_window({ number = 2, follow = false })
+//! spool.workspace.add()                        -- create + switch to a new virtual workspace
+//! spool.quit()
 //!
-//! for _, window in ipairs(paneru.query_on_screen()) do  -- actually visible
+//! for _, window in ipairs(spool.query_on_screen()) do  -- actually visible
 //!   print(window.app_name, window.title)
 //! end
 //!
-//! paneru.state.set("pads.term", 4213)          -- outlives reloads and restarts
-//! paneru.state.mutate("count", function(n) return (n or 0) + 1 end)
+//! spool.state.set("pads.term", 4213)          -- outlives reloads and restarts
+//! spool.state.mutate("count", function(n) return (n or 0) + 1 end)
 //!
-//! paneru.subscribe("window_focused", function(evt)  -- blocking; run in a helper process
+//! spool.subscribe("window_focused", function(evt)  -- blocking; run in a helper process
 //!   print(evt.title)
 //! end)
 //!
-//! paneru.subscribe(nil, function(evt) ... end)  -- nil event = every event
-//! paneru.subscribe({ "window_focused", "window_title_changed" }, function(evt) ... end)
+//! spool.subscribe(nil, function(evt) ... end)  -- nil event = every event
+//! spool.subscribe({ "window_focused", "window_title_changed" }, function(evt) ... end)
 //! ```
 //!
 //! Every verb builds a real [`Command`]: option tables are deserialized into
 //! the actual enums with mlua's serde support, so `"east"` becomes
 //! [`Direction::East`] and an unknown value fails at the call site. Only the
-//! host-specific extras differ (`paneru.on` / `paneru.bind` are embedded-only;
+//! host-specific extras differ (`spool.on` / `spool.bind` are embedded-only;
 //! `subscribe` and the socket-path helpers are client-only).
 
 #![allow(
@@ -55,53 +55,53 @@ use mlua::{Function, Lua, LuaSerdeExt, Result, Table, Value};
 use regex::Regex;
 use serde::Deserialize;
 
-use paneru_shared_types::commands::{
+use spool_shared_types::commands::{
     Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, parse_command,
 };
 
 /// Issues a [`Command`]. The only thing the two hosts differ by.
 pub type Dispatch = Rc<dyn Fn(&Lua, Command) -> Result<bool>>;
 
-/// Installs the shared API onto the `paneru` table, building every verb on
+/// Installs the shared API onto the `spool` table, building every verb on
 /// `dispatch`.
 ///
 /// # Errors
 ///
 /// Returns an error if any Lua table/function creation or assignment fails.
-pub fn install(lua: &Lua, paneru: &Table, dispatch: &Dispatch) -> Result<()> {
-    // paneru.run(cmd) / paneru.command(cmd) — the escape hatch: a command
+pub fn install(lua: &Lua, spool: &Table, dispatch: &Dispatch) -> Result<()> {
+    // spool.run(cmd) / spool.command(cmd) — the escape hatch: a command
     // string, an argv table, or a structured command table.
     let run = {
         let dispatch = Rc::clone(dispatch);
         lua.create_function(move |lua, command: Value| dispatch(lua, to_command(lua, &command)?))?
     };
-    paneru.set("run", run.clone())?;
-    paneru.set("command", run)?;
+    spool.set("run", run.clone())?;
+    spool.set("command", run)?;
 
-    paneru.set("window", window_table(lua, dispatch)?)?;
-    paneru.set("workspace", workspace_table(lua, dispatch)?)?;
+    spool.set("window", window_table(lua, dispatch)?)?;
+    spool.set("workspace", workspace_table(lua, dispatch)?)?;
 
     let mouse = lua.create_table()?;
     mouse.set(
         "next_display",
         verb(lua, dispatch, Command::Mouse(MouseMove::ToNextDisplay))?,
     )?;
-    paneru.set("mouse", mouse)?;
+    spool.set("mouse", mouse)?;
 
-    paneru.set("quit", verb(lua, dispatch, Command::Quit)?)?;
-    paneru.set("restart", verb(lua, dispatch, Command::Restart)?)?;
-    paneru.set("print_state", verb(lua, dispatch, Command::PrintState)?)?;
+    spool.set("quit", verb(lua, dispatch, Command::Quit)?)?;
+    spool.set("restart", verb(lua, dispatch, Command::Restart)?)?;
+    spool.set("print_state", verb(lua, dispatch, Command::PrintState)?)?;
 
-    // paneru.match{ app = …, bundle = …, title = …, floating = …, managed = … }
+    // spool.match{ app = …, bundle = …, title = …, floating = …, managed = … }
     // builds a predicate over window records, for `ws:find`/`ws:filter`.
     // `app`, `bundle` and `title` are regexes, compiled here so a bad pattern
     // errors at the call site rather than silently matching nothing.
-    paneru.set("match", lua.create_function(matcher)?)?;
+    spool.set("match", lua.create_function(matcher)?)?;
 
     Ok(())
 }
 
-/// One `paneru.match{…}` call: compiles the spec into a Lua predicate.
+/// One `spool.match{…}` call: compiles the spec into a Lua predicate.
 ///
 /// # Errors
 ///
@@ -113,7 +113,7 @@ pub fn matcher(lua: &Lua, spec: Table) -> Result<Function> {
         };
         Regex::new(&pattern)
             .map(Some)
-            .map_err(|err| mlua::Error::RuntimeError(format!("paneru.match: {field}: {err}")))
+            .map_err(|err| mlua::Error::RuntimeError(format!("spool.match: {field}: {err}")))
     };
     let (app, bundle, title) = (pattern("app")?, pattern("bundle")?, pattern("title")?);
     let floating: Option<bool> = spec.get("floating")?;
@@ -126,7 +126,7 @@ pub fn matcher(lua: &Lua, spec: Table) -> Result<Function> {
             "app" | "bundle" | "title" | "floating" | "managed"
         ) {
             return Err(mlua::Error::RuntimeError(format!(
-                "paneru.match: unknown field '{key}'"
+                "spool.match: unknown field '{key}'"
             )));
         }
     }
@@ -157,7 +157,7 @@ pub fn matcher(lua: &Lua, spec: Table) -> Result<Function> {
     })
 }
 
-/// Builds the `paneru.window` sub-table.
+/// Builds the `spool.window` sub-table.
 fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     let window = lua.create_table()?;
 
@@ -197,7 +197,7 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     Ok(window)
 }
 
-/// Builds the `paneru.workspace` sub-table.
+/// Builds the `spool.workspace` sub-table.
 fn workspace_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     let workspace = lua.create_table()?;
 
@@ -259,7 +259,7 @@ fn verb(lua: &Lua, dispatch: &Dispatch, command: Command) -> Result<Function> {
 }
 
 /// A verb taking `{ direction = "east" }` or `{ number = 3 }` (or the bare
-/// value), e.g. `paneru.window.focus{ number = 3 }`.
+/// value), e.g. `spool.window.focus{ number = 3 }`.
 fn directional(
     lua: &Lua,
     dispatch: &Dispatch,
@@ -286,7 +286,7 @@ fn follower(
     })
 }
 
-/// `paneru.window.resize{ direction = "grow" }`, defaulting to growing.
+/// `spool.window.resize{ direction = "grow" }`, defaulting to growing.
 fn resize(lua: &Lua, dispatch: &Dispatch) -> Result<Function> {
     let dispatch = Rc::clone(dispatch);
     lua.create_function(move |lua, opts: Value| {
@@ -333,7 +333,7 @@ impl Opts {
     }
 }
 
-/// `paneru.window.resize` options: `{ direction = "grow" }` or a bare
+/// `spool.window.resize` options: `{ direction = "grow" }` or a bare
 /// `"shrink"`, defaulting to growing.
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -352,7 +352,7 @@ impl ResizeOpts {
     }
 }
 
-/// Converts a `paneru.run` argument into a [`Command`]: a command string, an
+/// Converts a `spool.run` argument into a [`Command`]: a command string, an
 /// argv table, or a structured table deserialized straight into the enums.
 fn to_command(lua: &Lua, value: &Value) -> Result<Command> {
     let parse = |argv: &[String]| {
@@ -401,12 +401,12 @@ fn scalar_token(value: &Value) -> Result<String> {
     }
 }
 
-/// The loadable-module entry point: `require("paneru")` calls `luaopen_paneru`,
+/// The loadable-module entry point: `require("spool")` calls `luaopen_spool`,
 /// which returns the client table. Only compiled for the `module` feature —
 /// the daemon depends on this crate as a plain library.
 #[cfg(feature = "module")]
 #[mlua::lua_module]
-fn paneru(lua: &Lua) -> Result<Table> {
+fn spool(lua: &Lua) -> Result<Table> {
     client::module(lua, env!("CARGO_PKG_VERSION"))
 }
 
@@ -420,8 +420,8 @@ mod tests {
     fn run(source: &str) -> mlua::Result<Vec<Command>> {
         let lua = Lua::new();
         let issued = Rc::new(RefCell::new(Vec::new()));
-        let paneru = lua.create_table()?;
-        lua.globals().set("paneru", paneru.clone())?;
+        let spool = lua.create_table()?;
+        lua.globals().set("spool", spool.clone())?;
 
         let recorder = {
             let issued = Rc::clone(&issued);
@@ -430,7 +430,7 @@ mod tests {
                 Ok(true)
             }
         };
-        install(&lua, &paneru, &(Rc::new(recorder) as Dispatch))?;
+        install(&lua, &spool, &(Rc::new(recorder) as Dispatch))?;
         lua.load(source).exec()?;
 
         let commands = issued.borrow().clone();
@@ -444,10 +444,10 @@ mod tests {
     #[test]
     fn typed_verbs_build_typed_commands() {
         let commands = run(r#"
-            paneru.window.focus({ direction = "east" })
-            paneru.window.focus({ number = 3 })
-            paneru.window.balance()
-            paneru.workspace.move_window({ number = 2, follow = false })
+            spool.window.focus({ direction = "east" })
+            spool.window.focus({ number = 3 })
+            spool.window.balance()
+            spool.workspace.move_window({ number = 2, follow = false })
         "#)
         .unwrap();
 
@@ -465,9 +465,9 @@ mod tests {
     #[test]
     fn run_accepts_strings_argv_and_command_tables() {
         let commands = run(r#"
-            paneru.run("window focus east")
-            paneru.run({ "window", "focus", 3 })
-            paneru.run({ window = { focus = "east" } })
+            spool.run("window focus east")
+            spool.run({ "window", "focus", 3 })
+            spool.run({ window = { focus = "east" } })
         "#)
         .unwrap();
 
@@ -483,18 +483,18 @@ mod tests {
 
     #[test]
     fn bad_arguments_fail_at_the_call_site() {
-        assert!(run(r#"paneru.window.focus({ direction = "sideways" })"#).is_err());
-        assert!(run("paneru.window.focus({})").is_err());
-        assert!(run(r#"paneru.window.resize({ direction = "wider" })"#).is_err());
-        assert!(run(r#"paneru.run("not a command")"#).is_err());
+        assert!(run(r#"spool.window.focus({ direction = "sideways" })"#).is_err());
+        assert!(run("spool.window.focus({})").is_err());
+        assert!(run(r#"spool.window.resize({ direction = "wider" })"#).is_err());
+        assert!(run(r#"spool.run("not a command")"#).is_err());
     }
 
     #[test]
     fn defaults_match_the_documented_behaviour() {
         let commands = run(r"
-            paneru.window.resize()
-            paneru.window.next_display()
-            paneru.window.next_display({ follow = false })
+            spool.window.resize()
+            spool.window.next_display()
+            spool.window.next_display({ follow = false })
         ")
         .unwrap();
 

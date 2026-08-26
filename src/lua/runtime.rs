@@ -10,7 +10,7 @@
 //! suspends rather than blocking — so nothing here may hold a `RefCell`
 //! borrow across an await.
 
-use paneru_shared_types::script_value::ScriptValue;
+use spool_shared_types::script_value::ScriptValue;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use mlua::prelude::{FromLua, IntoLua};
 use mlua::{AnyUserData, Function, Lua, Table, Value};
-use paneru_shared_types::windowset::WindowSet;
+use spool_shared_types::windowset::WindowSet;
 use tracing::{error, warn};
 
 use super::api;
@@ -32,7 +32,7 @@ pub type LuaKeybind = (u8, Modifiers, u32);
 
 /// A store failure, spelled the way the script called it.
 pub(super) fn store_error(call: &str, message: &str) -> mlua::Error {
-    mlua::Error::RuntimeError(format!("paneru.state.{call}: {message}"))
+    mlua::Error::RuntimeError(format!("spool.state.{call}: {message}"))
 }
 
 /// A stored value as Lua sees it. Nothing stored is `nil`, which is how a
@@ -56,7 +56,7 @@ pub(super) fn from_lua_value(lua: &Lua, value: Value, call: &str) -> mlua::Resul
         .map_err(|err| store_error(call, &format!("value cannot be stored: {err}")))
 }
 
-/// Prepends `PANERU_LUA_PATH`/`PANERU_LUA_CPATH` (if set) onto `package.path`/
+/// Prepends `SPOOL_LUA_PATH`/`SPOOL_LUA_CPATH` (if set) onto `package.path`/
 /// `package.cpath`, so `require("sbar")` (or any module supplied via the Nix
 /// `extraLuaPackages` option) resolves. Each var is itself a `;`-separated
 /// list of Lua path templates - the same shape `package.path` already uses -
@@ -64,8 +64,8 @@ pub(super) fn from_lua_value(lua: &Lua, value: Value, call: &str) -> mlua::Resul
 /// no reformatting.
 fn extend_lua_search_paths(lua: &Lua) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
-    prepend_env_path(&package, "path", "PANERU_LUA_PATH")?;
-    prepend_env_path(&package, "cpath", "PANERU_LUA_CPATH")?;
+    prepend_env_path(&package, "path", "SPOOL_LUA_PATH")?;
+    prepend_env_path(&package, "cpath", "SPOOL_LUA_CPATH")?;
     Ok(())
 }
 
@@ -94,9 +94,9 @@ pub(super) struct HandlerEntry {
 /// has to reach back into Lua globals to find a callback.
 #[derive(Default)]
 pub(super) struct Registry {
-    /// `paneru.on` handlers, in registration order per event name.
+    /// `spool.on` handlers, in registration order per event name.
     pub(super) handlers: HashMap<String, Vec<HandlerEntry>>,
-    /// `paneru.bind` handlers indexed by `id - 1`: a Lua function, or a command
+    /// `spool.bind` handlers indexed by `id - 1`: a Lua function, or a command
     /// string to run as-is.
     pub(super) binds: Vec<Value>,
     /// Chords parallel to `binds`, for publishing to the event-tap registry.
@@ -110,9 +110,9 @@ pub(super) type SharedRegistry = Rc<RefCell<Registry>>;
 /// Pending side effects produced by Lua callbacks, drained after each dispatch.
 #[derive(Default)]
 pub(super) struct Outbox {
-    /// Commands queued via `paneru.run` / `paneru.cmd`.
+    /// Commands queued via `spool.run` / `spool.cmd`.
     pub(super) commands: Vec<Command>,
-    /// Flash messages queued via `paneru.flash` as `(message, duration_secs)`.
+    /// Flash messages queued via `spool.flash` as `(message, duration_secs)`.
     pub(super) flashes: Vec<(String, f32)>,
 }
 
@@ -129,11 +129,11 @@ pub struct LuaRuntime {
     lua: Lua,
     outbox: Rc<RefCell<Outbox>>,
     registry: SharedRegistry,
-    /// World access for the dispatches in flight, shared with the `paneru.*`
+    /// World access for the dispatches in flight, shared with the `spool.*`
     /// functions that read through it. Outlives a reload: the caches behind it
     /// are keyed by batch and revision, not by interpreter.
     world: Rc<DispatchWorld>,
-    /// The `Config` a script declared via `paneru.setup{...}`, if it called it.
+    /// The `Config` a script declared via `spool.setup{...}`, if it called it.
     /// `None` means the script left configuration to the TOML file.
     built_config: Option<Config>,
 }
@@ -145,7 +145,7 @@ impl LuaRuntime {
         Self::from_source(&source, world)
     }
 
-    /// Builds a runtime from Lua source, installing the `paneru` API and
+    /// Builds a runtime from Lua source, installing the `spool` API and
     /// executing the script. Registered keybinds are collected for publishing.
     pub fn from_source(source: &str, world: &Rc<DispatchWorld>) -> mlua::Result<Self> {
         // SAFETY: the runtime is confined to the thread that built it, and
@@ -158,7 +158,7 @@ impl LuaRuntime {
         let config_cell: Rc<RefCell<Option<Config>>> = Rc::new(RefCell::new(None));
         api::install(&lua, &outbox, &registry, &config_cell, world)?;
         lua.load(source).exec()?;
-        // The cell is only written by `paneru.setup`; take the built config out so
+        // The cell is only written by `spool.setup`; take the built config out so
         // the runtime owns it directly rather than keeping the shared cell alive.
         let built_config = config_cell.borrow_mut().take();
         Ok(Self {
@@ -180,13 +180,13 @@ impl LuaRuntime {
         self.registry.borrow().keybinds.clone()
     }
 
-    /// The `Config` the script declared via `paneru.setup{...}`, or `None` if it
+    /// The `Config` the script declared via `spool.setup{...}`, or `None` if it
     /// never called it (in which case the TOML config remains authoritative).
     pub fn built_config(&self) -> Option<&Config> {
         self.built_config.as_ref()
     }
 
-    /// Whether the script registered any `paneru.on` handler. Building the Lua
+    /// Whether the script registered any `spool.on` handler. Building the Lua
     /// table for an event is the costly step, so a script that only binds keys
     /// pays nothing for events it can never observe.
     pub(super) fn has_event_handlers(&self) -> bool {
@@ -207,7 +207,7 @@ impl LuaRuntime {
             .unwrap_or_default()
     }
 
-    /// Runs one `paneru.on` handler.
+    /// Runs one `spool.on` handler.
     ///
     /// `call_async`, so a handler that reads the world suspends here instead of
     /// holding the interpreter — which is what lets the next handler run rather
@@ -323,14 +323,14 @@ mod tests {
 
     use async_channel::{Receiver, unbounded};
     use futures_lite::future::{block_on, poll_once};
-    use paneru_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
-    use paneru_shared_types::windowset::WindowSet;
+    use spool_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
+    use spool_shared_types::windowset::WindowSet;
 
     use super::super::convert;
     use super::super::worker::{Shared, StoreRequest, WorldRequest};
     use super::super::world::WorldAccess;
     use super::*;
-    use crate::ecs::state::PaneruQueryState;
+    use crate::ecs::state::SpoolQueryState;
     use crate::events::Event;
 
     /// A competing writer, run just before a write lands.
@@ -379,7 +379,7 @@ mod tests {
         /// the request queue in turn rather than simply blocking on it.
         fn drive<T>(
             &self,
-            extract: &dyn Fn() -> Shared<PaneruQueryState>,
+            extract: &dyn Fn() -> Shared<SpoolQueryState>,
             future: impl Future<Output = T>,
         ) -> T {
             /// Ample for any dispatch here; only reached if one is wedged.
@@ -415,11 +415,11 @@ mod tests {
         }
 
         /// [`Self::drive`], but waiting between turns instead of spinning: for
-        /// a dispatch parked on `paneru.exec`, which is waiting on a process
+        /// a dispatch parked on `spool.exec`, which is waiting on a process
         /// rather than on this thread.
         fn drive_patiently<T>(
             &self,
-            extract: &dyn Fn() -> Shared<PaneruQueryState>,
+            extract: &dyn Fn() -> Shared<SpoolQueryState>,
             future: impl Future<Output = T>,
         ) -> T {
             const TURNS: usize = 2_000;
@@ -477,7 +477,7 @@ mod tests {
     fn bind_registers_keybind_and_stores_handler() {
         let world = TestWorld::default();
         let runtime = world
-            .runtime(r#"paneru.bind("alt - j", "window focus east")"#)
+            .runtime(r#"spool.bind("alt - j", "window focus east")"#)
             .unwrap();
         let binds = runtime.published_keybinds();
         assert_eq!(binds.len(), 1);
@@ -491,7 +491,7 @@ mod tests {
         let world = TestWorld::default();
         let runtime = world
             .runtime(
-                r#"paneru.setup{
+                r#"spool.setup{
                 options = { sliver_width = 7 },
                 bindings = { ["window focus east"] = "alt - j" },
             }"#,
@@ -506,7 +506,7 @@ mod tests {
     fn no_setup_call_leaves_config_to_toml() {
         let world = TestWorld::default();
         let runtime = world
-            .runtime(r#"paneru.bind("alt - b", "window balance")"#)
+            .runtime(r#"spool.bind("alt - b", "window balance")"#)
             .unwrap();
         assert!(runtime.built_config().is_none());
     }
@@ -515,7 +515,7 @@ mod tests {
     fn string_keybind_dispatch_queues_command() {
         let world = TestWorld::default();
         let runtime = world
-            .runtime(r#"paneru.bind("alt - b", "window balance")"#)
+            .runtime(r#"spool.bind("alt - b", "window balance")"#)
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
         world.drive(&extract, runtime.dispatch_bind(1));
@@ -533,9 +533,7 @@ mod tests {
     fn function_keybind_can_run_commands() {
         let world = TestWorld::default();
         let runtime = world
-            .runtime(
-                r#"paneru.bind("alt - j", function(state) paneru.run("window focus east") end)"#,
-            )
+            .runtime(r#"spool.bind("alt - j", function(state) spool.run("window focus east") end)"#)
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
         world.drive(&extract, runtime.dispatch_bind(1));
@@ -546,7 +544,7 @@ mod tests {
     fn event_handler_receives_event_and_queues_command() {
         let world = TestWorld::default();
         let runtime = world
-            .runtime(r#"paneru.on("space_changed", function(e) paneru.run("window balance") end)"#)
+            .runtime(r#"spool.on("space_changed", function(e) spool.run("window balance") end)"#)
             .unwrap();
         let (name, table) = convert::event_to_lua(runtime.lua(), &Event::SpaceChanged).unwrap();
         let extract = || Ok(Arc::new(test_state()));
@@ -563,32 +561,30 @@ mod tests {
     fn invalid_command_string_is_reported_not_panicking() {
         let world = TestWorld::default();
         // A bad command string surfaces as a Lua runtime error at bind time.
-        let result = world.runtime(r#"paneru.run("definitely not a command")"#);
+        let result = world.runtime(r#"spool.run("definitely not a command")"#);
         assert!(result.is_err());
     }
 
     /// A canned state document to answer queries with.
-    fn test_state() -> PaneruQueryState {
-        use crate::ecs::state::{
-            PaneruActiveState, PaneruVirtualWorkspaceState, PaneruWindowState,
-        };
+    fn test_state() -> SpoolQueryState {
+        use crate::ecs::state::{SpoolActiveState, SpoolVirtualWorkspaceState, SpoolWindowState};
 
-        PaneruQueryState {
+        SpoolQueryState {
             version: 2,
             timestamp: 0,
-            active: PaneruActiveState {
+            active: SpoolActiveState {
                 focused_window_id: Some(7),
                 focused_app_name: Some("Test App".to_string()),
-                ..PaneruActiveState::default()
+                ..SpoolActiveState::default()
             },
             displays: Vec::new(),
-            virtual_workspaces: vec![PaneruVirtualWorkspaceState {
+            virtual_workspaces: vec![SpoolVirtualWorkspaceState {
                 number: 1,
                 native_workspace_id: 10,
                 display_id: Some(1),
                 selected: true,
                 active: true,
-                windows: vec![PaneruWindowState {
+                windows: vec![SpoolWindowState {
                     window_id: 7,
                     bundle_id: "com.example.app".to_string(),
                     app_name: "Test App".to_string(),
@@ -609,11 +605,11 @@ mod tests {
         let runtime = world
             .runtime(
                 r#"
-            paneru.bind("alt - q", function()
-              local active = paneru.query_active()
-              paneru.flash(active.focused_app_name)
-              paneru.flash(tostring(#paneru.query_workspaces()))
-              paneru.flash(paneru.query("active"))
+            spool.bind("alt - q", function()
+              local active = spool.query_active()
+              spool.flash(active.focused_app_name)
+              spool.flash(tostring(#spool.query_workspaces()))
+              spool.flash(spool.query("active"))
             end)
             "#,
             )
@@ -633,7 +629,7 @@ mod tests {
         assert_eq!(flashes[1], "1");
         assert!(
             flashes[2].starts_with('{') && flashes[2].contains("\"focused_app_name\":\"Test App\""),
-            "paneru.query should return raw JSON, got {}",
+            "spool.query should return raw JSON, got {}",
             flashes[2]
         );
     }
@@ -644,11 +640,11 @@ mod tests {
         let runtime = world
             .runtime(
                 r#"
-            paneru.bind("alt - q", function()
-              paneru.query_active()
-              paneru.query_on_screen()
+            spool.bind("alt - q", function()
+              spool.query_active()
+              spool.query_on_screen()
             end)
-            paneru.bind("alt - w", function() paneru.flash("no query here") end)
+            spool.bind("alt - w", function() spool.flash("no query here") end)
             "#,
             )
             .unwrap();
@@ -672,7 +668,7 @@ mod tests {
     #[test]
     fn query_outside_a_callback_explains_itself() {
         let world = TestWorld::default();
-        let Err(error) = world.runtime("paneru.query_state()") else {
+        let Err(error) = world.runtime("spool.query_state()") else {
             panic!("there is no world to query at script top level");
         };
         let error = error.to_string();
@@ -686,7 +682,7 @@ mod tests {
             .runtime(
                 r#"
             escaped = nil
-            paneru.bind("alt - q", function() escaped = paneru.query_state end)
+            spool.bind("alt - q", function() escaped = spool.query_state end)
             "#,
             )
             .unwrap();
@@ -701,14 +697,14 @@ mod tests {
     #[test]
     fn a_window_set_outside_a_callback_explains_itself() {
         let world = TestWorld::default();
-        // Same contract as `paneru.query`: there is no world to read at script
+        // Same contract as `spool.query`: there is no world to read at script
         // top level, so say so rather than answering from nothing.
         let runtime = world.runtime("").unwrap();
         let error = runtime
             .lua()
             // The set has to actually be *used*: it is lazy, so merely
             // being handed one costs nothing and cannot fail.
-            .load("return paneru.windows(function(ws) return ws:focus(1) end)")
+            .load("return spool.windows(function(ws) return ws:focus(1) end)")
             .exec()
             .expect_err("there is no window set at script top level")
             .to_string();
@@ -723,13 +719,13 @@ mod tests {
         let world = TestWorld::default();
         let runtime = world.runtime("").unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        // Driven as a dispatch, because `paneru.query` is async now: at top
+        // Driven as a dispatch, because `spool.query` is async now: at top
         // level there is no coroutine to suspend in.
         let error = world
             .drive(&extract, async {
                 runtime
                     .lua()
-                    .load(r#"return paneru.query("windows")"#)
+                    .load(r#"return spool.query("windows")"#)
                     .exec_async()
                     .await
             })
@@ -747,9 +743,9 @@ mod tests {
         let runtime = world
             .runtime(
                 r#"
-            paneru.bind("alt - b", function()
-              paneru.run("window balance")
-              paneru.flash("done", 3.0)
+            spool.bind("alt - b", function()
+              spool.run("window balance")
+              spool.flash("done", 3.0)
             end)
             "#,
             )
@@ -767,7 +763,7 @@ mod tests {
     fn run_with_store(source: &str, world: &TestWorld) {
         let runtime = world
             .runtime(&format!(
-                r#"paneru.bind("alt - z", function() {source} end)"#
+                r#"spool.bind("alt - z", function() {source} end)"#
             ))
             .expect("script should load");
         let extract = || Ok(Arc::new(test_state()));
@@ -779,10 +775,10 @@ mod tests {
         let world = TestWorld::default();
         run_with_store(
             r#"
-            paneru.state.set("string", "hello")
-            paneru.state.set("number", 42)
-            paneru.state.set("bool", true)
-            paneru.state.set("table", { a = 1, nested = { "x", "y" } })
+            spool.state.set("string", "hello")
+            spool.state.set("number", 42)
+            spool.state.set("bool", true)
+            spool.state.set("table", { a = 1, nested = { "x", "y" } })
             "#,
             &world,
         );
@@ -812,9 +808,9 @@ mod tests {
         let world = TestWorld::default();
         run_with_store(
             r#"
-            paneru.state.set("pad", { id = 7, name = "term" })
-            local pad = paneru.state.get("pad")
-            paneru.state.set("echo", pad.id .. "/" .. pad.name)
+            spool.state.set("pad", { id = 7, name = "term" })
+            local pad = spool.state.get("pad")
+            spool.state.set("echo", pad.id .. "/" .. pad.name)
             "#,
             &world,
         );
@@ -829,9 +825,9 @@ mod tests {
         let world = TestWorld::default();
         run_with_store(
             r#"
-            paneru.state.set("gone", 1)
-            paneru.state.set("gone", nil)
-            paneru.state.set("was_nil", paneru.state.get("gone") == nil)
+            spool.state.set("gone", 1)
+            spool.state.set("gone", nil)
+            spool.state.set("was_nil", spool.state.get("gone") == nil)
             "#,
             &world,
         );
@@ -847,9 +843,9 @@ mod tests {
         let world = TestWorld::default();
         run_with_store(
             r#"
-            paneru.state.mutate("count", function(n) return (n or 0) + 1 end)
-            paneru.state.mutate("count", function(n) return n + 1 end)
-            paneru.state.set("returned", paneru.state.mutate("count", function(n) return n + 1 end))
+            spool.state.mutate("count", function(n) return (n or 0) + 1 end)
+            spool.state.mutate("count", function(n) return n + 1 end)
+            spool.state.set("returned", spool.state.mutate("count", function(n) return n + 1 end))
             "#,
             &world,
         );
@@ -868,15 +864,15 @@ mod tests {
         let world = TestWorld::default();
         run_with_store(
             r#"
-            paneru.state.set("pad", 1)
-            paneru.state.mutate("pad", function() return nil end)
+            spool.state.set("pad", 1)
+            spool.state.mutate("pad", function() return nil end)
             "#,
             &world,
         );
         assert_eq!(world.get("pad"), None);
     }
 
-    /// `paneru.exec` suspends the handler instead of holding the interpreter,
+    /// `spool.exec` suspends the handler instead of holding the interpreter,
     /// so a slow child process does not stall every other handler.
     ///
     /// Uses `drive_patiently` rather than `drive`, which spins a fixed number
@@ -886,8 +882,8 @@ mod tests {
         let world = TestWorld::default();
         let runtime = world
             .runtime(
-                r#"paneru.bind("alt - z", function()
-                       local result = paneru.exec("/bin/echo", {"hello"})
+                r#"spool.bind("alt - z", function()
+                       local result = spool.exec("/bin/echo", {"hello"})
                        code, out = result.code, result.stdout
                    end)"#,
             )
@@ -912,9 +908,9 @@ mod tests {
         let world = TestWorld::default();
         let runtime = world
             .runtime(
-                r#"paneru.bind("alt - z", function()
+                r#"spool.bind("alt - z", function()
                        local ok, err = pcall(function()
-                           paneru.exec("/nonexistent/paneru-test-binary")
+                           spool.exec("/nonexistent/spool-test-binary")
                        end)
                        succeeded, message = ok, tostring(err)
                    end)"#,
@@ -955,7 +951,7 @@ mod tests {
         }));
 
         run_with_store(
-            r#"paneru.state.mutate("count", function(n) return n + 1 end)"#,
+            r#"spool.state.mutate("count", function(n) return n + 1 end)"#,
             &world,
         );
 
@@ -975,8 +971,8 @@ mod tests {
             .runtime(
                 r#"
             errored = false
-            paneru.bind("alt - z", function()
-              local ok = pcall(function() paneru.state.set("fn", function() end) end)
+            spool.bind("alt - z", function()
+              local ok = pcall(function() spool.state.set("fn", function() end) end)
               errored = not ok
             end)
             "#,
@@ -997,11 +993,11 @@ mod tests {
         let world = TestWorld::default();
         // There is no world outside a callback, so there is nothing to read
         // from or write to, and it says so rather than inventing a value.
-        let Err(error) = world.runtime(r#"paneru.state.get("anything")"#) else {
+        let Err(error) = world.runtime(r#"spool.state.get("anything")"#) else {
             panic!("top-level access should fail");
         };
         assert!(
-            error.to_string().contains("paneru.state is only available"),
+            error.to_string().contains("spool.state is only available"),
             "unexpected error: {error}"
         );
     }
@@ -1022,14 +1018,14 @@ mod tests {
         let world = TestWorld::default();
         // Unique var name so this doesn't race other tests' env state.
         // SAFETY: no other test reads or writes this variable.
-        unsafe { std::env::set_var("PANERU_LUA_PATH", "/tmp/paneru-test/?.lua") };
+        unsafe { std::env::set_var("SPOOL_LUA_PATH", "/tmp/spool-test/?.lua") };
         let runtime = world.runtime("").unwrap();
         let package: Table = runtime.lua().globals().get("package").unwrap();
         let path: String = package.get("path").unwrap();
         // SAFETY: no other test reads or writes this variable.
-        unsafe { std::env::remove_var("PANERU_LUA_PATH") };
+        unsafe { std::env::remove_var("SPOOL_LUA_PATH") };
         assert!(
-            path.starts_with("/tmp/paneru-test/?.lua;"),
+            path.starts_with("/tmp/spool-test/?.lua;"),
             "expected the extra path to be prepended, got {path}"
         );
     }

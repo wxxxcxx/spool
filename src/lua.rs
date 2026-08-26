@@ -1,13 +1,13 @@
 //! Embedded Lua scripting runtime (mlua).
 //!
-//! Lets a user's `init.lua` hook into window-manager events (`paneru.on`),
-//! bind keys to Lua callbacks or commands (`paneru.bind`), read state via
-//! `paneru.query*`, and issue commands back via `paneru.run`.
+//! Lets a user's `init.lua` hook into window-manager events (`spool.on`),
+//! bind keys to Lua callbacks or commands (`spool.bind`), read state via
+//! `spool.query*`, and issue commands back via `spool.run`.
 //!
 //! The interpreter runs on its own thread (see [`worker`]), not the main
 //! thread: a handler is arbitrary user code of unbounded duration, and the
 //! main thread hosts the Cocoa event pump, which a slow handler must not
-//! freeze. As a result, `paneru.query*` results are up to about a frame
+//! freeze. As a result, `spool.query*` results are up to about a frame
 //! stale, and commands a handler issues reach the command bus a frame later
 //! than synchronous dispatch would. Handlers in a batch run concurrently;
 //! commands from any one handler stay in the order it queued them, but
@@ -50,7 +50,7 @@ pub use worker::{LuaSource, LuaWorker};
 #[derive(Resource, Debug, Clone)]
 pub struct LuaScriptPath(pub PathBuf);
 
-/// What a `paneru.state` call is told when there is no store in the world at
+/// What a `spool.state` call is told when there is no store in the world at
 /// all. Only reachable in a harness that never inserted one.
 const MISSING_STORE: &str = "the script state store is not available";
 
@@ -79,13 +79,13 @@ impl Plugin for LuaPlugin {
     }
 }
 
-/// Forwards window-manager events to the worker for dispatch to `paneru.on`
+/// Forwards window-manager events to the worker for dispatch to `spool.on`
 /// callbacks.
 pub fn dispatch_lua_events(worker: Option<Res<LuaWorker>>, mut reader: MessageReader<Event>) {
     let Some(worker) = worker else {
         return;
     };
-    // No `paneru.on` handlers means nothing consumes these events; just
+    // No `spool.on` handlers means nothing consumes these events; just
     // advance past them.
     if !worker.has_event_handlers() {
         for _ in reader.read() {}
@@ -121,7 +121,7 @@ pub fn command_lua_handler(worker: Option<Res<LuaWorker>>, mut reader: MessageRe
     worker.send_binds(ids);
 }
 
-/// Answers pending `paneru.query*` and window-set reads from the worker.
+/// Answers pending `spool.query*` and window-set reads from the worker.
 ///
 /// Runs in both `PreUpdate` and `PostUpdate`. Each request kind is extracted
 /// at most once per pass and shared among all waiters, since building the
@@ -130,7 +130,7 @@ pub fn command_lua_handler(worker: Option<Res<LuaWorker>>, mut reader: MessageRe
 /// Deliberately does *not* take the script state store: Bevy derives a
 /// system's access statically for the whole run, so asking for the store here
 /// would make every pass hold it exclusively even when no script has
-/// mentioned `paneru.state`. See [`serve_lua_store`].
+/// mentioned `spool.state`. See [`serve_lua_store`].
 pub fn serve_lua_queries(worker: Option<Res<LuaWorker>>, state: QueryStateParams) {
     let Some(worker) = worker else {
         return;
@@ -159,7 +159,7 @@ pub fn serve_lua_queries(worker: Option<Res<LuaWorker>>, state: QueryStateParams
     }
 }
 
-/// Answers pending `paneru.state` calls waiting on the store.
+/// Answers pending `spool.state` calls waiting on the store.
 ///
 /// Separate from [`serve_lua_queries`] because this needs the store
 /// *mutably*; keeping it in its own system limits that exclusivity to store
@@ -180,7 +180,7 @@ pub fn serve_lua_store(
                     .ok_or_else(|| MISSING_STORE.to_string());
                 let _ = reply.try_send(answer);
             }
-            // Unlike a read, a write's reply is acted on: `paneru.state.mutate`
+            // Unlike a read, a write's reply is acted on: `spool.state.mutate`
             // retries when this reports the value was overtaken.
             worker::StoreRequest::Write { write, reply } => {
                 let answer = script_state.as_mut().map_or_else(
@@ -207,7 +207,7 @@ fn extract_once<T>(
 
 /// Puts what the callbacks queued onto the command bus.
 ///
-/// Also the landing point for a reloaded `paneru.setup{...}`: the worker
+/// Also the landing point for a reloaded `spool.setup{...}`: the worker
 /// performs the rebuild, so the resulting config arrives here and is swapped
 /// into the shared handle.
 pub fn drain_lua_outbox(

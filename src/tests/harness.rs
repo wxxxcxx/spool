@@ -14,7 +14,7 @@ use crate::ecs::focus::FocusEventsPlugin;
 use crate::ecs::layout::LayoutEventsPlugin;
 use crate::ecs::mouse::MouseEventsPlugin;
 use crate::ecs::scroll::ScrollEventsPlugin;
-use crate::ecs::state::PaneruState;
+use crate::ecs::state::SpoolState;
 use crate::ecs::workspace::WorkspaceEventsPlugin;
 use crate::ecs::{
     BProcess, ExistingMarker, FocusFollowsMouse, Initializing, MissionControlActive, SkipReshuffle,
@@ -161,7 +161,7 @@ impl TestHarness {
         self
     }
 
-    pub(crate) fn with_state(mut self, state: PaneruState) -> Self {
+    pub(crate) fn with_state(mut self, state: SpoolState) -> Self {
         self.app.world_mut().insert_resource(state);
         self
     }

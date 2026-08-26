@@ -1,19 +1,19 @@
-# PaneruBar
+# SpoolBar
 
-PaneruBar is a native AppKit companion for Paneru. It renders one workspace bar
-per display and reads only Paneru's structured state; it does not request
+SpoolBar is a native AppKit companion for Spool. It renders one workspace bar
+per display and reads only Spool's structured state; it does not request
 Accessibility access or enumerate windows itself.
 
 The bar has one fixed workspace control followed by the selected workspace's
 window icons: `1 A B C`. It is right-aligned in the free menu-bar gap between
-the notch (or the screen midpoint) and the first system tray item. PaneruBar
+the notch (or the screen midpoint) and the first system tray item. SpoolBar
 reads menu-bar window bounds through Core Graphics, without Accessibility
 permission, and clips the window strip to the measured gap.
 
 Use the leading dotted grip to move the bar. Right-click anywhere on the bar to
 lock or unlock it, open Settings, refresh, or quit. When unlocked, moving the
 pointer onto an edge or corner reveals the appropriate resize cursor; drag that
-edge directly to resize. PaneruBar stores the frame and lock state separately
+edge directly to resize. SpoolBar stores the frame and lock state separately
 for each display and restores them after relaunching.
 
 The panel uses a native macOS material with a configurable tint, hairline border,
@@ -38,17 +38,20 @@ SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/module-cache" \
 swift test --disable-sandbox --scratch-path .build
 ```
 
-Run the debug build with the matching Paneru CLI:
+Run the debug build with the matching Spool CLI:
 
 ```sh
-PANERU_CLI=/path/to/paneru .build/debug/PaneruBar
+SPOOL_CLI=/path/to/spool .build/debug/SpoolBar
 ```
 
 Right-click the bar and choose Settings to open the native settings bubble.
-Changes are saved immediately to `~/.config/paneru-bar/config.toml`; comments,
-unknown keys, and workspace labels in that file are preserved. PaneruBar creates
+Changes are saved immediately to `$XDG_CONFIG_HOME/spool/bar.toml` (or
+`~/.config/spool/bar.toml` when `XDG_CONFIG_HOME` is unset); comments,
+unknown keys, and workspace labels in that file are preserved. SpoolBar creates
 the file with defaults when it is missing and continues to reload external
-changes automatically. Set `PANERU_BAR_CONFIG` to use a different path. See
+changes automatically. On first launch it moves the legacy
+`~/.config/spool-bar/config.toml` file to the new location without rewriting
+it. Set `SPOOL_BAR_CONFIG` to use a different path. See
 `config.example.toml` for every supported option:
 
 - bar height and workspace/window spacing;
@@ -59,7 +62,7 @@ changes automatically. Set `PANERU_BAR_CONFIG` to use a different path. See
 - editable per-workspace replacement labels;
 - window spacing, focus-indicator visibility, and interaction animation.
 
-Drag a window icon onto a workspace to move the exact Paneru window there and
+Drag a window icon onto a workspace to move the exact Spool window there and
 follow it. Scroll the workspace control in the reverse scroll direction to
 switch workspaces; clicking the label has no action. When every window cannot
 fit, scroll the window strip to rotate which icons are visible. Trackpad momentum
@@ -69,14 +72,14 @@ The settings header also provides a full reset to defaults. Legacy `icon_size`
 entries are ignored because icon dimensions now follow bar height and vertical
 padding.
 
-## Paneru protocol
+## Spool protocol
 
-The initial state comes from `paneru query state --json`. Every line from
-`paneru subscribe --json` invalidates the local snapshot and schedules a fresh
+The initial state comes from `spool query state --json`. Every line from
+`spool subscribe --json` invalidates the local snapshot and schedules a fresh
 full query. UI actions use only the targeted CLI commands:
 
 ```sh
-paneru send-cmd window focusid WINDOW_ID
-paneru send-cmd workspace select DISPLAY_ID WORKSPACE_NUMBER
-paneru send-cmd window move-to-workspace WINDOW_ID DISPLAY_ID WORKSPACE_NUMBER follow
+spool send-cmd window focusid WINDOW_ID
+spool send-cmd workspace select DISPLAY_ID WORKSPACE_NUMBER
+spool send-cmd window move-to-workspace WINDOW_ID DISPLAY_ID WORKSPACE_NUMBER follow
 ```

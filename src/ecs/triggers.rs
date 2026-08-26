@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
-use crate::ecs::state::PaneruState;
+use crate::ecs::state::SpoolState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
@@ -1044,7 +1044,7 @@ pub(super) fn spawn_window_trigger(
         let title = window.title().unwrap_or_default();
         let app_name = app.name().to_string();
         let bundle_id = app.bundle_id().unwrap_or_default().clone();
-        let window_frame = paneru_shared_types::state::Frame {
+        let window_frame = spool_shared_types::state::Frame {
             x: frame.min.x,
             y: frame.min.y,
             width: frame.width(),
@@ -1145,7 +1145,7 @@ pub(super) fn apply_window_positions(
     apps: Query<&Application>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
-    restoration: Option<Res<PaneruState>>,
+    restoration: Option<Res<SpoolState>>,
     mut ctx: WindowCtx,
 ) {
     for entity in added {

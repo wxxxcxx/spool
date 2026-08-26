@@ -2713,86 +2713,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "paneru"
-version = "0.4.4"
-dependencies = [
- "accessibility-sys",
- "arc-swap",
- "async-channel",
- "async-executor",
- "async-lock",
- "bevy",
- "bitflags",
- "cfg-if",
- "chrono",
- "clap",
- "crossbeam-channel",
- "ctrlc",
- "derive_more",
- "embed_plist",
- "futures-lite",
- "launchctl",
- "libc",
- "mlua",
- "mockall",
- "notify",
- "num_enum",
- "objc2",
- "objc2-app-kit",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-foundation",
- "objc2-quartz-core",
- "paneru-lua",
- "paneru-mach-ipc",
- "paneru-shared-types",
- "regex",
- "scopeguard",
- "serde",
- "serde_json",
- "stdext",
- "toml",
- "tracing",
- "tracing-subscriber",
- "xdg",
-]
-
-[[package]]
-name = "paneru-lua"
-version = "0.4.4"
-dependencies = [
- "cfg-if",
- "futures-lite",
- "mlua",
- "paneru-mach-ipc",
- "paneru-shared-types",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "paneru-mach-ipc"
-version = "0.4.4"
-dependencies = [
- "futures-lite",
- "libc",
- "mach2",
- "postcard",
- "serde",
-]
-
-[[package]]
-name = "paneru-shared-types"
-version = "0.4.4"
-dependencies = [
- "mlua",
- "postcard",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3317,6 +3237,86 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "spool"
+version = "0.4.4"
+dependencies = [
+ "accessibility-sys",
+ "arc-swap",
+ "async-channel",
+ "async-executor",
+ "async-lock",
+ "bevy",
+ "bitflags",
+ "cfg-if",
+ "chrono",
+ "clap",
+ "crossbeam-channel",
+ "ctrlc",
+ "derive_more",
+ "embed_plist",
+ "futures-lite",
+ "launchctl",
+ "libc",
+ "mlua",
+ "mockall",
+ "notify",
+ "num_enum",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-foundation",
+ "objc2-quartz-core",
+ "regex",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "spool-lua",
+ "spool-mach-ipc",
+ "spool-shared-types",
+ "stdext",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "xdg",
+]
+
+[[package]]
+name = "spool-lua"
+version = "0.4.4"
+dependencies = [
+ "cfg-if",
+ "futures-lite",
+ "mlua",
+ "regex",
+ "serde",
+ "serde_json",
+ "spool-mach-ipc",
+ "spool-shared-types",
+]
+
+[[package]]
+name = "spool-mach-ipc"
+version = "0.4.4"
+dependencies = [
+ "futures-lite",
+ "libc",
+ "mach2",
+ "postcard",
+ "serde",
+]
+
+[[package]]
+name = "spool-shared-types"
+version = "0.4.4"
+dependencies = [
+ "mlua",
+ "postcard",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

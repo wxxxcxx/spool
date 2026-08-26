@@ -3,9 +3,9 @@
 
 use futures_lite::StreamExt;
 use futures_lite::future::block_on;
-use paneru_mach_ipc::{Error, Receiver, Sender};
-use paneru_mach_ipc::{RecvPort, SendPort};
 use serde::{Deserialize, Serialize};
+use spool_mach_ipc::{Error, Receiver, Sender};
+use spool_mach_ipc::{RecvPort, SendPort};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 enum Request {
@@ -29,7 +29,7 @@ struct Event {
 /// Unique per test and per process, so concurrent runs and crash leftovers
 /// don't collide.
 fn service_name(test: &str) -> String {
-    format!("com.karinushka.paneru.test.{test}.{}", std::process::id())
+    format!("com.karinushka.spool.test.{test}.{}", std::process::id())
 }
 
 /// Connects, tolerating the receiver not having bound the name quite yet.

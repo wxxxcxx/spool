@@ -19,7 +19,7 @@
           (builtins.substring 6 2 longDate)
         ]);
       props = builtins.fromTOML (builtins.readFile ../Cargo.toml);
-      pname = "paneru";
+      pname = "spool";
       version = props.package.version;
 
       # One source tree for every derivation here: the daemon and the loadable
@@ -27,7 +27,7 @@
       # they vendor identical dependencies. `commonCargoSources` keeps only
       # Rust/Cargo files, so the plists pulled in by `embed_plist!` /
       # `include_str!` are added back.
-      paneruSource = lib.fileset.toSource {
+      spoolSource = lib.fileset.toSource {
         root = ../.;
         fileset = lib.fileset.unions [
           (craneLib.fileset.commonCargoSources ../.)
@@ -53,33 +53,33 @@
             feature = "lua" + lib.replaceStrings [ "." ] [ "" ] lua.luaversion;
           in
           if feature == "lua51" then
-            throw "paneru: Lua 5.1 is not supported (its C API cannot yield out of a Rust callback); use luajit or Lua 5.2+."
+            throw "spool: Lua 5.1 is not supported (its C API cannot yield out of a Rust callback); use luajit or Lua 5.2+."
           else
             feature;
 
       # Arguments common to everything built from this workspace.
       commonArgs = {
         inherit version;
-        src = paneruSource;
+        src = spoolSource;
         # The daemon links AppKit/etc.; nothing here runs tests as part of the
         # build.
         doCheck = false;
       };
 
       # The interpreter the dependency artifacts are built against. Also the
-      # default for `mkPaneru`'s `lua` knob: LuaJIT's tracing JIT keeps handler
+      # default for `mkSpool`'s `lua` knob: LuaJIT's tracing JIT keeps handler
       # dispatch cheap enough to run on the hot event path.
       defaultLua = pkgs.luajit;
 
       # Third-party dependencies, compiled once and reused by every derivation
       # here instead of being rebuilt per source change.
       #
-      # Deliberately NOT a function of `mkPaneru`'s knobs. Parameterising it
-      # gives one `paneru-deps` per (enableLua, lua) combination — same name,
+      # Deliberately NOT a function of `mkSpool`'s knobs. Parameterising it
+      # gives one `spool-deps` per (enableLua, lua) combination — same name,
       # different store path — so a config that touches both a Lua and a non-Lua
-      # variant (this flake's own `paneru` and `paneru-lua`, say) builds the
+      # variant (this flake's own `spool` and `spool-lua`, say) builds the
       # whole dependency graph twice over. Building the widest feature set once
-      # keeps a single `paneru-deps` in the closure: a non-Lua build simply
+      # keeps a single `spool-deps` in the closure: a non-Lua build simply
       # ignores the `mlua`/`mlua-sys` artifacts, and a build against a different
       # interpreter recompiles only those two crates inside its own derivation
       # rather than the graph beneath them.
@@ -99,18 +99,18 @@
 
       # Everything else is a function of the two knobs.
       #
-      # Overrideable like a nixpkgs package (`paneru.override { enableLua =
+      # Overrideable like a nixpkgs package (`spool.override { enableLua =
       # true; lua = pkgs.lua5_4; }`). `enableLua` toggles the `lua` Cargo
       # feature, which builds in the `init.lua` scripting runtime
-      # (`paneru.on`/`paneru.bind`); it is off by default at the Cargo level
+      # (`spool.on`/`spool.bind`); it is off by default at the Cargo level
       # (see `Cargo.toml`) and here. `lua` resolves the whole Lua dependency
       # graph: the daemon's `mlua` ABI feature (`luajit`/`lua54`/..., via
       # `luaFeature`), the interpreter it links against, and the one the
-      # loadable module (`paneru.luaModule`) is built for. It defaults to
+      # loadable module (`spool.luaModule`) is built for. It defaults to
       # `defaultLua`, the interpreter `sharedDeps` is built against, and the
       # module stays independently overrideable afterwards via
-      # `paneru.luaModule.override { lua = ...; }`.
-      mkPaneru =
+      # `spool.luaModule.override { lua = ...; }`.
+      mkSpool =
         {
           enableLua ? false,
           lua ? defaultLua,
@@ -132,12 +132,12 @@
           #
           # Mirrors a nixpkgs Lua package: takes `lua`, defaults to the one the
           # daemon was built for, and is overrideable
-          # (`paneru.luaModule.override { lua = pkgs.lua5_4; }`). Unlike the
+          # (`spool.luaModule.override { lua = pkgs.lua5_4; }`). Unlike the
           # daemon it links no Lua at all, resolving `lua_*` from the host
           # interpreter at load time (see the crate's build.rs); the
           # interpreter only supplies headers. Not exposed as its own top-level
-          # flake package — it only makes sense in the context of a `paneru`
-          # build, so it is reached through `paneru.luaModule`.
+          # flake package — it only makes sense in the context of a `spool`
+          # build, so it is reached through `spool.luaModule`.
           mkLuaModule =
             {
               lua ? pkgs.luajit,
@@ -148,7 +148,7 @@
                 commonArgs
                 // {
                   inherit version;
-                  pname = "lua${ver}-paneru";
+                  pname = "lua${ver}-spool";
                   # The module is a workspace member, just not a default one
                   # (see the root Cargo.toml), so it builds from the same
                   # source and dependency artifacts as the daemon.
@@ -156,19 +156,19 @@
                   nativeBuildInputs = [ pkgs.pkg-config ];
                   buildInputs = [ lua ];
                   # Select the Lua ABI feature matching the interpreter.
-                  cargoExtraArgs = "-p paneru-lua --no-default-features --features module,${luaFeature lua}";
-                  # Install the cdylib as `paneru.so` under the interpreter's
+                  cargoExtraArgs = "-p spool-lua --no-default-features --features module,${luaFeature lua}";
+                  # Install the cdylib as `spool.so` under the interpreter's
                   # C-module path, so a `${moduleDir}/?.so` cpath entry finds it.
                   installPhaseCommand = ''
-                    so=$(find target -name 'libpaneru_lua.dylib' -print -quit)
+                    so=$(find target -name 'libspool_lua.dylib' -print -quit)
                     if [ -z "$so" ]; then
-                      echo "paneru-lua: could not find built cdylib" >&2
+                      echo "spool-lua: could not find built cdylib" >&2
                       exit 1
                     fi
-                    install -Dm555 "$so" "$out/lib/lua/${ver}/paneru.so"
+                    install -Dm555 "$so" "$out/lib/lua/${ver}/spool.so"
                   '';
                   meta = {
-                    description = "Loadable Lua module for the Paneru window manager";
+                    description = "Loadable Lua module for the Spool window manager";
                     platforms = lib.platforms.darwin;
                   };
                 }
@@ -178,7 +178,7 @@
               passthru = (old.passthru or { }) // {
                 inherit lua;
                 moduleDir = "${drv}/lib/lua/${ver}";
-                modulePath = "${drv}/lib/lua/${ver}/paneru.so";
+                modulePath = "${drv}/lib/lua/${ver}/spool.so";
               };
             });
         in
@@ -187,14 +187,14 @@
           // luaBuildInputs
           // {
             inherit cargoExtraArgs;
-            pname = "paneru${if enableLua then "-with-lua" else ""}";
+            pname = "spool${if enableLua then "-with-lua" else ""}";
             cargoArtifacts = sharedDeps;
 
             # Expose the loadable Lua module so downstream configs can
-            # reference it as `paneru.luaModule` (the derivation, built for
-            # the same interpreter as `lua` above), `paneru.luaModule.moduleDir`
+            # reference it as `spool.luaModule` (the derivation, built for
+            # the same interpreter as `lua` above), `spool.luaModule.moduleDir`
             # (the dir for a `package.cpath` `?.so` entry), or
-            # `paneru.luaModule.modulePath` (the `paneru.so` file).
+            # `spool.luaModule.modulePath` (the `spool.so` file).
             passthru.luaModule = lib.makeOverridable mkLuaModule { inherit lua; };
 
             meta = {
@@ -208,8 +208,8 @@
     {
       devShells.default = craneLib.devShell {
         inputsFrom = [
-          self'.packages.paneru
-          self'.packages.paneru.luaModule
+          self'.packages.spool
+          self'.packages.spool.luaModule
         ];
         packages = [
           pkgs.rustc
@@ -221,9 +221,9 @@
         ];
       };
 
-      packages.default = self'.packages.paneru;
+      packages.default = self'.packages.spool;
 
-      packages.paneru = lib.makeOverridable mkPaneru { };
-      packages.paneru-lua = self'.packages.paneru.override { enableLua = true; };
+      packages.spool = lib.makeOverridable mkSpool { };
+      packages.spool-lua = self'.packages.spool.override { enableLua = true; };
     };
 }

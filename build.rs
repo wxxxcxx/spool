@@ -67,6 +67,6 @@ fn main() {
     }
 
     if cfg!(feature = "lua") {
-        println!("cargo:rustc-env=PANERU_LUA_VERSION={LUA_VERSION}");
+        println!("cargo:rustc-env=SPOOL_LUA_VERSION={LUA_VERSION}");
     }
 }

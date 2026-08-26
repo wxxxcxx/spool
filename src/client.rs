@@ -1,11 +1,11 @@
-//! The `paneru …` CLI side of the protocol: sends requests to the running
+//! The `spool …` CLI side of the protocol: sends requests to the running
 //! daemon and prints the answer as JSON. This is the only place JSON is
 //! produced; the daemon and its clients otherwise speak typed postcard values.
 
 use futures_lite::StreamExt;
-use paneru_mach_ipc::{SendPort, Sender};
-use paneru_shared_types::state::{StateEvent, StateQueryKind};
-use paneru_shared_types::wire::{
+use spool_mach_ipc::{SendPort, Sender};
+use spool_shared_types::state::{StateEvent, StateQueryKind};
+use spool_shared_types::wire::{
     QueryPayload, Request, Response, ScriptStateRequest, ScriptStateResponse, service_name,
 };
 
@@ -15,10 +15,10 @@ use crate::errors::{Error, Result};
 ///
 /// # Errors
 ///
-/// Returns a plain "paneru is not running" error when no daemon is running.
+/// Returns a plain "spool is not running" error when no daemon is running.
 fn connect() -> Result<Sender<Request>> {
     Sender::connect(&service_name()).map_err(|err| match err {
-        paneru_mach_ipc::Error::NotRunning => Error::Generic("paneru is not running".to_string()),
+        spool_mach_ipc::Error::NotRunning => Error::Generic("spool is not running".to_string()),
         other => Error::from(other),
     })
 }
@@ -31,7 +31,7 @@ fn connect() -> Result<Sender<Request>> {
 pub async fn send_command(argv: impl IntoIterator<Item = String>) -> Result<()> {
     let argv = argv.into_iter().collect::<Vec<_>>();
     let borrowed = argv.iter().map(String::as_str).collect::<Vec<_>>();
-    let command = paneru_shared_types::argv::parse_command(&borrowed)?;
+    let command = spool_shared_types::argv::parse_command(&borrowed)?;
 
     connect()?.send(&Request::Command(command)).await?;
     Ok(())
@@ -94,7 +94,7 @@ pub async fn subscribe() -> Result<()> {
         let event = match delivery {
             Ok(delivery) => delivery.value,
             // The daemon exiting ends the subscription normally.
-            Err(paneru_mach_ipc::Error::PeerGone) => break,
+            Err(spool_mach_ipc::Error::PeerGone) => break,
             Err(err) => return Err(Error::from(err)),
         };
 

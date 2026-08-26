@@ -8,7 +8,7 @@
 //! ([`StoreRequest`]) go through their own reply channels, so a handler
 //! awaiting an answer never blocks the others. Nothing crossing either
 //! channel is a Lua value — only plain data ([`LuaEvent`], [`WindowSet`],
-//! [`Command`], [`PaneruQueryState`]); see [`super::convert`] for the
+//! [`Command`], [`SpoolQueryState`]); see [`super::convert`] for the
 //! marshalling.
 
 use std::path::{Path, PathBuf};
@@ -31,10 +31,10 @@ use super::runtime::LuaRuntime;
 use super::world::{DispatchWorld, WorldAccess};
 use crate::commands::Command;
 use crate::config::Config;
-use crate::ecs::state::PaneruQueryState;
+use crate::ecs::state::SpoolQueryState;
 use crate::platform::input::set_lua_keybinds;
-use paneru_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
-use paneru_shared_types::windowset::WindowSet;
+use spool_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
+use spool_shared_types::windowset::WindowSet;
 
 /// How long [`Drop`] waits for an in-flight dispatch to finish before giving
 /// up and detaching the thread. Bounded, so a script stuck in a loop can
@@ -71,7 +71,7 @@ pub(super) enum FromLua {
         message: String,
         duration: f32,
     },
-    /// A reload installed a script that calls `paneru.setup{...}`; tells the
+    /// A reload installed a script that calls `spool.setup{...}`; tells the
     /// main thread to re-apply the config in [`LuaWorker::built_config`].
     ConfigChanged,
 }
@@ -89,9 +89,9 @@ pub(super) type Shared<T> = Result<Arc<T>, String>;
 /// parameters mention, so one system serving both would hold read access to
 /// the whole world and exclusive access to the state store on every pass.
 pub(super) enum WorldRequest {
-    /// The `paneru.query*` documents.
+    /// The `spool.query*` documents.
     State {
-        reply: Sender<Shared<PaneruQueryState>>,
+        reply: Sender<Shared<SpoolQueryState>>,
     },
     /// The layout tree a handler transforms.
     WindowSet { reply: Sender<Shared<WindowSet>> },
@@ -107,7 +107,7 @@ pub(super) enum StoreRequest {
     /// One write against the store.
     ///
     /// Unlike a command, a write waits for its answer: the store has a
-    /// second writer (a socket client), and `paneru.state.mutate` needs to
+    /// second writer (a socket client), and `spool.state.mutate` needs to
     /// know whether it was overtaken while the handler can still retry.
     Write {
         write: ScriptStateWrite,
@@ -119,7 +119,7 @@ pub(super) enum StoreRequest {
 impl WorldRequest {
     /// Answers a state query. Panics on a window-set request, which the tests
     /// using this never make.
-    fn answer(self, state: Shared<PaneruQueryState>) {
+    fn answer(self, state: Shared<SpoolQueryState>) {
         match self {
             WorldRequest::State { reply } => {
                 let _ = reply.try_send(state);
@@ -145,7 +145,7 @@ pub struct LuaWorker {
     /// load and reload, so the main thread's fast path never has to ask and
     /// wait.
     has_handlers: Arc<AtomicBool>,
-    /// The `Config` the loaded script declared through `paneru.setup{...}`,
+    /// The `Config` the loaded script declared through `spool.setup{...}`,
     /// or `None` if it left configuration to the TOML file.
     built_config: Arc<Mutex<Option<Config>>>,
     thread: Option<JoinHandle<()>>,
@@ -177,7 +177,7 @@ impl LuaWorker {
             let has_handlers = Arc::clone(&has_handlers);
             let built_config = Arc::clone(&built_config);
             std::thread::Builder::new()
-                .name("paneru-lua".to_string())
+                .name("spool-lua".to_string())
                 .spawn(move || {
                     run(
                         &source,
@@ -208,7 +208,7 @@ impl LuaWorker {
         }
     }
 
-    /// The `Config` the loaded script declared via `paneru.setup{...}`, or
+    /// The `Config` the loaded script declared via `spool.setup{...}`, or
     /// `None` if it never called it. Safe to read as soon as [`spawn`]
     /// returns, which waits for the load to finish.
     ///
@@ -220,7 +220,7 @@ impl LuaWorker {
             .clone()
     }
 
-    /// Whether the loaded script registered any `paneru.on` handler.
+    /// Whether the loaded script registered any `spool.on` handler.
     pub(super) fn has_event_handlers(&self) -> bool {
         self.has_handlers.load(Ordering::Relaxed)
     }
@@ -246,12 +246,12 @@ impl LuaWorker {
         std::iter::from_fn(|| self.outbox.try_recv().ok())
     }
 
-    /// The `paneru.query*` and window-set calls currently waiting on the world.
+    /// The `spool.query*` and window-set calls currently waiting on the world.
     pub(super) fn pending_world_queries(&self) -> impl Iterator<Item = WorldRequest> + '_ {
         std::iter::from_fn(|| self.world_queries.try_recv().ok())
     }
 
-    /// The `paneru.state` calls currently waiting on the store.
+    /// The `spool.state` calls currently waiting on the store.
     pub(super) fn pending_store_queries(&self) -> impl Iterator<Item = StoreRequest> + '_ {
         std::iter::from_fn(|| self.store_queries.try_recv().ok())
     }
@@ -320,7 +320,7 @@ fn reload(
     match LuaRuntime::from_file(path, world) {
         Ok(runtime) => {
             set_lua_keybinds(runtime.published_keybinds());
-            // A reloaded `paneru.setup{...}` stays authoritative: if the
+            // A reloaded `spool.setup{...}` stays authoritative: if the
             // edited script dropped `setup`, keep the config already in
             // force rather than reverting to TOML.
             if let Some(config) = runtime.built_config() {
@@ -339,7 +339,7 @@ fn reload(
     }
 }
 
-/// Publishes the config a `paneru.setup{...}` built, for the main thread to read.
+/// Publishes the config a `spool.setup{...}` built, for the main thread to read.
 fn publish_config(slot: &Mutex<Option<Config>>, config: &Config) {
     *slot
         .lock()
@@ -483,9 +483,9 @@ impl Task<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecs::state::{PaneruActiveState, PaneruVirtualWorkspaceState, PaneruWindowState};
+    use crate::ecs::state::{SpoolActiveState, SpoolVirtualWorkspaceState, SpoolWindowState};
     use crate::lua::convert::WindowSpawnPayload;
-    use paneru_shared_types::windowset::{LayoutOp, WinID};
+    use spool_shared_types::windowset::{LayoutOp, WinID};
 
     /// How long a test waits for the worker before calling it wedged. Generous:
     /// it only ever elapses on failure.
@@ -603,23 +603,23 @@ mod tests {
     }
 
     /// A canned state document to answer round-trips with.
-    fn test_state() -> PaneruQueryState {
-        PaneruQueryState {
+    fn test_state() -> SpoolQueryState {
+        SpoolQueryState {
             version: 2,
             timestamp: 0,
-            active: PaneruActiveState {
+            active: SpoolActiveState {
                 focused_window_id: Some(7),
                 focused_app_name: Some("Test App".to_string()),
-                ..PaneruActiveState::default()
+                ..SpoolActiveState::default()
             },
             displays: Vec::new(),
-            virtual_workspaces: vec![PaneruVirtualWorkspaceState {
+            virtual_workspaces: vec![SpoolVirtualWorkspaceState {
                 number: 1,
                 native_workspace_id: 10,
                 display_id: Some(1),
                 selected: true,
                 active: true,
-                windows: vec![PaneruWindowState {
+                windows: vec![SpoolWindowState {
                     window_id: 7,
                     bundle_id: "com.example.app".to_string(),
                     app_name: "Test App".to_string(),
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn bind_dispatch_reaches_the_outbox() {
-        let worker = worker(r#"paneru.bind("alt - b", "window balance")"#);
+        let worker = worker(r#"spool.bind("alt - b", "window balance")"#);
         worker.send_binds(vec![1]);
         let FromLua::Command(command) = next_effect(&worker, "the bound command") else {
             panic!("expected a command");
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn event_dispatch_reaches_the_outbox() {
-        let worker = worker(r#"paneru.on("space_changed", function(e) paneru.flash(e.type) end)"#);
+        let worker = worker(r#"spool.on("space_changed", function(e) spool.flash(e.type) end)"#);
         assert!(worker.has_event_handlers());
         worker.send_events(vec![LuaEvent::SpaceChanged]);
         assert_eq!(next_flash(&worker, "the event flash"), "space_changed");
@@ -679,8 +679,8 @@ mod tests {
     fn query_round_trip_is_served_by_the_host() {
         let worker = worker(
             r#"
-            paneru.bind("alt - q", function()
-              paneru.flash(paneru.query_active().focused_app_name)
+            spool.bind("alt - q", function()
+              spool.flash(spool.query_active().focused_app_name)
             end)
             "#,
         );
@@ -699,10 +699,10 @@ mod tests {
     fn two_queries_in_one_dispatch_cost_one_round_trip() {
         let worker = worker(
             r#"
-            paneru.bind("alt - q", function()
-              paneru.query_active()
-              paneru.query_on_screen()
-              paneru.flash("done")
+            spool.bind("alt - q", function()
+              spool.query_active()
+              spool.query_on_screen()
+              spool.flash("done")
             end)
             "#,
         );
@@ -721,8 +721,8 @@ mod tests {
     fn a_dropped_reply_channel_errors_the_handler_not_the_worker() {
         let worker = worker(
             r#"
-            paneru.bind("alt - q", function() paneru.query_active() end)
-            paneru.bind("alt - b", "window balance")
+            spool.bind("alt - q", function() spool.query_active() end)
+            spool.bind("alt - b", "window balance")
             "#,
         );
         worker.send_binds(vec![1]);
@@ -742,10 +742,10 @@ mod tests {
 
     #[test]
     fn reload_failure_keeps_the_old_runtime() {
-        let directory = std::env::temp_dir().join("paneru-lua-worker-reload-failure");
+        let directory = std::env::temp_dir().join("spool-lua-worker-reload-failure");
         std::fs::create_dir_all(&directory).unwrap();
         let script = directory.join("init.lua");
-        std::fs::write(&script, r#"paneru.bind("alt - b", "window balance")"#).unwrap();
+        std::fs::write(&script, r#"spool.bind("alt - b", "window balance")"#).unwrap();
 
         let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision());
         std::fs::write(&script, "this is not lua ===").unwrap();
@@ -767,17 +767,17 @@ mod tests {
 
     #[test]
     fn reload_republishes_handlers() {
-        let directory = std::env::temp_dir().join("paneru-lua-worker-reload-success");
+        let directory = std::env::temp_dir().join("spool-lua-worker-reload-success");
         std::fs::create_dir_all(&directory).unwrap();
         let script = directory.join("init.lua");
-        std::fs::write(&script, r#"paneru.bind("alt - b", "window balance")"#).unwrap();
+        std::fs::write(&script, r#"spool.bind("alt - b", "window balance")"#).unwrap();
 
         let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision());
-        assert!(!worker.has_event_handlers(), "no paneru.on handlers yet");
+        assert!(!worker.has_event_handlers(), "no spool.on handlers yet");
 
         std::fs::write(
             &script,
-            r#"paneru.on("space_changed", function(e) paneru.flash("reloaded") end)"#,
+            r#"spool.on("space_changed", function(e) spool.flash("reloaded") end)"#,
         )
         .unwrap();
         worker.send_reload(script.clone());
@@ -801,7 +801,7 @@ mod tests {
     /// A layout built from `(id, app, workspace)` triples, over workspaces 1
     /// (on screen) and 9 (the stash). Each window gets a column of its own.
     fn layout(windows: &[(WinID, &str, u32)]) -> WindowSet {
-        use paneru_shared_types::state::Frame;
+        use spool_shared_types::state::Frame;
 
         layout_on(
             1,
@@ -819,10 +819,10 @@ mod tests {
     /// proportional placement has to be resolved against.
     fn layout_on(
         display_id: u32,
-        display_frame: paneru_shared_types::state::Frame,
+        display_frame: spool_shared_types::state::Frame,
         windows: &[(WinID, &str, u32)],
     ) -> WindowSet {
-        use paneru_shared_types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
+        use spool_shared_types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
 
         let workspaces = [1, 9]
             .map(|number| WorkspaceSet {
@@ -895,8 +895,8 @@ mod tests {
     /// record an op — and a set handed to a handler has asked for nothing yet,
     /// which is what the real extractor produces.
     fn test_window_set_on(holding: u32) -> WindowSet {
-        use paneru_shared_types::state::Frame;
-        use paneru_shared_types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
+        use spool_shared_types::state::Frame;
+        use spool_shared_types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
 
         let window = WindowRec {
             id: 7,
@@ -951,14 +951,14 @@ mod tests {
 
     #[test]
     fn script_state_survives_a_reload() {
-        let directory = std::env::temp_dir().join("paneru-lua-worker-state-reload");
+        let directory = std::env::temp_dir().join("spool-lua-worker-state-reload");
         std::fs::create_dir_all(&directory).unwrap();
         let script = directory.join("init.lua");
         // Two scripts that share nothing but the store: the first writes, the
         // second reads. A Lua global could not carry a value across this.
         std::fs::write(
             &script,
-            r#"paneru.bind("alt - a", function() paneru.state.set("counter", 41) end)"#,
+            r#"spool.bind("alt - a", function() spool.state.set("counter", 41) end)"#,
         )
         .unwrap();
 
@@ -969,8 +969,8 @@ mod tests {
         // handler got that far.
         std::fs::write(
             &script,
-            r#"paneru.bind("alt - b", function()
-                 paneru.flash("counter=" .. tostring(paneru.state.get("counter")))
+            r#"spool.bind("alt - b", function()
+                 spool.flash("counter=" .. tostring(spool.state.get("counter")))
                end)"#,
         )
         .unwrap();
@@ -1000,7 +1000,7 @@ mod tests {
     #[test]
     fn a_returned_window_set_commits_its_operations() {
         let worker =
-            worker(r#"paneru.bind("alt - f", function(ws) return ws:focus(ws:focused()) end)"#);
+            worker(r#"spool.bind("alt - f", function(ws) return ws:focus(ws:focused()) end)"#);
         worker.send_binds(vec![1]);
         serve_window_set(&worker);
 
@@ -1017,9 +1017,9 @@ mod tests {
     fn a_window_set_computed_but_not_returned_commits_nothing() {
         let worker = worker(
             r#"
-            paneru.bind("alt - f", function(ws)
+            spool.bind("alt - f", function(ws)
               local unused = ws:focus(ws:focused()):view(2)
-              paneru.flash("discarded")
+              spool.flash("discarded")
             end)
             "#,
         );
@@ -1037,11 +1037,11 @@ mod tests {
     fn a_handler_that_raises_after_transforming_commits_nothing() {
         let worker = worker(
             r#"
-            paneru.bind("alt - f", function(ws)
+            spool.bind("alt - f", function(ws)
               local pending = ws:focus(ws:focused())
               error("nope")
             end)
-            paneru.bind("alt - b", "window balance")
+            spool.bind("alt - b", "window balance")
             "#,
         );
         worker.send_binds(vec![1]);
@@ -1059,7 +1059,7 @@ mod tests {
     fn chained_transforms_commit_in_order() {
         let worker = worker(
             r#"
-            paneru.bind("alt - x", function(ws)
+            spool.bind("alt - x", function(ws)
               return ws:focus(7):width(7, 0.75):shift(7, 2)
             end)
             "#,
@@ -1092,7 +1092,7 @@ mod tests {
     fn a_handler_that_ignores_the_window_set_never_fetches_one() {
         // Laziness is what keeps the window set affordable on hot events: it
         // costs a round-trip and reads every window title over the AX API.
-        let worker = worker(r#"paneru.bind("alt - b", "window balance")"#);
+        let worker = worker(r#"spool.bind("alt - b", "window balance")"#);
         worker.send_binds(vec![1]);
 
         assert!(matches!(
@@ -1109,8 +1109,8 @@ mod tests {
     fn two_handlers_in_one_batch_share_one_window_set() {
         let worker = worker(
             r#"
-            paneru.bind("alt - a", function(ws) paneru.flash(tostring(ws:focused())) end)
-            paneru.bind("alt - b", function(ws) paneru.flash(tostring(ws:focused())) end)
+            spool.bind("alt - a", function(ws) spool.flash(tostring(ws:focused())) end)
+            spool.bind("alt - b", function(ws) spool.flash(tostring(ws:focused())) end)
             "#,
         );
         worker.send_binds(vec![1, 2]);
@@ -1130,10 +1130,10 @@ mod tests {
     fn a_handler_waiting_on_the_world_does_not_hold_up_the_next_one() {
         let worker = worker(
             r#"
-            paneru.bind("alt - a", function()
-              paneru.flash(paneru.query_active().focused_app_name)
+            spool.bind("alt - a", function()
+              spool.flash(spool.query_active().focused_app_name)
             end)
-            paneru.bind("alt - b", function() paneru.flash("second") end)
+            spool.bind("alt - b", function() spool.flash("second") end)
             "#,
         );
         worker.send_binds(vec![1, 2]);
@@ -1156,8 +1156,8 @@ mod tests {
     fn event_handlers_receive_the_event_then_the_window_set() {
         let worker = worker(
             r#"
-            paneru.on("space_changed", function(event, ws)
-              paneru.flash(event.type .. ":" .. tostring(ws:focused()))
+            spool.on("space_changed", function(event, ws)
+              spool.flash(event.type .. ":" .. tostring(ws:focused()))
             end)
             "#,
         );
@@ -1173,11 +1173,11 @@ mod tests {
         let worker = worker(
             r#"
             escaped = nil
-            paneru.bind("alt - a", function(ws)
+            spool.bind("alt - a", function(ws)
               escaped = ws
-              paneru.flash(tostring(ws:focused()))
+              spool.flash(tostring(ws:focused()))
             end)
-            paneru.bind("alt - b", function() paneru.flash(tostring(escaped:focused())) end)
+            spool.bind("alt - b", function() spool.flash(tostring(escaped:focused())) end)
             "#,
         );
         worker.send_binds(vec![1]);
@@ -1258,9 +1258,9 @@ mod tests {
         -- The manage hook: place a pad window the first time we see it. What
         -- has been seen goes in the store, not a global, so a reload does not
         -- re-run the hook on every open window.
-        paneru.on("window_focused", function(event, ws)
+        spool.on("window_focused", function(event, ws)
           local first_time = false
-          paneru.state.mutate("scratchpad.seen", function(seen)
+          spool.state.mutate("scratchpad.seen", function(seen)
             seen = seen or {}
             first_time = not seen[tostring(event.window_id)]
             seen[tostring(event.window_id)] = true
@@ -1276,9 +1276,9 @@ mod tests {
         end)
 
         -- Hide a pad when the focus leaves it.
-        paneru.on("window_focused", function(event, ws)
-          local previous = paneru.state.get("scratchpad.focused")
-          paneru.state.set("scratchpad.focused", event.window_id)
+        spool.on("window_focused", function(event, ws)
+          local previous = spool.state.get("scratchpad.focused")
+          spool.state.set("scratchpad.focused", event.window_id)
           if not previous or previous == event.window_id then return end
           local window = ws:window(previous)
           if window and scratchpad.pad_of(window) then
@@ -1287,22 +1287,22 @@ mod tests {
         end)
 
         scratchpad.define("terminal", {
-          match = paneru.match{ app = "Alacritty" },
+          match = spool.match{ app = "Alacritty" },
           spawn = "true", group = "console",
           float = { x = 0.1, y = 0.05, width = 0.8, height = 0.5 },
         })
         scratchpad.define("notes", {
-          match = paneru.match{ app = "Obsidian" },
+          match = spool.match{ app = "Obsidian" },
           spawn = "true", group = "console",
         })
 
-        paneru.bind("alt - s", scratchpad.toggle("terminal"))
-        paneru.bind("alt - n", scratchpad.toggle("notes"))
-        paneru.bind("alt - 0", scratchpad.hide_all)
+        spool.bind("alt - s", scratchpad.toggle("terminal"))
+        spool.bind("alt - n", scratchpad.toggle("notes"))
+        spool.bind("alt - 0", scratchpad.hide_all)
 
         -- A sentinel for the tests: touches nothing, so anything queued ahead
         -- of its flash is something a handler actually asked for.
-        paneru.bind("alt - z", function() paneru.flash("sentinel") end)
+        spool.bind("alt - z", function() spool.flash("sentinel") end)
     "#;
 
     /// Asserts nothing was queued: dispatches a handler that only flashes, and
@@ -1433,7 +1433,7 @@ mod tests {
                 // 0.1/0.05/0.8/0.5 of the fixture's 1920x1080 display.
                 LayoutOp::SetFrame {
                     window: 7,
-                    frame: paneru_shared_types::state::Frame {
+                    frame: spool_shared_types::state::Frame {
                         x: 192,
                         y: 54,
                         width: 1536,
@@ -1470,7 +1470,7 @@ mod tests {
             &worker,
             layout_on(
                 2,
-                paneru_shared_types::state::Frame {
+                spool_shared_types::state::Frame {
                     x: 1920,
                     y: -200,
                     width: 1280,
@@ -1490,7 +1490,7 @@ mod tests {
                 // 0.1/0.05/0.8/0.5 of 1280x800, offset by the display origin.
                 LayoutOp::SetFrame {
                     window: 7,
-                    frame: paneru_shared_types::state::Frame {
+                    frame: spool_shared_types::state::Frame {
                         x: 2048,
                         y: -160,
                         width: 1024,
@@ -1584,8 +1584,8 @@ mod tests {
     fn window_spawned_event_is_dispatched_to_lua() {
         let worker = worker(
             r#"
-            paneru.on("window_spawned", function(event, ws)
-                paneru.flash(event.type .. ":" .. tostring(event.window_id) .. ":" .. event.title .. ":" .. event.app_name)
+            spool.on("window_spawned", function(event, ws)
+                spool.flash(event.type .. ":" .. tostring(event.window_id) .. ":" .. event.title .. ":" .. event.app_name)
             end)
         "#,
         );
@@ -1595,7 +1595,7 @@ mod tests {
             app_name: "Ghostty".into(),
             bundle_id: "com.mitchellh.ghostty".into(),
             title: "Terminal".into(),
-            frame: paneru_shared_types::state::Frame {
+            frame: spool_shared_types::state::Frame {
                 x: 0,
                 y: 0,
                 width: 800,
@@ -1615,8 +1615,8 @@ mod tests {
     fn filtered_window_spawned_event_only_fires_on_match() {
         let worker = worker(
             r#"
-            paneru.on("window_spawned", { bundle = "libreoffice" }, function(event, ws)
-                paneru.flash("matched:" .. event.app_name)
+            spool.on("window_spawned", { bundle = "libreoffice" }, function(event, ws)
+                spool.flash("matched:" .. event.app_name)
             end)
         "#,
         );
@@ -1626,7 +1626,7 @@ mod tests {
             app_name: "Ghostty".into(),
             bundle_id: "com.mitchellh.ghostty".into(),
             title: "Terminal".into(),
-            frame: paneru_shared_types::state::Frame {
+            frame: spool_shared_types::state::Frame {
                 x: 0,
                 y: 0,
                 width: 800,
@@ -1641,7 +1641,7 @@ mod tests {
             app_name: "LibreOffice".into(),
             bundle_id: "org.libreoffice.script".into(),
             title: "Document".into(),
-            frame: paneru_shared_types::state::Frame {
+            frame: spool_shared_types::state::Frame {
                 x: 0,
                 y: 0,
                 width: 300,

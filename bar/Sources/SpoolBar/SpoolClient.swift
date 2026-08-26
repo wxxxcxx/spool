@@ -1,6 +1,6 @@
 import Foundation
 
-protocol PaneruControlling: AnyObject {
+protocol SpoolControlling: AnyObject {
     func requestRefresh()
     func focus(windowID: Int32)
     func selectWorkspace(displayID: UInt32, number: UInt32)
@@ -12,11 +12,11 @@ protocol PaneruControlling: AnyObject {
     )
 }
 
-final class PaneruClient: PaneruControlling {
-    var onState: ((PaneruStateDocument) -> Void)?
+final class SpoolClient: SpoolControlling {
+    var onState: ((SpoolStateDocument) -> Void)?
     var onError: ((String) -> Void)?
 
-    private let queue = DispatchQueue(label: "com.wxxxcxx.paneru-bar.client", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.wxxxcxx.spool-bar.client", qos: .userInitiated)
     private let decoder = JSONDecoder()
     private var subscription: Process?
     private var stopped = false
@@ -78,10 +78,10 @@ final class PaneruClient: PaneruControlling {
                 try process.run()
                 process.waitUntilExit()
                 if process.terminationStatus != 0 {
-                    self.report("Paneru command failed: \(arguments.joined(separator: " "))")
+                    self.report("Spool command failed: \(arguments.joined(separator: " "))")
                 }
             } catch {
-                self.report("Unable to run Paneru command: \(error.localizedDescription)")
+                self.report("Unable to run Spool command: \(error.localizedDescription)")
             }
         }
     }
@@ -113,17 +113,17 @@ final class PaneruClient: PaneruControlling {
             process.waitUntilExit()
             if process.terminationStatus == 0 {
                 do {
-                    let document = try decoder.decode(PaneruStateDocument.self, from: data)
+                    let document = try decoder.decode(SpoolStateDocument.self, from: data)
                     DispatchQueue.main.async { [weak self] in self?.onState?(document) }
                 } catch {
-                    report("Unable to decode Paneru state: \(error.localizedDescription)")
+                    report("Unable to decode Spool state: \(error.localizedDescription)")
                 }
             } else {
                 let detail = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                report(detail?.isEmpty == false ? detail! : "Paneru state query failed")
+                report(detail?.isEmpty == false ? detail! : "Spool state query failed")
             }
         } catch {
-            report("Unable to query Paneru: \(error.localizedDescription)")
+            report("Unable to query Spool: \(error.localizedDescription)")
         }
 
         queryRunning = false
@@ -156,25 +156,25 @@ final class PaneruClient: PaneruControlling {
             subscription = process
         } catch {
             output.fileHandleForReading.readabilityHandler = nil
-            report("Unable to subscribe to Paneru: \(error.localizedDescription)")
+            report("Unable to subscribe to Spool: \(error.localizedDescription)")
             queue.asyncAfter(deadline: .now() + 1) { [weak self] in self?.startSubscription() }
         }
     }
 
     private func makeProcess(_ arguments: [String]) -> Process {
         let process = Process()
-        if let configured = ProcessInfo.processInfo.environment["PANERU_CLI"], !configured.isEmpty {
+        if let configured = ProcessInfo.processInfo.environment["SPOOL_CLI"], !configured.isEmpty {
             process.executableURL = URL(fileURLWithPath: configured)
             process.arguments = arguments
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["paneru"] + arguments
+            process.arguments = ["spool"] + arguments
         }
         return process
     }
 
     private func report(_ message: String) {
-        NSLog("PaneruBar: %@", message)
+        NSLog("SpoolBar: %@", message)
         DispatchQueue.main.async { [weak self] in self?.onError?(message) }
     }
 }

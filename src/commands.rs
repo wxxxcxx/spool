@@ -27,9 +27,9 @@ use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, 
 use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
-// The command vocabulary itself lives in the `paneru-command` crate, shared with
+// The command vocabulary itself lives in the `spool-command` crate, shared with
 // the Lua API in `crates/lua-api` so every host speaks the same types.
-pub use paneru_shared_types::commands::{
+pub use spool_shared_types::commands::{
     Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
 };
 

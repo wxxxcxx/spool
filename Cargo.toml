@@ -1,11 +1,11 @@
 [package]
-name = "paneru"
+name = "spool"
 version = "0.4.4"
 edition = "2024"
 rust-version = "1.95.0"
 description = "A sliding, tiling window manager for MacOS."
-homepage = "https://github.com/karinushka/paneru"
-repository = "https://github.com/karinushka/paneru"
+homepage = "https://github.com/wxxxcxx/spool"
+repository = "https://github.com/wxxxcxx/spool"
 readme = "README.md"
 license = "MIT"
 categories = ["os::macos-apis"]
@@ -23,9 +23,9 @@ cfg-if = "1.0.4"
 futures-lite = "2.6"
 mach2 = "0.6"
 mlua = { version = "0.12", default-features = false, features = ["serialize"] }
-paneru-lua = { path = "crates/lua" }
-paneru-mach-ipc = { path = "crates/mach_ipc" }
-paneru-shared-types = { path = "crates/shared_types" }
+spool-lua = { path = "crates/lua" }
+spool-mach-ipc = { path = "crates/mach_ipc" }
+spool-shared-types = { path = "crates/shared_types" }
 regex = "1.12"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
@@ -33,8 +33,8 @@ serde_json = "1.0"
 [lints.clippy]
 pedantic = "warn"
 
-# `lua` builds in the `init.lua` scripting runtime (`paneru.on`/
-# `paneru.bind`). Off by default; build with `--features lua,vendored,luajit`
+# `lua` builds in the `init.lua` scripting runtime (`spool.on`/
+# `spool.bind`). Off by default; build with `--features lua,vendored,luajit`
 # to include it. Exactly one ABI feature must be picked alongside `lua` (same
 # convention as `crates/lua`) — `luajit` is the one to pick unless you have a
 # reason not to: handlers run on the event path, and its tracing JIT is worth
@@ -42,7 +42,7 @@ pedantic = "warn"
 # `lua5x` features remain for scripts needing 5.2+ semantics LuaJIT lacks.
 #
 # Lua 5.1 and Luau are deliberately not offered. The world-access calls
-# (`paneru.query*`, the window set, `paneru.state`) are async, which means the
+# (`spool.query*`, the window set, `spool.state`) are async, which means the
 # interpreter has to be able to yield out of a Rust callback. LuaJIT can —
 # it is resumable across pcall, metamethods and C boundaries — but reference
 # 5.1 cannot yield across a C-call boundary at all, and Luau is missing the
@@ -59,11 +59,11 @@ default = []
 vendored = ["mlua/vendored"]
 lua = [
   "dep:mlua",
-  "dep:paneru-lua",
+  "dep:spool-lua",
   "dep:async-executor",
   # Brings in the `FromLua`/`IntoLua` impls the embedded runtime needs to hand
   # a script the values it stored.
-  "paneru-shared-types/lua",
+  "spool-shared-types/lua",
 ]
 luajit = ["mlua/luajit"]
 lua55 = ["mlua/lua55"]
@@ -138,9 +138,9 @@ objc2-app-kit = { version = "0.3", features = [
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 objc2-core-graphics = "0.3"
-paneru-mach-ipc = { workspace = true }
-paneru-shared-types = { workspace = true }
-paneru-lua = { workspace = true, optional = true }
+spool-mach-ipc = { workspace = true }
+spool-shared-types = { workspace = true }
+spool-lua = { workspace = true, optional = true }
 objc2-quartz-core = { version = "0.3", features = [
   "CALayer",
   "objc2-core-foundation",

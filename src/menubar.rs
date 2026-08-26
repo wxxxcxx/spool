@@ -26,7 +26,7 @@ struct MenuActionTargetIvars {
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "PaneruMenuActionTarget"]
+    #[name = "SpoolMenuActionTarget"]
     #[ivars = MenuActionTargetIvars]
     #[derive(Debug)]
     struct MenuActionTarget;
@@ -75,8 +75,8 @@ define_class!(
             }
         }
 
-        #[unsafe(method(quitPaneru:))]
-        fn quit_paneru(&self, _: &NSMenuItem) {
+        #[unsafe(method(quitSpool:))]
+        fn quit_spool(&self, _: &NSMenuItem) {
             self.send_command(Command::Quit);
         }
     }
@@ -159,10 +159,10 @@ impl MenuBarManager {
     fn rebuild_accessibility_menu(&mut self) {
         self.menu.removeAllItems();
 
-        let status = self.add_item("Paneru — Accessibility Required", None);
+        let status = self.add_item("Spool — Accessibility Required", None);
         status.setEnabled(false);
 
-        let hint = self.add_item("Grant access; Paneru will start automatically", None);
+        let hint = self.add_item("Grant access; Spool will start automatically", None);
         hint.setEnabled(false);
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
@@ -176,7 +176,7 @@ impl MenuBarManager {
         );
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
-        self.add_item("Quit Paneru", Some(sel!(quitPaneru:)));
+        self.add_item("Quit Spool", Some(sel!(quitSpool:)));
     }
 
     pub fn update(
@@ -223,7 +223,7 @@ impl MenuBarManager {
         self.managed_window_items.clear();
         self.manage_item = None;
 
-        let status = self.add_item("Paneru — Running", None);
+        let status = self.add_item("Spool — Running", None);
         status.setEnabled(false);
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
 
@@ -243,7 +243,7 @@ impl MenuBarManager {
         self.manage_item = Some(manage);
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
-        self.add_item("Quit Paneru", Some(sel!(quitPaneru:)));
+        self.add_item("Quit Spool", Some(sel!(quitSpool:)));
         self.configured_widths = widths.to_vec();
     }
 
@@ -266,7 +266,7 @@ impl MenuBarManager {
             return;
         }
 
-        let tooltip = NSString::from_str("Paneru window manager");
+        let tooltip = NSString::from_str("Spool window manager");
         let Some(button) = self.status_item.button(self.mtm) else {
             warn!("unable to update menu bar: status item has no button");
             return;

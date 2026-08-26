@@ -35,11 +35,11 @@ use events::{Event, EventSender};
 use client::ClientCommand;
 use ecs::state::StateQueryKind;
 use errors::Result;
-use paneru_shared_types::script_state::ScriptStateWrite;
-use paneru_shared_types::script_value::ScriptValue;
-use paneru_shared_types::wire::ScriptStateRequest;
 use platform::service;
 use reader::CommandReader;
+use spool_shared_types::script_state::ScriptStateWrite;
+use spool_shared_types::script_value::ScriptValue;
+use spool_shared_types::wire::ScriptStateRequest;
 
 use crate::ecs::setup_bevy_app;
 use crate::manager::{check_ax_privilege, request_ax_privilege};
@@ -51,61 +51,61 @@ use accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
 pub const VERSION_STRING: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
-    env!("PANERU_LUA_VERSION"),
+    env!("SPOOL_LUA_VERSION"),
     ")"
 );
 #[cfg(not(feature = "lua"))]
 pub const VERSION_STRING: &str = concat!(env!("CARGO_PKG_VERSION"));
 
-/// `Paneru` is the main command-line interface structure for the window manager.
-/// It defines the available subcommands for controlling the Paneru daemon.
+/// `Spool` is the main command-line interface structure for the window manager.
+/// It defines the available subcommands for controlling the Spool daemon.
 #[derive(Clone, Debug, Default, Parser)]
 #[command(
     version = VERSION_STRING,
     author = clap::crate_authors!(),
     about = clap::crate_description!(),
 )]
-pub struct Paneru {
+pub struct Spool {
     /// The subcommand to execute (e.g., `launch`, `install`, `send-cmd`).
     #[clap(subcommand)]
     subcmd: Option<SubCmd>,
 }
 
-/// `SubCmd` enumerates the available command-line subcommands for `paneru`.
+/// `SubCmd` enumerates the available command-line subcommands for `spool`.
 /// These subcommands allow users to launch the daemon, install/uninstall it as a service,
 /// install/uninstall its app launcher, start/stop/restart the service, or send commands to
 /// a running daemon.
 #[derive(Clone, Debug, Default, Subcommand)]
 pub enum SubCmd {
-    /// Launches the `paneru` daemon directly in the console (default behavior).
+    /// Launches the `spool` daemon directly in the console (default behavior).
     #[default]
     Launch,
 
-    /// Installs the `paneru` daemon as a background service.
+    /// Installs the `spool` daemon as a background service.
     Install,
 
-    /// Uninstalls the `paneru` background service.
+    /// Uninstalls the `spool` background service.
     Uninstall,
 
-    /// Reinstalls the `paneru` background service.
+    /// Reinstalls the `spool` background service.
     Reinstall,
 
-    /// Installs a Paneru app launcher to `~/Applications`.
+    /// Installs a Spool app launcher to `~/Applications`.
     InstallApp,
 
-    /// Uninstalls the Paneru app launcher from `~/Applications`.
+    /// Uninstalls the Spool app launcher from `~/Applications`.
     UninstallApp,
 
-    /// Starts the `paneru` background service.
+    /// Starts the `spool` background service.
     Start,
 
-    /// Stops the `paneru` background service.
+    /// Stops the `spool` background service.
     Stop,
 
-    /// Restarts the `paneru` background service.
+    /// Restarts the `spool` background service.
     Restart,
 
-    /// Sends a command via a Unix socket to the running `paneru` daemon.
+    /// Sends a command via a Unix socket to the running `spool` daemon.
     SendCmd {
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -123,7 +123,7 @@ pub enum SubCmd {
         json: bool,
     },
 
-    /// Reads and writes the script state store, the same one `paneru.state`
+    /// Reads and writes the script state store, the same one `spool.state`
     /// gives a Lua script.
     State {
         #[clap(subcommand)]
@@ -173,7 +173,7 @@ pub enum QueryCmd {
     },
 }
 
-/// The main entry point of the `paneru` application.
+/// The main entry point of the `spool` application.
 /// It sets up logging and dispatches commands accordingly.
 ///
 /// # Returns
@@ -196,7 +196,7 @@ fn main() -> Result<()> {
 
     let service = || service::Service::try_new(service::ID);
 
-    let subcmd = Paneru::parse().subcmd.unwrap_or_default();
+    let subcmd = Spool::parse().subcmd.unwrap_or_default();
     maybe_warn_deprecated_options_for_service(&subcmd);
 
     match subcmd {
@@ -218,7 +218,7 @@ fn main() -> Result<()> {
                 }
                 Err(err) => {
                     error!(
-                        "Error launching Paneru: {err}.\nStopping the service for now. You can restart it again with 'paneru restart'."
+                        "Error launching Spool: {err}.\nStopping the service for now. You can restart it again with 'spool restart'."
                     );
                     service()?.stop()?;
                 }
@@ -252,7 +252,7 @@ fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bo
     }
 
     warn!(
-        "Accessibility access is required. Paneru will remain in the menu bar and start automatically once access is granted."
+        "Accessibility access is required. Spool will remain in the menu bar and start automatically once access is granted."
     );
 
     loop {

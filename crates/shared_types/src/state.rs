@@ -1,10 +1,10 @@
-//! The state documents Paneru answers queries with, and the events it pushes to
+//! The state documents Spool answers queries with, and the events it pushes to
 //! subscribers.
 //!
 //! Shared by the daemon and every client: the window manager fills these in from
 //! its ECS world, the Lua module and any status bar deserialize the same types.
 //!
-//! They are the wire format of `paneru query …` and `paneru subscribe`, so
+//! They are the wire format of `spool query …` and `spool subscribe`, so
 //! nobody has to poke at untyped JSON to read them.
 
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ impl StateQueryKind {
         StateQueryKind::OnScreen,
     ];
 
-    /// The `paneru.query_*` shorthand each kind is exposed under in the Lua API,
+    /// The `spool.query_*` shorthand each kind is exposed under in the Lua API,
     /// paired with the kind it queries. Both Lua hosts (the embedded runtime and
     /// the loadable client module) iterate this so the shorthand name and the
     /// kind it maps to are defined exactly once.
@@ -43,7 +43,7 @@ impl StateQueryKind {
         ("query_on_screen", StateQueryKind::OnScreen),
     ];
 
-    /// The argv token naming this query (`paneru query <token> --json`).
+    /// The argv token naming this query (`spool query <token> --json`).
     #[must_use]
     pub fn token(self) -> &'static str {
         match self {
@@ -71,7 +71,7 @@ impl StateQueryKind {
     }
 }
 
-/// The complete state document (`paneru query state --json`).
+/// The complete state document (`spool query state --json`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct QueryState {
     pub version: u32,
@@ -82,11 +82,11 @@ pub struct QueryState {
     pub virtual_workspaces: Vec<VirtualWorkspaceState>,
 }
 
-/// The native Space and Paneru row currently visible on one physical display.
+/// The native Space and Spool row currently visible on one physical display.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DisplayState {
     pub display_id: u32,
-    /// Whether this is the display Paneru currently considers active.
+    /// Whether this is the display Spool currently considers active.
     pub active: bool,
     pub native_workspace_id: Option<u64>,
     pub virtual_workspace_number: Option<u32>,
@@ -113,7 +113,7 @@ pub struct VirtualWorkspaceState {
     /// Physical display that owns this row. `None` only represents an
     /// inconsistent or partially restored ECS hierarchy.
     pub display_id: Option<u32>,
-    /// The remembered Paneru row for this native Space. Consumers should pair
+    /// The remembered Spool row for this native Space. Consumers should pair
     /// this with `QueryState.displays[].native_workspace_id` to find the row
     /// currently visible on each display.
     #[serde(default)]
@@ -145,7 +145,7 @@ pub struct WindowState {
     /// Frame in global display coordinates, when known.
     pub frame: Option<Frame>,
     /// Whether the window is meaningfully on screen right now: not minimized or
-    /// hidden, and showing more than the sliver Paneru leaves poking out for
+    /// hidden, and showing more than the sliver Spool leaves poking out for
     /// off-screen windows.
     pub visible: bool,
 }
@@ -225,7 +225,7 @@ impl QueryState {
     }
 }
 
-/// An event pushed to `paneru subscribe` clients, one JSON object per line.
+/// An event pushed to `spool subscribe` clients, one JSON object per line.
 ///
 /// The serde tag is the `event` field consumers switch on, so the name and the
 /// payload have a single definition shared by the daemon that emits them and
@@ -233,7 +233,7 @@ impl QueryState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum StateEvent {
-    /// The visible workspace changed (native Space or Paneru virtual row).
+    /// The visible workspace changed (native Space or Spool virtual row).
     VirtualWorkspaceChanged { active: ActiveState },
     /// The managed window list of the current workspace changed.
     WindowsChanged {
@@ -256,12 +256,12 @@ pub enum StateEvent {
     /// A window's title changed.
     WindowTitleChanged { window_id: i32, title: String },
     /// Display configuration changed. `display_id` is `null` for a global
-    /// change Paneru cannot pin to one display.
+    /// change Spool cannot pin to one display.
     DisplayChanged { display_id: Option<u32> },
 }
 
 impl StateEvent {
-    /// The documented `{"event": …}` JSON that `paneru subscribe --json` prints.
+    /// The documented `{"event": …}` JSON that `spool subscribe --json` prints.
     ///
     /// # Errors
     ///

@@ -86,7 +86,7 @@ enum MenuBarOccupancy {
         return rows.compactMap { row in
             guard (row[kCGWindowOwnerPID as String] as? Int) != ownPID,
                   !((row[kCGWindowOwnerName as String] as? String) ?? "")
-                      .hasPrefix("PaneruBar"),
+                      .hasPrefix("SpoolBar"),
                   let layer = row[kCGWindowLayer as String] as? Int,
                   layer >= statusLevel,
                   let bounds = row[kCGWindowBounds as String] as? [String: Any],

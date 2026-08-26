@@ -1,13 +1,13 @@
-//! Installs the global `paneru` API table into a Lua state.
+//! Installs the global `spool` API table into a Lua state.
 //!
-//! The command-issuing half (`paneru.run`, `paneru.window.*`,
-//! `paneru.workspace.*`, `paneru.mouse.*`) comes from [`paneru_lua`], shared
+//! The command-issuing half (`spool.run`, `spool.window.*`,
+//! `spool.workspace.*`, `spool.mouse.*`) comes from [`spool_lua`], shared
 //! with the client module so both hosts expose the same surface over a typed
 //! [`Command`] dispatcher — here onto the command bus, there onto the daemon
 //! socket.
 //!
-//! What's installed here is embedded-only: `paneru.on` (event handlers),
-//! `paneru.bind` (keybinds), `paneru.flash`, `paneru.log`, and the `query*`
+//! What's installed here is embedded-only: `spool.on` (event handlers),
+//! `spool.bind` (keybinds), `spool.flash`, `spool.log`, and the `query*`
 //! functions (named after the client's, but answering from the world
 //! directly instead of over the socket).
 
@@ -17,8 +17,8 @@ use std::rc::Rc;
 use mlua::{IntoLua, Lua, LuaSerdeExt, Table, Value};
 use tracing::{error, info};
 
-use paneru_lua as shared;
-use paneru_shared_types::script_state::{ScriptStateWrite, WriteOutcome};
+use spool_lua as shared;
+use spool_shared_types::script_state::{ScriptStateWrite, WriteOutcome};
 
 use super::convert::LuaEvent;
 use super::runtime::{
@@ -28,22 +28,22 @@ use super::world::DispatchWorld;
 use crate::commands::Command;
 use crate::config::{Config, config_from_lua, resolve_chord};
 use crate::ecs::state::StateQueryKind;
-use paneru_shared_types::windowset_lua::returned_ops;
+use spool_shared_types::windowset_lua::returned_ops;
 
-/// One `paneru.exec` call: what to run, and where the answer goes.
+/// One `spool.exec` call: what to run, and where the answer goes.
 struct ExecJob {
     program: String,
     args: Vec<String>,
     reply: async_channel::Sender<std::io::Result<std::process::Output>>,
 }
 
-/// How many `paneru.exec` commands may run at once. A fixed worker pool
+/// How many `spool.exec` commands may run at once. A fixed worker pool
 /// rather than a thread per call; four is enough that one slow command
 /// doesn't hold up the rest, since these are waits on other processes, not
 /// work.
 const EXEC_WORKERS: usize = 4;
 
-/// Starts the pool that runs `paneru.exec` commands.
+/// Starts the pool that runs `spool.exec` commands.
 ///
 /// Jobs are taken from a shared queue, so two commands issued back to back
 /// can finish out of order — a script that needs ordering should await the
@@ -54,7 +54,7 @@ fn spawn_exec_pool() -> async_channel::Sender<ExecJob> {
     for worker in 0..EXEC_WORKERS {
         let queue = queue.clone();
         let spawned = std::thread::Builder::new()
-            .name(format!("paneru-lua-exec-{worker}"))
+            .name(format!("spool-lua-exec-{worker}"))
             .spawn(move || {
                 while let Ok(job) = queue.recv_blocking() {
                     let output = std::process::Command::new(&job.program)
@@ -66,17 +66,17 @@ fn spawn_exec_pool() -> async_channel::Sender<ExecJob> {
                 }
             });
         if let Err(err) = spawned {
-            error!("could not start paneru.exec worker {worker}: {err}");
+            error!("could not start spool.exec worker {worker}: {err}");
         }
     }
     jobs
 }
 
-/// How many times `paneru.state.mutate` may lose the compare-and-set race
+/// How many times `spool.state.mutate` may lose the compare-and-set race
 /// before giving up; looping forever would wedge the handler's dispatch.
 const MUTATE_ATTEMPTS: usize = 8;
 
-/// Installs the `paneru` API into `lua`, wiring the Rust-backed functions to the
+/// Installs the `spool` API into `lua`, wiring the Rust-backed functions to the
 /// shared `outbox` (queued commands/flashes) and `registry` (registered handlers
 /// and chords).
 #[allow(clippy::too_many_lines)]
@@ -87,8 +87,8 @@ pub(super) fn install(
     config_cell: &Rc<RefCell<Option<Config>>>,
     world: &Rc<DispatchWorld>,
 ) -> mlua::Result<()> {
-    let paneru = lua.create_table()?;
-    lua.globals().set("paneru", paneru.clone())?;
+    let spool = lua.create_table()?;
+    lua.globals().set("spool", spool.clone())?;
 
     // Queues the command onto the command bus; the primitive the shared API
     // is built on.
@@ -99,22 +99,22 @@ pub(super) fn install(
             Ok(true)
         }
     };
-    shared::install(lua, &paneru, &(Rc::new(dispatch) as shared::Dispatch))?;
+    shared::install(lua, &spool, &(Rc::new(dispatch) as shared::Dispatch))?;
     // `cmd` is the embedded runtime's historical alias for `run`.
-    let run: mlua::Function = paneru.get("run")?;
-    paneru.set("cmd", run)?;
+    let run: mlua::Function = spool.get("run")?;
+    spool.set("cmd", run)?;
 
-    install_query(lua, &paneru, world)?;
-    install_script_state(lua, &paneru, world)?;
+    install_query(lua, &spool, world)?;
+    install_script_state(lua, &spool, world)?;
 
-    // paneru.log(message) — emit a tracing log line.
+    // spool.log(message) — emit a tracing log line.
     let log = lua.create_function(|_, message: String| {
-        info!(target: "paneru::lua", "{message}");
+        info!(target: "spool::lua", "{message}");
         Ok(())
     })?;
-    paneru.set("log", log)?;
+    spool.set("log", log)?;
 
-    // paneru.flash(message[, duration]) — show an on-screen toast.
+    // spool.flash(message[, duration]) — show an on-screen toast.
     let flash = {
         let outbox = Rc::clone(outbox);
         lua.create_function(move |_, (message, duration): (String, Option<f32>)| {
@@ -125,9 +125,9 @@ pub(super) fn install(
             Ok(())
         })?
     };
-    paneru.set("flash", flash)?;
+    spool.set("flash", flash)?;
 
-    // paneru.exec(program[, args]) — run a program without holding the
+    // spool.exec(program[, args]) — run a program without holding the
     // interpreter while it runs.
     //
     // Async so the handler suspends and other handlers/world reads aren't
@@ -172,29 +172,29 @@ pub(super) fn install(
             }
         })?
     };
-    paneru.set("exec", exec)?;
+    spool.set("exec", exec)?;
 
-    // paneru.on(event_name, [filter,] handler) — run `handler` on matching events.
+    // spool.on(event_name, [filter,] handler) — run `handler` on matching events.
     // Accepts either (name, handler), (name, filter_table, handler), or (name, filter_fn, handler).
     let on = {
         let registry = Rc::clone(registry);
         lua.create_function(move |lua, args: mlua::Variadic<Value>| {
             if args.len() < 2 || args.len() > 3 {
                 return Err(mlua::Error::RuntimeError(
-                    "paneru.on requires 2 or 3 arguments: (event_name, [filter,] handler)".into(),
+                    "spool.on requires 2 or 3 arguments: (event_name, [filter,] handler)".into(),
                 ));
             }
             let name = match &args[0] {
                 Value::String(s) => s.to_str()?.to_string(),
                 _ => {
                     return Err(mlua::Error::RuntimeError(
-                        "paneru.on: expected event name string as 1st argument".into(),
+                        "spool.on: expected event name string as 1st argument".into(),
                     ));
                 }
             };
             if !LuaEvent::is_known(&name) {
                 return Err(mlua::Error::RuntimeError(format!(
-                    "paneru.on: unknown event '{name}'; known events are {}",
+                    "spool.on: unknown event '{name}'; known events are {}",
                     LuaEvent::NAMES.join(", ")
                 )));
             }
@@ -202,14 +202,14 @@ pub(super) fn install(
             let (filter, handler) = if args.len() == 2 {
                 let Value::Function(handler) = args[1].clone() else {
                     return Err(mlua::Error::RuntimeError(
-                        "paneru.on: expected handler function as 2nd argument".into(),
+                        "spool.on: expected handler function as 2nd argument".into(),
                     ));
                 };
                 (None, handler)
             } else {
                 let Value::Function(handler) = args[2].clone() else {
                     return Err(mlua::Error::RuntimeError(
-                        "paneru.on: expected handler function as 3rd argument".into(),
+                        "spool.on: expected handler function as 3rd argument".into(),
                     ));
                 };
                 let filter_fn = match &args[1] {
@@ -217,7 +217,7 @@ pub(super) fn install(
                     Value::Function(f) => Some(f.clone()),
                     _ => {
                         return Err(mlua::Error::RuntimeError(
-                            "paneru.on: expected table or function as filter".into(),
+                            "spool.on: expected table or function as filter".into(),
                         ));
                     }
                 };
@@ -233,9 +233,9 @@ pub(super) fn install(
             Ok(())
         })?
     };
-    paneru.set("on", on)?;
+    spool.set("on", on)?;
 
-    // paneru.bind(chord, handler) — register a keybind. `handler` is a Lua
+    // spool.bind(chord, handler) — register a keybind. `handler` is a Lua
     // function (receives a state snapshot) or a command string.
     let bind = {
         let registry = Rc::clone(registry);
@@ -243,11 +243,11 @@ pub(super) fn install(
             register_bind(&registry, &chord, handler)
         })?
     };
-    paneru.set("bind", bind)?;
+    spool.set("bind", bind)?;
 
-    // paneru.setup(table) — declare the whole configuration from Lua. Mirrors
+    // spool.setup(table) — declare the whole configuration from Lua. Mirrors
     // the TOML sections; a `bindings` sub-table is desugared onto the same
-    // path as `paneru.bind` and stripped before the rest is deserialized into
+    // path as `spool.bind` and stripped before the rest is deserialized into
     // a `Config`.
     let setup = {
         let registry = Rc::clone(registry);
@@ -266,9 +266,9 @@ pub(super) fn install(
             Ok(())
         })?
     };
-    paneru.set("setup", setup)?;
+    spool.set("setup", setup)?;
 
-    // paneru.windows(fn) — xmonad's `windows`: hand the window set to `fn` and
+    // spool.windows(fn) — xmonad's `windows`: hand the window set to `fn` and
     // commit whatever it returns.
     //
     // Async because `fn` may itself query and fetching the set is a round
@@ -293,7 +293,7 @@ pub(super) fn install(
             }
         })?
     };
-    paneru.set("windows", windows)?;
+    spool.set("windows", windows)?;
 
     Ok(())
 }
@@ -301,31 +301,31 @@ pub(super) fn install(
 /// Registers one keybind into the shared registry: validates the handler is a
 /// Lua function or a command string, resolves the chord to `(keycode,
 /// modifiers)`, and records it for publishing to the event tap. Shared by
-/// `paneru.bind` and the `bindings` sub-table of `paneru.setup`.
+/// `spool.bind` and the `bindings` sub-table of `spool.setup`.
 fn register_bind(registry: &SharedRegistry, chord: &str, handler: Value) -> mlua::Result<()> {
     match &handler {
         Value::Function(_) | Value::String(_) => {}
         other => {
             return Err(mlua::Error::RuntimeError(format!(
-                "paneru.bind: handler must be a function or command string, got {}",
+                "spool.bind: handler must be a function or command string, got {}",
                 other.type_name()
             )));
         }
     }
     let (code, modifiers) = resolve_chord(chord)
-        .map_err(|err| mlua::Error::RuntimeError(format!("paneru.bind: {err}")))?;
+        .map_err(|err| mlua::Error::RuntimeError(format!("spool.bind: {err}")))?;
 
     let mut registry = registry.borrow_mut();
     registry.binds.push(handler);
     let id = u32::try_from(registry.binds.len())
-        .map_err(|_| mlua::Error::RuntimeError("paneru.bind: too many binds".into()))?;
+        .map_err(|_| mlua::Error::RuntimeError("spool.bind: too many binds".into()))?;
     registry.keybinds.push((code, modifiers, id));
     Ok(())
 }
 
 /// Installs the state-query half of the API, matching the client module's
-/// naming: `paneru.query(kind)` hands back the raw JSON string,
-/// `paneru.query_json(kind)` the decoded table, and `query_state` /
+/// naming: `spool.query(kind)` hands back the raw JSON string,
+/// `spool.query_json(kind)` the decoded table, and `query_state` /
 /// `query_active` / `query_workspaces` / `query_on_screen` are fixed-kind
 /// shorthands.
 ///
@@ -333,22 +333,22 @@ fn register_bind(registry: &SharedRegistry, chord: &str, handler: Value) -> mlua
 /// (`super::LuaRuntime::with_query` installs the provider for exactly that
 /// long), so calling one of these at script top level fails with an
 /// explanation rather than returning stale data.
-fn install_query(lua: &Lua, paneru: &mlua::Table, world: &Rc<DispatchWorld>) -> mlua::Result<()> {
+fn install_query(lua: &Lua, spool: &mlua::Table, world: &Rc<DispatchWorld>) -> mlua::Result<()> {
     let raw = query_function(lua, world, None, true)?;
-    paneru.set("query", raw)?;
+    spool.set("query", raw)?;
 
     let json = query_function(lua, world, None, false)?;
-    paneru.set("query_json", json)?;
+    spool.set("query_json", json)?;
 
     for (name, kind) in StateQueryKind::SHORTHANDS {
         let shorthand = query_function(lua, world, Some(kind), false)?;
-        paneru.set(name, shorthand)?;
+        spool.set(name, shorthand)?;
     }
 
     Ok(())
 }
 
-/// One `paneru.query*` entry point.
+/// One `spool.query*` entry point.
 ///
 /// `fixed` is the kind for the shorthands, which take no argument; the general
 /// forms take one and fall back to the full state document. `as_json` picks the
@@ -373,7 +373,7 @@ fn query_function(
                 // valid kinds.
                 StateQueryKind::parse(token).ok_or_else(|| {
                     mlua::Error::RuntimeError(format!(
-                        "paneru.query: unknown kind '{token}'; expected one of {}",
+                        "spool.query: unknown kind '{token}'; expected one of {}",
                         StateQueryKind::tokens()
                     ))
                 })?
@@ -381,7 +381,7 @@ fn query_function(
             let state = world
                 .query_state()
                 .await
-                .map_err(|err| mlua::Error::RuntimeError(format!("paneru.query: {err}")))?;
+                .map_err(|err| mlua::Error::RuntimeError(format!("spool.query: {err}")))?;
             if as_json {
                 state
                     .to_query_json(kind)
@@ -395,14 +395,14 @@ fn query_function(
     })
 }
 
-/// Installs `paneru.state`: a named store a script can keep values in,
+/// Installs `spool.state`: a named store a script can keep values in,
 /// surviving hot reloads and restarts (unlike a Lua global). A client can
 /// also read and write the same store over the socket under the same names.
 ///
 /// ```lua
-/// paneru.state.get("pads.term")           -- the value, or nil
-/// paneru.state.set("pads.term", 12345)    -- nil removes the key
-/// paneru.state.mutate("count", function(n) return (n or 0) + 1 end)
+/// spool.state.get("pads.term")           -- the value, or nil
+/// spool.state.set("pads.term", 12345)    -- nil removes the key
+/// spool.state.mutate("count", function(n) return (n or 0) + 1 end)
 /// ```
 ///
 /// `mutate` reads, runs your function, and writes only if the value hasn't
@@ -412,7 +412,7 @@ fn query_function(
 /// rather than silently dropped.
 fn install_script_state(
     lua: &Lua,
-    paneru: &mlua::Table,
+    spool: &mlua::Table,
     world: &Rc<DispatchWorld>,
 ) -> mlua::Result<()> {
     let state = lua.create_table()?;
@@ -510,6 +510,6 @@ fn install_script_state(
         })?
     })?;
 
-    paneru.set("state", state)?;
+    spool.set("state", state)?;
     Ok(())
 }

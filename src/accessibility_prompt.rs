@@ -20,12 +20,12 @@ pub(crate) fn show_accessibility_setup(
     }
 
     let alert = NSAlert::new(main_thread_marker);
-    alert.setMessageText(&NSString::from_str("Allow Paneru to Control Windows"));
+    alert.setMessageText(&NSString::from_str("Allow Spool to Control Windows"));
     alert.setInformativeText(&NSString::from_str(
-        "Paneru needs Accessibility access to move, resize, and arrange windows.\n\n\
-         In System Settings, open Privacy & Security → Accessibility, then turn on Paneru.\n\n\
-         If Paneru is already listed but access still does not work, remove the old entry with \
-         the – button, add Paneru.app again with the + button, and turn it on.",
+        "Spool needs Accessibility access to move, resize, and arrange windows.\n\n\
+         In System Settings, open Privacy & Security → Accessibility, then turn on Spool.\n\n\
+         If Spool is already listed but access still does not work, remove the old entry with \
+         the – button, add Spool.app again with the + button, and turn it on.",
     ));
     alert.addButtonWithTitle(&NSString::from_str("Continue"));
     alert.addButtonWithTitle(&NSString::from_str("Not Now"));

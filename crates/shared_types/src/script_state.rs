@@ -3,9 +3,9 @@
 //! restart.
 //!
 //! Shared by the daemon and its clients: the embedded runtime writes it via
-//! `paneru.state.*`, a client via the same spelling over the socket. Because
+//! `spool.state.*`, a client via the same spelling over the socket. Because
 //! there are two writers, a write carries what it [`Expected`] to find — that
-//! is what makes `paneru.state.mutate` a real read-modify-write.
+//! is what makes `spool.state.mutate` a real read-modify-write.
 
 use std::collections::BTreeMap;
 
@@ -160,7 +160,7 @@ impl ScriptStateWrite {
 
     /// A write that lands only if the key still holds `expected` — where `None`
     /// means the key is still absent. The read-modify-write primitive
-    /// `paneru.state.mutate` is built on.
+    /// `spool.state.mutate` is built on.
     #[must_use]
     pub fn compare_and_set(
         key: String,

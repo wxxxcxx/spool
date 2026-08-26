@@ -136,7 +136,7 @@ pub trait WindowManagerApi: Send + Sync {
     ///
     /// * `app` - A mutable reference to the `Application` whose windows are to be added.
     /// * `spaces` - A slice of space IDs to query for windows.
-    /// * `config` - The current Paneru configuration, used to evaluate window rules.
+    /// * `config` - The current Spool configuration, used to evaluate window rules.
     ///
     /// # Returns
     ///
@@ -727,7 +727,7 @@ const BRUTEFORCE_BUDGET: Duration = Duration::from_millis(250);
 /// * `pid` - The process ID of the application whose windows are to be brute-forced.
 /// * `bundle_id` - The bundle identifier of the application, if known.
 /// * `window_list` - A mutable vector of `WinID`s representing the expected global window list; found windows are removed from this list.
-/// * `config` - The current Paneru configuration, used to evaluate window rules.
+/// * `config` - The current Spool configuration, used to evaluate window rules.
 pub fn bruteforce_windows(
     pid: Pid,
     bundle_id: Option<&str>,
@@ -835,7 +835,7 @@ pub fn request_ax_privilege() -> bool {
 }
 
 /// Checks if the macOS "Displays have separate Spaces" option is enabled.
-/// This is crucial for the window manager's functionality, as Paneru relies on independent spaces per display.
+/// This is crucial for the window manager's functionality, as Spool relies on independent spaces per display.
 ///
 /// # Returns
 ///

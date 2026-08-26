@@ -337,7 +337,7 @@ fn test_mouse_to_next_display() {
         .run(commands);
 }
 
-/// Regression test: paneru's init pass must not drag windows that live on
+/// Regression test: spool's init pass must not drag windows that live on
 /// inactive displays onto the active display. `apply_window_properties`
 /// initially appends every observed window to the active strip; if the
 /// layout writers run before `finish_setup` has reassigned them, they
@@ -427,7 +427,7 @@ fn test_wake_reconciles_unplugged_display() {
                 .count();
             assert_eq!(displays, 2, "should start with two displays");
 
-            // Unplug the external display behind paneru's back — no
+            // Unplug the external display behind spool's back — no
             // DisplayRemoved event is sent, mimicking a wake-from-sleep.
             state.remove_display(EXT_DISPLAY_ID);
         })

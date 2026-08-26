@@ -1,10 +1,10 @@
-# Agent Instructions: Paneru macOS Window Manager (Bevy-based)
+# Agent Instructions: Spool macOS Window Manager (Bevy-based)
 
-This document provides project-specific guidance for AI agents contributing to Paneru. It builds upon the core philosophy and technical architecture of the codebase.
+This document provides project-specific guidance for AI agents contributing to Spool. It builds upon the core philosophy and technical architecture of the codebase.
 
 ## 1. Bevy ECS Architecture & Patterns
 
-Paneru is built on Bevy and follows a strict Data-Driven Design (ECS).
+Spool is built on Bevy and follows a strict Data-Driven Design (ECS).
 
 *   **Marker Components:** Use markers extensively for filtering and state tracking (e.g., `ActiveWorkspaceMarker`, `FocusedMarker`, `FreshMarker`, `Unmanaged`). Most markers are found in `src/ecs.rs` or `src/ecs/mod.rs`.
 *   **Triggers & Observers:** Prefer Bevy's observer pattern for reactive logic. See `src/ecs/triggers.rs` and `src/ecs/workspace.rs` for examples like `SpawnWindowTrigger` and `WMEventTrigger`.
@@ -22,12 +22,12 @@ Paneru is built on Bevy and follows a strict Data-Driven Design (ECS).
 ## 3. Layout & Workspace Logic
 
 *   **LayoutStrip:** The core layout data structure is `LayoutStrip` (in `src/ecs/layout.rs`). It manages columns, stacks, and tabs.
-*   **Virtual Workspaces:** Paneru manages virtual workspaces that map to macOS "Spaces". See `src/ecs/workspace.rs` for how window movement and workspace switching are handled.
+*   **Virtual Workspaces:** Spool manages virtual workspaces that map to macOS "Spaces". See `src/ecs/workspace.rs` for how window movement and workspace switching are handled.
 *   **Coordinate Systems:** Be aware of the difference between Bevy's coordinate system (often Y-up) and macOS/AppKit (Y-down). Use the `Position` and `Size` abstractions to handle conversions.
 
 ## 4. Coding Standards & Idioms
 
-*   **Clippy:** Paneru enforces strict Clippy lints. Run `cargo clippy` before finalizing changes.
+*   **Clippy:** Spool enforces strict Clippy lints. Run `cargo clippy` before finalizing changes.
 *   **Formatting:** All code must be formatted using `cargo fmt`.
 *   **Tracing:** Use the `tracing` crate for logging. Use `#[instrument(level = Level::DEBUG, skip_all, fields(...))]` for complex systems.
 *   **Error Handling:** Use the project's `Result` type and `Error` enum in `src/errors.rs`. Avoid `unwrap()` in systems; log errors or use `inspect_err`.

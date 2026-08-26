@@ -3,14 +3,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "PaneruBar",
+    name: "SpoolBar",
     platforms: [.macOS(.v13)],
     products: [
-        .executable(name: "PaneruBar", targets: ["PaneruBar"]),
+        .executable(name: "SpoolBar", targets: ["SpoolBar"]),
     ],
     targets: [
-        .executableTarget(name: "PaneruBar"),
-        .testTarget(name: "PaneruBarTests", dependencies: ["PaneruBar"]),
+        .executableTarget(name: "SpoolBar"),
+        .testTarget(name: "SpoolBarTests", dependencies: ["SpoolBar"]),
     ],
     swiftLanguageModes: [.v5]
 )

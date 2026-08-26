@@ -10,12 +10,12 @@ use tracing::info;
 
 use crate::util::exe_path;
 
-const APP_BUNDLE_NAME: &str = "Paneru.app";
-const APP_EXECUTABLE_NAME: &str = "PaneruLauncher";
-const APP_BUNDLE_ID: &str = "com.github.karinushka.paneru.launcher";
+const APP_BUNDLE_NAME: &str = "Spool.app";
+const APP_EXECUTABLE_NAME: &str = "SpoolLauncher";
+const APP_BUNDLE_ID: &str = "com.wxxxcxx.spool.launcher";
 
 pub struct AppLauncher {
-    paneru_path: PathBuf,
+    spool_path: PathBuf,
     app_path: PathBuf,
 }
 
@@ -25,19 +25,19 @@ impl AppLauncher {
             ErrorKind::NotFound,
             "Cannot find home directory.",
         ))?;
-        let paneru_path = exe_path().ok_or(Error::new(
+        let spool_path = exe_path().ok_or(Error::new(
             ErrorKind::NotFound,
             "Cannot find current executable path.",
         ))?;
         Ok(Self::new(
-            paneru_path,
+            spool_path,
             home_dir.join("Applications").join(APP_BUNDLE_NAME),
         ))
     }
 
-    fn new(paneru_path: PathBuf, app_path: PathBuf) -> Self {
+    fn new(spool_path: PathBuf, app_path: PathBuf) -> Self {
         Self {
-            paneru_path,
+            spool_path,
             app_path,
         }
     }
@@ -83,10 +83,7 @@ impl AppLauncher {
         fs::write(contents_path.join("Info.plist"), info_plist())?;
 
         let executable_path = executable_dir.join(APP_EXECUTABLE_NAME);
-        fs::write(
-            &executable_path,
-            launcher_script(self.paneru_path.as_path()),
-        )?;
+        fs::write(&executable_path, launcher_script(self.spool_path.as_path()))?;
         let mut permissions = fs::metadata(&executable_path)?.permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(executable_path, permissions)
@@ -102,7 +99,7 @@ fn ensure_owned_bundle(app_path: &Path) -> Result<()> {
     Err(Error::new(
         ErrorKind::AlreadyExists,
         format!(
-            "refusing to replace application not owned by Paneru: {}",
+            "refusing to replace application not owned by Spool: {}",
             app_path.display()
         ),
     ))
@@ -117,7 +114,7 @@ fn info_plist() -> String {
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>Paneru</string>
+    <string>Spool</string>
     <key>CFBundleExecutable</key>
     <string>{APP_EXECUTABLE_NAME}</string>
     <key>CFBundleIdentifier</key>
@@ -125,7 +122,7 @@ fn info_plist() -> String {
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Paneru</string>
+    <string>Spool</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -144,10 +141,10 @@ fn info_plist() -> String {
     )
 }
 
-fn launcher_script(paneru_path: &Path) -> String {
+fn launcher_script(spool_path: &Path) -> String {
     format!(
         "#!/bin/sh\nexec {} start\n",
-        shell_quote(&paneru_path.to_string_lossy())
+        shell_quote(&spool_path.to_string_lossy())
     )
 }
 
@@ -189,24 +186,23 @@ mod tests {
     fn test_directory() -> PathBuf {
         let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "paneru-launcher-test-{}-{test_id}",
+            "spool-launcher-test-{}-{test_id}",
             std::process::id()
         ))
     }
 
     #[test]
-    fn launcher_script_quotes_the_paneru_path() {
-        let script = launcher_script(PathBuf::from("/tmp/Paneru's bin").as_path());
-        assert_eq!(script, "#!/bin/sh\nexec '/tmp/Paneru'\"'\"'s bin' start\n");
-        assert_eq!(shell_quote("paneru"), "'paneru'");
+    fn launcher_script_quotes_the_spool_path() {
+        let script = launcher_script(PathBuf::from("/tmp/Spool's bin").as_path());
+        assert_eq!(script, "#!/bin/sh\nexec '/tmp/Spool'\"'\"'s bin' start\n");
+        assert_eq!(shell_quote("spool"), "'spool'");
     }
 
     #[test]
     fn write_bundle_creates_a_launchable_application() {
         let root = test_directory();
-        let app_path = root.join("Paneru.app");
-        let launcher =
-            AppLauncher::new(PathBuf::from("/opt/homebrew/bin/paneru"), app_path.clone());
+        let app_path = root.join("Spool.app");
+        let launcher = AppLauncher::new(PathBuf::from("/opt/homebrew/bin/spool"), app_path.clone());
 
         launcher.write_bundle(&app_path).unwrap();
 
@@ -218,7 +214,7 @@ mod tests {
         let executable = app_path.join("Contents/MacOS").join(APP_EXECUTABLE_NAME);
         assert_eq!(
             fs::read_to_string(&executable).unwrap(),
-            "#!/bin/sh\nexec '/opt/homebrew/bin/paneru' start\n"
+            "#!/bin/sh\nexec '/opt/homebrew/bin/spool' start\n"
         );
         assert_ne!(
             fs::metadata(executable).unwrap().permissions().mode() & 0o111,
@@ -231,7 +227,7 @@ mod tests {
     #[test]
     fn owned_bundle_check_rejects_an_unrelated_application() {
         let root = test_directory();
-        let app_path = root.join("Paneru.app");
+        let app_path = root.join("Spool.app");
         fs::create_dir_all(app_path.join("Contents")).unwrap();
         fs::write(
             app_path.join("Contents/Info.plist"),
@@ -250,7 +246,7 @@ mod tests {
     #[test]
     fn install_replaces_owned_bundle_and_uninstall_removes_it() {
         let root = test_directory();
-        let app_path = root.join("Applications/Paneru.app");
+        let app_path = root.join("Applications/Spool.app");
         let launcher = AppLauncher::new(PathBuf::from("/usr/bin/true"), app_path.clone());
 
         launcher.install().unwrap();

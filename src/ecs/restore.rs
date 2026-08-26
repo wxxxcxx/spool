@@ -15,7 +15,7 @@ use crate::config::{Config, MissingWindowBehavior};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
-    PaneruState, SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
+    SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace, SpoolState,
 };
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
@@ -27,13 +27,13 @@ use crate::platform::{Pid, WinID, WorkspaceId};
 
 #[derive(Debug, Resource)]
 pub(crate) struct SessionRestore {
-    state: PaneruState,
+    state: SpoolState,
     timer: Timer,
     saved_hard_keys: HashSet<WindowHardMatchKey>,
 }
 
 impl SessionRestore {
-    fn new(state: PaneruState, grace: Duration) -> Self {
+    fn new(state: SpoolState, grace: Duration) -> Self {
         let saved_hard_keys = saved_hard_match_keys(&state);
         Self {
             state,
@@ -56,7 +56,7 @@ pub(super) fn tick_restore_grace(
     if session.timer.is_finished() {
         info!("Session restore grace period ended");
         commands.remove_resource::<SessionRestore>();
-        commands.remove_resource::<PaneruState>();
+        commands.remove_resource::<SpoolState>();
     }
 }
 
@@ -141,12 +141,12 @@ pub(crate) struct RestorePlan {
 }
 
 pub(crate) struct RestorePlanner<'a> {
-    state: &'a PaneruState,
+    state: &'a SpoolState,
     saved_hard_keys: HashSet<WindowHardMatchKey>,
 }
 
 impl<'a> RestorePlanner<'a> {
-    pub(crate) fn new(state: &'a PaneruState) -> Self {
+    pub(crate) fn new(state: &'a SpoolState) -> Self {
         Self {
             state,
             saved_hard_keys: saved_hard_match_keys(state),
@@ -316,7 +316,7 @@ impl<'a> RestorePlanner<'a> {
     }
 }
 
-fn saved_windows_in_state(state: &PaneruState) -> impl Iterator<Item = &SavedWindow> {
+fn saved_windows_in_state(state: &SpoolState) -> impl Iterator<Item = &SavedWindow> {
     state
         .workspaces
         .iter()
@@ -359,13 +359,13 @@ impl SavedWindow {
     }
 }
 
-fn saved_hard_match_keys(state: &PaneruState) -> HashSet<WindowHardMatchKey> {
+fn saved_hard_match_keys(state: &SpoolState) -> HashSet<WindowHardMatchKey> {
     saved_windows_in_state(state)
         .map(SavedWindow::hard_key)
         .collect()
 }
 
-fn has_saved_fallback_windows(state: &PaneruState) -> bool {
+fn has_saved_fallback_windows(state: &SpoolState) -> bool {
     saved_windows_in_state(state).any(|window| !window.title.is_empty())
 }
 
@@ -373,7 +373,7 @@ pub(crate) fn matches_startup_restore_state(
     window: &Window,
     app: &Application,
     session: Option<&SessionRestore>,
-    restoration: Option<&PaneruState>,
+    restoration: Option<&SpoolState>,
     config: &Config,
 ) -> bool {
     if !config.restore_enabled() {
@@ -409,7 +409,7 @@ pub(super) fn restore_window_state(
     displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
     apps: Query<&Application>,
     session: Option<Res<SessionRestore>>,
-    restoration: Option<Res<PaneruState>>,
+    restoration: Option<Res<SpoolState>>,
     mut ctx: WindowCtx,
 ) {
     let restoration = if let Some(session) = session.as_deref() {
@@ -420,7 +420,7 @@ pub(super) fn restore_window_state(
         };
         if !ctx.config.restore_enabled() {
             info!("Session restore disabled by configuration");
-            ctx.commands.remove_resource::<PaneruState>();
+            ctx.commands.remove_resource::<SpoolState>();
             return;
         }
         match ctx.config.restore_missing_windows() {
@@ -581,7 +581,7 @@ fn layout_strip_from_plan(planned: &PlannedStrip) -> LayoutStrip {
 fn current_window_identities(
     windows: &Windows,
     apps: &Query<&Application>,
-    restoration: &PaneruState,
+    restoration: &SpoolState,
 ) -> Vec<CurrentWindowIdentity> {
     let mut current = windows
         .managed_iter()

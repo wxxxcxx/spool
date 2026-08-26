@@ -5,7 +5,7 @@
 //!
 //! Values travel as postcard — compact, binary, and not self-describing, which
 //! is why [`crate::script_value::ScriptValue`] exists in place of
-//! `serde_json::Value`. JSON is still what `paneru query` prints to a terminal,
+//! `serde_json::Value`. JSON is still what `spool query` prints to a terminal,
 //! but it is not what the two processes speak to each other.
 
 use serde::{Deserialize, Serialize};
@@ -15,11 +15,11 @@ use serde::{Deserialize, Serialize};
 /// Matches the launchd job's `Label` and its `MachServices` key, which is what
 /// lets a service-started daemon check in with a port launchd already holds
 /// rather than registering one of its own.
-pub const SERVICE_NAME: &str = "com.github.karinushka.paneru";
+pub const SERVICE_NAME: &str = "com.wxxxcxx.spool";
 
 /// The environment variable that overrides [`SERVICE_NAME`], so a development
 /// build can run beside an installed one.
-pub const SERVICE_ENV: &str = "PANERU_MACH_SERVICE";
+pub const SERVICE_ENV: &str = "SPOOL_MACH_SERVICE";
 
 /// The service name to use, honouring [`SERVICE_ENV`].
 #[must_use]
@@ -44,7 +44,7 @@ pub enum Request {
     Command(Command),
     /// Read part of the state document.
     Query(StateQueryKind),
-    /// Read the window set — the same layout tree a `paneru.windows` handler is
+    /// Read the window set — the same layout tree a `spool.windows` handler is
     /// given inside the daemon, so a client script transforms an identical tree.
     WindowSet,
     /// Replay a transform's recorded operations against the live world.

@@ -120,7 +120,7 @@ enum BarTOML {
   ]
 
   static let template = """
-    # PaneruBar reloads this file automatically.
+    # SpoolBar reloads this file automatically.
     height = 28
     vertical_padding = 3
     workspace_spacing = 5
@@ -424,7 +424,7 @@ enum BarTOML {
     default fallback: String
   ) throws -> String {
     let value = try string(key, in: values, default: fallback)
-    guard NSColor(paneruHex: value) != nil else {
+    guard NSColor(spoolHex: value) != nil else {
       throw ParseError(line: 0, message: "\(key) must be #RRGGBB or #RRGGBBAA")
     }
     return value
@@ -502,13 +502,22 @@ enum BarTOML {
 
 final class BarConfigurationStore {
   let url: URL
+  private let legacyURL: URL?
   private(set) var preferences = BarPreferences()
   var onChange: ((BarPreferences) -> Void)?
   private var timer: Timer?
   private var signature = ""
 
-  init(url: URL = BarConfigurationStore.defaultURL()) {
+  convenience init() {
+    self.init(
+      url: BarConfigurationStore.defaultURL(),
+      legacyURL: BarConfigurationStore.defaultLegacyURL()
+    )
+  }
+
+  init(url: URL, legacyURL: URL? = nil) {
     self.url = url
+    self.legacyURL = legacyURL
   }
 
   func start() {
@@ -540,9 +549,16 @@ final class BarConfigurationStore {
         at: url.deletingLastPathComponent(),
         withIntermediateDirectories: true
       )
+      if let legacyURL,
+        FileManager.default.fileExists(atPath: legacyURL.path)
+      {
+        try FileManager.default.moveItem(at: legacyURL, to: url)
+        NSLog("SpoolBar: moved configuration from %@ to %@", legacyURL.path, url.path)
+        return
+      }
       try BarTOML.template.write(to: url, atomically: true, encoding: .utf8)
     } catch {
-      NSLog("PaneruBar: unable to create %@: %@", url.path, error.localizedDescription)
+      NSLog("SpoolBar: unable to create %@: %@", url.path, error.localizedDescription)
     }
   }
 
@@ -557,7 +573,7 @@ final class BarConfigurationStore {
       preferences = next
       onChange?(next)
     } catch {
-      NSLog("PaneruBar: unable to load %@: %@", url.path, error.localizedDescription)
+      NSLog("SpoolBar: unable to load %@: %@", url.path, error.localizedDescription)
     }
   }
 
@@ -569,18 +585,36 @@ final class BarConfigurationStore {
   }
 
   private static func defaultURL() -> URL {
-    if let configured = ProcessInfo.processInfo.environment["PANERU_BAR_CONFIG"],
+    if let configured = ProcessInfo.processInfo.environment["SPOOL_BAR_CONFIG"],
       !configured.isEmpty
     {
       return URL(fileURLWithPath: (configured as NSString).expandingTildeInPath)
     }
+    return spoolConfigurationDirectory().appendingPathComponent("bar.toml")
+  }
+
+  private static func defaultLegacyURL() -> URL? {
+    guard ProcessInfo.processInfo.environment["SPOOL_BAR_CONFIG"]?.isEmpty != false else {
+      return nil
+    }
     return FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent(".config/paneru-bar/config.toml")
+      .appendingPathComponent(".config/spool-bar/config.toml")
+  }
+
+  private static func spoolConfigurationDirectory() -> URL {
+    if let configured = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"],
+      !configured.isEmpty
+    {
+      return URL(fileURLWithPath: (configured as NSString).expandingTildeInPath)
+        .appendingPathComponent("spool", isDirectory: true)
+    }
+    return FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent(".config/spool", isDirectory: true)
   }
 }
 
 extension NSColor {
-  convenience init?(paneruHex value: String) {
+  convenience init?(spoolHex value: String) {
     let hex = value.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
     guard hex.count == 6 || hex.count == 8, let raw = UInt64(hex, radix: 16) else { return nil }
     let hasAlpha = hex.count == 8

@@ -22,19 +22,19 @@ final class WorkspaceBarController {
     let container: AdjustableWorkspaceBarView
   }
 
-  private let client: PaneruClient
+  private let client: SpoolClient
   private let configurationPanel: ConfigurationPanelController
   private var preferences: BarPreferences
   private let iconProvider = AppIconProvider()
   private let windowStateStore = BarWindowStateStore()
-  private var state: PaneruStateDocument?
+  private var state: SpoolStateDocument?
   private var panels: [PanelKey: PanelRecord] = [:]
   private var screenSignature = ""
   private var geometryTimer: Timer?
   private var settingsAnchorKey: PanelKey?
 
   init(
-    client: PaneruClient,
+    client: SpoolClient,
     preferences: BarPreferences = BarPreferences(),
     savePreferences: @escaping (BarPreferences) throws -> Void = { _ in }
   ) {
@@ -69,7 +69,7 @@ final class WorkspaceBarController {
     rebuild()
   }
 
-  func update(_ state: PaneruStateDocument) {
+  func update(_ state: SpoolStateDocument) {
     self.state = state
     rebuild()
   }

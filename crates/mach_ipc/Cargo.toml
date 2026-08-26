@@ -1,9 +1,9 @@
 [package]
-name = "paneru-mach-ipc"
+name = "spool-mach-ipc"
 version = "0.4.4"
 edition = "2024"
 rust-version = "1.95.0"
-description = "Mach port IPC transport for paneru: a well-known bootstrap service, send-once replies and subscriber ports."
+description = "Mach port IPC transport for spool: a well-known bootstrap service, send-once replies and subscriber ports."
 license = "MIT"
 
 [lints.clippy]

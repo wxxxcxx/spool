@@ -31,7 +31,7 @@ fn relative_rect(rect: &mlua::Table) -> mlua::Result<RelativeRect> {
     })
 }
 
-/// Reads what a `paneru.windows` transform handed back: the operations recorded
+/// Reads what a `spool.windows` transform handed back: the operations recorded
 /// onto the window set it returned, or none at all if it returned nothing.
 ///
 /// Shared so both hosts accept and reject exactly the same return values.
@@ -45,7 +45,7 @@ pub fn returned_ops(returned: &Value) -> mlua::Result<Vec<LayoutOp>> {
         Value::Nil => Ok(Vec::new()),
         Value::UserData(data) => Ok(data.borrow::<WindowSet>()?.ops()),
         other => Err(mlua::Error::RuntimeError(format!(
-            "paneru.windows: expected a window set back, got {}",
+            "spool.windows: expected a window set back, got {}",
             other.type_name()
         ))),
     }
@@ -139,7 +139,7 @@ impl UserData for WindowSet {
         methods.add_method("prev", |_, this, id: WinID| Ok(this.prev(id)));
 
         // Predicates are plain Lua functions taking a window record;
-        // `paneru.match` is a convenience, not a requirement.
+        // `spool.match` is a convenience, not a requirement.
         methods.add_method("find", |lua, this, predicate: Function| {
             for window in this.windows() {
                 let record = lua.to_value(window)?;

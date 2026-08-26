@@ -25,9 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_channel::{Sender, bounded};
 
 use super::worker::{Shared, StoreRequest, WorldRequest};
-use crate::ecs::state::PaneruQueryState;
-use paneru_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
-use paneru_shared_types::windowset::WindowSet;
+use crate::ecs::state::SpoolQueryState;
+use spool_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
+use spool_shared_types::windowset::WindowSet;
 
 /// What the worker reported when the main thread has already gone away. Surfaces
 /// inside the handler as an ordinary error, so the script unwinds normally
@@ -35,7 +35,7 @@ use paneru_shared_types::windowset::WindowSet;
 const SHUTTING_DOWN: &str = "the window manager is shutting down";
 
 /// What a script is told when it reaches for the world from outside a handler.
-const NO_DISPATCH: &str = "only available inside a paneru.on handler or a paneru.bind callback";
+const NO_DISPATCH: &str = "only available inside a spool.on handler or a spool.bind callback";
 
 /// The main thread, as a handler sees it: ask, and await the answer.
 ///
@@ -77,7 +77,7 @@ impl WorldAccess {
         }
     }
 
-    async fn state(&self) -> Shared<PaneruQueryState> {
+    async fn state(&self) -> Shared<SpoolQueryState> {
         ask(&self.world, |reply| WorldRequest::State { reply })
             .await
             .unwrap_or_else(Err)
@@ -180,7 +180,7 @@ pub(super) struct DispatchWorld {
     /// world from somewhere that has none — top-level code, say — which is an
     /// error rather than a stale answer.
     in_flight: Cell<usize>,
-    state: SharedRead<PaneruQueryState>,
+    state: SharedRead<SpoolQueryState>,
     window_set: SharedRead<WindowSet>,
     /// Unlike the other two caches, this survives the batch — the store only
     /// changes on a write, tracked by the revision stamp.
@@ -207,7 +207,7 @@ impl DispatchWorld {
         }
     }
 
-    /// `Err` when nothing is dispatching, so `paneru.query` at script top level
+    /// `Err` when nothing is dispatching, so `spool.query` at script top level
     /// says why rather than handing back an answer from nowhere.
     fn available(&self, call: &str) -> Result<(), String> {
         if self.in_flight.get() == 0 {
@@ -217,8 +217,8 @@ impl DispatchWorld {
     }
 
     /// The query documents, read once per batch however many handlers ask.
-    pub(super) async fn query_state(&self) -> Result<Arc<PaneruQueryState>, String> {
-        self.available("paneru.query")?;
+    pub(super) async fn query_state(&self) -> Result<Arc<SpoolQueryState>, String> {
+        self.available("spool.query")?;
         self.state.get(|| self.access.state()).await
     }
 
@@ -234,7 +234,7 @@ impl DispatchWorld {
     /// mid-read leaves the copy marked older than it is — re-read needlessly
     /// next time, which is the harmless direction to be wrong in.
     pub(super) async fn script_state(&self) -> Result<ScriptState, String> {
-        self.available("paneru.state")?;
+        self.available("spool.state")?;
         let revision = self.access.revision.load(Ordering::Acquire);
         let cached = self.script_state.borrow().clone();
         match cached {
@@ -248,13 +248,13 @@ impl DispatchWorld {
     }
 
     /// Applies one write and reports what became of it. Unlike a command, this
-    /// waits for the result: `paneru.state.mutate` needs to know whether it
+    /// waits for the result: `spool.state.mutate` needs to know whether it
     /// was overtaken while it's still there to retry.
     pub(super) async fn write_script_state(
         &self,
         write: &ScriptStateWrite,
     ) -> Result<WriteOutcome, String> {
-        self.available("paneru.state")?;
+        self.available("spool.state")?;
         self.access.write_script_state(write).await
     }
 }

@@ -1,6 +1,6 @@
 import Foundation
 
-struct PaneruStateDocument: Decodable, Equatable {
+struct SpoolStateDocument: Decodable, Equatable {
     let version: UInt32
     let timestamp: UInt64
     let active: ActiveState

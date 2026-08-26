@@ -25,7 +25,7 @@ use tracing::{Level, error, instrument, warn};
 use crate::commands::register_commands;
 use crate::config::{CONFIGURATION_FILE, Config, WindowParams};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::state::PaneruState;
+use crate::ecs::state::SpoolState;
 use crate::errors::Result;
 use crate::events::{Event, EventSender, InputEvent};
 #[cfg(feature = "lua")]
@@ -52,7 +52,7 @@ pub(crate) mod systems;
 mod triggers;
 pub mod workspace;
 
-// Shared by the Lua reload system so a `paneru.setup{...}` reload applies the
+// Shared by the Lua reload system so a `spool.setup{...}` reload applies the
 // same menubar/passthrough side effects as a TOML reload.
 #[cfg(feature = "lua")]
 pub(crate) use triggers::apply_config_side_effects;
@@ -676,8 +676,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_non_send(menu_bar_manager)
         .insert_non_send(receiver);
 
-    if let Some(previous_state) =
-        PaneruState::load_from_file(&PaneruState::default_state_file_path())
+    if let Some(previous_state) = SpoolState::load_from_file(&SpoolState::default_state_file_path())
     {
         app.insert_resource(previous_state);
     }
@@ -696,7 +695,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     // tap can see a keypress.
     #[cfg(feature = "lua")]
     if let Some(path) = lua_path {
-        // `paneru.bind` resolves chords on the worker, and the layout-aware
+        // `spool.bind` resolves chords on the worker, and the layout-aware
         // keymap behind that goes through Carbon/TIS — must capture it here,
         // on the main thread, before the worker can ask for it.
         crate::config::prime_virtual_keymap();
@@ -708,7 +707,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
             .resource::<script_state::ScriptStateStore>()
             .revision_handle();
         let worker = lua::LuaWorker::spawn(lua::LuaSource::Path(path.clone()), revision);
-        // A script that called `paneru.setup{...}` is authoritative: insert its
+        // A script that called `spool.setup{...}` is authoritative: insert its
         // config now, before `app.run()`, so it exists ahead of the Startup
         // schedule and wins over the TOML `InitialConfig` (see
         // `gather_initial_processes`). Without `setup`, the TOML config is used.

@@ -1,7 +1,7 @@
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let client = PaneruClient()
+    private let client = SpoolClient()
     private let configurationStore = BarConfigurationStore()
     private lazy var barController = WorkspaceBarController(
         client: client,

@@ -12,7 +12,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, Without};
 use bevy::ecs::system::{Commands, Query};
 use bevy::platform::collections::HashSet;
-use paneru_shared_types::windowset::LayoutOp;
+use spool_shared_types::windowset::LayoutOp;
 use tracing::debug;
 
 use crate::commands::{Command, MoveFocus, Operation};
@@ -67,7 +67,7 @@ fn apply(
     let entity = if let Some(window_id) = op.target() {
         let Some((_, entity)) = windows.find(window_id) else {
             debug!(
-                target: "paneru::lua",
+                target: "spool::lua",
                 "skipping {op:?}: window {window_id} is gone since the handler ran"
             );
             return;
@@ -89,14 +89,14 @@ fn apply(
         LayoutOp::Swap(_, other) => {
             let entity = entity.expect("Swap names a window");
             let Some((_, other_entity)) = windows.find(other) else {
-                debug!(target: "paneru::lua", "skipping {op:?}: window {other} is gone");
+                debug!(target: "spool::lua", "skipping {op:?}: window {other} is gone");
                 return;
             };
             let Some((mut strip, _)) = workspaces
                 .iter_mut()
                 .find(|(strip, _)| strip.contains(entity) && strip.contains(other_entity))
             else {
-                debug!(target: "paneru::lua", "skipping {op:?}: the two windows share no strip");
+                debug!(target: "spool::lua", "skipping {op:?}: the two windows share no strip");
                 return;
             };
             let (Ok(left), Ok(right)) = (strip.index_of(entity), strip.index_of(other_entity))
@@ -114,7 +114,7 @@ fn apply(
             // Virtual workspaces are numbered from one for a script and from
             // zero inside the layout.
             let Some(target_virtual_index) = workspace.checked_sub(1) else {
-                debug!(target: "paneru::lua", "skipping {op:?}: workspaces are numbered from 1");
+                debug!(target: "spool::lua", "skipping {op:?}: workspaces are numbered from 1");
                 return;
             };
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -131,7 +131,7 @@ fn apply(
 
         LayoutOp::View { workspace } => {
             let Some(index) = workspace.checked_sub(1) else {
-                debug!(target: "paneru::lua", "skipping {op:?}: workspaces are numbered from 1");
+                debug!(target: "spool::lua", "skipping {op:?}: workspaces are numbered from 1");
                 return;
             };
             commands.trigger(SendMessageTrigger(Event::Command {
@@ -162,7 +162,7 @@ fn apply(
         LayoutOp::SetWidth { ratio, .. } => {
             let entity = entity.expect("SetWidth names a window");
             if !ratio.is_finite() || ratio <= 0.0 {
-                debug!(target: "paneru::lua", "skipping {op:?}: a width ratio must be positive");
+                debug!(target: "spool::lua", "skipping {op:?}: a width ratio must be positive");
                 return;
             }
             // The layout pipeline turns the ratio into an actual width against
@@ -198,7 +198,7 @@ fn apply(
                     .is_some_and(|(_, _, unmanaged)| unmanaged.is_none())
             {
                 debug!(
-                    target: "paneru::lua",
+                    target: "spool::lua",
                     "{op:?} targets a tiled window; float it first or the layout will move it back"
                 );
             }
@@ -211,18 +211,18 @@ fn apply(
         LayoutOp::Stack { onto, .. } => {
             let entity = entity.expect("Stack names a window");
             let Some((_, onto_entity)) = windows.find(onto) else {
-                debug!(target: "paneru::lua", "skipping {op:?}: window {onto} is gone");
+                debug!(target: "spool::lua", "skipping {op:?}: window {onto} is gone");
                 return;
             };
             let Some((mut strip, _)) = workspaces
                 .iter_mut()
                 .find(|(strip, _)| strip.contains(entity) && strip.contains(onto_entity))
             else {
-                debug!(target: "paneru::lua", "skipping {op:?}: the two windows share no strip");
+                debug!(target: "spool::lua", "skipping {op:?}: the two windows share no strip");
                 return;
             };
             if strip.stack(entity).is_err() {
-                debug!(target: "paneru::lua", "skipping {op:?}: the layout refused the stack");
+                debug!(target: "spool::lua", "skipping {op:?}: the layout refused the stack");
                 return;
             }
             commands.reshuffle_around(entity);
@@ -237,7 +237,7 @@ fn apply(
                 return;
             };
             if strip.unstack(entity).is_err() {
-                debug!(target: "paneru::lua", "skipping {op:?}: the window is not in a stack");
+                debug!(target: "spool::lua", "skipping {op:?}: the window is not in a stack");
                 return;
             }
             commands.reshuffle_around(entity);

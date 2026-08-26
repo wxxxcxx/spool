@@ -1,9 +1,9 @@
 //! Conversions between window-manager types and Lua values.
 //!
 //! [`LuaEvent`] mirrors the marshallable subset of [`Event`]; its serde tag
-//! doubles as the `paneru.on` event name, so the registered name, the `type`
+//! doubles as the `spool.on` event name, so the registered name, the `type`
 //! field on the table a handler receives, and the payload shape cannot drift
-//! apart. [`LuaEvent::NAMES`] lists every emittable name, letting `paneru.on`
+//! apart. [`LuaEvent::NAMES`] lists every emittable name, letting `spool.on`
 //! reject a typo at registration time.
 //!
 //! [`TryFrom<&Event>`] is exhaustive, so a new [`Event`] variant is a compile
@@ -20,7 +20,7 @@ use crate::events::Event;
 use crate::platform::{Modifiers, Pid, WinID, WorkspaceId};
 
 /// The subset of [`Event`] that can be handed to Lua, with the payload each
-/// carries. The serde tag doubles as the `paneru.on` event name.
+/// carries. The serde tag doubles as the `spool.on` event name.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LuaEvent {
@@ -96,7 +96,7 @@ pub struct WindowSpawnPayload {
     pub app_name: String,
     pub bundle_id: String,
     pub title: String,
-    pub frame: paneru_shared_types::state::Frame,
+    pub frame: spool_shared_types::state::Frame,
     pub floating: bool,
     pub managed: bool,
 }
@@ -261,7 +261,7 @@ impl TryFrom<&Event> for LuaEvent {
 }
 
 impl LuaEvent {
-    /// Every name a script can register for with `paneru.on`. Checked against
+    /// Every name a script can register for with `spool.on`. Checked against
     /// the variants by `every_emitted_name_is_registrable` below, so the two
     /// cannot drift.
     pub const NAMES: &'static [&'static str] = &[
@@ -318,7 +318,7 @@ impl LuaEvent {
 }
 
 /// Marshals an already-extracted [`LuaEvent`] into `(name, table)` for dispatch
-/// to `paneru.on` callbacks.
+/// to `spool.on` callbacks.
 ///
 /// The dispatch name is the serde tag serde already wrote into the table's
 /// `type` field, so there is no second hand-written variant→name mapping to
@@ -360,7 +360,7 @@ mod tests {
                 app_name: "test".into(),
                 bundle_id: "test".into(),
                 title: "test".into(),
-                frame: paneru_shared_types::state::Frame {
+                frame: spool_shared_types::state::Frame {
                     x: 0,
                     y: 0,
                     width: 100,
@@ -442,7 +442,7 @@ mod tests {
             let name = serde_name(&lua, &event);
             assert!(
                 LuaEvent::is_known(&name),
-                "{name} is emitted but rejected by paneru.on"
+                "{name} is emitted but rejected by spool.on"
             );
         }
         assert!(!LuaEvent::is_known("window_focussed"), "typos are rejected");

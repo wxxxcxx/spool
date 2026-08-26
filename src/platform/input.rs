@@ -483,8 +483,8 @@ impl InputHandler {
         let mask = get_modifiers(eventflags);
 
         // On a native fullscreen space, keybindings are still intercepted so
-        // that paneru can actively switch back to the previous workspace.
-        // Non-paneru keys pass through naturally (find_keybind returns None).
+        // that spool can actively switch back to the previous workspace.
+        // Non-spool keys pass through naturally (find_keybind returns None).
 
         let keycode = keycode.try_into().ok();
         keycode

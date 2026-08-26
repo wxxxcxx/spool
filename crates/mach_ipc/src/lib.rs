@@ -8,18 +8,18 @@
 //! # use serde::{Serialize, Deserialize};
 //! # #[derive(Serialize, Deserialize)] struct Request;
 //! # #[derive(Serialize, Deserialize)] struct Response;
-//! # fn main() -> Result<(), paneru_mach_ipc::Error> {
-//! use paneru_mach_ipc::{RecvPort, SendPort};
+//! # fn main() -> Result<(), spool_mach_ipc::Error> {
+//! use spool_mach_ipc::{RecvPort, SendPort};
 //! # futures_lite::future::block_on(async {
 //! // The daemon.
-//! let receiver = paneru_mach_ipc::Receiver::<Request>::bind("com.example.service")?;
+//! let receiver = spool_mach_ipc::Receiver::<Request>::bind("com.example.service")?;
 //! let delivery = receiver.recv().await?;
 //! if let Some(reply) = delivery.reply {
 //!     reply.send(&Response)?;
 //! }
 //!
 //! // A client, in some other process.
-//! let sender = paneru_mach_ipc::Sender::<Request>::connect("com.example.service")?;
+//! let sender = spool_mach_ipc::Sender::<Request>::connect("com.example.service")?;
 //! let response: Response = sender.call(&Request).await?;
 //!
 //! // The same client with no executor to run on: same names, `_blocking`.
@@ -220,7 +220,7 @@ impl Reply {
     /// # Errors
     ///
     /// Returns [`Error::PeerGone`] if the sender stopped waiting and exited,
-    /// which is normal — an interrupted `paneru query` does exactly this.
+    /// which is normal — an interrupted `spool query` does exactly this.
     pub fn send<R: Serialize>(self, value: &R) -> Result<()> {
         let payload = postcard::to_allocvec(value).map_err(|_| Error::Encode)?;
         msg::reply(self.right, &payload)
@@ -468,7 +468,7 @@ impl<T: Serialize> Sender<T> {
     /// # Errors
     ///
     /// Returns [`Error::NotRunning`] when nothing has bound the name — the
-    /// ordinary "paneru isn't running" that clients should report as such.
+    /// ordinary "spool isn't running" that clients should report as such.
     pub fn connect(service: &str) -> Result<Self> {
         Ok(Self {
             service: bootstrap::look_up(service)?,

@@ -21,13 +21,13 @@ use crate::ecs::params::Windows;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
-use paneru_shared_types::windowset::WindowSet;
+use spool_shared_types::windowset::WindowSet;
 
 pub const STATE_FILE_NAME: &str = "state.json";
 const SUPPORTED_STATE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Resource)]
-pub struct PaneruState {
+pub struct SpoolState {
     pub version: u32,
     pub timestamp: u64,
     pub active_display_id: Option<CGDirectDisplayID>,
@@ -95,12 +95,12 @@ pub struct SavedWindow {
     pub subrole: String,
 }
 
-// These wire-format types live in the shared `paneru_shared_types` crate;
+// These wire-format types live in the shared `spool_shared_types` crate;
 // aliased here to the names the rest of the daemon already uses.
-pub use paneru_shared_types::state::{
-    ActiveState as PaneruActiveState, DisplayState as PaneruDisplayState, Frame,
-    QueryState as PaneruQueryState, StateEvent, StateQueryKind,
-    VirtualWorkspaceState as PaneruVirtualWorkspaceState, WindowState as PaneruWindowState,
+pub use spool_shared_types::state::{
+    ActiveState as SpoolActiveState, DisplayState as SpoolDisplayState, Frame,
+    QueryState as SpoolQueryState, StateEvent, StateQueryKind,
+    VirtualWorkspaceState as SpoolVirtualWorkspaceState, WindowState as SpoolWindowState,
 };
 
 /// Resolves which display a window frame is on and whether more than a sliver of
@@ -162,7 +162,7 @@ impl SavedWindow {
     }
 }
 
-impl PaneruState {
+impl SpoolState {
     #[allow(clippy::too_many_lines)]
     pub fn extract(
         workspaces: &Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
@@ -319,7 +319,7 @@ impl PaneruState {
     }
 
     pub fn default_state_file_path() -> PathBuf {
-        xdg::BaseDirectories::with_prefix("paneru")
+        xdg::BaseDirectories::with_prefix("spool")
             .get_state_file(STATE_FILE_NAME)
             .expect("XDG state directory should be available")
     }
@@ -441,8 +441,8 @@ impl QueryStateParams<'_, '_> {
     /// # Errors
     ///
     /// Returns an error if the window manager cannot enumerate a workspace.
-    pub fn extract(&self) -> crate::errors::Result<PaneruQueryState> {
-        PaneruQueryState::extract(
+    pub fn extract(&self) -> crate::errors::Result<SpoolQueryState> {
+        SpoolQueryState::extract(
             &self.workspaces,
             &self.displays,
             &self.windows,
@@ -459,7 +459,7 @@ impl QueryStateParams<'_, '_> {
 /// `ws:east`, `ws:stack` and friends to know what is beside what.
 impl QueryStateParams<'_, '_> {
     pub fn extract_window_set(&self) -> crate::errors::Result<WindowSet> {
-        use paneru_shared_types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
+        use spool_shared_types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
 
         let focused_entity = self.windows.focused().map(|(_, entity)| entity);
         let sliver_width = self.config.sliver_width();
@@ -579,7 +579,7 @@ impl QueryStateParams<'_, '_> {
         entity: Entity,
         focused: Option<Entity>,
         sliver_width: i32,
-    ) -> Option<paneru_shared_types::windowset::WindowRec> {
+    ) -> Option<spool_shared_types::windowset::WindowRec> {
         let (window, _, unmanaged) = self.windows.get_managed(entity)?;
         let (_, _, app_entity) = self.windows.find_parent(window.id())?;
         let app = self.apps.get(app_entity).ok()?;
@@ -591,7 +591,7 @@ impl QueryStateParams<'_, '_> {
             .and_then(|frame| window_visibility(frame, &self.displays, sliver_width))
             .is_some_and(|(_, visible)| visible && !hidden);
 
-        Some(paneru_shared_types::windowset::WindowRec {
+        Some(spool_shared_types::windowset::WindowRec {
             id: window.id(),
             app_name: app.name().to_string(),
             bundle_id: app.bundle_id().unwrap_or_default().clone(),
@@ -611,8 +611,8 @@ impl QueryStateParams<'_, '_> {
 }
 
 /// How a layout column arranges its windows, in the vocabulary a script sees.
-fn column_kind(column: &Column) -> paneru_shared_types::windowset::ColumnKind {
-    use paneru_shared_types::windowset::ColumnKind;
+fn column_kind(column: &Column) -> spool_shared_types::windowset::ColumnKind {
+    use spool_shared_types::windowset::ColumnKind;
     match column {
         Column::Single(_) => ColumnKind::Single,
         Column::Stack(_) => ColumnKind::Stack,
@@ -639,9 +639,9 @@ pub trait QueryState: std::marker::Sized {
 
 /// Builds the query/subscribe state document from the ECS world.
 ///
-/// A free function rather than an inherent method because [`PaneruQueryState`]
+/// A free function rather than an inherent method because [`SpoolQueryState`]
 /// belongs to the shared protocol crate, which knows nothing about the ECS.
-impl QueryState for PaneruQueryState {
+impl QueryState for SpoolQueryState {
     #[allow(clippy::too_many_lines)]
     fn extract(
         workspaces: &Query<(
@@ -674,9 +674,9 @@ impl QueryState for PaneruQueryState {
             .iter()
             .map(|(display, entity, active)| (entity, (display.id(), active)))
             .collect::<HashMap<_, _>>();
-        let mut active = PaneruActiveState {
+        let mut active = SpoolActiveState {
             display_id: active_display.map(|(display_id, _)| display_id),
-            ..PaneruActiveState::default()
+            ..SpoolActiveState::default()
         };
 
         for (child, strip, active_workspace, selected_workspace) in workspaces {
@@ -716,7 +716,7 @@ impl QueryState for PaneruQueryState {
                     let visibility = frame
                         .and_then(|frame| window_visibility(frame, displays, sliver_width))
                         .map(|(display_id, visible)| (display_id, visible && !hidden));
-                    Some(PaneruWindowState {
+                    Some(SpoolWindowState {
                         window_id: window.id(),
                         bundle_id,
                         app_name,
@@ -757,7 +757,7 @@ impl QueryState for PaneruQueryState {
                 active.focused_window_title = Some(window.title.clone());
             }
 
-            virtual_workspaces.push(PaneruVirtualWorkspaceState {
+            virtual_workspaces.push(SpoolVirtualWorkspaceState {
                 number,
                 native_workspace_id: strip.id(),
                 display_id,
@@ -781,7 +781,7 @@ impl QueryState for PaneruQueryState {
         for (workspace_id, max_number) in workspace_max_numbers {
             for number in 1..=max_number {
                 if !present_numbers.contains(&(workspace_id, number)) {
-                    virtual_workspaces.push(PaneruVirtualWorkspaceState {
+                    virtual_workspaces.push(SpoolVirtualWorkspaceState {
                         number,
                         native_workspace_id: workspace_id,
                         display_id: workspace_display_ids.get(&workspace_id).copied().flatten(),
@@ -807,7 +807,7 @@ impl QueryState for PaneruQueryState {
                 let selected = virtual_workspaces.iter().find(|workspace| {
                     workspace.display_id == Some(display_id) && workspace.selected
                 });
-                PaneruDisplayState {
+                SpoolDisplayState {
                     display_id,
                     active: display_active,
                     native_workspace_id: selected.map(|workspace| workspace.native_workspace_id),
@@ -817,7 +817,7 @@ impl QueryState for PaneruQueryState {
             .collect::<Vec<_>>();
         display_states.sort_by_key(|display| display.display_id);
 
-        Ok(PaneruQueryState {
+        Ok(SpoolQueryState {
             version: 2,
             timestamp: now_timestamp(),
             active,
@@ -840,8 +840,8 @@ pub fn periodic_state_save(
     windows: Windows,
     apps: Query<&Application>,
 ) {
-    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
-    let path = PaneruState::default_state_file_path();
+    let state = SpoolState::extract(&workspaces, &displays, &windows, &apps);
+    let path = SpoolState::default_state_file_path();
     if let Err(e) = state.save_to_file(&path) {
         warn!("Failed to save state: {e}");
     } else {
@@ -858,8 +858,8 @@ pub fn cleanup_on_exit(
 ) {
     if exit_events.read().next().is_some() {
         info!("Exiting, saving state...");
-        let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
-        let path = PaneruState::default_state_file_path();
+        let state = SpoolState::extract(&workspaces, &displays, &windows, &apps);
+        let path = SpoolState::default_state_file_path();
         if let Err(e) = state.save_to_file(&path) {
             error!("Failed to save state on exit: {e}");
         }

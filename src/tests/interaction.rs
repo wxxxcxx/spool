@@ -728,7 +728,7 @@ fn test_focus_recovers_when_focused_window_is_outside_strip() {
         .on_iteration(0, |world, _state| {
             // Make the focused entity genuinely live outside any strip,
             // mirroring the state the user reported: the OS handed focus
-            // to a window Paneru doesn't track on its active strip.
+            // to a window Spool doesn't track on its active strip.
             remove_focused_from_all_strips(world);
         })
         .on_iteration(1, |world, _state| {
@@ -1998,7 +1998,7 @@ fn test_app_self_activation_keeps_window_parked_on_hidden_virtual_row() {
         .run(commands);
 }
 
-/// A `WindowMoved` notification for a window paneru is not currently moving is
+/// A `WindowMoved` notification for a window spool is not currently moving is
 /// the app (or the user) moving it, and the layout must take that new origin on
 /// board.
 #[test]
@@ -2036,13 +2036,13 @@ fn test_foreign_window_move_is_adopted() {
             assert_eq!(
                 position.0,
                 Origin::new(77, 88),
-                "a move paneru did not make must be read back into the layout"
+                "a move spool did not make must be read back into the layout"
             );
         })
         .run(commands);
 }
 
-/// A `WindowMoved` echo of a move paneru itself just made must not perturb the
+/// A `WindowMoved` echo of a move spool itself just made must not perturb the
 /// in-flight animation — reading it back naively made the animation and the
 /// echo chase each other, causing jitter on every reflow.
 ///

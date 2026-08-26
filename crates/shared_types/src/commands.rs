@@ -1,4 +1,4 @@
-//! The Paneru command vocabulary.
+//! The Spool command vocabulary.
 //!
 //! Every way of telling the window manager to do something funnels through
 //! [`Command`]: the TOML `[bindings]` table, the `send-cmd` socket protocol, an
@@ -282,7 +282,7 @@ pub enum Command {
     Window(Operation),
     /// A command targeting the mouse with a specific `MouseOperation`.
     Mouse(MouseMove),
-    /// Focuses the exact Paneru-known window. If it belongs to a parked virtual
+    /// Focuses the exact Spool-known window. If it belongs to a parked virtual
     /// workspace, that row is selected first.
     FocusWindow {
         window_id: i32,
@@ -293,7 +293,7 @@ pub enum Command {
         /// Zero-based internally; CLI input remains one-based.
         virtual_index: u32,
     },
-    /// Moves an exact Paneru-known window to a numbered virtual workspace on a
+    /// Moves an exact Spool-known window to a numbered virtual workspace on a
     /// specific physical display.
     MoveWindowToVirtualWorkspace {
         window_id: i32,

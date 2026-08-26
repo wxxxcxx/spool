@@ -1,6 +1,6 @@
 # Lua Scripting Guide
 
-Paneru embeds a Lua runtime, letting a script declare the entire configuration via `paneru.setup{...}`, hook into window-manager events (`paneru.on`), bind keys to Lua callbacks or command strings (`paneru.bind`), query state, persist data across reloads, and programmatically manipulate window sets.
+Spool embeds a Lua runtime, letting a script declare the entire configuration via `spool.setup{...}`, hook into window-manager events (`spool.on`), bind keys to Lua callbacks or command strings (`spool.bind`), query state, persist data across reloads, and programmatically manipulate window sets.
 
 ---
 
@@ -8,34 +8,34 @@ Paneru embeds a Lua runtime, letting a script declare the entire configuration v
 
 ### Script Locations
 
-By default, Paneru looks for a Lua script in the following locations (in order):
+By default, Spool looks for a Lua script in the following locations (in order):
 
-1. `$PANERU_LUA` (environment variable)
-2. `$HOME/.paneru.lua`
-3. `$XDG_CONFIG_HOME/paneru/init.lua`
+1. `$SPOOL_LUA` (environment variable)
+2. `$HOME/.spool.lua`
+3. `$XDG_CONFIG_HOME/spool/init.lua`
 
 ### TOML Replacement
 
-**A script replaces the TOML.** When any of those files exist, the TOML path is switched off completely: no `paneru.toml` is read, created, or watched, and anything the script does not set takes its built-in default. Two authoritative configs cannot coexist, so a leftover TOML never quietly overrides the script. Conversely, no `init.lua` is created for you when a `paneru.toml` already exists — TOML setups keep working untouched until you write a script yourself.
+**A script replaces the TOML.** When any of those files exist, the TOML path is switched off completely: no `spool.toml` is read, created, or watched, and anything the script does not set takes its built-in default. Two authoritative configs cannot coexist, so a leftover TOML never quietly overrides the script. Conversely, no `init.lua` is created for you when a `spool.toml` already exists — TOML setups keep working untouched until you write a script yourself.
 
 Like the TOML config, the script is automatically reloaded when the file is saved.
 
 ```lua
-paneru.on("window_focused", function(event, ws)
-  paneru.run("window balance")
+spool.on("window_focused", function(event, ws)
+  spool.run("window balance")
 end)
 
-paneru.bind("alt - j", "window focus east")
+spool.bind("alt - j", "window focus east")
 ```
 
 ---
 
-## 2. Configuration from Lua (`paneru.setup`)
+## 2. Configuration from Lua (`spool.setup`)
 
-`paneru.setup{...}` declares the whole configuration from Lua, so `init.lua` can replace `paneru.toml` entirely. The table mirrors the TOML sections one-for-one — `options`, `padding`, `swipe`, `decorations`, `restore`, `windows`, and top-level `default_workspaces`.
+`spool.setup{...}` declares the whole configuration from Lua, so `init.lua` can replace `spool.toml` entirely. The table mirrors the TOML sections one-for-one — `options`, `padding`, `swipe`, `decorations`, `restore`, `windows`, and top-level `default_workspaces`.
 
 ```lua
-paneru.setup {
+spool.setup {
   default_workspaces = 3,
   options = {
     focus_follows_mouse = true,
@@ -59,11 +59,11 @@ paneru.setup {
 
 Two equivalent ways to bind keys, both accepting the exact chord syntax of the TOML `[bindings]` table:
 
-- `paneru.bind(chord, handler)` — the handler is a command string **or a Lua function** (function handlers receive a state snapshot; only `paneru.bind` supports them).
-- a `bindings` sub-table inside `setup`, keyed by command with the chord as the value — a shorthand that desugars onto the same path as `paneru.bind`:
+- `spool.bind(chord, handler)` — the handler is a command string **or a Lua function** (function handlers receive a state snapshot; only `spool.bind` supports them).
+- a `bindings` sub-table inside `setup`, keyed by command with the chord as the value — a shorthand that desugars onto the same path as `spool.bind`:
 
 ```lua
-paneru.setup {
+spool.setup {
   bindings = {
     ["window focus east"] = "alt - l",
     ["quit"] = "ctrl + alt - q",
@@ -73,27 +73,27 @@ paneru.setup {
 
 ### Precedence & Reloading
 
-An `init.lua` disables the TOML entirely, whether or not it calls `paneru.setup`. With `setup`, that table is the configuration; without it, the built-in defaults are used — never a `paneru.toml` sitting next to the script. To keep using TOML, do not create a script.
+An `init.lua` disables the TOML entirely, whether or not it calls `spool.setup`. With `setup`, that table is the configuration; without it, the built-in defaults are used — never a `spool.toml` sitting next to the script. To keep using TOML, do not create a script.
 
 Editing and saving `init.lua` hot-reloads the whole configuration (including menubar and passthrough updates), just like editing the TOML file.
 
 **Notes:**
 - Float-valued options (`animation_speed`, border `width`/`opacity`, window `width`, …) should be written with a decimal point (`12.0`, not `12`).
-- A reload that *removes* a previous `paneru.setup` call keeps the last config it produced rather than reverting to TOML.
-- With Nix modules, set `services.paneru.config` to this `init.lua` (Lua source or a path). See [`nix/README.md`](nix/README.md).
+- A reload that *removes* a previous `spool.setup` call keeps the last config it produced rather than reverting to TOML.
+- With Nix modules, set `services.spool.config` to this `init.lua` (Lua source or a path). See [`nix/README.md`](nix/README.md).
 
 ---
 
-## 3. Event Handling (`paneru.on`)
+## 3. Event Handling (`spool.on`)
 
-`paneru.on` registers callback functions that execute when window-manager events occur.
+`spool.on` registers callback functions that execute when window-manager events occur.
 
 ### Registration Syntax
 
-`paneru.on` accepts 2 or 3 arguments:
+`spool.on` accepts 2 or 3 arguments:
 
 ```lua
-paneru.on(event_name, [filter,] handler)
+spool.on(event_name, [filter,] handler)
 ```
 
 - `event_name` (string): The event to listen for.
@@ -102,20 +102,20 @@ paneru.on(event_name, [filter,] handler)
 
 ```lua
 -- Unfiltered handler:
-paneru.on("window_focused", function(event, ws)
-  paneru.log("Focused window: " .. tostring(event.window_id))
+spool.on("window_focused", function(event, ws)
+  spool.log("Focused window: " .. tostring(event.window_id))
 end)
 
 -- Filtered handler with table spec:
-paneru.on("window_spawned", { bundle = "libreoffice" }, function(event, ws)
+spool.on("window_spawned", { bundle = "libreoffice" }, function(event, ws)
   if event.frame.width < 400 or event.frame.height < 400 then
     return ws:float(event.window_id)
   end
 end)
 
--- Filtered handler with paneru.match:
-paneru.on("window_spawned", paneru.match{ app = "Ghostty" }, function(event, ws)
-  paneru.log("Spawned Ghostty window")
+-- Filtered handler with spool.match:
+spool.on("window_spawned", spool.match{ app = "Ghostty" }, function(event, ws)
+  spool.log("Spawned Ghostty window")
 end)
 ```
 
@@ -123,7 +123,7 @@ end)
 
 | Event Name | Description | Event Payload Fields |
 | --- | --- | --- |
-| `window_spawned` | A window was fully spawned and initialized in Paneru | `type`, `window_id`, `pid`, `app_name`, `bundle_id`, `title`, `frame` (`{x, y, width, height}`), `floating`, `managed` |
+| `window_spawned` | A window was fully spawned and initialized in Spool | `type`, `window_id`, `pid`, `app_name`, `bundle_id`, `title`, `frame` (`{x, y, width, height}`), `floating`, `managed` |
 | `window_focused` | A window gained focus | `type`, `window_id` |
 | `window_destroyed` | A window was closed / destroyed | `type`, `window_id` |
 | `window_moved` | A window was moved | `type`, `window_id` |
@@ -143,55 +143,55 @@ end)
 
 ## 4. Querying State
 
-Inside a `paneru.on` handler or a `paneru.bind` callback, the script can read the same state documents `paneru query …` returns — no round trip, no `io.popen`:
+Inside a `spool.on` handler or a `spool.bind` callback, the script can read the same state documents `spool query …` returns — no round trip, no `io.popen`:
 
 ```lua
-paneru.on("window_focused", function(event, ws)
-  for _, window in ipairs(paneru.query_on_screen()) do  -- actually visible
-    paneru.log(window.app_name .. ": " .. window.title)
+spool.on("window_focused", function(event, ws)
+  for _, window in ipairs(spool.query_on_screen()) do  -- actually visible
+    spool.log(window.app_name .. ": " .. window.title)
   end
 
-  local active = paneru.query_active()
-  paneru.flash("workspace " .. tostring(active.virtual_workspace_number))
+  local active = spool.query_active()
+  spool.flash("workspace " .. tostring(active.virtual_workspace_number))
 end)
 ```
 
 | Function | Returns |
 | --- | --- |
-| `paneru.query(kind)` | the raw JSON string, `kind` defaulting to `"state"` |
-| `paneru.query_json(kind)` | the same document, decoded into a table |
-| `paneru.query_state()` | the complete state document |
-| `paneru.query_active()` | the active display, workspace and focused window |
-| `paneru.query_workspaces()` | the virtual workspace rows |
-| `paneru.query_on_screen()` | the windows currently visible |
+| `spool.query(kind)` | the raw JSON string, `kind` defaulting to `"state"` |
+| `spool.query_json(kind)` | the same document, decoded into a table |
+| `spool.query_state()` | the complete state document |
+| `spool.query_active()` | the active display, workspace and focused window |
+| `spool.query_workspaces()` | the virtual workspace rows |
+| `spool.query_on_screen()` | the windows currently visible |
 
-These are spelled exactly as in the loadable client module (`require("paneru")`, see [`crates/lua`](crates/lua)), so a helper that reads state works unchanged in either host. The payloads are documented in [`QUERY_AND_SUBSCRIBE_FORMAT.md`](QUERY_AND_SUBSCRIBE_FORMAT.md).
+These are spelled exactly as in the loadable client module (`require("spool")`, see [`crates/lua`](crates/lua)), so a helper that reads state works unchanged in either host. The payloads are documented in [`QUERY_AND_SUBSCRIBE_FORMAT.md`](QUERY_AND_SUBSCRIBE_FORMAT.md).
 
 State is gathered on demand and at most once per callback, so handlers that never query cost nothing extra. Outside a callback there is no window-manager state to read, so calling one of these at script top level raises an error; call them inside a handler or keybinding callback.
 
 ---
 
-## 5. Persistent State (`paneru.state`)
+## 5. Persistent State (`spool.state`)
 
-A handler that wants to remember something — which window is the scratchpad, what was focused a moment ago, how many times something has happened — cannot keep it in a Lua global. Saving `init.lua` rebuilds the interpreter, and every global goes with it. `paneru.state` is the store that survives reloads and daemon restarts.
+A handler that wants to remember something — which window is the scratchpad, what was focused a moment ago, how many times something has happened — cannot keep it in a Lua global. Saving `init.lua` rebuilds the interpreter, and every global goes with it. `spool.state` is the store that survives reloads and daemon restarts.
 
 ```lua
-paneru.state.set("pads.term", 4213)     -- any JSON-shaped value
-paneru.state.get("pads.term")           -- 4213, or nil
-paneru.state.set("pads.term", nil)      -- nil removes the key
+spool.state.set("pads.term", 4213)     -- any JSON-shaped value
+spool.state.get("pads.term")           -- 4213, or nil
+spool.state.set("pads.term", nil)      -- nil removes the key
 
-paneru.state.mutate("count", function(n) return (n or 0) + 1 end)
+spool.state.mutate("count", function(n) return (n or 0) + 1 end)
 ```
 
 | Function | Description |
 | --- | --- |
-| `paneru.state.get(key)` | Returns the stored value, or `nil` |
-| `paneru.state.set(key, value)` | Stores a value; passing `nil` removes the key |
-| `paneru.state.mutate(key, fn)` | Passes the current value to `fn` and atomically stores what it returns |
+| `spool.state.get(key)` | Returns the stored value, or `nil` |
+| `spool.state.set(key, value)` | Stores a value; passing `nil` removes the key |
+| `spool.state.mutate(key, fn)` | Passes the current value to `fn` and atomically stores what it returns |
 
 Reach for `mutate` whenever the new value depends on the old one. It reads, runs your function, and stores the result only if the value is still what it read; if something else modified it first, `mutate` re-runs your function against the new value.
 
-Keys are plain strings; values can be strings, numbers, booleans, or JSON-shaped tables. The store is saved in `$XDG_STATE_HOME/paneru/script-state.json`.
+Keys are plain strings; values can be strings, numbers, booleans, or JSON-shaped tables. The store is saved in `$XDG_STATE_HOME/spool/script-state.json`.
 
 ---
 
@@ -200,16 +200,16 @@ Keys are plain strings; values can be strings, numbers, booleans, or JSON-shaped
 Handlers are given a **window set** (`ws`): the whole layout — displays, workspaces, columns, and the windows in them — as a value you can transform. It is modeled on xmonad's `StackSet`, and it is *pure*: every operation returns a **new** window set rather than changing the one you were given, and nothing touches a real window until you **return** it.
 
 ```lua
-paneru.bind("alt - h",       function(ws) return ws:focus(ws:west(ws:focused())) end)
-paneru.bind("alt - shift-h", function(ws) return ws:swap(ws:focused(), ws:west(ws:focused())) end)
-paneru.bind("alt - 3",       function(ws) return ws:view(3) end)
-paneru.bind("alt - shift-3", function(ws) return ws:shift(ws:focused(), 3) end)
+spool.bind("alt - h",       function(ws) return ws:focus(ws:west(ws:focused())) end)
+spool.bind("alt - shift-h", function(ws) return ws:swap(ws:focused(), ws:west(ws:focused())) end)
+spool.bind("alt - 3",       function(ws) return ws:view(3) end)
+spool.bind("alt - shift-3", function(ws) return ws:shift(ws:focused(), 3) end)
 ```
 
 Because the window set is pure:
 
 ```lua
-paneru.bind("alt - b", function(ws)
+spool.bind("alt - b", function(ws)
   local tidied = ws:width(ws:focused(), 0.6)   -- computed, not applied
   if #ws:columns() < 3 then
     return                                     -- returning nothing changes nothing
@@ -220,7 +220,7 @@ end)
 
 A handler that raises partway through changes nothing either, because it never returned anything. You can branch, compute candidate layouts, and return the chosen one.
 
-`paneru.windows(fn)` is the same contract for use partway through a handler: it hands `fn` the window set and commits what it gives back.
+`spool.windows(fn)` is the same contract for use partway through a handler: it hands `fn` the window set and commits what it gives back.
 
 ### Reading Layout State
 
@@ -241,7 +241,7 @@ A handler that raises partway through changes nothing either, because it never r
 
 A window record contains `id`, `app_name`, `bundle_id`, `title`, `frame`, `floating`, `managed`, `visible` and `focused`.
 
-`paneru.match{ app = …, bundle = …, title = …, floating = …, managed = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions.
+`spool.match{ app = …, bundle = …, title = …, floating = …, managed = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions.
 
 ### Transforming Layout State
 
@@ -316,7 +316,7 @@ function scratchpad.toggle(name)
 end
 
 -- Place a pad window the first time we see it
-paneru.on("window_spawned", { bundle = "org.libreoffice.script" }, function(event, ws)
+spool.on("window_spawned", { bundle = "org.libreoffice.script" }, function(event, ws)
   if event.frame.width < 400 or event.frame.height < 400 then
     return ws:float(event.window_id)
   end

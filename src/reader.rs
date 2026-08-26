@@ -1,6 +1,6 @@
 //! Where requests from other processes come in.
 //!
-//! Paneru publishes a Mach service under a well-known name; the CLI, the
+//! Spool publishes a Mach service under a well-known name; the CLI, the
 //! loadable Lua module and anything else that wants to drive the window manager
 //! connect to that name and send it a [`Request`]. Each one is turned into an
 //! [`Event`] for the world, and the ones that expect an answer carry a reply
@@ -8,8 +8,8 @@
 
 use bevy::tasks::{IoTaskPool, TaskPool};
 use futures_lite::StreamExt;
-use paneru_mach_ipc::{Delivery, Receiver, Reply as MachReply};
-use paneru_shared_types::wire::{Request, service_name};
+use spool_mach_ipc::{Delivery, Receiver, Reply as MachReply};
+use spool_shared_types::wire::{Request, service_name};
 use std::sync::Arc;
 use std::thread;
 use tracing::{error, warn};
@@ -38,11 +38,11 @@ impl CommandReader {
     ///
     /// # Errors
     ///
-    /// Returns an error if another Paneru daemon already owns the name.
+    /// Returns an error if another Spool daemon already owns the name.
     pub fn start(self) -> Result<()> {
         let receiver = Receiver::<Request>::bind(&service_name()).inspect_err(|_| {
             error!(
-                "can not register a Mach port - maybe another Paneru instance is already running?"
+                "can not register a Mach port - maybe another Spool instance is already running?"
             );
         })?;
 
@@ -167,7 +167,7 @@ fn answer(
                 Ok(response) => {
                     if let Err(err) = reply.send(&response) {
                         // A client that stopped waiting is normal — an
-                        // interrupted `paneru query` does exactly this.
+                        // interrupted `spool query` does exactly this.
                         warn!("answering {what}: {err}");
                     }
                 }

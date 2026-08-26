@@ -26,7 +26,7 @@ pub const BOOTSTRAP_SERVICE_ACTIVE: kern_return_t = 1103;
 #[derive(Debug)]
 pub enum Error {
     /// No daemon is registered under the service name. This is the ordinary
-    /// "paneru is not running" case, and clients should say exactly that.
+    /// "spool is not running" case, and clients should say exactly that.
     NotRunning,
     /// Another process already owns the service name — a second daemon.
     AlreadyRunning,
@@ -68,8 +68,8 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotRunning => write!(f, "paneru is not running"),
-            Self::AlreadyRunning => write!(f, "another paneru instance owns the service name"),
+            Self::NotRunning => write!(f, "spool is not running"),
+            Self::AlreadyRunning => write!(f, "another spool instance owns the service name"),
             Self::PeerGone => write!(f, "the peer has exited"),
             Self::WouldBlock => write!(f, "the peer's message queue is full"),
             Self::Malformed(what) => write!(f, "malformed message: {what}"),

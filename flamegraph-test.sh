@@ -4,7 +4,7 @@ unset DEVELOPER_DIR
 export PATH="$(echo $PATH | tr ':' '\n' | grep -v 'xcbuild.*xcrun' | paste -sd: -):$PATH"
 
 # STATIC CONFIG — edit these to match your plist
-PLIST="$HOME/Library/LaunchAgents/com.github.karinushka.paneru.plist"
+PLIST="$HOME/Library/LaunchAgents/com.wxxxcxx.spool.plist"
 
 # STATIC
 

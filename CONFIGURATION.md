@@ -1,13 +1,13 @@
 # Configuration Guide
 
-Paneru is configured via a TOML file *or* a Lua script — never both. By
+Spool is configured via a TOML file *or* a Lua script — never both. By
 default, it looks for the TOML configuration in the following locations (in
 order):
 
-1.  `$PANERU_CONFIG` (environment variable)
-2.  `$HOME/.paneru`
-3.  `$HOME/.paneru.toml`
-4.  `$XDG_CONFIG_HOME/paneru/paneru.toml`
+1.  `$SPOOL_CONFIG` (environment variable)
+2.  `$HOME/.spool`
+3.  `$HOME/.spool.toml`
+4.  `$XDG_CONFIG_HOME/spool/spool.toml`
 
 The configuration is automatically reloaded when the file is saved.
 
@@ -36,8 +36,8 @@ General behavior settings for the window manager.
 | `window_resize_cycle` | Boolean | `true` | If disabled, `window_resize` and `window_shrink` stop at the largest/smallest preset instead of cycling back. |
 | `mouse_resize_modifier` | String | *None* | If enabled allows window resizing using mouse movement. For example `cmd + shift` will allow resizing of the window when holding those keys. Proximity of the pointer to left or right window edge determines which side will be adjusted. |
 | `reap_empty_workspaces` | String | `false` | If enabled, a virtual workspace without any windows will be removed. |
-| `disable_native_tabs` | Boolean | `false` | If enabled, Paneru will not auto-merge a newly-spawned window into a tab group with an existing same-app sibling that shares its frame. Use this if you find unrelated windows being grouped together. |
-| `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
+| `disable_native_tabs` | Boolean | `false` | If enabled, Spool will not auto-merge a newly-spawned window into a tab group with an existing same-app sibling that shares its frame. Use this if you find unrelated windows being grouped together. |
+| `virtual_workspace_animations` | Boolean | `false` | If enabled, Spool will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
 | `create_virtual_workspace_automatically` | Boolean | `false` | Automatically creates a new virtual workspace when using `window_virtual_south `or Southward gesture controls. |
 
@@ -73,7 +73,7 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `direction` | String | `"Natural"` | Direction of movement: `"Natural"` or `"Reversed"`. |
 | `vertical` | Boolean | `true` | Interpret the vertical gestures with `fingers_count` or ignore them. Enabling this allows using vertical swipe gestures to change virtual desktops. |
 
-When `fingers_count` is omitted or set below 3, Paneru does not intercept native macOS gestures. If macOS uses three-finger horizontal swipes for Spaces, prefer `[swipe.scroll]` with a modifier or configure a different finger count.
+When `fingers_count` is omitted or set below 3, Spool does not intercept native macOS gestures. If macOS uses three-finger horizontal swipes for Spaces, prefer `[swipe.scroll]` with a modifier or configure a different finger count.
 
 ### `[swipe.scroll]`
 | Option | Type | Default | Description |
@@ -103,7 +103,7 @@ workspace_popup_status = true
 
 ### `[decorations.inactive.dim] (Native macOS Dimming)`
 
-Paneru supports native macOS window dimming. To use this mode, **only** set `opacity` (and optionally `opacity_night`). Do not set a `color`.
+Spool supports native macOS window dimming. To use this mode, **only** set `opacity` (and optionally `opacity_night`). Do not set a `color`.
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -164,8 +164,8 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_snap` | Snap an overflowing window into the viewport. |
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
-| `quit` | Exit Paneru. |
-| `restart` | Restart the Paneru service (`paneru restart`). |
+| `quit` | Exit Spool. |
+| `restart` | Restart the Spool service (`spool restart`). |
 
 **Example:**
 ```toml
@@ -176,7 +176,7 @@ window_resize = ["alt - r", "ctrl - r"]
 
 ### Virtual workspaces (Experimental)
 
-Paneru allows having virtual spaces inside of the native macOS workspace.
+Spool allows having virtual spaces inside of the native macOS workspace.
 Logically it can be thought of several strips of windows (rows) stacked on top
 of each other within the single workspace. Similar to how Niri implements the
 movement between the vertical workspaces.
@@ -219,19 +219,19 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
 **Example command line:**
 ```shell
 # Move to the previous virtual workspace.
-$ paneru send-cmd window virtual north
+$ spool send-cmd window virtual north
 # Move the current window to the next virtual workspace.
-$ paneru send-cmd window virtualmove south
+$ spool send-cmd window virtualmove south
 # Move directly to virtual workspace 3.
-$ paneru send-cmd window virtualnum 3
+$ spool send-cmd window virtualnum 3
 # Move the current window to virtual workspace 3 and follow it.
-$ paneru send-cmd window virtualmovenum 3
+$ spool send-cmd window virtualmovenum 3
 # Send the current window to virtual workspace 3 and stay here.
-$ paneru send-cmd window virtualsendnum 3
+$ spool send-cmd window virtualsendnum 3
 ```
 
 See [QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md) for the
-structured `paneru query` responses and `paneru subscribe` event stream.
+structured `spool query` responses and `spool subscribe` event stream.
 
 ---
 
@@ -244,14 +244,14 @@ Define specific behaviors for applications based on their Title or Bundle ID.
 | `title` | Regex | **(Required)** Regex pattern to match the window title. |
 | `bundle_id` | String | Optional Bundle ID to match (e.g., `com.apple.Terminal`). |
 | `floating` | Boolean | Force the window to be floating/unmanaged. |
-| `manage` | Boolean | Force Paneru to manage this app/window even if macOS reports the app as unobservable or the window has a non-standard role/subrole. |
+| `manage` | Boolean | Force Spool to manage this app/window even if macOS reports the app as unobservable or the window has a non-standard role/subrole. |
 | `index` | Integer | Preferred position in the strip when spawned. |
 | `dont_focus` | Boolean | Prevent the window from taking focus when spawned. |
 | `width` | Positive Float | Initial width ratio for the window. Values above `1.0` create an oversized, horizontally scrollable window. |
 | `grid` | String | placement for floating windows: `"cols:rows:x:y:w:h"`. |
 | `horizontal_padding` | Integer | Gaps to the left/right of this window. |
 | `vertical_padding` | Integer | Gaps to the top/bottom of this window. |
-| `bindings_passthrough`| Array (String)| Keys that should bypass Paneru and go directly to the app. |
+| `bindings_passthrough`| Array (String)| Keys that should bypass Spool and go directly to the app. |
 
 **Example:**
 ```toml
@@ -266,7 +266,7 @@ bindings_passthrough = ["ctrl-h", "ctrl-l"]
 
 Some applications (e.g., BetterTouchTool, ProtonVPN) are flagged as background apps
 (`LSUIElement`) or expose windows with unusual accessibility roles such as `AXTable`
-or `AXTextField`. Paneru normally ignores these processes and windows. Use `manage = true`
+or `AXTextField`. Spool normally ignores these processes and windows. Use `manage = true`
 to opt in and forcibly manage the matching windows.
 
 ```toml
@@ -283,10 +283,10 @@ floating = true
 
 ### Session Restore
 
-Paneru saves its managed window layout and can restore it the next time it
-starts. Restore is a startup-only phase: Paneru loads the saved session, applies
+Spool saves its managed window layout and can restore it the next time it
+starts. Restore is a startup-only phase: Spool loads the saved session, applies
 it after initial window discovery, keeps matching open for a short grace period,
-then stops consulting the saved state until the next Paneru process start.
+then stops consulting the saved state until the next Spool process start.
 
 The saved session includes:
 
@@ -305,7 +305,7 @@ grace period ends, keep normal `[windows]` behavior.
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `enabled` | Boolean | `true` | Enables session restore on startup. |
-| `startup_grace_ms` | Integer (ms) | `2000` | How long Paneru keeps restore matching active after startup. This gives apps a chance to create windows shortly after Paneru starts. |
+| `startup_grace_ms` | Integer (ms) | `2000` | How long Spool keeps restore matching active after startup. This gives apps a chance to create windows shortly after Spool starts. |
 | `missing_windows` | String | `"ignore"` | Behavior when a saved window is not present during restore. Currently only `"ignore"` is supported, which drops the missing window and compacts the restored layout. |
 
 **Example:**
@@ -322,7 +322,7 @@ Restore matches windows first by stable startup identity:
 - process id
 - bundle id
 
-If an application has restarted and those ids changed, Paneru can use a
+If an application has restarted and those ids changed, Spool can use a
 conservative fallback match:
 
 - bundle id
@@ -332,20 +332,20 @@ conservative fallback match:
 - accessibility subrole
 
 Fallback matching is only used when it is unambiguous. If multiple current
-windows could match the same saved window, Paneru skips that saved window rather
+windows could match the same saved window, Spool skips that saved window rather
 than moving the wrong one.
 
 If a saved app or window is missing, the default `"ignore"` policy simply drops
 it from the restored layout. Empty stacks, tab groups, columns, and virtual rows
 are removed. If the previously selected virtual row is removed because all of
-its windows are missing, Paneru selects the nearest remaining restored row for
+its windows are missing, Spool selects the nearest remaining restored row for
 that native workspace. If no restored row remains, the normal startup workspace
 selection is kept.
 
-For screens, Paneru prefers the current macOS workspace-to-display mapping when
+For screens, Spool prefers the current macOS workspace-to-display mapping when
 the workspace is already present on a display. Otherwise it restores to the
 saved display id when that screen is still connected, then falls back to the
-current active display, then the first available display by id. Paneru does not
+current active display, then the first available display by id. Spool does not
 create placeholder displays or off-screen state for disconnected monitors.
 
 ---
@@ -355,7 +355,7 @@ create placeholder displays or off-screen state for disconnected monitors.
 > [!WARNING]
 > These features rely on undocumented macOS window-server APIs and have known issues. For example, overlay windows (like YouTube Picture-in-Picture) may be partially shaded, and layer ordering can behave unexpectedly. Both features are **disabled by default**. 
 >
-> Disabling **System Integrity Protection (SIP)** is **not required**, but without it Paneru has limited control over window layering, which is the root cause of most visual edge-cases. Enable these only if you are comfortable with occasional glitches.
+> Disabling **System Integrity Protection (SIP)** is **not required**, but without it Spool has limited control over window layering, which is the root cause of most visual edge-cases. Enable these only if you are comfortable with occasional glitches.
 
 ### Inactive Window Overlay Dimming
 Another dimming option that draws a translucent overlay on every inactive window to visually emphasize the focused one. 
@@ -398,15 +398,15 @@ radius = 12.0
 
 ## 8. Lua Scripting
 
-Paneru embeds a Lua runtime that allows full configuration via `init.lua`, replacing `paneru.toml` entirely. When a Lua configuration or script exists (`$PANERU_LUA`, `$HOME/.paneru.lua`, or `$XDG_CONFIG_HOME/paneru/init.lua`), it takes over completely and no TOML config is read.
+Spool embeds a Lua runtime that allows full configuration via `init.lua`, replacing `spool.toml` entirely. When a Lua configuration or script exists (`$SPOOL_LUA`, `$HOME/.spool.lua`, or `$XDG_CONFIG_HOME/spool/init.lua`), it takes over completely and no TOML config is read.
 
-All options, padding, gesture settings, window rules, and keybindings documented in sections 1–7 above are available under identical names via `paneru.setup{...}`.
+All options, padding, gesture settings, window rules, and keybindings documented in sections 1–7 above are available under identical names via `spool.setup{...}`.
 
 In addition to static configuration, Lua scripting allows:
-- **Event Hooks (`paneru.on`)**: React to window creation (`window_spawned`), focus changes, or space switches with optional filter specs or regex matchers.
-- **Keybinding Callbacks (`paneru.bind`)**: Map hotkeys to custom Lua callbacks or commands.
-- **State Queries (`paneru.query_*`)**: Read real-time window, workspace, and display layout state without round-trip shell executions.
-- **Persistent State (`paneru.state`)**: Store and mutate data across reloads and daemon restarts.
+- **Event Hooks (`spool.on`)**: React to window creation (`window_spawned`), focus changes, or space switches with optional filter specs or regex matchers.
+- **Keybinding Callbacks (`spool.bind`)**: Map hotkeys to custom Lua callbacks or commands.
+- **State Queries (`spool.query_*`)**: Read real-time window, workspace, and display layout state without round-trip shell executions.
+- **Persistent State (`spool.state`)**: Store and mutate data across reloads and daemon restarts.
 - **Programmatic Layout Transformations (`ws`)**: Pure layout operations (`ws:focus`, `ws:swap`, `ws:float`, `ws:shift`, `ws:view`, etc.) for custom workflows like named scratchpads.
 
 For complete documentation, event specifications, API reference, and examples, see the **[Lua Scripting Guide](./SCRIPTING.md)**.

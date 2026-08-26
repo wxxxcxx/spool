@@ -46,12 +46,12 @@ struct BarMotionSpec: Equatable {
 }
 
 enum BarMotion {
-  static let workspaceKey = "PaneruBar.workspaceTransition"
-  static let windowScrollKey = "PaneruBar.windowScroll"
-  static let focusKey = "PaneruBar.focusMove"
-  static let focusFadeKey = "PaneruBar.focusFade"
-  static let buttonPressKey = "PaneruBar.buttonPress"
-  static let buttonHoverKey = "PaneruBar.buttonHover"
+  static let workspaceKey = "SpoolBar.workspaceTransition"
+  static let windowScrollKey = "SpoolBar.windowScroll"
+  static let focusKey = "SpoolBar.focusMove"
+  static let focusFadeKey = "SpoolBar.focusFade"
+  static let buttonPressKey = "SpoolBar.buttonPress"
+  static let buttonHoverKey = "SpoolBar.buttonHover"
 
   static func addPush(
     to layer: CALayer?,

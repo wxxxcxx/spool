@@ -10,7 +10,7 @@
 //! Only transforms that follow from the layout alone are here (focus,
 //! ordering, workspace membership, stacking, floating, width ratios); ops the
 //! layout engine decides (centring, equalise, raising a float, ...) stay as
-//! imperative `paneru.window.*` verbs instead. The returned tree is a
+//! imperative `spool.window.*` verbs instead. The returned tree is a
 //! prediction — the layout engine settles the actual geometry.
 
 use std::sync::Arc;

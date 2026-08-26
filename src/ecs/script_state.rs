@@ -1,15 +1,15 @@
 //! The script-owned key-value store, as the daemon holds it.
 //!
-//! [`ScriptState`] is the data; this is where it lives while Paneru runs and how
+//! [`ScriptState`] is the data; this is where it lives while Spool runs and how
 //! it gets to disk. Both the embedded Lua runtime and a socket client write
 //! through this single-authority resource; the Lua worker caches a copy and
 //! checks [`ScriptStateStore::revision_handle`] to know when to re-read.
 //!
-//! Kept separate from [`PaneruState`] (which is rebuilt from the world on every
+//! Kept separate from [`SpoolState`] (which is rebuilt from the world on every
 //! save) since script state has neither that property nor a reason to be
 //! removed once session restore finishes.
 //!
-//! [`PaneruState`]: super::state::PaneruState
+//! [`SpoolState`]: super::state::SpoolState
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
 use crate::events::Event;
-use paneru_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
-use paneru_shared_types::wire::{Response, ScriptStateRequest, ScriptStateResponse};
+use spool_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
+use spool_shared_types::wire::{Response, ScriptStateRequest, ScriptStateResponse};
 
 pub const SCRIPT_STATE_FILE_NAME: &str = "script-state.json";
 const SUPPORTED_SCRIPT_STATE_VERSION: u32 = 1;
@@ -166,14 +166,14 @@ impl ScriptStateStore {
 
     #[must_use]
     pub fn default_file_path() -> PathBuf {
-        xdg::BaseDirectories::with_prefix("paneru")
+        xdg::BaseDirectories::with_prefix("spool")
             .get_state_file(SCRIPT_STATE_FILE_NAME)
             .expect("XDG state directory should be available")
     }
 }
 
 /// Answers the script-state requests a socket client made — the client half
-/// of `paneru.state`, backed by the same store a script writes through.
+/// of `spool.state`, backed by the same store a script writes through.
 pub fn script_state_handler(
     mut messages: MessageReader<Event>,
     store: Option<ResMut<ScriptStateStore>>,
@@ -240,8 +240,8 @@ pub fn script_state_cleanup_on_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paneru_shared_types::script_value::ScriptValue;
     use serde_json::json;
+    use spool_shared_types::script_value::ScriptValue;
 
     fn set(key: &str, value: serde_json::Value) -> ScriptStateWrite {
         ScriptStateWrite::set(key.to_string(), ScriptValue::from(value))
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn an_oversized_value_is_refused_and_leaves_the_store_alone() {
         let mut store = ScriptStateStore::default();
-        let huge = "x".repeat(paneru_shared_types::script_state::MAX_SERIALISED_BYTES + 1);
+        let huge = "x".repeat(spool_shared_types::script_state::MAX_SERIALISED_BYTES + 1);
         assert!(store.apply(&set("big", json!(huge))).is_err());
         assert!(store.state().is_empty());
     }
@@ -381,7 +381,7 @@ mod tests {
 
     fn unique_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "paneru-script-state-{name}-{}-{}.json",
+            "spool-script-state-{name}-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

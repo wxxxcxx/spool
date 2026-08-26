@@ -6,8 +6,8 @@ use crate::ecs::params::Windows;
 use crate::ecs::restore::CurrentWindowIdentity;
 use crate::ecs::state::QueryState;
 use crate::ecs::state::{
-    PaneruQueryState, PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStackItem,
-    SavedStrip, SavedWindow, SavedWorkspace,
+    SavedColumn, SavedDisplay, SavedRect, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
+    SpoolQueryState, SpoolState,
 };
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker};
 use crate::events::Event;
@@ -54,10 +54,10 @@ type QueryStateExtractionState<'w, 's> = SystemState<(
     Res<'w, Config>,
 )>;
 
-fn extract_query_state(world: &mut World) -> crate::errors::Result<PaneruQueryState> {
+fn extract_query_state(world: &mut World) -> crate::errors::Result<SpoolQueryState> {
     let mut system_state: QueryStateExtractionState<'_, '_> = SystemState::new(world);
     let (workspaces, displays, windows, apps, window_manager, config) = system_state.get(world)?;
-    PaneruQueryState::extract(
+    SpoolQueryState::extract(
         &workspaces,
         &displays,
         &windows,
@@ -80,7 +80,7 @@ fn test_state_serialization() {
         subrole: "AXStandardWindow".to_string(),
     };
 
-    let state = PaneruState {
+    let state = SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),
@@ -107,7 +107,7 @@ fn test_state_serialization() {
     };
 
     let json = serde_json::to_string(&state).expect("Failed to serialize");
-    let deserialized: PaneruState = serde_json::from_str(&json).expect("Failed to deserialize");
+    let deserialized: SpoolState = serde_json::from_str(&json).expect("Failed to deserialize");
 
     assert_eq!(state, deserialized);
 }
@@ -125,7 +125,7 @@ fn test_state_restoration() {
         subrole: "AXStandardWindow".to_string(),
     };
 
-    let state = PaneruState {
+    let state = SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: None,
@@ -165,7 +165,7 @@ fn test_state_extraction() {
     let (workspaces, displays, windows, apps) =
         system_state.get(world).expect("failed to get world state");
 
-    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
+    let state = SpoolState::extract(&workspaces, &displays, &windows, &apps);
 
     assert_eq!(state.workspaces.len(), 1);
     assert_eq!(state.active_display_id, Some(TEST_DISPLAY_ID));
@@ -209,7 +209,7 @@ fn test_state_serializes_display_and_active_virtual_workspace() {
     let (workspaces, displays, windows, apps) =
         system_state.get(world).expect("failed to get world state");
 
-    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
+    let state = SpoolState::extract(&workspaces, &displays, &windows, &apps);
 
     assert_eq!(state.version, 2);
     assert_eq!(state.active_display_id, Some(TEST_DISPLAY_ID));
@@ -259,7 +259,7 @@ fn test_state_extraction_includes_parentless_layout_strips() {
     let (workspaces, displays, windows, apps) =
         system_state.get(world).expect("failed to get world state");
 
-    let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
+    let state = SpoolState::extract(&workspaces, &displays, &windows, &apps);
 
     let parentless_workspace = state
         .workspaces
@@ -289,14 +289,14 @@ fn test_state_load_rejects_unsupported_version() {
     )
     .expect("state fixture should write");
 
-    assert!(PaneruState::load_from_file(&path).is_none());
+    assert!(SpoolState::load_from_file(&path).is_none());
 
     let _ = std::fs::remove_file(path);
 }
 
 #[test]
 fn test_state_save_is_loadable_from_path() {
-    let state = PaneruState {
+    let state = SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),
@@ -324,7 +324,7 @@ fn test_state_save_is_loadable_from_path() {
         .save_to_file(&path)
         .expect("state should save to requested path");
 
-    let loaded = PaneruState::load_from_file(&path).expect("state should load from saved path");
+    let loaded = SpoolState::load_from_file(&path).expect("state should load from saved path");
     assert_eq!(loaded, state);
 
     let _ = std::fs::remove_file(path);
@@ -332,7 +332,7 @@ fn test_state_save_is_loadable_from_path() {
 
 fn unique_state_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "paneru-{name}-{}-{}.json",
+        "spool-{name}-{}-{}.json",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -497,8 +497,8 @@ fn restore_plan_skips_ambiguous_fallback_match() {
     assert_eq!(plan.skipped_ambiguous_matches, 1);
 }
 
-fn restore_state(workspaces: Vec<SavedWorkspace>) -> PaneruState {
-    PaneruState {
+fn restore_state(workspaces: Vec<SavedWorkspace>) -> SpoolState {
+    SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),
@@ -790,7 +790,7 @@ fn test_query_state_tracks_float_after_virtual_workspace_is_reaped() {
 #[cfg(feature = "lua")]
 fn extract_window_set(
     world: &mut World,
-) -> crate::errors::Result<paneru_shared_types::windowset::WindowSet> {
+) -> crate::errors::Result<spool_shared_types::windowset::WindowSet> {
     use crate::ecs::state::QueryStateParams;
 
     let mut system_state: SystemState<QueryStateParams> = SystemState::new(world);
@@ -802,7 +802,7 @@ fn extract_window_set(
 #[test]
 fn test_window_set_keeps_the_column_structure_a_flat_query_loses() {
     use crate::tests::harness::TestHarness;
-    use paneru_shared_types::windowset::ColumnKind;
+    use spool_shared_types::windowset::ColumnKind;
 
     let mut harness = TestHarness::new().with_windows(3);
     harness.app.update();
@@ -891,7 +891,7 @@ fn test_window_set_marks_floating_windows_outside_the_strip() {
 fn test_layout_ops_apply_to_the_named_window_not_the_focused_one() {
     use crate::commands::Command;
     use crate::tests::harness::TestHarness;
-    use paneru_shared_types::windowset::LayoutOp;
+    use spool_shared_types::windowset::LayoutOp;
 
     let mut harness = TestHarness::new().with_windows(3);
     harness.app.update();
@@ -937,7 +937,7 @@ fn test_layout_ops_apply_to_the_named_window_not_the_focused_one() {
 fn test_layout_ops_skip_a_vanished_window_and_apply_its_neighbours() {
     use crate::commands::Command;
     use crate::tests::harness::TestHarness;
-    use paneru_shared_types::windowset::LayoutOp;
+    use spool_shared_types::windowset::LayoutOp;
 
     let mut harness = TestHarness::new().with_windows(2);
     harness.app.update();
@@ -974,8 +974,8 @@ fn test_layout_ops_skip_a_vanished_window_and_apply_its_neighbours() {
 fn test_set_frame_places_a_floating_window() {
     use crate::commands::Command;
     use crate::tests::harness::TestHarness;
-    use paneru_shared_types::state::Frame;
-    use paneru_shared_types::windowset::LayoutOp;
+    use spool_shared_types::state::Frame;
+    use spool_shared_types::windowset::LayoutOp;
 
     let mut harness = TestHarness::new().with_windows(1);
     // Let the window settle into the strip first: a window still being added

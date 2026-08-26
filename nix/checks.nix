@@ -28,7 +28,7 @@
             }:
             {
               imports = [
-                self.darwinModules.paneru
+                self.darwinModules.spool
                 test
               ];
 
@@ -70,11 +70,11 @@
       checks.darwin-module = makeTest "darwin-module" (
         { config, pkgs, ... }:
         let
-          plistPath = "${config.out}/user/Library/LaunchAgents/com.github.karinushka.paneru.plist";
+          plistPath = "${config.out}/user/Library/LaunchAgents/com.wxxxcxx.spool.plist";
         in
         {
-          system.primaryUser = "test-paneru-user";
-          services.paneru = {
+          system.primaryUser = "test-spool-user";
+          services.spool = {
             enable = true;
             settings = {
               options = {
@@ -90,7 +90,7 @@
               };
             };
             config = ''
-              paneru.setup {
+              spool.setup {
                 options = { focus_follows_mouse = true },
               }
             '';
@@ -106,22 +106,22 @@
                 ]
               }:$PATH
 
-              echo >&2 "checking paneru service in ~/Library/LaunchAgents"
+              echo >&2 "checking spool service in ~/Library/LaunchAgents"
               plutil -lint ${plistPath}
               plutil -convert json ${plistPath} -o service.json
               <service.json jq -e ".EnvironmentVariables.NO_COLOR == \"1\""
               <service.json jq -e ".KeepAlive.Crashed == true"
               <service.json jq -e ".KeepAlive.SuccessfulExit == false"
-              <service.json jq -e ".Label == \"com.github.karinushka.paneru\""
+              <service.json jq -e ".Label == \"com.wxxxcxx.spool\""
               # The Mach service clients look up; without it `bootstrap_check_in`
               # finds nothing and the daemon falls back to registering its own.
-              <service.json jq -e '.MachServices."com.github.karinushka.paneru" == true'
+              <service.json jq -e '.MachServices."com.wxxxcxx.spool" == true'
               <service.json jq -e ".ProcessType == \"Interactive\""
               <service.json jq -e ".RunAtLoad == true"
-              <service.json jq -e ".StandardErrorPath == \"/tmp/paneru.err.log\""
-              <service.json jq -e ".StandardOutPath == \"/tmp/paneru.log\""
+              <service.json jq -e ".StandardErrorPath == \"/tmp/spool.err.log\""
+              <service.json jq -e ".StandardOutPath == \"/tmp/spool.log\""
 
-              confPath=`<service.json jq -r ".EnvironmentVariables.PANERU_CONFIG"`
+              confPath=`<service.json jq -r ".EnvironmentVariables.SPOOL_CONFIG"`
               echo >&2 "checking config in $confPath"
               conf=`<"$confPath" toml2json`
               echo $conf | jq -e ".options.focus_follows_mouse == true"
@@ -132,9 +132,9 @@
               echo $conf | jq -e ".bindings.window_center == \"alt - c\""
               echo $conf | jq -e ".bindings.quit == \"ctrl + alt - q\""
 
-              luaPath=`<service.json jq -r ".EnvironmentVariables.PANERU_LUA"`
+              luaPath=`<service.json jq -r ".EnvironmentVariables.SPOOL_LUA"`
               echo >&2 "checking init.lua in $luaPath"
-              grep -q "paneru.setup" "$luaPath"
+              grep -q "spool.setup" "$luaPath"
             '';
         }
       );

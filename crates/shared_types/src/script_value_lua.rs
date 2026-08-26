@@ -51,7 +51,7 @@ impl FromLua for ScriptValue {
             LuaValue::Table(table) => table_to_value(&table, lua)?,
             other => {
                 return Err(LuaError::RuntimeError(format!(
-                    "cannot store a {} in paneru.state",
+                    "cannot store a {} in spool.state",
                     other.type_name()
                 )));
             }
@@ -88,7 +88,7 @@ fn table_to_value(table: &LuaTable, lua: &Lua) -> LuaResult<ScriptValue> {
             LuaValue::Integer(key) => key.to_string(),
             other => {
                 return Err(LuaError::RuntimeError(format!(
-                    "paneru.state keys must be strings, got {}",
+                    "spool.state keys must be strings, got {}",
                     other.type_name()
                 )));
             }

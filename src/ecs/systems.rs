@@ -895,7 +895,7 @@ pub(crate) fn gather_initial_processes(
         }
     }
 
-    // A Lua `paneru.setup{...}` config is inserted at build time and wins; the
+    // A Lua `spool.setup{...}` config is inserted at build time and wins; the
     // TOML config drained from the channel is only the fallback. Use whichever
     // is authoritative for the force-manage and menubar decisions below.
     let effective = existing_config
@@ -936,7 +936,7 @@ pub(crate) fn gather_initial_processes(
 
     // The input event tap holds its own clone of the `Config` handle from
     // `InitialConfig` and reads swipe/scroll settings off it per event. A Lua
-    // `paneru.setup{...}` builds a fresh handle, so its settings must be
+    // `spool.setup{...}` builds a fresh handle, so its settings must be
     // published into the tap's existing handle rather than replacing it, or
     // gestures would keep reading stale settings.
     match (existing_config.as_deref(), toml_config) {
@@ -1114,7 +1114,7 @@ pub(super) fn commit_window_size(
         });
 }
 
-/// Restores user-visible window state before Paneru shuts down: clears any
+/// Restores user-visible window state before Spool shuts down: clears any
 /// brightness dim, removes the dim/border overlay window, and centers every
 /// managed window on the display its frame center falls in.
 pub(super) fn cleanup_on_exit(

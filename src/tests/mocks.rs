@@ -317,7 +317,7 @@ impl MockState {
 
     /// Makes a window disappear with no notification at all, modelling a
     /// destroy event that never arrived — a lost notification, or a window
-    /// closed while paneru was not running.
+    /// closed while spool was not running.
     #[allow(unused)]
     pub fn os_vanish_window(&self, id: WinID) {
         self.inner.force_write().windows.remove(&id);

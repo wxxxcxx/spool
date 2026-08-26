@@ -2,7 +2,7 @@ import AppKit
 import QuartzCore
 
 extension NSPasteboard.PasteboardType {
-  static let paneruWindowID = Self("com.wxxxcxx.paneru-bar.window-id")
+  static let spoolWindowID = Self("com.wxxxcxx.spool-bar.window-id")
 }
 
 class BarActionButton: NSButton {
@@ -224,7 +224,7 @@ final class WindowActionButton: BarActionButton, NSDraggingSource {
   private func beginWindowDrag(with event: NSEvent) {
     guard let windowID else { return }
     let item = NSPasteboardItem()
-    item.setString(String(windowID), forType: .paneruWindowID)
+    item.setString(String(windowID), forType: .spoolWindowID)
     let draggingItem = NSDraggingItem(pasteboardWriter: item)
     draggingItem.setDraggingFrame(bounds, contents: draggingImage())
     beginDraggingSession(with: [draggingItem], event: event, source: self)

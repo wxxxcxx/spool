@@ -5,7 +5,7 @@ use crate::commands::Command;
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::state::{
-    PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStrip, SavedWindow, SavedWorkspace,
+    SavedColumn, SavedDisplay, SavedRect, SavedStrip, SavedWindow, SavedWorkspace, SpoolState,
 };
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{SpawnWindowTrigger, Unmanaged};
@@ -20,7 +20,7 @@ use crate::tests::{
 
 #[test]
 fn test_startup_restore_rebuilds_virtual_workspace_layout() {
-    let state = PaneruState {
+    let state = SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),
@@ -82,7 +82,7 @@ fn test_startup_restore_rebuilds_virtual_workspace_layout() {
 fn test_startup_restore_keeps_unmatched_windows_on_the_restored_row() {
     let mut harness = TestHarness::new().with_windows(2);
 
-    harness.world().insert_resource(PaneruState {
+    harness.world().insert_resource(SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),
@@ -132,7 +132,7 @@ fn test_startup_restore_keeps_unmatched_windows_on_the_restored_row() {
 fn test_startup_restore_keeps_fullscreen_separate_from_unmatched_windows() {
     let mut harness = TestHarness::new().with_windows(2);
 
-    harness.world().insert_resource(PaneruState {
+    harness.world().insert_resource(SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),
@@ -186,7 +186,7 @@ fn test_startup_restore_prefers_existing_workspace_parent_before_saved_or_active
         200,
         IRect::from_corners(origin, origin + size),
     );
-    harness.world().insert_resource(PaneruState {
+    harness.world().insert_resource(SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(EXT_DISPLAY_ID),
@@ -258,7 +258,7 @@ fn test_startup_restore_preserves_saved_display_when_present() {
         IRect::from_corners(origin, origin + size),
     );
 
-    harness.world().insert_resource(PaneruState {
+    harness.world().insert_resource(SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(EXT_DISPLAY_ID),
@@ -327,7 +327,7 @@ fn test_startup_restore_keeps_current_native_workspace_active_across_multiple_wo
         IRect::from_corners(ext_origin, ext_origin + size),
     );
 
-    harness.world().insert_resource(PaneruState {
+    harness.world().insert_resource(SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),
@@ -435,7 +435,7 @@ fn test_restore_resource_is_removed_after_grace_period() {
             .world()
             .contains_resource::<crate::ecs::restore::SessionRestore>()
     );
-    assert!(!harness.app.world().contains_resource::<PaneruState>());
+    assert!(!harness.app.world().contains_resource::<SpoolState>());
 }
 
 #[test]
@@ -470,7 +470,7 @@ enabled = false
             .world()
             .contains_resource::<crate::ecs::restore::SessionRestore>()
     );
-    assert!(!harness.app.world().contains_resource::<PaneruState>());
+    assert!(!harness.app.world().contains_resource::<SpoolState>());
 
     let world = harness.world();
     let mut query = world.query::<&LayoutStrip>();
@@ -597,7 +597,7 @@ fn test_late_startup_window_restores_during_grace_period() {
 #[test]
 fn test_startup_restore_keeps_one_selected_row_and_hides_inactive_rows() {
     let mut harness = TestHarness::new().with_windows(2);
-    harness.world().insert_resource(PaneruState {
+    harness.world().insert_resource(SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),
@@ -668,8 +668,8 @@ fn saved_display(display_id: u32, active: bool) -> SavedDisplay {
     }
 }
 
-fn state_with_strips(strips: Vec<SavedStrip>) -> PaneruState {
-    PaneruState {
+fn state_with_strips(strips: Vec<SavedStrip>) -> SpoolState {
+    SpoolState {
         version: 2,
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),

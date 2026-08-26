@@ -9,16 +9,16 @@ use tracing::{info, warn};
 
 use crate::util::exe_path;
 
-/// The bundle identifier for the `paneru` service.
-pub const ID: &str = "com.github.karinushka.paneru";
+/// The bundle identifier for the `spool` service.
+pub const ID: &str = "com.wxxxcxx.spool";
 
-/// `Service` manages the installation, uninstallation, starting, and stopping of the `paneru` application as a launchd service.
+/// `Service` manages the installation, uninstallation, starting, and stopping of the `spool` application as a launchd service.
 /// It encapsulates the `launchctl::Service` and the path to the executable.
 #[derive(Debug)]
 pub struct Service {
     /// The underlying `launchctl::Service` instance.
     pub raw: launchctl::Service,
-    /// The absolute path to the `paneru` executable.
+    /// The absolute path to the `spool` executable.
     pub bin_path: PathBuf,
     /// The user's home directory.
     home_dir: PathBuf,
@@ -30,7 +30,7 @@ impl Service {
     ///
     /// # Arguments
     ///
-    /// * `name` - The name of the service (e.g., "com.github.karinushka.paneru").
+    /// * `name` - The name of the service (e.g., "com.wxxxcxx.spool").
     ///
     /// # Returns
     ///
@@ -93,7 +93,7 @@ impl Service {
         let mut plist = fs::File::create(plist_path)?;
         plist.write_all(self.launchd_plist().as_bytes())?;
         info!("installed launch agent to `{}`", plist_path.display());
-        info!("check logfile /tmp/com.github.karinushka.paneru*.log for potential error messages");
+        info!("check logfile /tmp/com.wxxxcxx.spool*.log for potential error messages");
         Ok(())
     }
 
@@ -209,7 +209,7 @@ impl Service {
         self.start()
     }
 
-    /// Spawns a detached `paneru restart` subprocess.
+    /// Spawns a detached `spool restart` subprocess.
     /// Used by the in-daemon restart command so launchctl stop/start runs outside
     /// the process being stopped.
     pub fn request_restart() -> Result<()> {
@@ -266,9 +266,9 @@ mod tests {
 
     fn service() -> launchctl::Service {
         launchctl::Service::builder()
-            .name("com.github.karinushka.paneru")
+            .name("com.wxxxcxx.spool")
             .uid("501")
-            .plist_path("/Users/test/Library/LaunchAgents/com.github.karinushka.paneru.plist")
+            .plist_path("/Users/test/Library/LaunchAgents/com.wxxxcxx.spool.plist")
             .build()
     }
 
@@ -276,7 +276,7 @@ mod tests {
     fn start_kickstarts_a_bootstrapped_service_by_service_target() {
         assert_eq!(
             start_commands(&service(), true),
-            vec![vec!["kickstart", "gui/501/com.github.karinushka.paneru"]]
+            vec![vec!["kickstart", "gui/501/com.wxxxcxx.spool"]]
         );
     }
 
@@ -285,11 +285,11 @@ mod tests {
         assert_eq!(
             start_commands(&service(), false),
             vec![
-                vec!["enable", "gui/501/com.github.karinushka.paneru"],
+                vec!["enable", "gui/501/com.wxxxcxx.spool"],
                 vec![
                     "bootstrap",
                     "gui/501",
-                    "/Users/test/Library/LaunchAgents/com.github.karinushka.paneru.plist"
+                    "/Users/test/Library/LaunchAgents/com.wxxxcxx.spool.plist"
                 ]
             ]
         );

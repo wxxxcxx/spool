@@ -2,7 +2,7 @@ use bevy::ecs::message::Message;
 use objc2::rc::Retained;
 use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::CGDirectDisplayID;
-use paneru_shared_types::wire::{Response, ScriptStateRequest};
+use spool_shared_types::wire::{Response, ScriptStateRequest};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -71,7 +71,7 @@ pub enum Event {
     /// The frontmost application has switched.
     ApplicationFrontSwitched { psn: ProcessSerialNumber },
     /// An application has become the active (frontmost) application. Carries
-    /// the pid for subscribers; Paneru's own focus handling uses
+    /// the pid for subscribers; Spool's own focus handling uses
     /// [`Event::ApplicationFrontSwitched`] instead.
     ApplicationActivated { pid: i32 },
     /// An application has stopped being the active application.
@@ -90,7 +90,7 @@ pub enum Event {
         app_name: String,
         bundle_id: String,
         title: String,
-        frame: paneru_shared_types::state::Frame,
+        frame: spool_shared_types::state::Frame,
         floating: bool,
         managed: bool,
     },
@@ -207,13 +207,13 @@ pub enum Event {
     },
 
     /// A client has asked for the window set: the same layout value a
-    /// `paneru.windows` handler is given inside the daemon.
+    /// `spool.windows` handler is given inside the daemon.
     WindowSetQuery { respond_to: Reply },
 
     /// A client has subscribed to state events. Carries the channel they are
     /// pushed to, which outlives the request that delivered it.
     StateSubscribe {
-        subscriber: Arc<paneru_mach_ipc::Subscriber>,
+        subscriber: Arc<spool_mach_ipc::Subscriber>,
     },
 
     /// A client has read or written the script state store. Answered

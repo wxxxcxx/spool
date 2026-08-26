@@ -3,8 +3,8 @@
   perSystem =
     { lib, pkgs, ... }:
     {
-      packages.paneru-bar = pkgs.stdenv.mkDerivation {
-        pname = "paneru-bar";
+      packages.spool-bar = pkgs.stdenv.mkDerivation {
+        pname = "spool-bar";
         version = "0.1.0";
         src = lib.cleanSource ../bar;
 
@@ -21,19 +21,19 @@
 
         installPhase = ''
           runHook preInstall
-          app="$out/Applications/PaneruBar.app"
+          app="$out/Applications/SpoolBar.app"
           mkdir -p "$app/Contents/MacOS" "$out/bin"
-          cp .build/release/PaneruBar "$app/Contents/MacOS/PaneruBar"
+          cp .build/release/SpoolBar "$app/Contents/MacOS/SpoolBar"
           cp Resources/Info.plist "$app/Contents/Info.plist"
-          ln -s "$app/Contents/MacOS/PaneruBar" "$out/bin/paneru-bar"
+          ln -s "$app/Contents/MacOS/SpoolBar" "$out/bin/spool-bar"
           runHook postInstall
         '';
 
         meta = {
-          description = "Native multi-display workspace bar for Paneru";
-          homepage = "https://github.com/wxxxcxx/paneru";
+          description = "Native multi-display workspace bar for Spool";
+          homepage = "https://github.com/wxxxcxx/spool";
           license = lib.licenses.mit;
-          mainProgram = "paneru-bar";
+          mainProgram = "spool-bar";
           platforms = lib.platforms.darwin;
         };
       };

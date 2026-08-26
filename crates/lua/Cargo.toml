@@ -1,15 +1,15 @@
 [package]
-name = "paneru-lua"
+name = "spool-lua"
 version = "0.4.4"
 edition = "2024"
 rust-version = "1.89.0"
-description = "The Paneru Lua API: shared by the window manager's embedded runtime and, as a loadable module, by external scripts."
+description = "The Spool Lua API: shared by the window manager's embedded runtime and, as a loadable module, by external scripts."
 license = "MIT"
 publish = false
 
 # As a plain library this is what the daemon links against. With the `module`
-# feature it additionally builds the `luaopen_paneru` C extension that
-# `require("paneru")` loads.
+# feature it additionally builds the `luaopen_spool` C extension that
+# `require("spool")` loads.
 [lib]
 crate-type = ["rlib", "cdylib"]
 
@@ -21,7 +21,7 @@ pedantic = "warn"
 # exactly one must be enabled alongside it. 5.1 and Luau are not among them —
 # see the daemon's Cargo.toml for why the workspace does not carry them. Build
 # the module with:
-#   cargo build -p paneru-lua --no-default-features --features module,lua54
+#   cargo build -p spool-lua --no-default-features --features module,lua54
 # The daemon takes the default (no features) and supplies its own vendored
 # interpreter through its own mlua dependency.
 [features]
@@ -37,11 +37,11 @@ luajit = ["mlua/luajit"]
 [dependencies]
 mlua = { workspace = true }
 cfg-if = { workspace = true }
-paneru-shared-types = { workspace = true, features = ["lua"] }
+spool-shared-types = { workspace = true, features = ["lua"] }
 serde = { workspace = true }
 # Decoding daemon query responses into Lua values.
 serde_json = { workspace = true }
-# `paneru.match` compiles app/bundle/title patterns.
+# `spool.match` compiles app/bundle/title patterns.
 regex = { workspace = true }
 futures-lite = "2.6"
-paneru-mach-ipc.workspace = true
+spool-mach-ipc.workspace = true

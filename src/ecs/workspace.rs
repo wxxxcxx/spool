@@ -120,7 +120,7 @@ impl Plugin for WorkspaceEventsPlugin {
 }
 
 /// Commands used by external UI clients carry their targets explicitly instead
-/// of borrowing Paneru's current focus/display. They still mutate the same ECS
+/// of borrowing Spool's current focus/display. They still mutate the same ECS
 /// markers and strips as keyboard commands, so there is only one workspace
 /// implementation to keep consistent.
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -258,7 +258,7 @@ fn handle_targeted_workspace_commands(
                         })
                     })
                 else {
-                    warn!(window_id, "targeted move requires a tiled Paneru window");
+                    warn!(window_id, "targeted move requires a tiled Spool window");
                     continue;
                 };
 

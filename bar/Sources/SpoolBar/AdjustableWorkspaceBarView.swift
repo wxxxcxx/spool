@@ -16,7 +16,7 @@ final class BarWindowStateStore {
 
   init(
     defaults: UserDefaults = .standard,
-    keyPrefix: String = "PaneruBar.windowState"
+    keyPrefix: String = "SpoolBar.windowState"
   ) {
     self.defaults = defaults
     self.keyPrefix = keyPrefix
@@ -206,7 +206,7 @@ final class AdjustableWorkspaceBarView: NSView {
   private let content: WorkspaceBarView
   private let materialView = NSVisualEffectView()
   private let moveHandle = BarGestureHandle(
-    toolTip: "Drag PaneruBar"
+    toolTip: "Drag SpoolBar"
   )
   private var minimumContentSize: CGSize
   private var allowedFrame: CGRect
@@ -388,7 +388,7 @@ final class AdjustableWorkspaceBarView: NSView {
   private func applyAppearance(_ preferences: BarPreferences) {
     wantsLayer = true
     layer?.backgroundColor = NSColor.clear.cgColor
-    layer?.borderColor = (NSColor(paneruHex: preferences.borderColorHex) ?? .separatorColor).cgColor
+    layer?.borderColor = (NSColor(spoolHex: preferences.borderColorHex) ?? .separatorColor).cgColor
     layer?.borderWidth = preferences.borderWidth
     layer?.cornerRadius = preferences.cornerRadius
     layer?.masksToBounds = true
@@ -398,7 +398,7 @@ final class AdjustableWorkspaceBarView: NSView {
     materialView.isEmphasized = false
     materialView.wantsLayer = true
     materialView.layer?.backgroundColor =
-      (NSColor(paneruHex: preferences.backgroundColorHex) ?? .windowBackgroundColor).cgColor
+      (NSColor(spoolHex: preferences.backgroundColorHex) ?? .windowBackgroundColor).cgColor
     materialView.layer?.masksToBounds = true
   }
 

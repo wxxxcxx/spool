@@ -8,14 +8,14 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
   )
   private static let navigationButtonWidth: CGFloat = 16
   static let previousWorkspaceButtonID = NSUserInterfaceItemIdentifier(
-    "PaneruBar.previousWorkspace")
-  static let nextWorkspaceButtonID = NSUserInterfaceItemIdentifier("PaneruBar.nextWorkspace")
-  static let previousWindowButtonID = NSUserInterfaceItemIdentifier("PaneruBar.previousWindow")
-  static let nextWindowButtonID = NSUserInterfaceItemIdentifier("PaneruBar.nextWindow")
+    "SpoolBar.previousWorkspace")
+  static let nextWorkspaceButtonID = NSUserInterfaceItemIdentifier("SpoolBar.nextWorkspace")
+  static let previousWindowButtonID = NSUserInterfaceItemIdentifier("SpoolBar.previousWindow")
+  static let nextWindowButtonID = NSUserInterfaceItemIdentifier("SpoolBar.nextWindow")
 
   private let displayID: UInt32
   private let preferences: BarPreferences
-  private weak var client: (any PaneruControlling)?
+  private weak var client: (any SpoolControlling)?
   private let iconProvider: AppIconProvider
   private let onSettingsRequested: ((CGRect, NSScreen?) -> Void)?
   private let isBarLocked: () -> Bool
@@ -51,7 +51,7 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
     displayID: UInt32,
     workspaces: [VirtualWorkspaceState],
     preferences: BarPreferences,
-    client: any PaneruControlling,
+    client: any SpoolControlling,
     iconProvider: AppIconProvider,
     onSettingsRequested: ((CGRect, NSScreen?) -> Void)? = nil,
     isBarLocked: @escaping () -> Bool = { false },
@@ -204,8 +204,8 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
     workspaceButton.title = label
     workspaceButton.toolTip = "Workspace \(active.number). Scroll to switch."
     workspaceButton.setSelectedAppearance(
-      fill: NSColor(paneruHex: preferences.activeWorkspaceColorHex) ?? .clear,
-      accent: NSColor(paneruHex: preferences.selectionColorHex) ?? .controlAccentColor
+      fill: NSColor(spoolHex: preferences.activeWorkspaceColorHex) ?? .clear,
+      accent: NSColor(spoolHex: preferences.selectionColorHex) ?? .controlAccentColor
     )
 
     let orderedWindows = active.displayOrderedWindows
@@ -307,7 +307,7 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
   private func build() {
     wantsLayer = true
     layer?.backgroundColor = NSColor.clear.cgColor
-    registerForDraggedTypes([.paneruWindowID])
+    registerForDraggedTypes([.spoolWindowID])
 
     configureNavigationButton(
       previousWorkspaceButton,
@@ -401,7 +401,7 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
     refreshItem.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
     menu.addItem(.separator())
     let quitItem = menu.addItem(
-      withTitle: "Quit PaneruBar",
+      withTitle: "Quit SpoolBar",
       action: #selector(quit),
       keyEquivalent: "q"
     )
@@ -503,7 +503,7 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
       focusRing.isHidden = true
       return
     }
-    let color = NSColor(paneruHex: preferences.selectionColorHex) ?? .controlAccentColor
+    let color = NSColor(spoolHex: preferences.selectionColorHex) ?? .controlAccentColor
     focusRing.apply(color: color, indicatorHeight: preferences.focusRingWidth)
     let ringOutset = ceil(preferences.focusRingWidth / 2)
     let targetFrame = convert(button.bounds, from: button).insetBy(
@@ -656,7 +656,7 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
   }
 
   private func draggedWindowID(_ sender: NSDraggingInfo) -> Int32? {
-    sender.draggingPasteboard.string(forType: .paneruWindowID).flatMap(Int32.init)
+    sender.draggingPasteboard.string(forType: .spoolWindowID).flatMap(Int32.init)
   }
 
   private func setDropHighlighted(_ highlighted: Bool) {

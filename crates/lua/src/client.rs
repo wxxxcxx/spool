@@ -1,8 +1,8 @@
 //! The client half of the API: talks to a running daemon over its Mach
-//! service. [`module`] builds the table `require("paneru")` returns.
+//! service. [`module`] builds the table `require("spool")` returns.
 //!
-//! Service name defaults to `com.karinushka.paneru`, overridable via the
-//! `PANERU_MACH_SERVICE` environment variable or `paneru.set_service_name`.
+//! Service name defaults to `com.karinushka.spool`, overridable via the
+//! `SPOOL_MACH_SERVICE` environment variable or `spool.set_service_name`.
 //!
 //! Every call here blocks: Lua's C API is synchronous, so a callback cannot
 //! yield into an executor.
@@ -11,32 +11,32 @@ use std::rc::Rc;
 use std::sync::{LazyLock, Mutex};
 
 use mlua::prelude::*;
-use paneru_mach_ipc::{RecvPort, SendPort, Sender};
-use paneru_shared_types::commands::Command;
-use paneru_shared_types::script_state::ScriptStateWrite;
-use paneru_shared_types::script_value::ScriptValue;
-use paneru_shared_types::state::{StateEvent, StateQueryKind};
-use paneru_shared_types::windowset_lua::returned_ops;
-use paneru_shared_types::wire::{
+use spool_mach_ipc::{RecvPort, SendPort, Sender};
+use spool_shared_types::commands::Command;
+use spool_shared_types::script_state::ScriptStateWrite;
+use spool_shared_types::script_value::ScriptValue;
+use spool_shared_types::state::{StateEvent, StateQueryKind};
+use spool_shared_types::windowset_lua::returned_ops;
+use spool_shared_types::wire::{
     Request, Response, ScriptStateRequest, ScriptStateResponse, WriteOutcome,
 };
 
 /// The active service name, seeded from the shared default and mutable via
 /// `set_service_name`.
 static SERVICE: LazyLock<Mutex<String>> =
-    LazyLock::new(|| Mutex::new(paneru_shared_types::wire::service_name()));
+    LazyLock::new(|| Mutex::new(spool_shared_types::wire::service_name()));
 
 fn service_name() -> String {
     SERVICE.lock().map_or_else(
-        |_| paneru_shared_types::wire::SERVICE_NAME.to_string(),
+        |_| spool_shared_types::wire::SERVICE_NAME.to_string(),
         |guard| guard.clone(),
     )
 }
 
 fn connect() -> LuaResult<Sender<Request>> {
     Sender::connect(&service_name()).map_err(|err| match err {
-        paneru_mach_ipc::Error::NotRunning => {
-            LuaError::RuntimeError("paneru is not running".to_string())
+        spool_mach_ipc::Error::NotRunning => {
+            LuaError::RuntimeError("spool is not running".to_string())
         }
         other => LuaError::external(other),
     })
@@ -65,7 +65,7 @@ fn dispatch(_: &Lua, command: Command) -> LuaResult<bool> {
     Ok(true)
 }
 
-fn query_payload(kind: StateQueryKind) -> LuaResult<paneru_shared_types::wire::QueryPayload> {
+fn query_payload(kind: StateQueryKind) -> LuaResult<spool_shared_types::wire::QueryPayload> {
     match call(&Request::Query(kind))? {
         Response::Query(payload) => Ok(payload),
         other => Err(unexpected(&other)),
@@ -82,7 +82,7 @@ fn read_kind(kind: Option<String>) -> LuaResult<StateQueryKind> {
     })
 }
 
-/// `paneru.query(kind)` — run a state query and return the raw JSON string.
+/// `spool.query(kind)` — run a state query and return the raw JSON string.
 fn query(_: &Lua, kind: Option<String>) -> LuaResult<String> {
     Ok(query_payload(read_kind(kind)?)?
         .to_json()
@@ -90,7 +90,7 @@ fn query(_: &Lua, kind: Option<String>) -> LuaResult<String> {
         .to_string())
 }
 
-/// `paneru.query_json(kind)` — like `query` but decoded into a Lua value.
+/// `spool.query_json(kind)` — like `query` but decoded into a Lua value.
 fn query_json(lua: &Lua, kind: Option<String>) -> LuaResult<LuaValue> {
     let json = query_payload(read_kind(kind)?)?
         .to_json()
@@ -113,7 +113,7 @@ fn state_get(key: &str) -> LuaResult<Option<ScriptValue>> {
     })? {
         ScriptStateResponse::Value(value) => Ok(value.filter(|value| !value.is_null())),
         ScriptStateResponse::Write(_) => Err(LuaError::RuntimeError(
-            "paneru.state.get: the daemon answered a read with a write outcome".to_string(),
+            "spool.state.get: the daemon answered a read with a write outcome".to_string(),
         )),
     }
 }
@@ -122,12 +122,12 @@ fn state_write(write: ScriptStateWrite) -> LuaResult<WriteOutcome> {
     match script_state(ScriptStateRequest::Write(write))? {
         ScriptStateResponse::Write(outcome) => Ok(outcome),
         ScriptStateResponse::Value(_) => Err(LuaError::RuntimeError(
-            "paneru.state: the daemon answered a write with a value".to_string(),
+            "spool.state: the daemon answered a write with a value".to_string(),
         )),
     }
 }
 
-/// Builds the `paneru.state` table: the same store the embedded runtime
+/// Builds the `spool.state` table: the same store the embedded runtime
 /// exposes, but each call round-trips to the daemon instead of reading a local
 /// copy. `mutate`'s compare-and-set guarantee holds either way, since the
 /// daemon is the one deciding whether a write still matches.
@@ -197,7 +197,7 @@ fn state_table(lua: &Lua) -> LuaResult<LuaTable> {
                 }
             }
             Err(LuaError::RuntimeError(format!(
-                "paneru.state.mutate: '{key}' kept changing under it after {ATTEMPTS} attempts"
+                "spool.state.mutate: '{key}' kept changing under it after {ATTEMPTS} attempts"
             )))
         })?,
     )?;
@@ -205,7 +205,7 @@ fn state_table(lua: &Lua) -> LuaResult<LuaTable> {
     Ok(state)
 }
 
-/// `paneru.windows(fn)` — xmonad's `windows`: hand the window set to `fn` and
+/// `spool.windows(fn)` — xmonad's `windows`: hand the window set to `fn` and
 /// commit whatever it returns. Costs two round trips (fetch, then commit)
 /// rather than the embedded runtime's shared read; a transform returning
 /// nothing skips the commit.
@@ -251,7 +251,7 @@ fn event_name(event: &StateEvent) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `paneru.subscribe(event, callback[, opts])` — stream events matching `event`
+/// `spool.subscribe(event, callback[, opts])` — stream events matching `event`
 /// to `callback`. Blocks until the daemon exits, so run it in a dedicated
 /// process. `event` is the event name to filter on (e.g. `"window_focused"`), a
 /// table of several names, or `nil` for every event. Each event is a decoded Lua
@@ -275,7 +275,7 @@ fn subscribe(
         let event = match stream.recv_blocking() {
             Ok(delivery) => delivery.value,
             // The daemon is gone; the subscription ends.
-            Err(paneru_mach_ipc::Error::PeerGone) => break,
+            Err(spool_mach_ipc::Error::PeerGone) => break,
             Err(err) => return Err(LuaError::external(err)),
         };
 
@@ -296,7 +296,7 @@ fn subscribe(
     Ok(true)
 }
 
-/// `paneru.set_service_name(name)` — override the daemon's Mach service name.
+/// `spool.set_service_name(name)` — override the daemon's Mach service name.
 #[allow(clippy::unnecessary_wraps)]
 fn set_service_name(_: &Lua, name: String) -> LuaResult<()> {
     if let Ok(mut guard) = SERVICE.lock() {
@@ -305,17 +305,17 @@ fn set_service_name(_: &Lua, name: String) -> LuaResult<()> {
     Ok(())
 }
 
-/// `paneru.service_name()` — the service name currently in use.
+/// `spool.service_name()` — the service name currently in use.
 #[allow(clippy::unnecessary_wraps)]
 fn service_name_fn(_: &Lua, (): ()) -> LuaResult<String> {
     Ok(service_name())
 }
 
 fn unexpected(response: &Response) -> LuaError {
-    LuaError::RuntimeError(format!("unexpected response from paneru: {response:?}"))
+    LuaError::RuntimeError(format!("unexpected response from spool: {response:?}"))
 }
 
-/// Builds the module table `require("paneru")` hands back.
+/// Builds the module table `require("spool")` hands back.
 ///
 /// # Errors
 ///

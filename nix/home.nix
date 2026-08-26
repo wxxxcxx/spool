@@ -1,6 +1,6 @@
 { self, ... }:
 {
-  flake.homeModules.paneru =
+  flake.homeModules.spool =
     {
       config,
       lib,
@@ -8,30 +8,30 @@
       ...
     }:
     let
-      cfg = config.services.paneru;
+      cfg = config.services.spool;
     in
     {
-      imports = [ (import ./_paneru-common.nix { inherit self; }) ];
+      imports = [ (import ./_spool-common.nix { inherit self; }) ];
 
       config = lib.mkIf cfg.enable {
         assertions = [
-          (lib.hm.assertions.assertPlatform "services.paneru" pkgs lib.platforms.darwin)
+          (lib.hm.assertions.assertPlatform "services.spool" pkgs lib.platforms.darwin)
           {
             assertion = cfg.config == null || cfg.luaConfig.enable;
-            message = "services.paneru.config (init.lua) requires services.paneru.luaConfig.enable = true.";
+            message = "services.spool.config (init.lua) requires services.spool.luaConfig.enable = true.";
           }
         ];
         home.packages = [ cfg.finalPackage ];
-        launchd.agents.paneru = {
+        launchd.agents.spool = {
           enable = true;
           config = {
-            Label = "com.github.karinushka.paneru";
+            Label = "com.wxxxcxx.spool";
             # The Mach service clients look up. launchd creates and holds the
-            # port, so `paneru send-cmd`/`query`/`subscribe` and the Lua module
+            # port, so `spool send-cmd`/`query`/`subscribe` and the Lua module
             # keep working across a daemon restart rather than racing it to
             # register the name.
             MachServices = {
-              "com.github.karinushka.paneru" = true;
+              "com.wxxxcxx.spool" = true;
             };
             KeepAlive = {
               Crashed = true;
@@ -45,27 +45,27 @@
                 if config.xdg.enable then config.xdg.configHome else "${config.home.homeDirectory}/.config";
             };
             RunAtLoad = true;
-            StandardOutPath = "/tmp/paneru.log";
-            StandardErrorPath = "/tmp/paneru.err.log";
+            StandardOutPath = "/tmp/spool.log";
+            StandardErrorPath = "/tmp/spool.err.log";
             Program = lib.getExe cfg.finalPackage;
           };
         };
 
-        # TOML config (paneru.toml). The paneru.setup{...} in `config` (init.lua)
+        # TOML config (spool.toml). The spool.setup{...} in `config` (init.lua)
         # takes precedence over the options declared here.
-        xdg.configFile."paneru/paneru.toml" = lib.mkIf (config.xdg.enable && cfg.settings != null) {
+        xdg.configFile."spool/spool.toml" = lib.mkIf (config.xdg.enable && cfg.settings != null) {
           source = cfg.settingsFile;
         };
-        home.file.".paneru.toml" = lib.mkIf (!config.xdg.enable && cfg.settings != null) {
+        home.file.".spool.toml" = lib.mkIf (!config.xdg.enable && cfg.settings != null) {
           source = cfg.settingsFile;
         };
 
-        # Lua config (init.lua), following paneru's discovery order:
-        # $XDG_CONFIG_HOME/paneru/init.lua, else ~/.paneru.lua.
-        xdg.configFile."paneru/init.lua" = lib.mkIf (config.xdg.enable && cfg.config != null) {
+        # Lua config (init.lua), following spool's discovery order:
+        # $XDG_CONFIG_HOME/spool/init.lua, else ~/.spool.lua.
+        xdg.configFile."spool/init.lua" = lib.mkIf (config.xdg.enable && cfg.config != null) {
           source = cfg.configFile;
         };
-        home.file.".paneru.lua" = lib.mkIf (!config.xdg.enable && cfg.config != null) {
+        home.file.".spool.lua" = lib.mkIf (!config.xdg.enable && cfg.config != null) {
           source = cfg.configFile;
         };
       };

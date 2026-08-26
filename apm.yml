@@ -1,6 +1,6 @@
-name: paneru
+name: spool
 version: 1.0.0
-description: APM project for paneru
+description: APM project for spool
 author: W
 dependencies:
   apm:

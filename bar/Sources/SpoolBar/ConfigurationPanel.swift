@@ -287,22 +287,22 @@ private final class ConfigurationFormView: NSView {
     horizontalPaddingSlider.doubleValue = Double(preferences.horizontalPadding)
     backgroundColorWell.color =
       NSColor(
-        paneruHex: preferences.backgroundColorHex
+        spoolHex: preferences.backgroundColorHex
       ) ?? .windowBackgroundColor
     borderColorWell.color =
       NSColor(
-        paneruHex: preferences.borderColorHex
+        spoolHex: preferences.borderColorHex
       ) ?? .separatorColor
     borderWidthSlider.doubleValue = Double(preferences.borderWidth)
     cornerRadiusSlider.doubleValue = Double(preferences.cornerRadius)
     shadowButton.state = preferences.showsShadow ? .on : .off
     focusColorWell.color =
       NSColor(
-        paneruHex: preferences.selectionColorHex
+        spoolHex: preferences.selectionColorHex
       ) ?? .controlAccentColor
     activeWorkspaceColorWell.color =
       NSColor(
-        paneruHex: preferences.activeWorkspaceColorHex
+        spoolHex: preferences.activeWorkspaceColorHex
       ) ?? .controlAccentColor
     if let item = floatingStylePopup.itemArray.first(where: {
       $0.representedObject as? String == preferences.floatingIconStyle.rawValue
@@ -338,7 +338,7 @@ private final class ConfigurationFormView: NSView {
     icon.heightAnchor.constraint(equalToConstant: 18).isActive = true
     header.addArrangedSubview(icon)
 
-    let title = NSTextField(labelWithString: "PaneruBar Settings")
+    let title = NSTextField(labelWithString: "SpoolBar Settings")
     title.font = .systemFont(ofSize: 13, weight: .semibold)
     header.addArrangedSubview(title)
 
@@ -536,9 +536,9 @@ private final class ConfigurationFormView: NSView {
     } else if sender === horizontalPaddingSlider {
       next.horizontalPadding = CGFloat(horizontalPaddingSlider.doubleValue.rounded())
     } else if sender === backgroundColorWell {
-      next.backgroundColorHex = backgroundColorWell.color.paneruHexString ?? next.backgroundColorHex
+      next.backgroundColorHex = backgroundColorWell.color.spoolHexString ?? next.backgroundColorHex
     } else if sender === borderColorWell {
-      next.borderColorHex = borderColorWell.color.paneruHexString ?? next.borderColorHex
+      next.borderColorHex = borderColorWell.color.spoolHexString ?? next.borderColorHex
     } else if sender === borderWidthSlider {
       next.borderWidth = CGFloat((borderWidthSlider.doubleValue * 4).rounded() / 4)
     } else if sender === cornerRadiusSlider {
@@ -546,10 +546,10 @@ private final class ConfigurationFormView: NSView {
     } else if sender === shadowButton {
       next.showsShadow = shadowButton.state == .on
     } else if sender === focusColorWell {
-      next.selectionColorHex = focusColorWell.color.paneruHexString ?? next.selectionColorHex
+      next.selectionColorHex = focusColorWell.color.spoolHexString ?? next.selectionColorHex
     } else if sender === activeWorkspaceColorWell {
       next.activeWorkspaceColorHex =
-        activeWorkspaceColorWell.color.paneruHexString ?? next.activeWorkspaceColorHex
+        activeWorkspaceColorWell.color.spoolHexString ?? next.activeWorkspaceColorHex
     } else if sender === floatingStylePopup {
       let raw = floatingStylePopup.selectedItem?.representedObject as? String
       next.floatingIconStyle =
@@ -724,7 +724,7 @@ private final class ConfigurationFormView: NSView {
 }
 
 extension NSColor {
-  var paneruHexString: String? {
+  var spoolHexString: String? {
     guard let color = usingColorSpace(.sRGB) else { return nil }
     let red = Int((color.redComponent * 255).rounded())
     let green = Int((color.greenComponent * 255).rounded())

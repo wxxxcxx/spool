@@ -80,7 +80,7 @@ pub trait ApplicationApi: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `config` - The current Paneru configuration, used to evaluate window rules.
+    /// * `config` - The current Spool configuration, used to evaluate window rules.
     ///
     /// # Errors
     ///
@@ -390,7 +390,7 @@ impl ObserverContext {
     /// * `element` - The `AXUIElementRef` associated with the notification.
     fn notify_app(&self, notification: &str, element: AXUIElementRef) {
         // Handled before the window-id lookup below: a creation notification is
-        // the one case whose element is not yet a window paneru knows about.
+        // the one case whose element is not yet a window spool knows about.
         if notification == accessibility_sys::kAXCreatedNotification {
             let Ok(element) = AXUIWrapper::retain(element).inspect_err(|err| {
                 error!("invalid element {element:?}: {err}");

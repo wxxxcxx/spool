@@ -204,7 +204,7 @@ impl WindowOS {
     /// # Arguments
     ///
     /// * `element` - A `CFRetained<AXUIWrapper>` reference to the Accessibility UI element.
-    /// * `config` - The current Paneru configuration, used to evaluate window rules.
+    /// * `config` - The current Spool configuration, used to evaluate window rules.
     /// * `bundle_id` - The bundle identifier of the owning application, if known.
     ///
     /// # Returns

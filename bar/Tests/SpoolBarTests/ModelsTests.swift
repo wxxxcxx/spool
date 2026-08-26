@@ -2,7 +2,7 @@ import XCTest
 import AppKit
 import QuartzCore
 
-@testable import PaneruBar
+@testable import SpoolBar
 
 final class ModelsTests: XCTestCase {
   func testDefaultPreferencesShowWorkspaceNumbersAsLabels() {
@@ -101,7 +101,7 @@ final class ModelsTests: XCTestCase {
   }
 
   func testWorkspaceArrowButtonsSelectPreviousAndNextWorkspace() throws {
-    let controller = RecordingPaneruController()
+    let controller = RecordingSpoolController()
     let document = try state(workspaces: [
       (number: 1, windowIDs: [], selected: false),
       (number: 2, windowIDs: [], selected: true),
@@ -153,7 +153,7 @@ final class ModelsTests: XCTestCase {
   }
 
   func testWorkspaceLabelDoesNotSwitchOnClick() throws {
-    let controller = RecordingPaneruController()
+    let controller = RecordingSpoolController()
     let document = try state(workspaces: [
       (number: 1, windowIDs: [], selected: false),
       (number: 2, windowIDs: [], selected: true),
@@ -176,7 +176,7 @@ final class ModelsTests: XCTestCase {
   }
 
   func testWorkspaceScrollDirectionIsReversed() throws {
-    let controller = RecordingPaneruController()
+    let controller = RecordingSpoolController()
     let document = try state(workspaces: [
       (number: 1, windowIDs: [], selected: false),
       (number: 2, windowIDs: [], selected: true),
@@ -211,7 +211,7 @@ final class ModelsTests: XCTestCase {
   }
 
   func testWorkspaceAndDragInteractionsSendTargetedCommands() throws {
-    let controller = RecordingPaneruController()
+    let controller = RecordingSpoolController()
     let document = try state(workspaces: [
       (number: 1, windowIDs: [20, 10], selected: true),
       (number: 2, windowIDs: [30], selected: false),
@@ -244,7 +244,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: document.virtualWorkspaces,
       preferences: BarPreferences(animationStyle: .none),
-      client: RecordingPaneruController(),
+      client: RecordingSpoolController(),
       iconProvider: AppIconProvider()
     )
     XCTAssertEqual(view.renderedWindowIDs, [20, 30, 40, 50])
@@ -278,7 +278,7 @@ final class ModelsTests: XCTestCase {
       }
       """#.utf8)
 
-    let state = try JSONDecoder().decode(PaneruStateDocument.self, from: data)
+    let state = try JSONDecoder().decode(SpoolStateDocument.self, from: data)
     XCTAssertEqual(state.visibleWorkspaces(on: state.displays[0]).map(\.number), [1, 2])
     XCTAssertEqual(state.visibleWorkspaces(on: state.displays[1]).map(\.number), [1])
   }
@@ -388,7 +388,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: document.virtualWorkspaces,
       preferences: BarPreferences(),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider(),
       isBarLocked: { locked },
       onBarLockChanged: { locked = $0 }
@@ -433,7 +433,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: document.virtualWorkspaces,
       preferences: preferences,
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider()
     )
     let view = AdjustableWorkspaceBarView(
@@ -447,13 +447,13 @@ final class ModelsTests: XCTestCase {
 
     XCTAssertEqual(
       view.renderedSurfaceTintColor,
-      NSColor(paneruHex: preferences.backgroundColorHex)?.cgColor
+      NSColor(spoolHex: preferences.backgroundColorHex)?.cgColor
     )
     XCTAssertEqual(view.renderedSurfaceMaterial, .menu)
     XCTAssertEqual(view.layer?.backgroundColor, NSColor.clear.cgColor)
     XCTAssertEqual(
       view.layer?.borderColor,
-      NSColor(paneruHex: preferences.borderColorHex)?.cgColor
+      NSColor(spoolHex: preferences.borderColorHex)?.cgColor
     )
     XCTAssertEqual(view.layer?.borderWidth, 1.5)
     XCTAssertEqual(view.layer?.cornerRadius, 10)
@@ -466,7 +466,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: document.virtualWorkspaces,
       preferences: BarPreferences(),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider()
     )
     let view = AdjustableWorkspaceBarView(
@@ -517,7 +517,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: document.virtualWorkspaces,
       preferences: BarPreferences(),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider()
     )
     let view = AdjustableWorkspaceBarView(
@@ -543,7 +543,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: document.virtualWorkspaces,
       preferences: BarPreferences(),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider()
     )
     let ownerFrame = CGRect(x: 1_000, y: 0, width: 800, height: 600)
@@ -666,6 +666,38 @@ final class ModelsTests: XCTestCase {
     XCTAssertEqual(try BarTOML.parse(updated), next)
   }
 
+  func testConfigurationStoreMovesLegacyFileWithoutRewritingIt() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let legacyURL = directory.appendingPathComponent("spool-bar/config.toml")
+    let destinationURL = directory.appendingPathComponent("spool/bar.toml")
+    try FileManager.default.createDirectory(
+      at: legacyURL.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
+    let source = """
+      # Preserve this file byte-for-byte during migration.
+      height = 31
+      custom_option = "preserve-me"
+
+      [workspace_labels]
+      1 = "work"
+      """
+    try source.write(to: legacyURL, atomically: true, encoding: .utf8)
+
+    let store = BarConfigurationStore(url: destinationURL, legacyURL: legacyURL)
+    store.start()
+    defer { store.stop() }
+
+    XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+    XCTAssertEqual(try String(contentsOf: destinationURL, encoding: .utf8), source)
+    XCTAssertEqual(store.preferences.barHeight, 31)
+    XCTAssertEqual(store.preferences.workspaceLabels, [1: "work"])
+  }
+
   func testConfigurationSaveUpdatesAndRemovesWorkspaceLabels() throws {
     let source = #"""
       height = 28
@@ -707,7 +739,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: document.virtualWorkspaces,
       preferences: BarPreferences(),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider()
     )
     let workspaceButton = descendants(of: view, as: BarActionButton.self)
@@ -728,18 +760,18 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: active.virtualWorkspaces,
       preferences: preferences,
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider()
     )
     let workspaceButton = descendants(of: view, as: BarActionButton.self)
       .first { $0.workspaceNumber == 1 }
     XCTAssertEqual(
       workspaceButton?.renderedSelectionFillColor,
-      NSColor(paneruHex: "#00FF0080")?.cgColor
+      NSColor(spoolHex: "#00FF0080")?.cgColor
     )
   }
 
-  func testWindowButtonsFollowPaneruWindowOrder() throws {
+  func testWindowButtonsFollowSpoolWindowOrder() throws {
     let first = try state(windowIDs: [20, 10])
     let view = WorkspaceBarView(
       displayID: 1,
@@ -749,7 +781,7 @@ final class ModelsTests: XCTestCase {
         itemSpacing: 5,
         horizontalPadding: 7
       ),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider()
     )
     XCTAssertEqual(view.renderedWindowIDs, [20, 10])
@@ -772,7 +804,7 @@ final class ModelsTests: XCTestCase {
         itemSpacing: 5,
         horizontalPadding: 7
       ),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider()
     )
 
@@ -791,7 +823,7 @@ final class ModelsTests: XCTestCase {
         horizontalPadding: 7,
         animationStyle: .none
       ),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider()
     )
     view.frame = CGRect(x: 0, y: 0, width: 150, height: 28)
@@ -832,7 +864,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: document.virtualWorkspaces,
       preferences: preferences,
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider(),
       reduceMotion: false
     )
@@ -867,7 +899,7 @@ final class ModelsTests: XCTestCase {
   }
 
   func testWorkspaceStateChangePushesContentTowardTheSelectedWorkspace() throws {
-    let controller = RecordingPaneruController()
+    let controller = RecordingSpoolController()
     let first = try state(workspaces: [
       (number: 1, windowIDs: [10], selected: true),
       (number: 2, windowIDs: [20], selected: false),
@@ -903,7 +935,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: first.virtualWorkspaces,
       preferences: BarPreferences(animationStyle: .smooth),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider(),
       reduceMotion: false
     )
@@ -924,7 +956,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: first.virtualWorkspaces,
       preferences: BarPreferences(animationStyle: .smooth),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider(),
       reduceMotion: false
     )
@@ -950,7 +982,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: document.virtualWorkspaces,
       preferences: BarPreferences(animationStyle: .spring),
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider(),
       reduceMotion: true
     )
@@ -1002,7 +1034,7 @@ final class ModelsTests: XCTestCase {
       displayID: 1,
       workspaces: document.virtualWorkspaces,
       preferences: preferences,
-      client: PaneruClient(),
+      client: SpoolClient(),
       iconProvider: AppIconProvider()
     )
 
@@ -1015,7 +1047,7 @@ final class ModelsTests: XCTestCase {
     XCTAssertEqual(view.renderedFocusRingFrame, expected)
     XCTAssertEqual(
       view.renderedFocusFillColor,
-      NSColor(paneruHex: preferences.selectionColorHex)?.withAlphaComponent(0.16).cgColor
+      NSColor(spoolHex: preferences.selectionColorHex)?.withAlphaComponent(0.16).cgColor
     )
     XCTAssertEqual(view.renderedFocusIndicatorFrame.height, preferences.focusRingWidth)
   }
@@ -1028,7 +1060,7 @@ final class ModelsTests: XCTestCase {
 
   func testColorSerializationPreservesAlpha() {
     let color = NSColor(srgbRed: 1, green: 0.5, blue: 0, alpha: 0.25)
-    XCTAssertEqual(color.paneruHexString, "#FF800040")
+    XCTAssertEqual(color.spoolHexString, "#FF800040")
   }
 
   private func state(
@@ -1036,7 +1068,7 @@ final class ModelsTests: XCTestCase {
     floatingWindowIDs: Set<Int32> = [],
     focusedWindowID: Int32? = nil,
     selected: Bool = true
-  ) throws -> PaneruStateDocument {
+  ) throws -> SpoolStateDocument {
     let windows: [[String: Any]] = windowIDs.map { windowID in
       [
         "window_id": windowID,
@@ -1077,12 +1109,12 @@ final class ModelsTests: XCTestCase {
       ],
     ]
     let data = try JSONSerialization.data(withJSONObject: payload)
-    return try JSONDecoder().decode(PaneruStateDocument.self, from: data)
+    return try JSONDecoder().decode(SpoolStateDocument.self, from: data)
   }
 
   private func state(
     workspaces: [(number: UInt32, windowIDs: [Int32], selected: Bool)]
-  ) throws -> PaneruStateDocument {
+  ) throws -> SpoolStateDocument {
     let rows: [[String: Any]] = workspaces.map { workspace in
       [
         "number": workspace.number,
@@ -1124,7 +1156,7 @@ final class ModelsTests: XCTestCase {
       "virtual_workspaces": rows,
     ]
     let data = try JSONSerialization.data(withJSONObject: payload)
-    return try JSONDecoder().decode(PaneruStateDocument.self, from: data)
+    return try JSONDecoder().decode(SpoolStateDocument.self, from: data)
   }
 
   private func notchedGeometry(trayFrames: [CGRect]) -> ScreenGeometry {
@@ -1145,7 +1177,7 @@ final class ModelsTests: XCTestCase {
   }
 }
 
-private final class RecordingPaneruController: PaneruControlling {
+private final class RecordingSpoolController: SpoolControlling {
   struct Move: Equatable {
     let windowID: Int32
     let displayID: UInt32
