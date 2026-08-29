@@ -198,21 +198,6 @@ impl MoveFocus {
     }
 }
 
-/// A 1-based virtual workspace number as written by users, stored 0-based.
-///
-/// # Errors
-///
-/// Returns [`ParseError`] if `input` is not a positive integer.
-pub fn parse_virtual_workspace_number(input: &str) -> Result<u32, ParseError> {
-    let number = input
-        .parse::<u32>()
-        .map_err(|_| ParseError::new(format!("unhandled virtual workspace '{input}'")))?;
-    if number == 0 {
-        return Err(ParseError::new("virtual workspace numbers start at 1"));
-    }
-    Ok(number - 1)
-}
-
 /// Defines the various operations that can be performed on windows.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -235,28 +220,17 @@ pub enum Operation {
     Equalize,
     /// Makes all columns in the active strip the same width as the focused window.
     Balance,
-    /// Toggles the managed state of the focused window.
-    Manage,
+    /// Toggles the focused window between tiled and floating layout modes.
+    ToggleFloating,
     /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
     Stack(bool),
     /// Resizes and repositions the focused window to fit within the visible viewport
     /// (including edge padding).
     Snap,
-    /// Cyclically selects the virtual strip for the current workspace.
-    Virtual(Direction),
-    /// Selects a virtual strip by its zero-based index for the current workspace.
-    VirtualNumber(u32),
-    /// Creates a new empty virtual strip after the highest existing one for
-    /// the current workspace, and switches to it.
-    VirtualAdd,
-    /// Moves the focused window to the virtual strip.
-    VirtualMove(Direction, MoveFocus),
-    /// Moves the focused window to a virtual strip by its zero-based index.
-    VirtualMoveNumber(u32, MoveFocus),
-    /// Focuses the workspace's last-focused floating window.
-    FocusUnmanaged,
-    /// Focuses the workspace's last-focused managed (tiled) window.
-    FocusManaged,
+    /// Focuses the Space's last-focused floating window.
+    FocusFloating,
+    /// Focuses the Space's last-focused tiled window.
+    FocusTiled,
     /// Raises all visible floating windows on the active display and focuses
     /// the last-floating window (idempotent — repeat presses behave the same).
     RaiseFloating,
@@ -287,26 +261,31 @@ pub enum Command {
     FocusWindow {
         window_id: i32,
     },
-    /// Selects a numbered virtual workspace on a specific physical display.
-    SelectVirtualWorkspace {
-        display_id: u32,
-        /// Zero-based internally; CLI input remains one-based.
-        virtual_index: u32,
+    /// Requests that macOS focus an existing native Space.
+    FocusSpace {
+        space_id: u64,
     },
-    /// Moves an exact Spool-known window to a numbered virtual workspace on a
-    /// specific physical display.
-    MoveWindowToVirtualWorkspace {
+    /// Requests that macOS move a window to an existing native Space.
+    MoveWindowToSpace {
         window_id: i32,
-        display_id: u32,
-        /// Zero-based internally; CLI input remains one-based.
-        virtual_index: u32,
+        space_id: u64,
         move_focus: MoveFocus,
+    },
+    /// Requests creation of a native Space on a display.
+    CreateSpace {
+        display_id: u32,
+    },
+    /// Requests deletion of an existing native Space.
+    DeleteSpace {
+        space_id: u64,
     },
     /// A command to quit the window manager application.
     Quit,
     /// A command to restart the window manager service.
     Restart,
     PrintState,
+    /// Reconciles Spool's tracked windows with the current macOS inventory.
+    ReconcileWindows,
     /// Invokes a Lua keybind handler by its registry id (see the daemon's
     /// `crate::lua`). Never produced by parsing; the runtime issues it directly.
     Lua(u32),

@@ -10,17 +10,73 @@ use bevy::tasks::{IoTaskPool, TaskPool};
 use futures_lite::StreamExt;
 use spool_mach_ipc::{Delivery, Receiver, Reply as MachReply};
 use spool_shared_types::wire::{Request, service_name};
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use tracing::{error, warn};
 
-use crate::errors::Result;
+use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender, Reply};
 
 /// `CommandReader` owns the service port and feeds what arrives on it into the
 /// world.
 pub struct CommandReader {
     events: EventSender,
+}
+
+/// Keeps the daemon's process-level singleton lock alive for the main loop.
+pub struct CommandReaderGuard {
+    _instance_lock: InstanceLock,
+}
+
+struct InstanceLock {
+    _file: File,
+}
+
+impl InstanceLock {
+    fn acquire(service: &str) -> Result<Self> {
+        Self::acquire_path(&lock_path(service))
+    }
+
+    fn acquire_path(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(Self { _file: file });
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Err(Error::Generic(
+                "another Spool instance is already running".to_string(),
+            ))
+        } else {
+            Err(error.into())
+        }
+    }
+}
+
+fn lock_path(service: &str) -> PathBuf {
+    let filename = service
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    std::env::temp_dir().join(format!("{filename}.lock"))
 }
 
 impl CommandReader {
@@ -39,30 +95,48 @@ impl CommandReader {
     /// # Errors
     ///
     /// Returns an error if another Spool daemon already owns the name.
-    pub fn start(self) -> Result<()> {
-        let receiver = Receiver::<Request>::bind(&service_name()).inspect_err(|_| {
-            error!(
-                "can not register a Mach port - maybe another Spool instance is already running?"
-            );
-        })?;
+    pub fn start(self) -> Result<CommandReaderGuard> {
+        self.start_with_service(&service_name())
+    }
 
-        thread::spawn(move || {
-            // Parks this one thread for the process lifetime; each request is
-            // handed to the IO pool rather than served inline.
-            futures_lite::future::block_on(async move {
-                let mut requests = std::pin::pin!(receiver);
-                while let Some(delivery) = requests.next().await {
-                    match delivery {
-                        Ok(delivery) => self.dispatch(delivery),
-                        // A request that fails to decode is a bad client, not a
-                        // reason to stop serving.
-                        Err(err) => warn!("reading request: {err}"),
+    fn start_with_service(self, service: &str) -> Result<CommandReaderGuard> {
+        let instance_lock = InstanceLock::acquire(service)?;
+        let receiver = match Receiver::<Request>::bind(service) {
+            Ok(receiver) => Some(receiver),
+            Err(spool_mach_ipc::Error::NotPrivileged) => {
+                warn!(
+                    service,
+                    "Mach IPC is unavailable for a shell-launched Spool; continuing without CLI access"
+                );
+                None
+            }
+            Err(error) => {
+                error!(%error, service, "can not register the Spool Mach service");
+                return Err(error.into());
+            }
+        };
+
+        if let Some(receiver) = receiver {
+            thread::spawn(move || {
+                // Parks this one thread for the process lifetime; each request
+                // is handed to the IO pool rather than served inline.
+                futures_lite::future::block_on(async move {
+                    let mut requests = std::pin::pin!(receiver);
+                    while let Some(delivery) = requests.next().await {
+                        match delivery {
+                            Ok(delivery) => self.dispatch(delivery),
+                            // A request that fails to decode is a bad client,
+                            // not a reason to stop serving.
+                            Err(err) => warn!("reading request: {err}"),
+                        }
                     }
-                }
+                });
             });
-        });
+        }
 
-        Ok(())
+        Ok(CommandReaderGuard {
+            _instance_lock: instance_lock,
+        })
     }
 
     /// Turns one request into an event, and arranges for its answer.
@@ -175,4 +249,36 @@ fn answer(
             }
         })
         .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandReader, InstanceLock};
+    use crate::events::EventSender;
+
+    #[test]
+    fn shell_launch_continues_when_launchd_check_in_is_not_permitted() {
+        let service = format!("com.wxxxcxx.spool.reader-test.{}", std::process::id());
+        let (events, _receiver) = EventSender::new();
+
+        let _guard = CommandReader::new(events)
+            .start_with_service(&service)
+            .expect("a shell launch should continue without Mach IPC");
+    }
+
+    #[test]
+    fn instance_lock_refuses_a_second_daemon_and_releases_on_drop() {
+        let path = std::env::temp_dir().join(format!(
+            "com.wxxxcxx.spool.lock-test-{}",
+            std::process::id()
+        ));
+        let first = InstanceLock::acquire_path(&path).expect("first daemon lock");
+
+        assert!(InstanceLock::acquire_path(&path).is_err());
+
+        drop(first);
+        let second = InstanceLock::acquire_path(&path).expect("released daemon lock");
+        drop(second);
+        std::fs::remove_file(path).expect("remove test lock file");
+    }
 }

@@ -322,15 +322,7 @@ impl InputHandler {
         let modifiers = get_modifiers(flags);
 
         let target_modifier = self.config.swipe_scroll_modifier();
-        let vertical_mod = self.config.swipe_scroll_vertical_modifier();
-
-        // Check the combined modifier (base + vertical) first, then fall back to
-        // base-only. matches() rejects extra modifier groups, so cmd+shift held
-        // would fail a cmd-only check. We need to accept both.
-        let base_match = target_modifier.matches(modifiers);
-        let combined_match =
-            vertical_mod.is_some_and(|vm| (target_modifier | vm).matches(modifiers));
-        if !combined_match && !base_match {
+        if !target_modifier.matches(modifiers) {
             return false;
         }
 
@@ -343,14 +335,6 @@ impl InputHandler {
                 Some(event),
                 CGEventField::ScrollWheelEventFixedPtDeltaAxis1,
             );
-
-            // Vertical workspace switching when vertical modifier is also held.
-            // Don't set last_vertical_gesture here: the suppress timer is for
-            // trackpad momentum scroll, not discrete wheel ticks.
-            if combined_match && v_delta.abs() > 0.001 {
-                _ = events.send(Event::VerticalScrollTick { delta: v_delta });
-                return true;
-            }
 
             // If we have any horizontal delta, or if there's only vertical delta, use it.
             let delta = if h_delta.abs() > 0.001 {
@@ -369,8 +353,8 @@ impl InputHandler {
         false
     }
 
-    /// Handles swipe gesture events. Routes to horizontal `Swipe` or vertical
-    /// `VerticalSwipe` based on axis dominance. Returns true to intercept the event.
+    /// Handles swipe gestures. Either dominant axis can scroll the horizontal
+    /// layout strip when vertical gesture handling is enabled.
     fn handle_swipe(&mut self, event: &CGEvent) -> bool {
         const NS_EVENT_PHASE_ENDED: usize = 1 << 3; // 8
         const NS_EVENT_PHASE_CANCELLED: usize = 1 << 4; // 16
@@ -448,8 +432,7 @@ impl InputHandler {
                         // Do not intercept the vertical swipe
                         return false;
                     }
-                    // Vertical dominant: send vertical swipe, intercept the event
-                    _ = events.send(Event::VerticalSwipe {
+                    _ = events.send(Event::Swipe {
                         delta: y_sum,
                         fingers: y_deltas.len(),
                     });

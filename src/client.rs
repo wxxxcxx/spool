@@ -4,6 +4,7 @@
 
 use futures_lite::StreamExt;
 use spool_mach_ipc::{SendPort, Sender};
+use spool_shared_types::commands::{Command, MoveFocus};
 use spool_shared_types::state::{StateEvent, StateQueryKind};
 use spool_shared_types::wire::{
     QueryPayload, Request, Response, ScriptStateRequest, ScriptStateResponse, service_name,
@@ -33,7 +34,37 @@ pub async fn send_command(argv: impl IntoIterator<Item = String>) -> Result<()> 
     let borrowed = argv.iter().map(String::as_str).collect::<Vec<_>>();
     let command = spool_shared_types::argv::parse_command(&borrowed)?;
 
-    connect()?.send(&Request::Command(command)).await?;
+    let sender = connect()?;
+    if matches!(
+        command,
+        Command::FocusSpace { .. }
+            | Command::MoveWindowToSpace { .. }
+            | Command::CreateSpace { .. }
+            | Command::DeleteSpace { .. }
+    ) {
+        let response: Response = sender.call(&Request::Query(StateQueryKind::State)).await?;
+        let Response::Query(QueryPayload::State(state)) = response else {
+            return Err(unexpected(&response));
+        };
+        let available = match command {
+            Command::FocusSpace { .. } => state.capabilities.focus,
+            Command::MoveWindowToSpace {
+                move_focus: MoveFocus::Follow,
+                ..
+            } => state.capabilities.move_windows && state.capabilities.focus,
+            Command::MoveWindowToSpace { .. } => state.capabilities.move_windows,
+            Command::CreateSpace { .. } => state.capabilities.create,
+            Command::DeleteSpace { .. } => state.capabilities.delete,
+            _ => true,
+        };
+        if !available {
+            return Err(Error::Generic(format!(
+                "Space capability unavailable for '{command:?}'"
+            )));
+        }
+    }
+
+    sender.send(&Request::Command(command)).await?;
     Ok(())
 }
 

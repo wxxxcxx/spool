@@ -16,8 +16,9 @@ use crate::platform::{
 use crate::util::AXUIWrapper;
 
 /// Where a [`Event::WindowDestroyed`] came from, which decides how far it can be
-/// trusted. macOS reports a closing window through two unrelated channels, and
-/// only one of them actually means "this window is gone".
+/// trusted. macOS reports a closing window through several unrelated channels;
+/// only the AX element teardown and subscribed `WindowServer` close are
+/// definitive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DestroySource {
     /// `kAXUIElementDestroyedNotification` on the window's own AX element. The
@@ -26,6 +27,70 @@ pub enum DestroySource {
     /// SLS `SpaceWindowDestroyed`. Despite the name this also fires when a
     /// window merely leaves a space, so it has to be confirmed before acting.
     SpaceNotification,
+    /// SLS `WindowClosed`, delivered for explicitly subscribed windows on
+    /// macOS 15 and newer. Unlike the Space notification, this identifies an
+    /// actual `WindowServer` close.
+    WindowServer,
+    /// A successful AX inventory query and CG on-screen snapshot both confirmed
+    /// that the tracked window disappeared without delivering a destroy event.
+    Reconciliation,
+}
+
+/// Limits a window-inventory reconciliation to one application or all known
+/// applications. Application-scoped requests are cheap enough to issue from
+/// noisy AX notifications; the full scope is reserved for explicit recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconcileScope {
+    Application(Pid),
+    All,
+}
+
+/// Identifies the macOS signal that caused Spool to resolve the focused
+/// window. UI-element notifications deliberately carry no window id: their AX
+/// element may be a control or native tab, so the owning application must be
+/// queried again for its actual focused window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusSource {
+    AccessibilityWindow,
+    AccessibilityUiElement,
+    ApplicationFrontSwitch,
+    Retry,
+    Internal,
+}
+
+/// A focused-window observation plus enough provenance to reject it when a
+/// newer application transition has already superseded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FocusObservation {
+    pub window_id: WinID,
+    pub pid: Option<Pid>,
+    pub source: FocusSource,
+    pub generation: Option<u64>,
+}
+
+impl FocusObservation {
+    pub const fn internal(window_id: WinID) -> Self {
+        Self {
+            window_id,
+            pid: None,
+            source: FocusSource::Internal,
+            generation: None,
+        }
+    }
+
+    pub const fn resolved(
+        window_id: WinID,
+        pid: Pid,
+        source: FocusSource,
+        generation: u64,
+    ) -> Self {
+        Self {
+            window_id,
+            pid: Some(pid),
+            source,
+            generation: Some(generation),
+        }
+    }
 }
 
 /// Where a client's answer goes.
@@ -92,7 +157,6 @@ pub enum Event {
         title: String,
         frame: spool_shared_types::state::Frame,
         floating: bool,
-        managed: bool,
     },
     /// A window has been destroyed. `source` records which notification
     /// reported it; see [`DestroySource`].
@@ -101,7 +165,10 @@ pub enum Event {
         source: DestroySource,
     },
     /// A window has gained focus.
-    WindowFocused { window_id: WinID },
+    WindowFocused(FocusObservation),
+    /// A macOS signal changed what may be focused, but did not itself provide
+    /// a trustworthy window id. Query the application's focused window.
+    FocusRevalidationRequested { pid: Pid, source: FocusSource },
     /// A window has been moved.
     WindowMoved { window_id: WinID },
     /// A window has been resized.
@@ -112,6 +179,8 @@ pub enum Event {
     WindowDeminimized { window_id: WinID },
     /// A window's title has changed.
     WindowTitleChanged { window_id: WinID },
+    /// Requests that the current macOS window inventory be reconciled with ECS.
+    ReconcileWindows { scope: ReconcileScope },
 
     /// A mouse down event has occurred.
     MouseDown {
@@ -136,12 +205,6 @@ pub enum Event {
 
     /// A swipe gesture has been detected.
     Swipe { delta: f64, fingers: usize },
-
-    /// A vertical trackpad gesture (accumulates delta to threshold before firing).
-    VerticalSwipe { delta: f64, fingers: usize },
-
-    /// A single scroll wheel tick for vertical workspace switching (fires immediately).
-    VerticalScrollTick { delta: f64 },
 
     /// A mouse scroll has been detected.
     Scroll { delta: f64 },
@@ -225,6 +288,23 @@ pub enum Event {
     },
 }
 
+impl Event {
+    pub const fn window_focused(window_id: WinID) -> Self {
+        Self::WindowFocused(FocusObservation::internal(window_id))
+    }
+
+    pub const fn resolved_focus(
+        window_id: WinID,
+        pid: Pid,
+        source: FocusSource,
+        generation: u64,
+    ) -> Self {
+        Self::WindowFocused(FocusObservation::resolved(
+            window_id, pid, source, generation,
+        ))
+    }
+}
+
 /// `EventSender` is a thin wrapper around a `std::sync::mpsc::Sender` for `Event`s.
 /// It provides a convenient way to send events to the main event loop from various parts of the application.
 #[derive(Clone, Debug)]
@@ -246,8 +326,6 @@ impl Event {
                 | Event::MouseDragged { .. }
                 | Event::MouseMoved { .. }
                 | Event::Swipe { .. }
-                | Event::VerticalSwipe { .. }
-                | Event::VerticalScrollTick { .. }
                 | Event::Scroll { .. }
                 | Event::TouchpadDown
                 | Event::TouchpadUp

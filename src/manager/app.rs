@@ -20,7 +20,7 @@ use super::skylight::_SLPSGetFrontProcess;
 use super::{ProcessApi, Window, WindowOS, ax_window_id};
 use crate::config::Config;
 use crate::errors::{Error, Result};
-use crate::events::{DestroySource, Event, EventSender};
+use crate::events::{DestroySource, Event, EventSender, FocusSource, ReconcileScope};
 use crate::platform::{
     AXObserverAddNotification, AXObserverCreate, AXObserverRemoveNotification, CFStringRef, ConnID,
     Pid, ProcessSerialNumber, WinID,
@@ -76,6 +76,10 @@ pub trait ApplicationApi: Send + Sync {
     ///
     /// Returns an `Error` if the focused window cannot be determined.
     fn focused_window_id(&self) -> Result<WinID>;
+    /// Returns the current AX window inventory without constructing full window
+    /// wrappers. Unlike `window_list`, query failure remains distinguishable
+    /// from an application which genuinely has no windows.
+    fn window_ids(&self) -> Result<Vec<WinID>>;
     /// Returns a list of all windows belonging to this application.
     ///
     /// # Arguments
@@ -253,6 +257,12 @@ impl ApplicationApi for ApplicationOS {
         self.element.focused_window_id()
     }
 
+    fn window_ids(&self) -> Result<Vec<WinID>> {
+        self.element
+            .windows()
+            .map(|windows| collect_window_ids(windows, |element| ax_window_id(element.as_ptr())))
+    }
+
     /// Retrieves a list of all windows associated with the application.
     ///
     /// # Returns
@@ -350,6 +360,16 @@ impl ApplicationApi for ApplicationOS {
     }
 }
 
+fn collect_window_ids<T, E>(
+    elements: impl IntoIterator<Item = T>,
+    mut resolve: impl FnMut(T) -> std::result::Result<WinID, E>,
+) -> Vec<WinID> {
+    elements
+        .into_iter()
+        .filter_map(|element| resolve(element).ok())
+        .collect()
+}
+
 /// An enum representing the type of observer being used.
 /// `Application` refers to an observer for application-level events.
 /// `Window(WinID)` refers to an observer for a specific window, identified by its `WinID`.
@@ -364,6 +384,7 @@ enum ObserverType {
 struct ObserverContext {
     events: EventSender,
     which: ObserverType,
+    pid: Pid,
 }
 
 impl ObserverContext {
@@ -398,6 +419,23 @@ impl ObserverContext {
                 return;
             };
             _ = self.events.send(Event::WindowCreated { element });
+            self.request_reconciliation();
+            return;
+        }
+
+        if notification == accessibility_sys::kAXFocusedUIElementChangedNotification {
+            _ = self.events.send(Event::FocusRevalidationRequested {
+                pid: self.pid,
+                source: FocusSource::AccessibilityUiElement,
+            });
+            return;
+        }
+        if notification == accessibility_sys::kAXFocusedWindowChangedNotification {
+            _ = self.events.send(Event::FocusRevalidationRequested {
+                pid: self.pid,
+                source: FocusSource::AccessibilityWindow,
+            });
+            self.request_reconciliation();
             return;
         }
 
@@ -407,10 +445,6 @@ impl ObserverContext {
             return;
         };
         let event = match notification {
-            accessibility_sys::kAXFocusedWindowChangedNotification
-            | accessibility_sys::kAXFocusedUIElementChangedNotification => {
-                Event::WindowFocused { window_id }
-            }
             accessibility_sys::kAXWindowMovedNotification => Event::WindowMoved { window_id },
             accessibility_sys::kAXWindowResizedNotification => Event::WindowResized { window_id },
             accessibility_sys::kAXMenuOpenedNotification => Event::MenuOpened { window_id },
@@ -421,6 +455,12 @@ impl ObserverContext {
             }
         };
         _ = self.events.send(event);
+    }
+
+    fn request_reconciliation(&self) {
+        _ = self.events.send(Event::ReconcileWindows {
+            scope: ReconcileScope::Application(self.pid),
+        });
     }
 
     /// Notifies the event sender about a window-level accessibility event.
@@ -460,6 +500,7 @@ impl ObserverContext {
 struct AxObserverHandler {
     observer: CFRetained<AXUIWrapper>,
     events: EventSender,
+    pid: Pid,
     contexts: Arc<RwLock<Vec<Pin<Box<ObserverContext>>>>>,
 }
 
@@ -499,6 +540,7 @@ impl AxObserverHandler {
         Ok(Self {
             observer,
             events,
+            pid,
             contexts: Arc::new(RwLock::new(Vec::new())),
         })
     }
@@ -639,6 +681,7 @@ impl AxObserverHandler {
         self.contexts.force_write().push(Box::pin(ObserverContext {
             events: self.events.clone(),
             which,
+            pid: self.pid,
         }));
         self.get_context(which)
             .expect("inserted observer context must be present")
@@ -654,7 +697,7 @@ mod tests {
     };
     use stdext::sync::rw_lock::RwLockExt as _;
 
-    use super::ObserverType;
+    use super::{ObserverType, collect_window_ids};
     use crate::{events::EventSender, manager::app::AxObserverHandler, util::AXUIWrapper};
 
     #[test]
@@ -665,6 +708,7 @@ mod tests {
         let handler = ManuallyDrop::new(AxObserverHandler {
             observer,
             events,
+            pid: 1,
             contexts: Arc::new(RwLock::new(Vec::new())),
         });
 
@@ -673,5 +717,12 @@ mod tests {
 
         assert_eq!(reused, first);
         assert_eq!(handler.contexts.as_ref().force_read().len(), 1);
+    }
+
+    #[test]
+    fn window_inventory_keeps_resolvable_ids_when_one_element_has_no_id() {
+        let ids = collect_window_ids([Some(11), None, Some(22)], |id| id.ok_or("no window id"));
+
+        assert_eq!(ids, vec![11, 22]);
     }
 }

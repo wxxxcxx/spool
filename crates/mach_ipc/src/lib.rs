@@ -129,9 +129,10 @@ pub struct Receiver<T> {
 impl<T: DeserializeOwned> Receiver<T> {
     /// Takes ownership of the service name.
     ///
-    /// Tries launchd's `MachServices` handover first and falls back to
-    /// registering the name directly, so the same call works whether the process
-    /// was started by `launchctl` or from a shell.
+    /// Tries launchd's `MachServices` handover first and then the deprecated
+    /// direct registration path. Recent macOS versions can reject direct
+    /// registration with [`Error::NotPrivileged`]; daemon callers may use that
+    /// result to continue without a named IPC service.
     ///
     /// # Errors
     ///
@@ -139,8 +140,11 @@ impl<T: DeserializeOwned> Receiver<T> {
     pub fn bind(service: &str) -> Result<Self> {
         let port = match bootstrap::check_in(service) {
             Ok(port) => port,
-            // Not a launchd job, so publish the name ourselves.
-            Err(Error::NotRunning) => bootstrap::register(service)?,
+            // Not a launchd job, so publish the name ourselves. macOS may
+            // report either an unknown service or reject check-in because a
+            // shell process is not privileged to claim launchd's receive
+            // right.
+            Err(Error::NotRunning | Error::NotPrivileged) => bootstrap::register(service)?,
             Err(err) => return Err(err),
         };
         Ok(Self::from_port(port))

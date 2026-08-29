@@ -1,7 +1,7 @@
 //! The `spool` Lua API, in both the shapes it is used in.
 //!
 //! [`install`] puts the typed, host-agnostic API onto a table — `spool.run`,
-//! `spool.window.*`, `spool.workspace.*`, `spool.mouse.*` — built on a
+//! `spool.window.*`, `spool.space.*`, `spool.mouse.*` — built on a
 //! caller-supplied dispatcher. The daemon's embedded runtime (`src/lua`) hands
 //! it one that queues the [`Command`] onto the command bus; [`client`] hands it
 //! one that writes the command to a running daemon's Unix socket, and adds the
@@ -16,9 +16,8 @@
 //! spool.window.focus({ direction = "east" })   -- directional
 //! spool.window.focus({ number = 3 })           -- by column number
 //! spool.window.balance()
-//! spool.workspace.select({ number = 2 })       -- switch virtual workspace
-//! spool.workspace.move_window({ number = 2, follow = false })
-//! spool.workspace.add()                        -- create + switch to a new virtual workspace
+//! spool.space.focus(12345)
+//! spool.space.move_window({ window_id = 42, space_id = 12345 })
 //! spool.quit()
 //!
 //! for _, window in ipairs(spool.query_on_screen()) do  -- actually visible
@@ -79,7 +78,7 @@ pub fn install(lua: &Lua, spool: &Table, dispatch: &Dispatch) -> Result<()> {
     spool.set("command", run)?;
 
     spool.set("window", window_table(lua, dispatch)?)?;
-    spool.set("workspace", workspace_table(lua, dispatch)?)?;
+    spool.set("space", space_table(lua, dispatch)?)?;
 
     let mouse = lua.create_table()?;
     mouse.set(
@@ -92,7 +91,7 @@ pub fn install(lua: &Lua, spool: &Table, dispatch: &Dispatch) -> Result<()> {
     spool.set("restart", verb(lua, dispatch, Command::Restart)?)?;
     spool.set("print_state", verb(lua, dispatch, Command::PrintState)?)?;
 
-    // spool.match{ app = …, bundle = …, title = …, floating = …, managed = … }
+    // spool.match{ app = …, bundle = …, title = …, floating = … }
     // builds a predicate over window records, for `ws:find`/`ws:filter`.
     // `app`, `bundle` and `title` are regexes, compiled here so a bad pattern
     // errors at the call site rather than silently matching nothing.
@@ -117,14 +116,10 @@ pub fn matcher(lua: &Lua, spec: Table) -> Result<Function> {
     };
     let (app, bundle, title) = (pattern("app")?, pattern("bundle")?, pattern("title")?);
     let floating: Option<bool> = spec.get("floating")?;
-    let managed: Option<bool> = spec.get("managed")?;
 
     for entry in spec.pairs::<String, Value>() {
         let (key, _) = entry?;
-        if !matches!(
-            key.as_str(),
-            "app" | "bundle" | "title" | "floating" | "managed"
-        ) {
+        if !matches!(key.as_str(), "app" | "bundle" | "title" | "floating") {
             return Err(mlua::Error::RuntimeError(format!(
                 "spool.match: unknown field '{key}'"
             )));
@@ -152,8 +147,7 @@ pub fn matcher(lua: &Lua, spec: Table) -> Result<Function> {
         Ok(matches(&app, &["app_name", "app"])?
             && matches(&bundle, &["bundle_id", "bundle"])?
             && matches(&title, &["title"])?
-            && flag(floating, "floating")?
-            && flag(managed, "managed")?)
+            && flag(floating, "floating")?)
     })
 }
 
@@ -176,11 +170,11 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     )?;
 
     for (name, operation) in [
-        ("focus_managed", Operation::FocusManaged),
-        ("focus_unmanaged", Operation::FocusUnmanaged),
+        ("focus_tiled", Operation::FocusTiled),
+        ("focus_floating", Operation::FocusFloating),
         ("center", Operation::Center),
         ("snap", Operation::Snap),
-        ("manage", Operation::Manage),
+        ("toggle_floating", Operation::ToggleFloating),
         ("equalize", Operation::Equalize),
         ("balance", Operation::Balance),
         ("stack", Operation::Stack(true)),
@@ -197,59 +191,55 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     Ok(window)
 }
 
-/// Builds the `spool.workspace` sub-table.
-fn workspace_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
-    let workspace = lua.create_table()?;
+/// Builds the stable-ID `spool.space` sub-table.
+fn space_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
+    let space = lua.create_table()?;
 
-    let select = {
+    let focus = {
         let dispatch = Rc::clone(dispatch);
-        lua.create_function(move |lua, opts: Value| {
-            let operation = virtual_operation(
-                Opts::read(lua, &opts)?.target("workspace.select")?,
-                Operation::VirtualNumber,
-                Operation::Virtual,
-            )?;
-            dispatch(lua, Command::Window(operation))
+        lua.create_function(move |lua, space_id: u64| {
+            dispatch(lua, Command::FocusSpace { space_id })
         })?
     };
-    workspace.set("select", select)?;
+    space.set("focus", focus)?;
 
     let move_window = {
         let dispatch = Rc::clone(dispatch);
-        lua.create_function(move |lua, opts: Value| {
-            let opts = Opts::read(lua, &opts)?;
-            let follow = opts.follow();
-            let operation = virtual_operation(
-                opts.target("workspace.move_window")?,
-                |index| Operation::VirtualMoveNumber(index, follow),
-                |direction| Operation::VirtualMove(direction, follow),
-            )?;
-            dispatch(lua, Command::Window(operation))
+        lua.create_function(move |lua, opts: Table| {
+            let move_focus = if opts.get::<Option<bool>>("follow")?.unwrap_or(false) {
+                MoveFocus::Follow
+            } else {
+                MoveFocus::Stay
+            };
+            dispatch(
+                lua,
+                Command::MoveWindowToSpace {
+                    window_id: opts.get("window_id")?,
+                    space_id: opts.get("space_id")?,
+                    move_focus,
+                },
+            )
         })?
     };
-    workspace.set("move_window", move_window)?;
+    space.set("move_window", move_window)?;
 
-    workspace.set(
-        "add",
-        verb(lua, dispatch, Command::Window(Operation::VirtualAdd))?,
-    )?;
+    let create = {
+        let dispatch = Rc::clone(dispatch);
+        lua.create_function(move |lua, display_id: u32| {
+            dispatch(lua, Command::CreateSpace { display_id })
+        })?
+    };
+    space.set("create", create)?;
 
-    Ok(workspace)
-}
+    let delete = {
+        let dispatch = Rc::clone(dispatch);
+        lua.create_function(move |lua, space_id: u64| {
+            dispatch(lua, Command::DeleteSpace { space_id })
+        })?
+    };
+    space.set("delete", delete)?;
 
-/// Virtual-workspace verbs come in two shapes: a position selects a numbered
-/// workspace, a direction cycles through them.
-fn virtual_operation(
-    direction: Direction,
-    numbered: impl Fn(u32) -> Operation,
-    directional: impl Fn(Direction) -> Operation,
-) -> Result<Operation> {
-    match direction {
-        Direction::Nth(index) => u32::try_from(index)
-            .map(&numbered)
-            .map_err(|_| mlua::Error::RuntimeError("workspace number is too large".into())),
-        direction => Ok(directional(direction)),
-    }
+    Ok(space)
 }
 
 /// A zero-argument verb issuing a fixed command.
@@ -447,7 +437,7 @@ mod tests {
             spool.window.focus({ direction = "east" })
             spool.window.focus({ number = 3 })
             spool.window.balance()
-            spool.workspace.move_window({ number = 2, follow = false })
+            spool.space.move_window({ window_id = 42, space_id = 123, follow = false })
         "#)
         .unwrap();
 
@@ -457,7 +447,11 @@ mod tests {
                 Command::Window(Operation::Focus(Direction::East)),
                 Command::Window(Operation::Focus(Direction::Nth(2))),
                 Command::Window(Operation::Balance),
-                Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+                Command::MoveWindowToSpace {
+                    window_id: 42,
+                    space_id: 123,
+                    move_focus: MoveFocus::Stay,
+                },
             ])
         );
     }
@@ -486,6 +480,8 @@ mod tests {
         assert!(run(r#"spool.window.focus({ direction = "sideways" })"#).is_err());
         assert!(run("spool.window.focus({})").is_err());
         assert!(run(r#"spool.window.resize({ direction = "wider" })"#).is_err());
+        assert!(run("spool.window.manage()").is_err());
+        assert!(run("spool.match({ managed = true })").is_err());
         assert!(run(r#"spool.run("not a command")"#).is_err());
     }
 

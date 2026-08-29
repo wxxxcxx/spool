@@ -36,6 +36,14 @@ unsafe extern "C" {
     /// extern int SLSMainConnectionID(void);
     pub fn SLSMainConnectionID() -> ConnID;
 
+    /// Requests per-window `WindowServer` notifications for the supplied IDs.
+    /// On macOS 15 and newer this enables the `WindowClosed` notification.
+    pub fn SLSRequestNotificationsForWindows(
+        cid: ConnID,
+        window_list: *const u32,
+        window_count: i32,
+    ) -> CGError;
+
     /// Retrieves the bounding rectangle (`CGRect`) of a window.
     ///
     /// # Arguments

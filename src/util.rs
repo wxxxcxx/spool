@@ -358,7 +358,7 @@ impl MacResult for OSStatus {
     fn to_result(self, place: &str) -> Result<()> {
         match self {
             0 => Ok(()),
-            err => Err(Error::Generic(format!("{place}: MacOS Error Code: {err}"))),
+            err => Err(Error::macos(place, err)),
         }
     }
 }

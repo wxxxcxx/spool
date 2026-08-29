@@ -1,5 +1,5 @@
 use bevy::ecs::query::{Has, With};
-use bevy::ecs::system::{NonSendMut, Query, Res};
+use bevy::ecs::system::{NonSendMut, Query, Res, Single};
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
@@ -12,8 +12,9 @@ use tracing::warn;
 use crate::accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
 use crate::commands::{Command, Operation};
 use crate::config::Config;
+use crate::ecs::native_space::NativeSpace;
 use crate::ecs::params::ActiveDisplay;
-use crate::ecs::{Bounds, FocusedMarker, Unmanaged};
+use crate::ecs::{ActiveWorkspaceMarker, Bounds, Floating, FocusedMarker};
 use crate::events::{Event, EventSender};
 use crate::manager::request_ax_privilege;
 use crate::util::round_px;
@@ -46,9 +47,9 @@ define_class!(
             self.send_command(Command::Window(Operation::Center));
         }
 
-        #[unsafe(method(toggleManaged:))]
-        fn toggle_managed(&self, _: &NSMenuItem) {
-            self.send_command(Command::Window(Operation::Manage));
+        #[unsafe(method(toggleFloating:))]
+        fn toggle_floating(&self, _: &NSMenuItem) {
+            self.send_command(Command::Window(Operation::ToggleFloating));
         }
 
         #[unsafe(method(openAccessibilitySettings:))]
@@ -102,16 +103,16 @@ pub struct MenuBarManager {
     menu: Retained<NSMenu>,
     action_target: Retained<MenuActionTarget>,
     width_items: Vec<(i32, Retained<NSMenuItem>)>,
-    managed_window_items: Vec<Retained<NSMenuItem>>,
-    manage_item: Option<Retained<NSMenuItem>>,
+    tiled_window_items: Vec<Retained<NSMenuItem>>,
+    toggle_floating_item: Option<Retained<NSMenuItem>>,
     configured_widths: Vec<i32>,
     current_label: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
 struct WindowMenuEnablement {
-    managed_actions: bool,
-    toggle_managed: bool,
+    tiled_actions: bool,
+    toggle_floating: bool,
 }
 
 fn window_menu_enablement(
@@ -119,8 +120,8 @@ fn window_menu_enablement(
     focused_width_ratio: Option<f64>,
 ) -> WindowMenuEnablement {
     WindowMenuEnablement {
-        managed_actions: focused_width_ratio.is_some(),
-        toggle_managed: has_focused_window,
+        tiled_actions: focused_width_ratio.is_some(),
+        toggle_floating: has_focused_window,
     }
 }
 
@@ -142,8 +143,8 @@ impl MenuBarManager {
             menu,
             action_target,
             width_items: Vec::new(),
-            managed_window_items: Vec::new(),
-            manage_item: None,
+            tiled_window_items: Vec::new(),
+            toggle_floating_item: None,
             configured_widths: Vec::new(),
             current_label: None,
         }
@@ -181,8 +182,7 @@ impl MenuBarManager {
 
     pub fn update(
         &mut self,
-        virtual_index: u32,
-        show_virtual_workspace: bool,
+        space_ordinal: u32,
         preset_widths: &[f64],
         has_focused_window: bool,
         focused_width_ratio: Option<f64>,
@@ -193,11 +193,11 @@ impl MenuBarManager {
         }
 
         let enablement = window_menu_enablement(has_focused_window, focused_width_ratio);
-        for item in &self.managed_window_items {
-            item.setEnabled(enablement.managed_actions);
+        for item in &self.tiled_window_items {
+            item.setEnabled(enablement.tiled_actions);
         }
-        if let Some(manage_item) = &self.manage_item {
-            manage_item.setEnabled(enablement.toggle_managed);
+        if let Some(toggle_floating_item) = &self.toggle_floating_item {
+            toggle_floating_item.setEnabled(enablement.toggle_floating);
         }
         for (percentage, item) in &self.width_items {
             let selected = focused_width_ratio
@@ -209,19 +209,15 @@ impl MenuBarManager {
             });
         }
 
-        let label = if show_virtual_workspace {
-            virtual_workspace_label(virtual_index)
-        } else {
-            String::new()
-        };
+        let label = native_space_label(space_ordinal);
         self.show_label(label);
     }
 
     fn rebuild_menu(&mut self, widths: &[i32]) {
         self.menu.removeAllItems();
         self.width_items.clear();
-        self.managed_window_items.clear();
-        self.manage_item = None;
+        self.tiled_window_items.clear();
+        self.toggle_floating_item = None;
 
         let status = self.add_item("Spool — Running", None);
         status.setEnabled(false);
@@ -232,15 +228,15 @@ impl MenuBarManager {
         for &percentage in widths {
             let item = self.add_item(&format!("{percentage}%"), Some(sel!(setWidth:)));
             item.setTag(isize::try_from(percentage).expect("width percentage fits in isize"));
-            self.managed_window_items.push(item.clone());
+            self.tiled_window_items.push(item.clone());
             self.width_items.push((percentage, item));
         }
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
         let center = self.add_item("Center Window", Some(sel!(centerWindow:)));
-        let manage = self.add_item("Toggle Managed", Some(sel!(toggleManaged:)));
-        self.managed_window_items.push(center);
-        self.manage_item = Some(manage);
+        let toggle_floating = self.add_item("Toggle Floating", Some(sel!(toggleFloating:)));
+        self.tiled_window_items.push(center);
+        self.toggle_floating_item = Some(toggle_floating);
 
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
         self.add_item("Quit Spool", Some(sel!(quitSpool:)));
@@ -298,32 +294,31 @@ impl Drop for MenuBarManager {
 
 pub fn update_menu_bar(
     active_display: ActiveDisplay,
-    focused: Query<(&Bounds, Has<Unmanaged>), With<FocusedMarker>>,
+    active_space: Single<&NativeSpace, With<ActiveWorkspaceMarker>>,
+    focused: Query<(&Bounds, Has<Floating>), With<FocusedMarker>>,
     config: Res<Config>,
     menu_bar: Option<NonSendMut<MenuBarManager>>,
 ) {
     let Some(mut menu_bar) = menu_bar else {
         return;
     };
-    let strip = active_display.active_strip();
     let viewport = active_display.actual_bounds(&config);
 
     let focused_window = focused.iter().next();
-    let focused_width_ratio = focused_window.and_then(|(bounds, unmanaged)| {
-        (!unmanaged).then(|| f64::from(bounds.0.x) / f64::from(viewport.width()))
+    let focused_width_ratio = focused_window.and_then(|(bounds, floating)| {
+        (!floating).then(|| f64::from(bounds.0.x) / f64::from(viewport.width()))
     });
 
     menu_bar.update(
-        strip.virtual_index,
-        config.workspace_menu_status(),
+        active_space.ordinal,
         &config.preset_column_widths(),
         focused_window.is_some(),
         focused_width_ratio,
     );
 }
 
-pub(crate) fn virtual_workspace_label(virtual_index: u32) -> String {
-    (virtual_index + 1).to_string()
+pub(crate) fn native_space_label(ordinal: u32) -> String {
+    (ordinal + 1).to_string()
 }
 
 fn normalized_width_percentages(widths: &[f64]) -> Vec<i32> {
@@ -342,14 +337,14 @@ fn normalized_width_percentages(widths: &[f64]) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        WindowMenuEnablement, normalized_width_percentages, virtual_workspace_label,
+        WindowMenuEnablement, native_space_label, normalized_width_percentages,
         window_menu_enablement,
     };
 
     #[test]
-    fn virtual_workspace_label_is_one_based() {
-        assert_eq!(virtual_workspace_label(0), "1");
-        assert_eq!(virtual_workspace_label(4), "5");
+    fn native_space_label_is_one_based() {
+        assert_eq!(native_space_label(0), "1");
+        assert_eq!(native_space_label(4), "5");
     }
 
     #[test]
@@ -361,26 +356,26 @@ mod tests {
     }
 
     #[test]
-    fn unmanaged_focus_only_enables_toggle_managed() {
+    fn floating_focus_only_enables_toggle_floating() {
         assert_eq!(
             window_menu_enablement(true, None),
             WindowMenuEnablement {
-                managed_actions: false,
-                toggle_managed: true,
+                tiled_actions: false,
+                toggle_floating: true,
             }
         );
         assert_eq!(
             window_menu_enablement(false, None),
             WindowMenuEnablement {
-                managed_actions: false,
-                toggle_managed: false,
+                tiled_actions: false,
+                toggle_floating: false,
             }
         );
         assert_eq!(
             window_menu_enablement(true, Some(1.0)),
             WindowMenuEnablement {
-                managed_actions: true,
-                toggle_managed: true,
+                tiled_actions: true,
+                toggle_floating: true,
             }
         );
     }

@@ -567,23 +567,25 @@ mod tests {
 
     /// A canned state document to answer queries with.
     fn test_state() -> SpoolQueryState {
-        use crate::ecs::state::{SpoolActiveState, SpoolVirtualWorkspaceState, SpoolWindowState};
+        use crate::ecs::state::{SpaceKind, SpoolActiveState, SpoolSpaceState, SpoolWindowState};
 
         SpoolQueryState {
-            version: 2,
+            version: 3,
             timestamp: 0,
             active: SpoolActiveState {
                 focused_window_id: Some(7),
                 focused_app_name: Some("Test App".to_string()),
                 ..SpoolActiveState::default()
             },
+            capabilities: spool_shared_types::state::SpaceCapabilities::default(),
             displays: Vec::new(),
-            virtual_workspaces: vec![SpoolVirtualWorkspaceState {
-                number: 1,
-                native_workspace_id: 10,
-                display_id: Some(1),
-                selected: true,
-                active: true,
+            spaces: vec![SpoolSpaceState {
+                space_id: 10,
+                display_id: 1,
+                ordinal: 0,
+                kind: SpaceKind::User,
+                visible: true,
+                focused: true,
                 windows: vec![SpoolWindowState {
                     window_id: 7,
                     bundle_id: "com.example.app".to_string(),
@@ -608,7 +610,7 @@ mod tests {
             spool.bind("alt - q", function()
               local active = spool.query_active()
               spool.flash(active.focused_app_name)
-              spool.flash(tostring(#spool.query_workspaces()))
+              spool.flash(tostring(#spool.query_spaces()))
               spool.flash(spool.query("active"))
             end)
             "#,

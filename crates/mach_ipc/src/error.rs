@@ -15,6 +15,10 @@ pub const MACH_SEND_TIMED_OUT: kern_return_t = 0x1000_0004;
 /// `MACH_RCV_TIMED_OUT` — nothing was queued and we asked not to wait. This is
 /// the ordinary "not ready yet" of the async receive loop, not a failure.
 pub const MACH_RCV_TIMED_OUT: kern_return_t = 0x1000_4003;
+/// `BOOTSTRAP_NOT_PRIVILEGED` — the caller is not the launchd job that owns
+/// the requested service. A shell-launched daemon sees this while probing
+/// `bootstrap_check_in` and should fall back to publishing its own port.
+pub const BOOTSTRAP_NOT_PRIVILEGED: kern_return_t = 1100;
 /// `BOOTSTRAP_UNKNOWN_SERVICE` — nobody has registered that name.
 pub const BOOTSTRAP_UNKNOWN_SERVICE: kern_return_t = 1102;
 /// `BOOTSTRAP_NAME_IN_USE` — somebody already has.
@@ -28,6 +32,8 @@ pub enum Error {
     /// No daemon is registered under the service name. This is the ordinary
     /// "spool is not running" case, and clients should say exactly that.
     NotRunning,
+    /// The caller is not the launchd job authorized to check in to a service.
+    NotPrivileged,
     /// Another process already owns the service name — a second daemon.
     AlreadyRunning,
     /// The peer is gone. On a reply this means the client stopped waiting; on a
@@ -58,6 +64,7 @@ impl Error {
         match rc {
             MACH_SEND_INVALID_DEST => Self::PeerGone,
             MACH_SEND_TIMED_OUT | MACH_RCV_TIMED_OUT => Self::WouldBlock,
+            BOOTSTRAP_NOT_PRIVILEGED => Self::NotPrivileged,
             BOOTSTRAP_UNKNOWN_SERVICE => Self::NotRunning,
             BOOTSTRAP_NAME_IN_USE | BOOTSTRAP_SERVICE_ACTIVE => Self::AlreadyRunning,
             other => Self::Mach(other),
@@ -69,6 +76,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotRunning => write!(f, "spool is not running"),
+            Self::NotPrivileged => write!(f, "not authorized to check in to the Mach service"),
             Self::AlreadyRunning => write!(f, "another spool instance owns the service name"),
             Self::PeerGone => write!(f, "the peer has exited"),
             Self::WouldBlock => write!(f, "the peer's message queue is full"),

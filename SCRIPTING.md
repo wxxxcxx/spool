@@ -32,11 +32,10 @@ spool.bind("alt - j", "window focus east")
 
 ## 2. Configuration from Lua (`spool.setup`)
 
-`spool.setup{...}` declares the whole configuration from Lua, so `init.lua` can replace `spool.toml` entirely. The table mirrors the TOML sections one-for-one — `options`, `padding`, `swipe`, `decorations`, `restore`, `windows`, and top-level `default_workspaces`.
+`spool.setup{...}` declares the whole configuration from Lua, so `init.lua` can replace `spool.toml` entirely. The table mirrors the TOML sections one-for-one: `options`, `padding`, `swipe`, `decorations`, `restore`, and `windows`.
 
 ```lua
 spool.setup {
-  default_workspaces = 3,
   options = {
     focus_follows_mouse = true,
     sliver_width = 5,
@@ -123,7 +122,7 @@ end)
 
 | Event Name | Description | Event Payload Fields |
 | --- | --- | --- |
-| `window_spawned` | A window was fully spawned and initialized in Spool | `type`, `window_id`, `pid`, `app_name`, `bundle_id`, `title`, `frame` (`{x, y, width, height}`), `floating`, `managed` |
+| `window_spawned` | A window was fully spawned and initialized in Spool | `type`, `window_id`, `pid`, `app_name`, `bundle_id`, `title`, `frame` (`{x, y, width, height}`), `floating` |
 | `window_focused` | A window gained focus | `type`, `window_id` |
 | `window_destroyed` | A window was closed / destroyed | `type`, `window_id` |
 | `window_moved` | A window was moved | `type`, `window_id` |
@@ -137,7 +136,7 @@ end)
 | `application_hidden` | An application became hidden | `type`, `pid` |
 | `mouse_down` / `mouse_up` / `mouse_dragged` / `mouse_moved` | Mouse actions | `type`, `x`, `y`, `modifiers` |
 | `space_changed` | Active workspace changed | `type` |
-| `space_created` / `space_destroyed` | Virtual workspace added or removed | `type`, `space_id` |
+| `space_created` / `space_destroyed` | Native macOS Space added or removed | `type`, `space_id` |
 
 ---
 
@@ -152,7 +151,7 @@ spool.on("window_focused", function(event, ws)
   end
 
   local active = spool.query_active()
-  spool.flash("workspace " .. tostring(active.virtual_workspace_number))
+  spool.flash("Space " .. tostring(active.space_id))
 end)
 ```
 
@@ -162,7 +161,7 @@ end)
 | `spool.query_json(kind)` | the same document, decoded into a table |
 | `spool.query_state()` | the complete state document |
 | `spool.query_active()` | the active display, workspace and focused window |
-| `spool.query_workspaces()` | the virtual workspace rows |
+| `spool.query_spaces()` | native macOS Spaces and their tracked windows |
 | `spool.query_on_screen()` | the windows currently visible |
 
 These are spelled exactly as in the loadable client module (`require("spool")`, see [`crates/lua`](crates/lua)), so a helper that reads state works unchanged in either host. The payloads are documented in [`QUERY_AND_SUBSCRIBE_FORMAT.md`](QUERY_AND_SUBSCRIBE_FORMAT.md).
@@ -197,13 +196,14 @@ Keys are plain strings; values can be strings, numbers, booleans, or JSON-shaped
 
 ## 6. Programmatic Window Management
 
-Handlers are given a **window set** (`ws`): the whole layout — displays, workspaces, columns, and the windows in them — as a value you can transform. It is modeled on xmonad's `StackSet`, and it is *pure*: every operation returns a **new** window set rather than changing the one you were given, and nothing touches a real window until you **return** it.
+Handlers are given a **window set** (`ws`): the whole layout — displays, native Spaces, columns, and the windows in them — as a value you can transform. It is modeled on xmonad's `StackSet`, and it is *pure*: every operation returns a **new** window set rather than changing the one you were given, and nothing touches a real window until you **return** it.
 
 ```lua
 spool.bind("alt - h",       function(ws) return ws:focus(ws:west(ws:focused())) end)
 spool.bind("alt - shift-h", function(ws) return ws:swap(ws:focused(), ws:west(ws:focused())) end)
-spool.bind("alt - 3",       function(ws) return ws:view(3) end)
-spool.bind("alt - shift-3", function(ws) return ws:shift(ws:focused(), 3) end)
+spool.bind("alt - 3", function(ws)
+  return ws:view(spool.query_spaces()[3].space_id)
+end)
 ```
 
 Because the window set is pure:
@@ -230,30 +230,28 @@ A handler that raises partway through changes nothing either, because it never r
 | `ws:windows()` | Every window, as records |
 | `ws:window(id)` | One window record |
 | `ws:find(pred)` / `ws:filter(pred)` | The first / all windows matching a predicate |
-| `ws:current()` | The number of the workspace on screen |
-| `ws:workspaces()` | Every workspace number |
-| `ws:workspace_windows(n)` | The windows on workspace `n` |
-| `ws:columns([n])` | The columns of a workspace, each a list of window IDs |
-| `ws:column_of(id)` / `ws:workspace_of(id)` | The column index / workspace number a window is on |
+| `ws:current()` | Stable ID of the focused native Space |
+| `ws:spaces()` | Stable IDs of all known native Spaces |
+| `ws:space_windows(space_id)` | The windows on a Space |
+| `ws:columns([space_id])` | The columns of a Space, each a list of window IDs |
+| `ws:column_of(id)` / `ws:space_of(id)` | The column index / Space ID a window is on |
 | `ws:display_of(id)` | The display a window is on: `{ id, active, x, y, width, height }` |
 | `ws:east(id)` / `ws:west(id)` | The window one column over |
 | `ws:next(id)` / `ws:prev(id)` | The next/previous window, wrapping |
 
-A window record contains `id`, `app_name`, `bundle_id`, `title`, `frame`, `floating`, `managed`, `visible` and `focused`.
+A window record contains `id`, `app_name`, `bundle_id`, `title`, `frame`, `floating`, `visible` and `focused`.
 
-`spool.match{ app = …, bundle = …, title = …, floating = …, managed = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions.
+`spool.match{ app = …, bundle = …, title = …, floating = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions.
 
 ### Transforming Layout State
 
 Each method returns a new window set:
 - `ws:focus(id)`
 - `ws:swap(a, b)`
-- `ws:shift(id, workspace[, follow])`
-- `ws:view(workspace)`
+- `ws:shift(id, space_id[, follow])`
+- `ws:view(space_id)`
 - `ws:float(id[, rect])`
 - `ws:sink(id)`
-- `ws:manage(id)`
-- `ws:unmanage(id)`
 - `ws:width(id, ratio)`
 - `ws:stack(id, onto)`
 - `ws:tab(id, onto)`
@@ -265,60 +263,8 @@ Each method returns a new window set:
 ws:float(id, { x = 0.1, y = 0.05, width = 0.8, height = 0.5 })
 ```
 
----
-
-## 7. Example: Named Scratchpads
-
-A worked port of xmonad's `NamedScratchpad`. A scratchpad is a window you toggle in and out of view; when not wanted, it is parked on a workspace you never look at (`stash = 9`).
-
-```lua
-scratchpad = { stash = 9, pads = {}, order = {} }
-
-function scratchpad.define(name, spec)
-  scratchpad.pads[name] = spec
-  table.insert(scratchpad.order, name)
-end
-
--- The pad a window belongs to, if any. Declaration order decides ties.
-function scratchpad.pad_of(window)
-  for _, name in ipairs(scratchpad.order) do
-    if scratchpad.pads[name].match(window) then
-      return name, scratchpad.pads[name]
-    end
-  end
-end
-
--- Park every pad in `names` that is currently on screen.
-function scratchpad.hide(ws, names)
-  for _, name in ipairs(names) do
-    local window = ws:find(scratchpad.pads[name].match)
-    if window and ws:workspace_of(window.id) == ws:current() then
-      ws = ws:shift(window.id, scratchpad.stash)
-    end
-  end
-  return ws
-end
-
-function scratchpad.toggle(name)
-  return function(ws)
-    local pad = scratchpad.pads[name]
-    local window = ws:find(pad.match)
-    if not window then
-      os.execute(pad.spawn .. " &")                 -- not running: start it
-      return
-    end
-    if ws:workspace_of(window.id) == ws:current() then
-      return ws:shift(window.id, scratchpad.stash)  -- in view: put it away
-    end
-    ws = scratchpad.hide(ws, scratchpad.order)
-    return ws:shift(window.id, ws:current(), true):focus(window.id)
-  end
-end
-
--- Place a pad window the first time we see it
-spool.on("window_spawned", { bundle = "org.libreoffice.script" }, function(event, ws)
-  if event.frame.width < 400 or event.frame.height < 400 then
-    return ws:float(event.window_id)
-  end
-end)
-```
+Cross-Space transforms record native Space commands. Check
+`spool.query_state().capabilities` first: in the current backend only a
+non-following window move may be available, and it is disabled by default.
+Focus, create, delete, and the old hidden-workspace scratchpad pattern are not
+provided by the observe-only core.

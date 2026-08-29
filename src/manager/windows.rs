@@ -185,7 +185,7 @@ pub struct WindowOS {
 
 impl WindowOS {
     /// Creates a new `Window` instance using an empty configuration.
-    /// Non-standard windows are rejected unless they match a `manage = true` rule.
+    /// Non-standard windows are rejected unless they match a `track = true` rule.
     ///
     /// # Arguments
     ///
@@ -230,7 +230,7 @@ impl WindowOS {
             title: RwLock::new(None),
         };
 
-        let forced = window.is_forced_manage(config, bundle_id);
+        let forced = window.is_forced_track(config, bundle_id);
 
         if window.is_unknown() && !forced {
             return Err(Error::invalid_window(&format!(
@@ -260,16 +260,16 @@ impl WindowOS {
         Ok(window)
     }
 
-    /// Checks whether a configured window rule forces this window to be managed
+    /// Checks whether a configured window rule forces this window to be tracked
     /// despite having a non-standard role/subrole.
-    fn is_forced_manage(&self, config: &Config, bundle_id: Option<&str>) -> bool {
+    fn is_forced_track(&self, config: &Config, bundle_id: Option<&str>) -> bool {
         let Ok(title) = self.title() else {
             return false;
         };
         config
             .find_window_properties(&title, bundle_id.unwrap_or_default())
             .iter()
-            .any(|params| params.manage.is_some_and(|manage| manage))
+            .any(|params| params.track.is_some_and(|track| track))
     }
 
     /// Checks if the window's subrole is "`AXUnknownSubrole`".

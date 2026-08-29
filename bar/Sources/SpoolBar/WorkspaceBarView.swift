@@ -31,7 +31,7 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
   private let windowViewport = WindowViewportView()
   private let nextWindowButton = BarActionButton()
   private let focusRing = FocusRingView()
-  private var workspaces: [VirtualWorkspaceState] = []
+  private var workspaces: [SpaceState] = []
   private var workspaceNumbers: [UInt32] = []
   private var activeWorkspaceNumber: UInt32?
   private var windowButtons: [Int32: WindowActionButton] = [:]
@@ -49,7 +49,7 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
 
   init(
     displayID: UInt32,
-    workspaces: [VirtualWorkspaceState],
+    workspaces: [SpaceState],
     preferences: BarPreferences,
     client: any SpoolControlling,
     iconProvider: AppIconProvider,
@@ -79,7 +79,7 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
   required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 
   static func estimatedWidth(
-    workspace: VirtualWorkspaceState,
+    workspace: SpaceState,
     preferences: BarPreferences
   ) -> CGFloat {
     let label = preferences.workspaceLabel(for: workspace.number)
@@ -91,7 +91,7 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
   }
 
   static func minimumWidth(
-    workspace: VirtualWorkspaceState,
+    workspace: SpaceState,
     preferences: BarPreferences
   ) -> CGFloat {
     let label = preferences.workspaceLabel(for: workspace.number)
@@ -172,7 +172,7 @@ final class WorkspaceBarView: NSView, NSMenuDelegate {
     updateFocusRing()
   }
 
-  func update(workspaces: [VirtualWorkspaceState]) {
+  func update(workspaces: [SpaceState]) {
     self.workspaces = workspaces.sorted { $0.number < $1.number }
     workspaceNumbers = self.workspaces.map(\.number)
     guard let active = self.workspaces.first(where: \.selected) ?? self.workspaces.first else {

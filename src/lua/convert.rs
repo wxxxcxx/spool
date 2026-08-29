@@ -47,8 +47,6 @@ pub enum LuaEvent {
     MouseMoved(MousePayload),
 
     Swipe { delta: f64, fingers: usize },
-    VerticalSwipe { delta: f64, fingers: usize },
-    VerticalScrollTick { delta: f64 },
     Scroll { delta: f64 },
     TouchpadDown,
     TouchpadUp,
@@ -98,7 +96,6 @@ pub struct WindowSpawnPayload {
     pub title: String,
     pub frame: spool_shared_types::state::Frame,
     pub floating: bool,
-    pub managed: bool,
 }
 
 /// An [`Event`] that carries something Lua cannot see — an `AppKit` handle, a
@@ -136,7 +133,6 @@ impl TryFrom<&Event> for LuaEvent {
                 title,
                 frame,
                 floating,
-                managed,
             } => LuaEvent::WindowSpawned(WindowSpawnPayload {
                 window_id: *window_id,
                 pid: *pid,
@@ -145,13 +141,12 @@ impl TryFrom<&Event> for LuaEvent {
                 title: title.clone(),
                 frame: *frame,
                 floating: *floating,
-                managed: *managed,
             }),
             Event::WindowDestroyed { window_id, .. } => LuaEvent::WindowDestroyed {
                 window_id: *window_id,
             },
-            Event::WindowFocused { window_id } => LuaEvent::WindowFocused {
-                window_id: *window_id,
+            Event::WindowFocused(observation) => LuaEvent::WindowFocused {
+                window_id: observation.window_id,
             },
             Event::WindowMoved { window_id } => LuaEvent::WindowMoved {
                 window_id: *window_id,
@@ -182,11 +177,6 @@ impl TryFrom<&Event> for LuaEvent {
                 delta: *delta,
                 fingers: *fingers,
             },
-            Event::VerticalSwipe { delta, fingers } => LuaEvent::VerticalSwipe {
-                delta: *delta,
-                fingers: *fingers,
-            },
-            Event::VerticalScrollTick { delta } => LuaEvent::VerticalScrollTick { delta: *delta },
             Event::Scroll { delta } => LuaEvent::Scroll { delta: *delta },
             Event::TouchpadDown => LuaEvent::TouchpadDown,
             Event::TouchpadUp => LuaEvent::TouchpadUp,
@@ -251,11 +241,13 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::ApplicationTerminated { .. }
             | Event::ApplicationFrontSwitched { .. }
             | Event::WindowCreated { .. }
+            | Event::ReconcileWindows { .. }
             | Event::Command { .. }
             | Event::StateQuery { .. }
             | Event::WindowSetQuery { .. }
             | Event::StateSubscribe { .. }
-            | Event::ScriptState { .. } => return Err(NotMarshallable),
+            | Event::ScriptState { .. }
+            | Event::FocusRevalidationRequested { .. } => return Err(NotMarshallable),
         })
     }
 }
@@ -367,7 +359,6 @@ mod tests {
                     height: 100,
                 },
                 floating: false,
-                managed: true,
             }),
             LuaEvent::WindowDestroyed { window_id: 1 },
             LuaEvent::WindowFocused { window_id: 1 },
@@ -384,11 +375,6 @@ mod tests {
                 delta: 1.0,
                 fingers: 3,
             },
-            LuaEvent::VerticalSwipe {
-                delta: 1.0,
-                fingers: 3,
-            },
-            LuaEvent::VerticalScrollTick { delta: 1.0 },
             LuaEvent::Scroll { delta: 1.0 },
             LuaEvent::TouchpadDown,
             LuaEvent::TouchpadUp,
@@ -451,8 +437,8 @@ mod tests {
     #[test]
     fn window_event_maps_to_named_table() {
         let lua = Lua::new();
-        let (name, table) = event_to_lua(&lua, &Event::WindowFocused { window_id: 42 })
-            .expect("window_focused should marshal");
+        let (name, table) =
+            event_to_lua(&lua, &Event::window_focused(42)).expect("window_focused should marshal");
         assert_eq!(name, "window_focused");
         assert_eq!(table.get::<String>("type").unwrap(), "window_focused");
         assert_eq!(table.get::<i64>("window_id").unwrap(), 42);

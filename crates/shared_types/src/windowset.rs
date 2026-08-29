@@ -31,18 +31,16 @@ pub enum LayoutOp {
     Focus(WinID),
     /// Exchange the two windows' positions in the layout.
     Swap(WinID, WinID),
-    /// Send `window` to a virtual workspace, optionally following it there.
+    /// Send `window` to a native Space, optionally following it there.
     MoveToWorkspace {
         window: WinID,
-        workspace: u32,
+        space_id: u64,
         follow: bool,
     },
-    /// Show a virtual workspace on its display.
-    View { workspace: u32 },
+    /// Focus a native Space by stable session ID.
+    View { space_id: u64 },
     /// Take `window` out of the tiling layout, or put it back in.
     SetFloating { window: WinID, floating: bool },
-    /// Let the window manager lay `window` out, or stop doing so.
-    SetManaged { window: WinID, managed: bool },
     /// Set the column width `window` occupies, as a fraction of the display.
     SetWidth { window: WinID, ratio: f64 },
     /// Put `window` at an exact frame. Only meaningful for a floating window:
@@ -69,7 +67,6 @@ impl LayoutOp {
             | LayoutOp::Unstack(window)
             | LayoutOp::MoveToWorkspace { window, .. }
             | LayoutOp::SetFloating { window, .. }
-            | LayoutOp::SetManaged { window, .. }
             | LayoutOp::SetWidth { window, .. }
             | LayoutOp::SetFrame { window, .. }
             | LayoutOp::Stack { window, .. } => Some(*window),
@@ -140,9 +137,7 @@ pub enum ColumnKind {
 }
 
 /// One window, as a script sees it.
-// The four flags are genuinely independent -- a window can be any combination
-// of floating, managed, visible and focused -- so there is no enum hiding here.
-#[allow(clippy::struct_excessive_bools)]
+// These flags are independent: a floating window can be visible and focused.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WindowRec {
     pub id: WinID,
@@ -153,8 +148,6 @@ pub struct WindowRec {
     pub frame: Option<Frame>,
     /// Outside the tiling layout, positioned by hand.
     pub floating: bool,
-    /// Laid out by the window manager at all.
-    pub managed: bool,
     /// More than a sliver of it is actually showing.
     pub visible: bool,
     pub focused: bool,
@@ -193,14 +186,13 @@ impl ColumnSet {
     }
 }
 
-/// One virtual workspace: an ordered strip of columns, plus whatever floats
-/// above it.
+/// One native Space: an ordered strip of columns, plus whatever floats above it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceSet {
-    /// The virtual workspace number a script addresses it by.
-    pub number: u32,
-    /// The macOS space it lives on.
-    pub native_id: u64,
+    /// The macOS Space identity for this session.
+    pub space_id: u64,
+    /// Current per-display presentation order.
+    pub ordinal: u32,
     /// Whether it is the one currently shown on its display.
     pub active: bool,
     pub columns: Arc<Vec<ColumnSet>>,
@@ -292,11 +284,11 @@ impl WindowSet {
         self.windows().find(|window| window.id == id)
     }
 
-    /// The workspace numbered `number`.
+    /// The native Space identified by `space_id`.
     #[must_use]
-    pub fn workspace(&self, number: u32) -> Option<&WorkspaceSet> {
+    pub fn workspace(&self, space_id: u64) -> Option<&WorkspaceSet> {
         self.workspaces()
-            .find(|workspace| workspace.number == number)
+            .find(|workspace| workspace.space_id == space_id)
     }
 
     /// The active workspace of the active display — "here", for a script.
@@ -468,19 +460,19 @@ impl WindowSet {
         })
     }
 
-    /// Sends `window` to virtual workspace `workspace`, without following it.
+    /// Sends `window` to native Space `space_id`, without following it.
     #[must_use]
-    pub fn shift(&self, window: WinID, workspace: u32) -> Self {
-        self.shift_following(window, workspace, false)
+    pub fn shift(&self, window: WinID, space_id: u64) -> Self {
+        self.shift_following(window, space_id, false)
     }
 
-    /// Sends `window` to virtual workspace `workspace`, following it there.
+    /// Sends `window` to native Space `space_id`, optionally following it there.
     #[must_use]
-    pub fn shift_following(&self, window: WinID, workspace: u32, follow: bool) -> Self {
+    pub fn shift_following(&self, window: WinID, space_id: u64, follow: bool) -> Self {
         self.with(
             LayoutOp::MoveToWorkspace {
                 window,
-                workspace,
+                space_id,
                 follow,
             },
             |displays| {
@@ -490,35 +482,35 @@ impl WindowSet {
                     display
                         .workspaces
                         .iter()
-                        .any(|candidate| candidate.number == workspace)
+                        .any(|candidate| candidate.space_id == space_id)
                 }) {
                     return;
                 }
                 let Some(record) = take_window(displays, window) else {
                     return;
                 };
-                if let Some(target) = find_workspace_mut(displays, workspace) {
+                if let Some(target) = find_workspace_mut(displays, space_id) {
                     Arc::make_mut(&mut target.columns).push(ColumnSet::single(record, 0.5));
                 }
             },
         )
     }
 
-    /// Shows virtual workspace `workspace` on its display.
+    /// Requests focus for native Space `space_id`.
     #[must_use]
-    pub fn view(&self, workspace: u32) -> Self {
-        self.with(LayoutOp::View { workspace }, |displays| {
+    pub fn view(&self, space_id: u64) -> Self {
+        self.with(LayoutOp::View { space_id }, |displays| {
             let on_display = displays.iter().position(|display| {
                 display
                     .workspaces
                     .iter()
-                    .any(|candidate| candidate.number == workspace)
+                    .any(|candidate| candidate.space_id == space_id)
             });
             let Some(index) = on_display else {
                 return;
             };
             for candidate in Arc::make_mut(&mut displays[index].workspaces) {
-                candidate.active = candidate.number == workspace;
+                candidate.active = candidate.space_id == space_id;
             }
         })
     }
@@ -588,28 +580,6 @@ impl WindowSet {
             } else {
                 Arc::make_mut(&mut target.columns).push(ColumnSet::single(record, 0.5));
             }
-        })
-    }
-
-    /// Starts laying `window` out.
-    #[must_use]
-    pub fn manage(&self, window: WinID) -> Self {
-        self.set_managed(window, true)
-    }
-
-    /// Stops laying `window` out, leaving it where it is.
-    #[must_use]
-    pub fn unmanage(&self, window: WinID) -> Self {
-        self.set_managed(window, false)
-    }
-
-    fn set_managed(&self, window: WinID, managed: bool) -> Self {
-        self.with(LayoutOp::SetManaged { window, managed }, |displays| {
-            for_each_window(displays, |record| {
-                if record.id == window {
-                    record.managed = managed;
-                }
-            });
         })
     }
 
@@ -721,12 +691,12 @@ fn find_window(displays: &[DisplaySet], id: WinID) -> Option<&WindowRec> {
         .find(|window| window.id == id)
 }
 
-/// Finds a workspace by number, ready to be changed.
-fn find_workspace_mut(displays: &mut [DisplaySet], number: u32) -> Option<&mut WorkspaceSet> {
+/// Finds a native Space by ID, ready to be changed.
+fn find_workspace_mut(displays: &mut [DisplaySet], space_id: u64) -> Option<&mut WorkspaceSet> {
     displays.iter_mut().find_map(|display| {
         Arc::make_mut(&mut display.workspaces)
             .iter_mut()
-            .find(|workspace| workspace.number == number)
+            .find(|workspace| workspace.space_id == space_id)
     })
 }
 
@@ -773,7 +743,6 @@ mod tests {
             title: format!("{name} window"),
             frame: None,
             floating: false,
-            managed: true,
             visible: true,
             focused: false,
         }
@@ -803,15 +772,15 @@ mod tests {
                 active: true,
                 workspaces: Arc::new(vec![
                     WorkspaceSet {
-                        number: 1,
-                        native_id: 10,
+                        space_id: 1,
+                        ordinal: 0,
                         active: true,
                         columns: Arc::new(columns),
                         floating: Arc::new(Vec::new()),
                     },
                     WorkspaceSet {
-                        number: 2,
-                        native_id: 11,
+                        space_id: 2,
+                        ordinal: 1,
                         active: false,
                         columns: Arc::new(Vec::new()),
                         floating: Arc::new(Vec::new()),
@@ -863,7 +832,7 @@ mod tests {
                 },
                 LayoutOp::MoveToWorkspace {
                     window: 2,
-                    workspace: 2,
+                    space_id: 2,
                     follow: false
                 },
             ]
@@ -1064,7 +1033,7 @@ mod tests {
         let set = fixture().view(2);
         assert!(!set.workspace(1).unwrap().active);
         assert!(set.workspace(2).unwrap().active);
-        assert_eq!(set.ops(), vec![LayoutOp::View { workspace: 2 }]);
+        assert_eq!(set.ops(), vec![LayoutOp::View { space_id: 2 }]);
     }
 
     #[test]
@@ -1081,9 +1050,9 @@ mod tests {
     fn lookups_find_where_a_window_lives() {
         let set = fixture();
         assert_eq!(set.column_of(2), Some(1));
-        assert_eq!(set.workspace_of(2).map(|w| w.number), Some(1));
+        assert_eq!(set.workspace_of(2).map(|w| w.space_id), Some(1));
         assert_eq!(set.display_of(2).map(|d| d.id), Some(1));
-        assert_eq!(set.current().map(|w| w.number), Some(1));
+        assert_eq!(set.current().map(|w| w.space_id), Some(1));
         assert_eq!(set.window(2).map(|w| w.app_name.as_str()), Some("beta"));
         assert_eq!(set.window(99), None);
     }
@@ -1100,7 +1069,7 @@ mod tests {
             .target(),
             Some(4)
         );
-        assert_eq!(LayoutOp::View { workspace: 2 }.target(), None);
+        assert_eq!(LayoutOp::View { space_id: 2 }.target(), None);
     }
 
     #[test]
@@ -1110,12 +1079,12 @@ mod tests {
             set.window(2).is_some(),
             "the window should still be somewhere"
         );
-        assert_eq!(set.workspace_of(2).map(|w| w.number), Some(1));
+        assert_eq!(set.workspace_of(2).map(|w| w.space_id), Some(1));
         assert_eq!(
             set.ops(),
             vec![LayoutOp::MoveToWorkspace {
                 window: 2,
-                workspace: 42,
+                space_id: 42,
                 follow: false
             }]
         );

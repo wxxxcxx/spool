@@ -23,6 +23,7 @@ final class SpoolClient: SpoolControlling {
     private var queryRunning = false
     private var queryPending = false
     private var refreshWorkItem: DispatchWorkItem?
+    private var latestState: SpoolStateDocument?
 
     func start() {
         queue.async { [weak self] in
@@ -53,7 +54,15 @@ final class SpoolClient: SpoolControlling {
     }
 
     func selectWorkspace(displayID: UInt32, number: UInt32) {
-        send(["send-cmd", "workspace", "select", String(displayID), String(number)])
+        queue.async { [weak self] in
+            guard let self,
+                let space = latestState?.spaces.first(where: {
+                    $0.displayID == displayID && $0.number == number
+                }),
+                latestState?.capabilities.focus == true
+            else { return }
+            self.sendNow(["send-cmd", "space", "focus", String(space.spaceID)])
+        }
     }
 
     func moveWindow(
@@ -62,27 +71,40 @@ final class SpoolClient: SpoolControlling {
         workspaceNumber: UInt32,
         follow: Bool = true
     ) {
-        send([
-            "send-cmd", "window", "move-to-workspace", String(windowID),
-            String(displayID), String(workspaceNumber), follow ? "follow" : "stay",
-        ])
+        queue.async { [weak self] in
+            guard let self,
+                let space = latestState?.spaces.first(where: {
+                    $0.displayID == displayID && $0.number == workspaceNumber
+                }),
+                latestState?.capabilities.moveWindows == true
+            else { return }
+            self.sendNow([
+                "send-cmd", "window", "move-to-space", String(windowID),
+                String(space.spaceID), follow ? "follow" : "stay",
+            ])
+        }
     }
 
     private func send(_ arguments: [String]) {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
-            let process = self.makeProcess(arguments)
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            do {
-                try process.run()
-                process.waitUntilExit()
-                if process.terminationStatus != 0 {
-                    self.report("Spool command failed: \(arguments.joined(separator: " "))")
-                }
-            } catch {
-                self.report("Unable to run Spool command: \(error.localizedDescription)")
+            self.sendNow(arguments)
+        }
+    }
+
+    private func sendNow(_ arguments: [String]) {
+        guard !stopped else { return }
+        let process = makeProcess(arguments)
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus != 0 {
+                report("Spool command failed: \(arguments.joined(separator: " "))")
             }
+        } catch {
+            report("Unable to run Spool command: \(error.localizedDescription)")
         }
     }
 
@@ -114,6 +136,7 @@ final class SpoolClient: SpoolControlling {
             if process.terminationStatus == 0 {
                 do {
                     let document = try decoder.decode(SpoolStateDocument.self, from: data)
+                    latestState = document
                     DispatchQueue.main.async { [weak self] in self?.onState?(document) }
                 } catch {
                     report("Unable to decode Spool state: \(error.localizedDescription)")

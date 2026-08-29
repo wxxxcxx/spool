@@ -14,13 +14,10 @@ use tracing::{Level, info, instrument, warn};
 use crate::config::{Config, MissingWindowBehavior};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{WindowCtx, Windows};
-use crate::ecs::state::{
-    SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace, SpoolState,
-};
-use crate::ecs::workspace::PreviousStripPosition;
+use crate::ecs::state::{SavedColumn, SavedSpace, SavedStackItem, SavedWindow, SpoolState};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, RefreshWindowSizes, RestoreWindowState,
-    SpawnCommandsExt, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Floating, RefreshWindowSizes, RestoreWindowState,
+    SpawnCommandsExt,
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -76,20 +73,6 @@ impl CurrentWindowIdentity {
     fn hard_key(&self) -> WindowHardMatchKey {
         WindowHardMatchKey::new(self.window_id, self.pid, self.bundle_id.clone())
     }
-
-    #[cfg(test)]
-    pub(crate) fn fallback_only(entity: Entity, bundle_id: &str, title: &str) -> Self {
-        Self {
-            entity,
-            window_id: -1,
-            pid: -1,
-            bundle_id: bundle_id.to_string(),
-            title: title.to_string(),
-            identifier: "main".to_string(),
-            role: "AXWindow".to_string(),
-            subrole: "AXStandardWindow".to_string(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -127,14 +110,13 @@ pub(crate) enum PlannedStackItem {
 pub(crate) struct PlannedStrip {
     pub workspace_id: WorkspaceId,
     pub display_id: Option<CGDirectDisplayID>,
-    pub virtual_index: u32,
     pub columns: Vec<PlannedColumn>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RestorePlan {
     pub strips: Vec<PlannedStrip>,
-    pub active_virtual_by_workspace: HashMap<WorkspaceId, u32>,
+    pub active_workspaces: HashSet<WorkspaceId>,
     pub consumed_entities: HashSet<Entity>,
     pub ignored_missing_windows: usize,
     pub skipped_ambiguous_matches: usize,
@@ -156,47 +138,37 @@ impl<'a> RestorePlanner<'a> {
     pub(crate) fn plan(&self, current: &[CurrentWindowIdentity]) -> RestorePlan {
         let mut plan = RestorePlan::default();
 
-        for workspace in &self.state.workspaces {
-            let surviving_strips = self.plan_workspace(workspace, current, &mut plan);
-            Self::record_active_virtual(workspace, &surviving_strips, &mut plan);
+        for space in &self.state.spaces {
+            let surviving_strips = self.plan_space(space, current, &mut plan);
+            if !surviving_strips.is_empty() {
+                plan.active_workspaces.insert(space.space_id);
+            }
             plan.strips.extend(surviving_strips);
         }
 
         plan
     }
 
-    fn plan_workspace(
+    fn plan_space(
         &self,
-        workspace: &SavedWorkspace,
+        space: &SavedSpace,
         current: &[CurrentWindowIdentity],
         plan: &mut RestorePlan,
     ) -> Vec<PlannedStrip> {
-        workspace
-            .strips
-            .iter()
-            .filter_map(|strip| self.plan_strip(workspace, strip, current, plan))
-            .collect()
-    }
-
-    fn plan_strip(
-        &self,
-        workspace: &SavedWorkspace,
-        strip: &SavedStrip,
-        current: &[CurrentWindowIdentity],
-        plan: &mut RestorePlan,
-    ) -> Option<PlannedStrip> {
-        let columns = strip
+        let columns = space
             .columns
             .iter()
             .filter_map(|column| self.plan_column(column, current, plan))
             .collect::<Vec<_>>();
-
-        (!columns.is_empty()).then_some(PlannedStrip {
-            workspace_id: workspace.workspace_id,
-            display_id: workspace.display_id,
-            virtual_index: strip.virtual_index,
-            columns,
-        })
+        if columns.is_empty() {
+            Vec::new()
+        } else {
+            vec![PlannedStrip {
+                workspace_id: space.space_id,
+                display_id: space.display_id,
+                columns,
+            }]
+        }
     }
 
     fn plan_column(
@@ -286,42 +258,13 @@ impl<'a> RestorePlanner<'a> {
     fn current_window_has_saved_hard_match(&self, current: &CurrentWindowIdentity) -> bool {
         self.saved_hard_keys.contains(&current.hard_key())
     }
-
-    fn record_active_virtual(
-        workspace: &SavedWorkspace,
-        surviving_strips: &[PlannedStrip],
-        plan: &mut RestorePlan,
-    ) {
-        let Some(saved_active) = workspace.active_virtual_index else {
-            if let Some(first_survivor) = surviving_strips
-                .iter()
-                .map(|strip| strip.virtual_index)
-                .min()
-            {
-                plan.active_virtual_by_workspace
-                    .insert(workspace.workspace_id, first_survivor);
-            }
-            return;
-        };
-        let Some(nearest_active) = surviving_strips
-            .iter()
-            .map(|strip| strip.virtual_index)
-            .min_by_key(|virtual_index| (virtual_index.abs_diff(saved_active), *virtual_index))
-        else {
-            return;
-        };
-
-        plan.active_virtual_by_workspace
-            .insert(workspace.workspace_id, nearest_active);
-    }
 }
 
 fn saved_windows_in_state(state: &SpoolState) -> impl Iterator<Item = &SavedWindow> {
     state
-        .workspaces
+        .spaces
         .iter()
-        .flat_map(|workspace| &workspace.strips)
-        .flat_map(|strip| &strip.columns)
+        .flat_map(|space| &space.columns)
         .flat_map(saved_windows_in_column)
 }
 
@@ -478,7 +421,7 @@ pub(super) fn restore_window_state(
 
     for entity in &plan.consumed_entities {
         if let Ok(mut entity_commands) = ctx.commands.get_entity(*entity) {
-            entity_commands.try_remove::<Unmanaged>();
+            entity_commands.try_remove::<Floating>();
         }
     }
 
@@ -491,8 +434,8 @@ pub(super) fn restore_window_state(
             &displays,
         ) else {
             warn!(
-                "Skipping restore for workspace {} virtual {} because no display exists",
-                planned.workspace_id, planned.virtual_index
+                "Skipping restore for Space {} because no display exists",
+                planned.workspace_id
             );
             continue;
         };
@@ -509,7 +452,6 @@ pub(super) fn restore_window_state(
                 workspaces.iter_mut().find(|(entity, existing, _, _)| {
                     !emptied_existing_strips.contains(entity)
                         && existing.id() == planned.workspace_id
-                        && existing.virtual_index == planned.virtual_index
                         && !existing.is_fullscreen()
                 })
         {
@@ -520,10 +462,7 @@ pub(super) fn restore_window_state(
             }
         }
 
-        let is_active = plan
-            .active_virtual_by_workspace
-            .get(&planned.workspace_id)
-            .is_some_and(|active| *active == planned.virtual_index);
+        let is_active = plan.active_workspaces.contains(&planned.workspace_id);
         let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
         if is_active {
             for (entity, strip, _, _) in &mut workspaces {
@@ -537,23 +476,13 @@ pub(super) fn restore_window_state(
             }
         }
 
-        let origin = if is_global_active {
-            display.bounds().min
-        } else {
-            display.bounds().max - 10
-        };
-        let previous = PreviousStripPosition {
-            origin: display.bounds().min,
-            focus: strip.all_windows().first().copied(),
-        };
-
-        let mut spawned =
-            ctx.commands
-                .spawn_layout_strip(strip, origin, display_entity, is_global_active);
+        let mut spawned = ctx.commands.spawn_layout_strip(
+            strip,
+            display.bounds().min,
+            display_entity,
+            is_global_active,
+        );
         spawned.try_insert(RefreshWindowSizes::default());
-        if !is_global_active {
-            spawned.insert(previous);
-        }
         restored_strips += 1;
     }
 
@@ -568,12 +497,10 @@ pub(super) fn restore_window_state(
 
 fn layout_strip_from_plan(planned: &PlannedStrip) -> LayoutStrip {
     if let [PlannedColumn::Fullscreen(entity)] = planned.columns.as_slice() {
-        let mut strip = LayoutStrip::fullscreen(planned.workspace_id, *entity);
-        strip.virtual_index = planned.virtual_index;
-        return strip;
+        return LayoutStrip::fullscreen(planned.workspace_id, *entity);
     }
 
-    let mut strip = LayoutStrip::new(planned.workspace_id, planned.virtual_index);
+    let mut strip = LayoutStrip::new(planned.workspace_id);
     apply_planned_columns(&mut strip, &planned.columns);
     strip
 }
@@ -584,7 +511,7 @@ fn current_window_identities(
     restoration: &SpoolState,
 ) -> Vec<CurrentWindowIdentity> {
     let mut current = windows
-        .managed_iter()
+        .tiled_iter()
         .filter_map(|(window, entity, child)| {
             let app = apps.get(child.parent()).ok()?;
             Some(CurrentWindowIdentity {

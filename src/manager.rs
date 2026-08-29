@@ -7,14 +7,17 @@ use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use notify::{RecursiveMode, Watcher};
+use objc2::runtime::{AnyClass, AnyObject};
+use objc2::{msg_send, sel};
 use objc2_core_foundation::{
     CFArray, CFDictionary, CFMutableData, CFNumber, CFNumberType, CFRetained, CFString, CFType,
     CGPoint, CGRect, CGSize, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
-    CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds,
-    CGGetActiveDisplayList, CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo,
-    CGWindowListOption, kCGNullWindowID, kCGWindowNumber,
+    CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEvent,
+    CGEventField, CGEventFlags, CGEventTapLocation, CGGetActiveDisplayList,
+    CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
+    kCGWindowNumber,
 };
 use std::path::Path;
 use std::ptr::null_mut;
@@ -39,9 +42,10 @@ use skylight::{
     SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
     SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
     SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIteratorAdvance,
-    SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags,
-    SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
+    SLSManagedDisplayGetCurrentSpace, SLSRequestNotificationsForWindows, SLSSpaceGetType,
+    SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID,
+    SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
+    SLSWindowQueryWindows,
 };
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
 
@@ -58,6 +62,144 @@ mod windows;
 
 pub type Origin = IVec2;
 pub type Size = IVec2;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent runtime capabilities"
+)]
+pub struct NativeSpaceCapabilities {
+    pub move_windows: bool,
+    pub focus: bool,
+    pub create: bool,
+    pub delete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeSpaceIntent {
+    MoveWindows {
+        window_ids: Vec<WinID>,
+        space_id: WorkspaceId,
+    },
+    Focus {
+        space_id: WorkspaceId,
+        animate: bool,
+    },
+    Create {
+        display_id: CGDirectDisplayID,
+    },
+    Delete {
+        space_id: WorkspaceId,
+    },
+}
+
+fn bridged_window_move_class() -> Option<&'static AnyClass> {
+    let class = AnyClass::get(c"SLSBridgedMoveWindowsToManagedSpaceOperation")?;
+    let has_initializer: bool =
+        unsafe { msg_send![class, instancesRespondToSelector: sel!(initWithWindows:spaceID:)] };
+    let has_executor: bool =
+        unsafe { msg_send![class, instancesRespondToSelector: sel!(performWithWMBridgeDelegate)] };
+    (has_initializer && has_executor).then_some(class)
+}
+
+fn create_bridged_window_move_operation(
+    class: &AnyClass,
+    windows: &CFArray,
+    space_id: WorkspaceId,
+) -> Result<*mut AnyObject> {
+    // CFArray and NSArray are toll-free bridged. The Objective-C initializer
+    // expects an object (`id`), matching yabai's `(__bridge id)window_list_ref`.
+    let windows_object: &AnyObject = unsafe { &*std::ptr::from_ref(windows).cast() };
+    let operation = unsafe {
+        let allocated: *mut AnyObject = msg_send![class, alloc];
+        let operation: *mut AnyObject = msg_send![allocated,
+            initWithWindows: windows_object,
+            spaceID: space_id
+        ];
+        operation
+    };
+    if operation.is_null() {
+        Err(Error::Generic(
+            "native window-to-Space operation initialization failed".to_string(),
+        ))
+    } else {
+        Ok(operation)
+    }
+}
+
+fn native_space_gesture_delta(
+    spaces: &[WorkspaceId],
+    current: WorkspaceId,
+    target: WorkspaceId,
+) -> Result<isize> {
+    let current = spaces
+        .iter()
+        .position(|space_id| *space_id == current)
+        .ok_or_else(|| Error::NotFound("current Space is not in its display".to_string()))?;
+    let target = spaces
+        .iter()
+        .position(|space_id| *space_id == target)
+        .ok_or_else(|| Error::NotFound("target Space is not in its display".to_string()))?;
+    Ok(target.cast_signed() - current.cast_signed())
+}
+
+fn post_native_space_gesture(delta: isize) -> Result<()> {
+    // Private CGEvent fields used by yabai's SIP-on gesture fallback.
+    const EVENT_TYPE: CGEventField = CGEventField(55);
+    const GESTURE_HID_TYPE: CGEventField = CGEventField(110);
+    const SWIPE_MOTION: CGEventField = CGEventField(123);
+    const SWIPE_PROGRESS: CGEventField = CGEventField(124);
+    const SWIPE_VELOCITY_X: CGEventField = CGEventField(129);
+    const GESTURE_PHASE: CGEventField = CGEventField(132);
+
+    if delta == 0 {
+        return Ok(());
+    }
+
+    let event = CGEvent::new(None)
+        .ok_or_else(|| Error::Generic("unable to create Space gesture".to_string()))?;
+    let event = event.as_ref();
+    let sign = if delta > 0 { 1.0 } else { -1.0 };
+    CGEvent::set_integer_value_field(Some(event), EVENT_TYPE, 30);
+    CGEvent::set_integer_value_field(Some(event), GESTURE_HID_TYPE, 23);
+    CGEvent::set_integer_value_field(Some(event), SWIPE_MOTION, 1);
+    CGEvent::set_double_value_field(Some(event), SWIPE_PROGRESS, sign);
+    CGEvent::set_double_value_field(Some(event), SWIPE_VELOCITY_X, sign * 9999.0);
+
+    for _ in 0..delta.unsigned_abs() {
+        CGEvent::set_integer_value_field(Some(event), GESTURE_PHASE, 1);
+        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(event));
+        CGEvent::set_integer_value_field(Some(event), GESTURE_PHASE, 4);
+        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(event));
+    }
+    Ok(())
+}
+
+fn post_animated_space_shortcut(delta: isize) -> Result<()> {
+    const LEFT_ARROW_KEYCODE: u16 = 0x7b;
+    const RIGHT_ARROW_KEYCODE: u16 = 0x7c;
+
+    if delta == 0 {
+        return Ok(());
+    }
+
+    let keycode = if delta > 0 {
+        RIGHT_ARROW_KEYCODE
+    } else {
+        LEFT_ARROW_KEYCODE
+    };
+    let flags = CGEventFlags::MaskControl | CGEventFlags::MaskSecondaryFn;
+    for _ in 0..delta.unsigned_abs() {
+        for key_down in [true, false] {
+            let event = CGEvent::new_keyboard_event(None, keycode, key_down).ok_or_else(|| {
+                Error::Generic("unable to create animated Space shortcut".to_string())
+            })?;
+            CGEvent::set_flags(Some(&event), flags);
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        }
+    }
+    Ok(())
+}
 
 pub fn origin_from(point: CGPoint) -> Origin {
     Origin::new(round_px(point.x), round_px(point.y))
@@ -79,6 +221,11 @@ pub fn irect_from(rect: CGRect) -> IRect {
 /// Defines the interface for a window manager, abstracting OS-specific operations.
 #[automock]
 pub trait WindowManagerApi: Send + Sync {
+    /// Capabilities available without Dock injection or disabling SIP.
+    fn native_space_capabilities(&self) -> NativeSpaceCapabilities;
+    /// Submits a Space operation. Success means accepted by macOS, not
+    /// yet reconciled; callers must wait for events and verify OS membership.
+    fn perform_native_space_intent(&self, intent: &NativeSpaceIntent) -> Result<()>;
     /// Creates a new `Application` instance from a given `ProcessApi`.
     ///
     /// # Arguments
@@ -121,6 +268,8 @@ pub trait WindowManagerApi: Send + Sync {
     ///
     /// `Ok(u64)` with the space ID if successful, otherwise `Err(Error)`.
     fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId>;
+    /// Returns `true` when `space_id` is a native macOS fullscreen Space.
+    fn workspace_is_fullscreen(&self, space_id: WorkspaceId) -> bool;
     /// Returns `true` if the current space on the given display is a native fullscreen space.
     fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool;
     /// Centers the mouse cursor on a given window within its display bounds if it's not already within the window.
@@ -184,6 +333,13 @@ pub trait WindowManagerApi: Send + Sync {
     fn dim_windows(&self, windows: &[WinID], level: f32);
 
     fn windows_on_screen(&self) -> Option<Vec<WinID>>;
+
+    /// Returns every `WindowServer` window in the current GUI session,
+    /// including off-screen and minimized windows.
+    fn windows_in_session(&self) -> Option<Vec<WinID>>;
+
+    /// Refreshes the per-window `WindowServer` notification subscription.
+    fn request_window_notifications(&self, window_ids: &[WinID]) -> Result<()>;
 }
 
 /// `WindowManager` is a Bevy resource that holds a boxed `WindowManagerApi` trait object.
@@ -314,9 +470,65 @@ impl WindowManagerOS {
         unsafe { SLSGetConnectionIDForPSN(self.main_cid, &psn, &mut connection) };
         (connection != 0).then_some(connection)
     }
+
+    fn focus_native_space(&self, target_space_id: WorkspaceId, animate: bool) -> Result<()> {
+        let active_display_id = self.active_display_id()?;
+        let (_, spaces) = self
+            .present_displays()
+            .into_iter()
+            .find(|(display, spaces)| {
+                display.id() == active_display_id && spaces.contains(&target_space_id)
+            })
+            .ok_or_else(|| {
+                Error::InvalidInput("target Space is not on the active display".to_string())
+            })?;
+        let current_space_id = self.active_display_space(active_display_id)?;
+        let delta = native_space_gesture_delta(&spaces, current_space_id, target_space_id)?;
+        if animate {
+            post_animated_space_shortcut(delta)
+        } else {
+            post_native_space_gesture(delta)
+        }
+    }
 }
 
 impl WindowManagerApi for WindowManagerOS {
+    fn native_space_capabilities(&self) -> NativeSpaceCapabilities {
+        NativeSpaceCapabilities {
+            move_windows: bridged_window_move_class().is_some(),
+            focus: true,
+            ..NativeSpaceCapabilities::default()
+        }
+    }
+
+    fn perform_native_space_intent(&self, intent: &NativeSpaceIntent) -> Result<()> {
+        if let NativeSpaceIntent::Focus { space_id, animate } = intent {
+            return self.focus_native_space(*space_id, *animate);
+        }
+        let NativeSpaceIntent::MoveWindows {
+            window_ids,
+            space_id,
+        } = intent
+        else {
+            return Err(Error::Generic(
+                "Space capability unavailable without Dock automation".to_string(),
+            ));
+        };
+        if window_ids.is_empty() {
+            return Err(Error::InvalidInput("window list is empty".to_string()));
+        }
+        let class = bridged_window_move_class().ok_or_else(|| {
+            Error::Generic("native window-to-Space capability unavailable".to_string())
+        })?;
+        let windows = create_array(window_ids, CFNumberType::SInt32Type)?;
+        unsafe {
+            let operation = create_bridged_window_move_operation(class, &windows, *space_id)?;
+            let _: () = msg_send![operation, performWithWMBridgeDelegate];
+            let _: () = msg_send![operation, release];
+        }
+        Ok(())
+    }
+
     fn new_application(&self, process: &dyn ProcessApi) -> Result<Application> {
         let connection = self.connection_for_process(process.psn());
         ApplicationOS::new(connection, process, &self.event_sender)
@@ -392,9 +604,13 @@ impl WindowManagerApi for WindowManagerOS {
         })
     }
 
+    fn workspace_is_fullscreen(&self, space_id: WorkspaceId) -> bool {
+        unsafe { SLSSpaceGetType(self.main_cid, space_id) == 4 }
+    }
+
     fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool {
         self.active_display_space(display_id)
-            .is_ok_and(|space_id| unsafe { SLSSpaceGetType(self.main_cid, space_id) } == 4)
+            .is_ok_and(|space_id| self.workspace_is_fullscreen(space_id))
     }
 
     /// Centers the mouse cursor on the window if it's not already within the window's bounds.
@@ -563,18 +779,46 @@ impl WindowManagerApi for WindowManagerOS {
     fn windows_on_screen(&self) -> Option<Vec<WinID>> {
         let options =
             CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
-        let window_list_info = CGWindowListCopyWindowInfo(options, kCGNullWindowID);
-        window_list_info.map(|window_info| {
-            let array = unsafe { window_info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
-            array
-                .iter()
-                .filter_map(|dict| {
-                    dict.get(unsafe { kCGWindowNumber })
-                        .and_then(|id| id.as_i32())
-                })
-                .collect::<Vec<_>>()
-        })
+        window_ids_matching(options)
     }
+
+    fn windows_in_session(&self) -> Option<Vec<WinID>> {
+        window_ids_matching(
+            CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements,
+        )
+    }
+
+    fn request_window_notifications(&self, window_ids: &[WinID]) -> Result<()> {
+        if crate::platform::macos_major_version() < 15 {
+            return Ok(());
+        }
+        let count = i32::try_from(window_ids.len()).map_err(|_| {
+            Error::InvalidInput(
+                "too many windows for WindowServer notification subscription".into(),
+            )
+        })?;
+        unsafe {
+            SLSRequestNotificationsForWindows(
+                self.main_cid,
+                window_ids.as_ptr().cast::<u32>(),
+                count,
+            )
+        }
+        .to_result(function_name!())
+    }
+}
+
+fn window_ids_matching(options: CGWindowListOption) -> Option<Vec<WinID>> {
+    CGWindowListCopyWindowInfo(options, kCGNullWindowID).map(|window_info| {
+        let array = unsafe { window_info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
+        array
+            .iter()
+            .filter_map(|dict| {
+                dict.get(unsafe { kCGWindowNumber })
+                    .and_then(|id| id.as_i32())
+            })
+            .collect::<Vec<_>>()
+    })
 }
 
 /// Retrieves a list of window IDs for specified spaces and connection, with an option to include minimized windows.
@@ -864,5 +1108,38 @@ impl notify::EventHandler for ConfigHandler {
                 warn!("error sending config refresh: {err}");
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod native_space_runtime_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires macOS 26.4+ private SkyLight runtime"]
+    fn bridged_window_move_capability_is_discoverable() {
+        assert!(bridged_window_move_class().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires macOS 26.4+ private SkyLight runtime"]
+    fn cf_window_list_is_bridged_as_an_object() {
+        let class = bridged_window_move_class().expect("bridged move class");
+        let windows = create_array(&[0], CFNumberType::SInt32Type).expect("window array");
+        let operation = create_bridged_window_move_operation(class, &windows, 0)
+            .expect("bridged move operation");
+        unsafe {
+            let _: () = msg_send![operation, release];
+        }
+    }
+
+    #[test]
+    fn native_space_gesture_delta_uses_display_order() {
+        let spaces = [10, 20, 30, 40];
+        assert_eq!(native_space_gesture_delta(&spaces, 10, 40).unwrap(), 3);
+        assert_eq!(native_space_gesture_delta(&spaces, 40, 20).unwrap(), -2);
+        assert_eq!(native_space_gesture_delta(&spaces, 20, 20).unwrap(), 0);
+        assert!(native_space_gesture_delta(&spaces, 99, 20).is_err());
+        assert!(native_space_gesture_delta(&spaces, 20, 99).is_err());
     }
 }

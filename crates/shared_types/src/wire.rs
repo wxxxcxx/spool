@@ -32,7 +32,7 @@ pub use crate::script_state::WriteOutcome;
 
 use crate::script_state::ScriptStateWrite;
 use crate::script_value::ScriptValue;
-use crate::state::{ActiveState, QueryState, StateQueryKind, VirtualWorkspaceState, WindowState};
+use crate::state::{ActiveState, QueryState, SpaceState, StateQueryKind, WindowState};
 use crate::windowset::{LayoutOp, WindowSet};
 
 /// Something a client asks the daemon to do.
@@ -81,7 +81,7 @@ pub enum Response {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum QueryPayload {
     State(Box<QueryState>),
-    VirtualWorkspaces(Vec<VirtualWorkspaceState>),
+    Spaces(Vec<SpaceState>),
     Active(Box<ActiveState>),
     OnScreen(Vec<WindowState>),
 }
@@ -96,7 +96,7 @@ impl QueryPayload {
     pub fn to_json(&self) -> serde_json::Result<serde_json::Value> {
         match self {
             Self::State(state) => serde_json::to_value(state),
-            Self::VirtualWorkspaces(rows) => serde_json::to_value(rows),
+            Self::Spaces(spaces) => serde_json::to_value(spaces),
             Self::Active(active) => serde_json::to_value(active),
             Self::OnScreen(windows) => serde_json::to_value(windows),
         }
@@ -148,9 +148,7 @@ mod tests {
     #[test]
     fn every_response_survives_the_wire() {
         round_trip(&Response::Query(QueryPayload::Active(Box::default())));
-        round_trip(&Response::Query(
-            QueryPayload::VirtualWorkspaces(Vec::new()),
-        ));
+        round_trip(&Response::Query(QueryPayload::Spaces(Vec::new())));
         round_trip(&Response::Query(QueryPayload::OnScreen(Vec::new())));
         round_trip(&Response::ScriptState(ScriptStateResponse::Value(Some(
             ScriptValue::Str("hello".to_string()),
@@ -179,7 +177,6 @@ mod tests {
                 height: 600,
             }),
             floating: false,
-            managed: true,
             visible: true,
             focused: id == 1,
         };
@@ -194,8 +191,8 @@ mod tests {
                 },
                 active: true,
                 workspaces: Arc::new(vec![WorkspaceSet {
-                    number: 1,
-                    native_id: 10,
+                    space_id: 10,
+                    ordinal: 0,
                     active: true,
                     columns: Arc::new(vec![
                         ColumnSet::single(window(1), 0.5),

@@ -35,11 +35,21 @@ General behavior settings for the window manager.
 | `window_hidden_ratio` | Float (0.0–1.0) | `0.0` | How much of a window can be hidden before it's forced into view on focus change. `0.0` = eager, `1.0` = lazy. |
 | `window_resize_cycle` | Boolean | `true` | If disabled, `window_resize` and `window_shrink` stop at the largest/smallest preset instead of cycling back. |
 | `mouse_resize_modifier` | String | *None* | If enabled allows window resizing using mouse movement. For example `cmd + shift` will allow resizing of the window when holding those keys. Proximity of the pointer to left or right window edge determines which side will be adjusted. |
-| `reap_empty_workspaces` | String | `false` | If enabled, a virtual workspace without any windows will be removed. |
 | `disable_native_tabs` | Boolean | `false` | If enabled, Spool will not auto-merge a newly-spawned window into a tab group with an existing same-app sibling that shares its frame. Use this if you find unrelated windows being grouped together. |
-| `virtual_workspace_animations` | Boolean | `false` | If enabled, Spool will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
-| `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
-| `create_virtual_workspace_automatically` | Boolean | `false` | Automatically creates a new virtual workspace when using `window_virtual_south `or Southward gesture controls. |
+| `experimental_space_control` | Boolean | `false` | Enables capability-probed private Space control. The current backend may focus a Space on the active display or move windows to a user Space; create/delete remain unavailable. This never injects into Dock and does not require disabling SIP. |
+| `space_switch_animation` | Boolean | `true` | Uses the native Mission Control animation when focusing a Space. Requires macOS's “Move left/right a space” shortcuts to be enabled. When disabled, Spool uses the instant high-velocity gesture path. |
+
+---
+
+Numeric shortcuts include both user and fullscreen Spaces in the order returned
+by `spool.query_spaces()`. The same order drives bounded adjacent-Space bindings such as
+`Option+[` / `Option+]` or `Ctrl+Option+Left/Right`; reaching the first or last
+numbered Space is a no-op.
+
+The example Lua configuration binds `Shift+Option+1...7` to move the focused
+window, switch to the destination Space, and focus it after macOS confirms the
+move. `Shift+Control+Option+1...7` keeps the original move-without-following
+behavior.
 
 ---
 
@@ -71,7 +81,7 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | :--- | :--- | :--- | :--- |
 | `fingers_count` | Integer | *None* | Number of fingers for the swipe gesture. Set to 3 or more to enable. |
 | `direction` | String | `"Natural"` | Direction of movement: `"Natural"` or `"Reversed"`. |
-| `vertical` | Boolean | `true` | Interpret the vertical gestures with `fingers_count` or ignore them. Enabling this allows using vertical swipe gestures to change virtual desktops. |
+| `vertical` | Boolean | `true` | Let vertical gestures scroll the current Space's horizontal layout strip. Disable it to leave vertical gestures to macOS. |
 
 When `fingers_count` is omitted or set below 3, Spool does not intercept native macOS gestures. If macOS uses three-finger horizontal swipes for Spaces, prefer `[swipe.scroll]` with a modifier or configure a different finger count.
 
@@ -79,27 +89,12 @@ When `fingers_count` is omitted or set below 3, Spool does not intercept native 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `modifier` | String | `"alt"` | Modifier key(s) required to slide windows with the scroll wheel: `"alt"`, `"rcmd"`, `"ralt + cmd"`, `"lctrl + lalt + cmd"`, etc. |
-| `vertical_modifier` | String | *None* | Additional modifier key that, when held together with `modifier`, switches virtual workspaces vertically instead of scrolling horizontally. For example, if `modifier = "alt"` and `vertical_modifier = "shift"`, then `alt + scroll` slides windows horizontally and `alt + shift + scroll` switches virtual workspace rows. |
 
 ---
 
 ## 4. Decorations (`[decorations]`)
 
 Visual styling for workspaces, active and inactive windows.
-
-### Virtual Workspace indicators
-
-Toggles display of the currently active virtual workspace in the menubar or in a brief status popup window. Both are enabled by default.
-(Note: disabling menubar indicator requires a restart)
-
-**Example:**
-```toml
-[decorations]
-# Both default to true
-workspace_menu_status = false
-workspace_popup_status = true
-```
-
 
 ### `[decorations.inactive.dim] (Native macOS Dimming)`
 
@@ -143,8 +138,8 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_focus_west` / `_east` | Focus window to the left/right. |
 | `window_focus_north` / `_south` | Focus window above/below. If no window exists, switches focus to the display in that direction. |
 | `window_focus_first` / `_last` | Jump to the start/end of the strip. |
-| `window_focus_managed` | Switch to a previously focused window on this workspace. |
-| `window_focus_unmanaged` | Switch to a previously focused floating window on this workspace. |
+| `window_focus_tiled` | Switch to a previously focused tiled window on this Space. |
+| `window_focus_floating` | Switch to a previously focused floating window on this Space. |
 | `window_swap_west` / `_east` | Swap current window with neighbor. |
 | `window_swap_north` / `_south` | Swap current window above/below. If no window exists, moves the window to the display in that direction. |
 | `window_swap_first` / `_last` | Move current window to start/end of strip. |
@@ -153,7 +148,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_grow` | Alias for `window_resize`. |
 | `window_shrink` | Cycle through preset widths (Shrink). |
 | `window_fullwidth` | Toggle full-width mode. |
-| `window_manage` | Toggle between tiled and floating state. |
+| `window_togglefloating` | Toggle between tiled and floating state. |
 | `window_stack` | Stack the current window into the column on the left. |
 | `window_unstack` | Pull a window out of a stack into its own column. |
 | `window_equalize` | Make all windows in a stack equal height. |
@@ -174,61 +169,13 @@ window_focus_west = "cmd - h"
 window_resize = ["alt - r", "ctrl - r"]
 ```
 
-### Virtual workspaces (Experimental)
+### Spaces
 
-Spool allows having virtual spaces inside of the native macOS workspace.
-Logically it can be thought of several strips of windows (rows) stacked on top
-of each other within the single workspace. Similar to how Niri implements the
-movement between the vertical workspaces.
-
-Shifting up or down goes to the previous or next strip of windows - wrapping
-around at the start or the end.
-
-Moving the last window out of the virtual row, will "collapse it".
-
-Virtual workspaces can also be navigated using trackpad gestures. If `[swipe.gesture]` is configured, a vertical 3/4-finger swipe will switch between virtual workspace rows, while horizontal swipes continue to scroll the strip as usual. For mouse users, see the `vertical_modifier` option under `[swipe.scroll]`.
-
-| Action | Description |
-| :--- | :--- |
-| `window_virtual_north` / `_south` / `_first` / `_last` | Switch to the previous/next or first/last virtual workspace (row of windows). `_east` or `_west` are aliases for `_north` and `_south`. |
-| `window_virtualnum_<number>` | Switch directly to the numbered virtual workspace. |
-| `window_virtualmove_north` / `_south` / `_first` / `_last` | Move currently focused window to the previous/next or first/last virtual workspace and follow it. `_east` or `_west` are aliases for `_north` and `_south`. |
-| `window_virtualsend_north` / `_south` / `_first` / `_last` | Move currently focused window to the previous/next or first/last virtual workspace but stay on the current one. `_east` or `_west` are aliases for `_north` and `_south`. |
-| `window_virtualmovenum_<number>` | Move currently focused window to the numbered virtual workspace and follow it. |
-| `window_virtualsendnum_<number>` | Move currently focused window to the numbered virtual workspace but stay on the current one. |
-
-
-**Example:**
-```toml
-[bindings]
-window_virtual_north = "cmd + shift - k"
-window_virtual_south = "cmd + shift - j"
-window_virtualmove_north = "cmd + alt - k"
-window_virtualmove_south = "cmd + alt - j"
-window_virtualnum_1 = "cmd + alt - 1"
-window_virtualnum_2 = "cmd + alt - 2"
-window_virtualnum_3 = "cmd + alt - 3"
-window_virtualmovenum_1 = "cmd + alt + ctrl - 1"
-window_virtualmovenum_2 = "cmd + alt + ctrl - 2"
-window_virtualmovenum_3 = "cmd + alt + ctrl - 3"
-window_virtualsendnum_1 = "cmd + alt + shift - 1"
-window_virtualsendnum_2 = "cmd + alt + shift - 2"
-window_virtualsendnum_3 = "cmd + alt + shift - 3"
-```
-
-**Example command line:**
-```shell
-# Move to the previous virtual workspace.
-$ spool send-cmd window virtual north
-# Move the current window to the next virtual workspace.
-$ spool send-cmd window virtualmove south
-# Move directly to virtual workspace 3.
-$ spool send-cmd window virtualnum 3
-# Move the current window to virtual workspace 3 and follow it.
-$ spool send-cmd window virtualmovenum 3
-# Send the current window to virtual workspace 3 and stay here.
-$ spool send-cmd window virtualsendnum 3
-```
+Spool owns one `LayoutStrip` per macOS Space. macOS remains the source
+of truth for Space lifecycle, order, visibility, and fullscreen Spaces. Use
+Mission Control or system gestures to navigate by default. Experimental
+commands are documented in
+[QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md).
 
 See [QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md) for the
 structured `spool query` responses and `spool subscribe` event stream.
@@ -243,8 +190,8 @@ Define specific behaviors for applications based on their Title or Bundle ID.
 | :--- | :--- | :--- |
 | `title` | Regex | **(Required)** Regex pattern to match the window title. |
 | `bundle_id` | String | Optional Bundle ID to match (e.g., `com.apple.Terminal`). |
-| `floating` | Boolean | Force the window to be floating/unmanaged. |
-| `manage` | Boolean | Force Spool to manage this app/window even if macOS reports the app as unobservable or the window has a non-standard role/subrole. |
+| `floating` | Boolean | Start the tracked window outside the tiling layout. |
+| `track` | Boolean | Force Spool to track this app/window even if macOS reports the app as unobservable or the window has a non-standard role/subrole. |
 | `index` | Integer | Preferred position in the strip when spawned. |
 | `dont_focus` | Boolean | Prevent the window from taking focus when spawned. |
 | `width` | Positive Float | Initial width ratio for the window. Values above `1.0` create an oversized, horizontally scrollable window. |
@@ -262,18 +209,18 @@ horizontal_padding = 5
 bindings_passthrough = ["ctrl-h", "ctrl-l"]
 ```
 
-### Forcing management of LSUIElement or non-standard windows
+### Tracking LSUIElement or non-standard windows
 
 Some applications (e.g., BetterTouchTool, ProtonVPN) are flagged as background apps
 (`LSUIElement`) or expose windows with unusual accessibility roles such as `AXTable`
-or `AXTextField`. Spool normally ignores these processes and windows. Use `manage = true`
-to opt in and forcibly manage the matching windows.
+or `AXTextField`. Spool normally ignores these processes and windows. Use `track = true`
+to opt in and forcibly track the matching windows.
 
 ```toml
 [windows.btt_main]
 bundle_id = "com.hegenberg.BetterTouchTool"
 title = "BetterTouchTool"
-manage = true
+track = true
 
 [windows.btt_screenshot]
 bundle_id = "com.hegenberg.BetterTouchTool"
@@ -283,7 +230,7 @@ floating = true
 
 ### Session Restore
 
-Spool saves its managed window layout and can restore it the next time it
+Spool saves its tracked window layout and can restore it the next time it
 starts. Restore is a startup-only phase: Spool loads the saved session, applies
 it after initial window discovery, keeps matching open for a short grace period,
 then stops consulting the saved state until the next Spool process start.
@@ -291,13 +238,13 @@ then stops consulting the saved state until the next Spool process start.
 The saved session includes:
 
 - native workspace ids
-- virtual workspace rows and the selected row per native workspace
+- Space ID, order hint, kind, and one layout strip per Space
 - layout structure: singles, stacks, tabs, and fullscreen strips
 - display/screen association
 - window identity for matching across restarts
 
 Matched startup windows use the saved session before static `[windows]` rules.
-That means saved layout, virtual workspace, display, and managed/floating state
+That means saved layout, Space, display, and tiled/floating state
 win over configured `index`, `floating`, `width`, and `grid` rules during
 restore. Unmatched startup windows, and all windows created after the restore
 grace period ends, keep normal `[windows]` behavior.

@@ -88,6 +88,14 @@ struct MockStateInner {
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
+    /// Windows missing from both inventories whose cached AX handles still
+    /// answer attribute queries, as some applications do after closing.
+    stale_ax_handles: HashSet<WinID>,
+    /// AX has withdrawn these windows while CoreGraphics still retains an
+    /// on-screen surface for them briefly.
+    withdrawn_surfaces: HashMap<WinID, MockWindowData>,
+    native_space_control: bool,
+    native_space_intents: Vec<crate::manager::NativeSpaceIntent>,
 }
 
 #[derive(Clone)]
@@ -107,6 +115,10 @@ impl MockState {
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
+                stale_ax_handles: HashSet::new(),
+                withdrawn_surfaces: HashMap::new(),
+                native_space_control: false,
+                native_space_intents: Vec::new(),
             })),
         }
     }
@@ -115,6 +127,22 @@ impl MockState {
         let mut state = self.inner.force_write();
         let window = state.windows.get_mut(&window_id).expect("finding window");
         window.visible = visible;
+    }
+
+    pub(crate) fn enable_native_space_control(&self) {
+        self.inner.force_write().native_space_control = true;
+    }
+
+    pub(crate) fn native_space_intents(&self) -> Vec<crate::manager::NativeSpaceIntent> {
+        self.inner.force_read().native_space_intents.clone()
+    }
+
+    pub(crate) fn window_workspace(&self, window_id: WinID) -> Option<WorkspaceId> {
+        self.inner
+            .force_read()
+            .windows
+            .get(&window_id)
+            .map(|window| window.workspace_id)
     }
 
     // --- OS Behavior Methods ---
@@ -169,9 +197,7 @@ impl MockState {
                 inner
                     .event_queue
                     .push_back(Event::ApplicationFrontSwitched { psn });
-                inner
-                    .event_queue
-                    .push_back(Event::WindowFocused { window_id: id });
+                inner.event_queue.push_back(Event::window_focused(id));
             }
         }
     }
@@ -321,6 +347,40 @@ impl MockState {
     #[allow(unused)]
     pub fn os_vanish_window(&self, id: WinID) {
         self.inner.force_write().windows.remove(&id);
+    }
+
+    /// Makes a window disappear without notifications while its cached AX
+    /// element keeps responding to attribute queries.
+    #[allow(unused)]
+    pub fn os_vanish_window_with_stale_ax_handle(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        if inner.windows.remove(&id).is_some() {
+            inner.stale_ax_handles.insert(id);
+        }
+    }
+
+    /// Withdraws the AX window while leaving its CoreGraphics surface visible.
+    #[allow(unused)]
+    pub fn os_withdraw_window(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        if let Some(window) = inner.windows.remove(&id) {
+            inner.withdrawn_surfaces.insert(id, window);
+        }
+    }
+
+    /// Lets CoreGraphics catch up after an AX-withdrawn window is closed.
+    #[allow(unused)]
+    pub fn os_settle_withdrawn_surface(&self, id: WinID) {
+        self.inner.force_write().withdrawn_surfaces.remove(&id);
+    }
+
+    /// Makes an AX-withdrawn window available again.
+    #[allow(unused)]
+    pub fn os_restore_withdrawn_window(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        if let Some(window) = inner.withdrawn_surfaces.remove(&id) {
+            inner.windows.insert(id, window);
+        }
     }
 
     /// Lets the app's window list catch up with reality after a close.
@@ -473,12 +533,16 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_role().returning(move || {
-            Ok(s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.role.clone())
-                .unwrap_or_default())
+            let inner = s.inner.force_read();
+            if let Some(window) = inner.windows.get(&id) {
+                Ok(window.role.clone())
+            } else if inner.stale_window_ids.contains_key(&id)
+                || inner.stale_ax_handles.contains(&id)
+            {
+                Ok("AXWindow".to_string())
+            } else {
+                Err(Error::InvalidWindow)
+            }
         });
 
         let s = self.clone();
@@ -625,8 +689,88 @@ impl MockState {
         let (s, ids) = (self.clone(), window_ids.clone());
         ma.expect_window_list()
             .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
+        ma.expect_window_ids().returning(move || Ok(window_ids()));
 
         Application::new(Box::new(ma))
+    }
+
+    fn mock_native_space_queries(&self, wm: &mut MockWindowManagerApi) {
+        let s = self.clone();
+        wm.expect_native_space_capabilities().returning(move || {
+            let enabled = s.inner.force_read().native_space_control;
+            crate::manager::NativeSpaceCapabilities {
+                move_windows: enabled,
+                focus: enabled,
+                ..crate::manager::NativeSpaceCapabilities::default()
+            }
+        });
+        let s = self.clone();
+        wm.expect_perform_native_space_intent()
+            .returning(move |intent| {
+                let mut state = s.inner.force_write();
+                if !state.native_space_control {
+                    return Err(Error::Generic("Space capability unavailable".to_string()));
+                }
+                if let crate::manager::NativeSpaceIntent::MoveWindows {
+                    window_ids,
+                    space_id,
+                } = intent
+                {
+                    for id in window_ids {
+                        if let Some(window) = state.windows.get_mut(id) {
+                            window.workspace_id = *space_id;
+                        }
+                    }
+                } else if let crate::manager::NativeSpaceIntent::Focus { space_id, .. } = intent {
+                    let active_display_id = state.active_display_id;
+                    if let Some(display) = state.displays.get_mut(&active_display_id) {
+                        display.workspaces.retain(|id| id != space_id);
+                        display.workspaces.insert(0, *space_id);
+                        state.event_queue.push_back(Event::SpaceChanged);
+                    }
+                }
+                state.native_space_intents.push(intent.clone());
+                Ok(())
+            });
+        let s = self.clone();
+        wm.expect_workspace_is_fullscreen()
+            .returning(move |workspace_id| {
+                s.inner
+                    .force_read()
+                    .fullscreen_spaces
+                    .contains(&workspace_id)
+            });
+    }
+
+    fn mock_window_server_inventory(&self, wm: &mut MockWindowManagerApi) {
+        let s = self.clone();
+        wm.expect_windows_on_screen().returning(move || {
+            let inner = s.inner.force_read();
+            let windows = inner
+                .windows
+                .iter()
+                .chain(inner.withdrawn_surfaces.iter())
+                .filter_map(|(id, window)| window.visible.then_some(id))
+                .copied()
+                .collect::<Vec<_>>();
+            Some(windows)
+        });
+
+        let s = self.clone();
+        wm.expect_windows_in_session().returning(move || {
+            let inner = s.inner.force_read();
+            Some(
+                inner
+                    .windows
+                    .keys()
+                    .chain(inner.withdrawn_surfaces.keys())
+                    .copied()
+                    .collect(),
+            )
+        });
+
+        wm.expect_request_window_notifications()
+            .returning(|_| Ok(()));
     }
 
     pub fn create_window_manager(&self) -> MockWindowManagerApi {
@@ -645,6 +789,8 @@ impl MockState {
                 .map(|d| d.workspaces[0])
                 .ok_or(Error::InvalidWindow)
         });
+
+        self.mock_native_space_queries(&mut wm);
 
         let s = self.clone();
         wm.expect_is_fullscreen_space()
@@ -705,18 +851,7 @@ impl MockState {
                 Ok(windows)
             });
 
-        let s = self.clone();
-        wm.expect_windows_on_screen().returning(move || {
-            let windows = s
-                .inner
-                .force_read()
-                .windows
-                .iter()
-                .filter_map(|(id, window)| window.visible.then_some(id))
-                .copied()
-                .collect::<Vec<_>>();
-            Some(windows)
-        });
+        self.mock_window_server_inventory(&mut wm);
 
         let s = self.clone();
         wm.expect_warp_mouse()
@@ -762,7 +897,7 @@ impl MockState {
         mp.expect_is_observable().returning(|| true);
         mp.expect_application().return_const(None);
         mp.expect_ready().return_const(true);
-        mp.expect_force_manage().return_const(());
+        mp.expect_force_track().return_const(());
 
         mp
     }

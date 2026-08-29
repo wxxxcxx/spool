@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 use self::decorations::BorderRadiusOption;
 use self::swipe::SwipeGestureDirection;
 #[cfg(test)]
-use crate::commands::{MoveFocus, Operation, ResizeDirection};
+use crate::commands::{Operation, ResizeDirection};
 use crate::{
     commands::Command,
     manager::ProcessApi,
@@ -446,8 +446,8 @@ impl Config {
     }
 
     /// Returns `true` if any window rule for the given bundle ID requests that the
-    /// process be forcibly managed even when macOS reports it as unobservable.
-    pub fn should_force_manage_process(&self, process: &dyn ProcessApi) -> bool {
+    /// process be forcibly tracked even when macOS reports it as unobservable.
+    pub fn should_force_track_process(&self, process: &dyn ProcessApi) -> bool {
         self.inner().windows.as_ref().is_some_and(|windows| {
             let Some(bundle_id) = process
                 .application()
@@ -462,7 +462,7 @@ impl Config {
                     .bundle_id
                     .as_ref()
                     .is_some_and(|id| id.as_str() == bundle_id)
-                    && params.manage.is_some_and(|manage| manage)
+                    && params.track.is_some_and(|track| track)
             })
         })
     }
@@ -715,15 +715,6 @@ impl Config {
             .unwrap_or(Modifiers::ALT)
     }
 
-    pub fn swipe_scroll_vertical_modifier(&self) -> Option<Modifiers> {
-        let config = self.inner();
-        config
-            .swipe
-            .as_ref()
-            .and_then(|swipe| swipe.scroll.as_ref())
-            .and_then(|scroll| scroll.vertical_modifier)
-    }
-
     pub fn window_dim_ratio(&self, is_dark: bool) -> Option<f32> {
         let config = self.inner();
         if config
@@ -795,13 +786,6 @@ impl Config {
         self.options().horizontal_mouse_warp_offset.unwrap_or(0)
     }
 
-    pub fn reap_empty_workspaces(&self) -> bool {
-        // Default is disabled..
-        self.options()
-            .reap_empty_workspaces
-            .is_some_and(|reap| reap)
-    }
-
     pub fn native_tabs_enabled(&self) -> bool {
         // Default is enabled.
         !self
@@ -810,48 +794,20 @@ impl Config {
             .is_some_and(|disabled| disabled)
     }
 
-    pub fn workspace_menu_status(&self) -> bool {
-        self.inner()
-            .decorations
-            .as_ref()
-            .and_then(|decorations| decorations.workspace_menu_status)
+    /// Enables the private, capability-probed Space control adapter.
+    /// Off by default; observe-only Space state remains available.
+    pub fn space_control_enabled(&self) -> bool {
+        self.options()
+            .experimental_space_control
+            .is_some_and(|enabled| enabled)
+    }
+
+    /// Uses Mission Control's animated Control+Arrow transition when focusing
+    /// a Space. Enabled by default; set the option to false for instant switching.
+    pub fn space_switch_animation(&self) -> bool {
+        self.options()
+            .space_switch_animation
             .is_none_or(|enabled| enabled)
-    }
-
-    pub fn workspace_popup_status(&self) -> bool {
-        self.inner()
-            .decorations
-            .as_ref()
-            .and_then(|decorations| decorations.workspace_popup_status)
-            .is_none_or(|enabled| enabled)
-    }
-
-    pub fn virtual_workspace_animations(&self) -> bool {
-        // Default is disabled
-        self.options()
-            .virtual_workspace_animations
-            .is_some_and(|enabled| enabled)
-    }
-
-    /// Number of virtual workspaces to pre-create on each physical space at
-    /// startup. Default: 1 (just the physical space itself, no extra virtual
-    /// workspaces).
-    pub fn default_workspaces(&self) -> u32 {
-        self.inner().default_workspaces.unwrap_or(1).max(1)
-    }
-
-    pub fn insert_windows_mid_strip(&self) -> bool {
-        // Default is disabled: appending to the end of the strip is the
-        // expected behaviour, especially when moving several windows.
-        self.options()
-            .insert_windows_mid_strip
-            .is_some_and(|enabled| enabled)
-    }
-
-    pub fn create_workspace_automatically(&self) -> bool {
-        self.options()
-            .create_virtual_workspace_automatically
-            .is_some_and(|enabled| enabled)
     }
 }
 
@@ -939,7 +895,6 @@ struct InnerConfig {
     bindings: HashMap<String, OneOrMore>,
     windows: Option<HashMap<String, WindowParams>>,
     decorations: Option<decorations::DecorationsOptions>,
-    default_workspaces: Option<u32>,
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
     restore: Option<RestoreOptions>,
@@ -1108,29 +1063,18 @@ pub struct MainOptions {
     /// Default: true (cycles). Set to false to stop at the limits.
     pub window_resize_cycle: Option<bool>,
 
-    /// If enabled, an empty virtual workspace will be removed.
-    /// Default: false.
-    pub reap_empty_workspaces: Option<bool>,
-
     /// Disable detection of native macOS tabs. When set, newly-spawned windows are
     /// never auto-merged into a tab group with an existing same-app sibling.
     /// Default: false.
     pub disable_native_tabs: Option<bool>,
 
-    /// Enable animation of virtual workspace swaps.
-    /// Off by default, because people use virtual workspaces due to the slow animation of the
-    /// native macOS workspaces.
-    pub virtual_workspace_animations: Option<bool>,
+    /// Opts into private Space control when the running macOS exposes
+    /// the required bridged operation. Never disables SIP or injects Dock.
+    pub experimental_space_control: Option<bool>,
 
-    /// When moving a window to another virtual workspace, insert it at the column
-    /// matching its current on-screen position (keeping it where you see it,
-    /// shifting the rest) instead of appending it to the end of the strip.
-    /// Off by default.
-    pub insert_windows_mid_strip: Option<bool>,
-
-    /// If a non-enumerated (e.g. South) gesture or window movement would target a nonexistent
-    /// virtual workspace, create the workspace automatically.
-    pub create_virtual_workspace_automatically: Option<bool>,
+    /// Use the native Mission Control animation when switching Spaces.
+    /// Default: true.
+    pub space_switch_animation: Option<bool>,
 }
 
 /// Returns a default set of column widths.
@@ -1194,11 +1138,11 @@ pub struct WindowParams {
     title: Regex,
     /// An optional bundle identifier to match against the application's bundle ID.
     bundle_id: Option<String>,
-    /// If `true`, the window will be managed as a floating window (not tiled).
+    /// If `true`, the tracked window starts floating instead of tiled.
     pub floating: Option<bool>,
-    /// If `true`, force the process/window to be managed even if macOS reports it as
+    /// If `true`, force the process/window to be tracked even if macOS reports it as
     /// unobservable or the window does not look like a standard window.
-    pub manage: Option<bool>,
+    pub track: Option<bool>,
     /// An optional preferred index for the window's position in the window strip.
     pub index: Option<usize>,
     pub vertical_padding: Option<i32>,
@@ -1206,7 +1150,7 @@ pub struct WindowParams {
     pub dont_focus: Option<bool>,
     /// An optional positive initial width ratio relative to the display width.
     /// Values above 1.0 create an oversized, horizontally scrollable window.
-    /// Overrides the default column width when the window is first managed.
+    /// Overrides the default column width when the window is first tiled.
     pub width: Option<f64>,
     /// Grid placement for floating windows: "cols:rows:x:y:w:h".
     /// Divides the display into a grid and positions the window at the given cell/span.
@@ -1230,7 +1174,7 @@ impl WindowParams {
             title: Regex::new(title).unwrap(),
             bundle_id,
             floating: None,
-            manage: None,
+            track: None,
             index: None,
             vertical_padding: None,
             horizontal_padding: None,
@@ -1760,7 +1704,7 @@ focus_follows_mouse = true
 
 [bindings]
 quit = "ctrl+alt-q"
-window_manage = "ctrl+alt-t"
+window_togglefloating = "ctrl+alt-t"
 window_stack = ["ctrl-s", "alt-s"]
 window_shrink = "alt-d"
 window_snap = "fn-x"
@@ -1808,17 +1752,17 @@ index = 1
     let keycode = find_key('t');
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::ALT | Modifiers::CTRL),
-        Some(Command::Window(Operation::Manage))
+        Some(Command::Window(Operation::ToggleFloating))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::LALT | Modifiers::LCTRL),
-        Some(Command::Window(Operation::Manage))
+        Some(Command::Window(Operation::ToggleFloating))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::RALT | Modifiers::RCTRL),
-        Some(Command::Window(Operation::Manage))
+        Some(Command::Window(Operation::ToggleFloating))
     ));
 
     let keycode = find_key('s');
@@ -1884,41 +1828,6 @@ index = 1
 }
 
 #[test]
-fn test_config_parsing_absolute_virtual_workspace_bindings() {
-    let input = r#"
-[options]
-
-[bindings]
-window_virtualnum_3 = "cmd + alt - 3"
-window_virtualsendnum_3 = "cmd + alt + shift - 3"
-"#;
-    let virtual_keys = test_virtual_keymap();
-    let config = Config {
-        inner: Arc::new(ArcSwap::from_pointee(
-            InnerConfig::parse_config_with_virtual_keys(input, &virtual_keys)
-                .expect("Failed to parse config"),
-        )),
-    };
-    let find_key = |k| {
-        virtual_keycode()
-            .find_map(|(s, v)| (format!("{k}") == *s).then_some(*v))
-            .unwrap()
-    };
-    let keycode = find_key('3');
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::CMD | Modifiers::ALT),
-        Some(Command::Window(Operation::VirtualNumber(2)))
-    ));
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::CMD | Modifiers::ALT | Modifiers::SHIFT),
-        Some(Command::Window(Operation::VirtualMoveNumber(
-            2,
-            MoveFocus::Stay
-        )))
-    ));
-}
-
-#[test]
 fn test_parse_resize_commands() {
     assert!(matches!(
         parse_command(&["window", "resize"]).unwrap(),
@@ -1947,49 +1856,6 @@ fn test_parse_restart_command() {
 }
 
 #[test]
-fn test_parse_absolute_virtual_workspace_commands() {
-    assert!(matches!(
-        parse_command(&["window", "virtualnum", "3"]).unwrap(),
-        Command::Window(Operation::VirtualNumber(2))
-    ));
-    assert!(parse_command(&["workspace", "virtual", "3"]).is_err());
-    assert!(matches!(
-        parse_command(&["window", "virtualmove", "3"]).unwrap(),
-        Command::Window(Operation::VirtualMoveNumber(2, MoveFocus::Follow))
-    ));
-    assert!(matches!(
-        parse_command(&["window", "virtualsend", "3"]).unwrap(),
-        Command::Window(Operation::VirtualMoveNumber(2, MoveFocus::Stay))
-    ));
-    assert!(matches!(
-        parse_command(&["window", "virtualmovenum", "3"]).unwrap(),
-        Command::Window(Operation::VirtualMoveNumber(2, MoveFocus::Follow))
-    ));
-    assert!(matches!(
-        parse_command(&["window", "virtualsendnum", "3"]).unwrap(),
-        Command::Window(Operation::VirtualMoveNumber(2, MoveFocus::Stay))
-    ));
-    assert!(matches!(
-        parse_command(&["window", "virtualadd"]).unwrap(),
-        Command::Window(Operation::VirtualAdd)
-    ));
-}
-
-#[test]
-fn test_default_workspaces() {
-    let base = "[options]\n[bindings]\n";
-    let config = Config::try_from(base).unwrap();
-    assert_eq!(config.default_workspaces(), 1);
-
-    let config = Config::try_from(&*format!("default_workspaces = 4\n{base}")).unwrap();
-    assert_eq!(config.default_workspaces(), 4);
-
-    // Zero is clamped up to 1 (the physical space always exists).
-    let config = Config::try_from(&*format!("default_workspaces = 0\n{base}")).unwrap();
-    assert_eq!(config.default_workspaces(), 1);
-}
-
-#[test]
 #[allow(clippy::float_cmp)]
 fn test_grid_ratios() {
     use regex::Regex;
@@ -1998,7 +1864,7 @@ fn test_grid_ratios() {
         title: Regex::new(".*").unwrap(),
         bundle_id: None,
         floating: None,
-        manage: None,
+        track: None,
         index: None,
         vertical_padding: None,
         horizontal_padding: None,
@@ -2131,7 +1997,7 @@ fn defaults_config_matches_the_generated_stub() {
 }
 
 #[test]
-fn test_window_rules_manage() {
+fn test_window_rules_track() {
     let input = r#"
 [options]
 
@@ -2140,7 +2006,7 @@ fn test_window_rules_manage() {
 [windows.btt_main]
 bundle_id = "com.hegenberg.BetterTouchTool"
 title = "BetterTouchTool"
-manage = true
+track = true
 
 [windows.btt_floating]
 bundle_id = "com.hegenberg.BetterTouchTool"
@@ -2149,10 +2015,10 @@ floating = true
 "#;
     let config = Config::try_from(input).expect("config should parse");
 
-    // Main window should match the manage rule.
+    // Main window should match the canonical track rule.
     let props = config.find_window_properties("BetterTouchTool", "com.hegenberg.BetterTouchTool");
     assert_eq!(props.len(), 1);
-    assert_eq!(props[0].manage, Some(true));
+    assert_eq!(props[0].track, Some(true));
 
     // Screenshot window matches the floating rule.
     let props = config.find_window_properties("Screenshot 1", "com.hegenberg.BetterTouchTool");
@@ -2251,14 +2117,19 @@ mod lua_setup_tests {
     fn setup_table_populates_accessors() {
         let config = config_from_source(
             r"return {
-                default_workspaces = 3,
-                options = { sliver_width = 9, focus_follows_mouse = false },
+                options = {
+                    sliver_width = 9,
+                    focus_follows_mouse = false,
+                    experimental_space_control = true,
+                    space_switch_animation = false,
+                },
                 padding = { top = 10, bottom = 4 },
             }",
         );
-        assert_eq!(config.default_workspaces(), 3);
         assert_eq!(config.sliver_width(), 9);
         assert!(!config.focus_follows_mouse());
+        assert!(config.space_control_enabled());
+        assert!(!config.space_switch_animation());
         let (top, _right, bottom, _left) = config.edge_padding();
         assert_eq!((top, bottom), (10, 4));
     }
@@ -2268,8 +2139,8 @@ mod lua_setup_tests {
         // Regression guard for the `#[serde(default)]` fix: a table that omits
         // `options` and `bindings` must still deserialize.
         let config = config_from_source(r"return { padding = { top = 4 } }");
-        assert_eq!(config.default_workspaces(), 1);
         assert_eq!(config.edge_padding().0, 4);
+        assert!(config.space_switch_animation());
     }
 
     #[test]

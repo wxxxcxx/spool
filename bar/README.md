@@ -1,10 +1,10 @@
 # SpoolBar
 
-SpoolBar is a native AppKit companion for Spool. It renders one workspace bar
+SpoolBar is a native AppKit companion for Spool. It renders one native Space bar
 per display and reads only Spool's structured state; it does not request
 Accessibility access or enumerate windows itself.
 
-The bar has one fixed workspace control followed by the selected workspace's
+The bar has one fixed Space control followed by the visible Space's
 window icons: `1 A B C`. It is right-aligned in the free menu-bar gap between
 the notch (or the screen midpoint) and the first system tray item. SpoolBar
 reads menu-bar window bounds through Core Graphics, without Accessibility
@@ -24,7 +24,7 @@ background plus an accent underline. Interactive elements provide stable hover
 feedback, and the unlocked move control uses a low-contrast two-column dotted
 grip that strengthens on hover.
 
-Workspace changes push the label and window strip in the navigation direction.
+Space changes push the label and window strip in the navigation direction.
 Window overflow arrows scroll icons as a strip, while focus changes glide the
 indicator between visible icons and automatically reveal a newly focused hidden
 window. Buttons use restrained hover and press feedback. All motion follows the
@@ -59,12 +59,12 @@ it. Set `SPOOL_BAR_CONFIG` to use a different path. See
 - vertical padding with automatically derived icon sizing;
 - focus-indicator color and thickness, workspace background, and floating-window icon
   treatment;
-- editable per-workspace replacement labels;
+- editable per-Space-order replacement labels;
 - window spacing, focus-indicator visibility, and interaction animation.
 
-Drag a window icon onto a workspace to move the exact Spool window there and
-follow it. Scroll the workspace control in the reverse scroll direction to
-switch workspaces; clicking the label has no action. When every window cannot
+When the daemon reports the required capabilities, dragging a window icon onto
+a Space moves that exact Spool window and Space navigation controls become
+available. Clicking the label has no action. When every window cannot
 fit, scroll the window strip to rotate which icons are visible. Trackpad momentum
 is ignored to avoid continuing either operation after the gesture ends.
 
@@ -80,6 +80,10 @@ full query. UI actions use only the targeted CLI commands:
 
 ```sh
 spool send-cmd window focusid WINDOW_ID
-spool send-cmd workspace select DISPLAY_ID WORKSPACE_NUMBER
-spool send-cmd window move-to-workspace WINDOW_ID DISPLAY_ID WORKSPACE_NUMBER follow
+spool send-cmd space focus SPACE_ID
+spool send-cmd window move-to-space WINDOW_ID SPACE_ID stay
 ```
+
+SpoolBar addresses Spaces by stable `space_id`, not by their display order. It
+keeps a v2 decode fallback for one upgrade transition, while current daemons
+publish v3 only. Unsupported controls are hidden from the UI.

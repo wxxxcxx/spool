@@ -47,7 +47,8 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 | `src/ecs/params.rs` | High-level Bevy `SystemParam` abstractions for querying the World. |
 | `src/ecs/triggers.rs` | Reactive event handlers (Observers) for OS and internal events. |
 | `src/ecs/restore.rs` | Startup session restore planning and application, including window matching, layout rebuilding, and restore grace-period handling. |
-| `src/ecs/workspace.rs` | Management of virtual workspaces, display changes, and window movement between spaces. |
+| `src/ecs/native_space.rs` | Native Space topology, visibility, capability-gated commands, and post-operation reconciliation. |
+| `src/ecs/workspace.rs` | Native Space/display lifecycle event handling. |
 | `src/ecs/scroll.rs` | Input handling for trackpad swipe gestures, inertia, and snapping. |
 | `src/ecs/focus.rs` | Focus management logic, including focus-follows-mouse and mouse-follows-focus. |
 | `src/ecs/state.rs` | Persistence of window layout and workspace state across restarts. |
@@ -65,20 +66,22 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 ### Components
 - **`Window`:** A wrapper around a macOS window handle (AXUIElement).
 - **`Display`:** Represents a physical monitor and its bounds.
-- **`LayoutStrip`:** A component attached to a Workspace/Display that manages the ordered list of `Column`s.
+- **`LayoutStrip`:** One per native Space; manages its ordered list of `Column`s.
+- **`NativeSpace`:** Stable session ID, per-display ordinal, and user/fullscreen kind read from macOS.
 - **`LayoutPosition` / `Position`:** The intended (layout) vs. actual (on-screen) coordinates.
 - **`Bounds` / `WidthRatio`:** The size of the window and its relative width in the tiling strip.
 - **`FocusedMarker`:** Identifies the currently focused window.
 - **`ActiveWorkspaceMarker`**: Identifies the currently active workspace.
-- **`SelectedVirtualMarker`**: Marks a virtual workspace that is currently selected by the user.
+- **`VisibleNativeSpaceMarker`**: Marks the native Space currently visible on each display.
 - **`NativeFullscreenMarker`**: Marks a window that is in macOS native fullscreen mode.
-- **`Unmanaged`:** An enum identifying windows that are `Floating`, `Minimized`, or `Hidden`.
+- **`Floating`:** Marks a tracked window that is outside the tiling layout but remains focusable and operable.
+- **`WindowVisibility`:** Records why a tracked window is temporarily unavailable (`Minimized` or `Hidden`) without changing whether it is tiled or floating.
 - **`RepositionMarker` / `ResizeMarker`**: Used to signal that a window needs to be moved or resized.
 
 ### Resources
 - **`WindowManager`:** A wrapper for the global window management state and OS bridge.
 - **`Config`:** The current user configuration.
-- **`SpoolState`**: The durable snapshot of managed layout, display, native workspace, and virtual workspace state used for recovery after restarts.
+- **`SpoolState`**: The v3 durable snapshot of displays and one layout per native Space, used for recovery after restarts.
 - **`SessionRestore`**: A short-lived startup resource that keeps loaded state and restore timing active until the startup grace period expires.
 - **`MissionControlActive`:** A flag indicating if macOS Mission Control is visible (disabling tiling).
 - **`FocusFollowsMouse`:** Tracks which window should gain focus based on mouse position.
@@ -86,7 +89,7 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 ## 5. Architectural Invariants
 
 - **Main Thread Only:** Any interaction with `objc2`, `AppKit`, or `Accessibility` APIs **must** occur on the main thread.
-- **ECS as Source of Truth:** Tiling logic must operate on ECS components (`WidthRatio`, `LayoutStrip`). The physical macOS window state should be a reflection of the ECS state, not the other way around.
+- **Split ownership:** ECS is the source of truth for tiling inside a Space. macOS is the source of truth for Space topology, visibility, and window membership; private operations must be reconciled from OS state before ECS converges.
 - **Pure Layout:** Layout math (in `layout.rs`) should remain as pure as possible, operating on coordinates and ratios rather than directly calling OS APIs.
 - **Bounded Restore:** Saved session state is only consulted during startup restore. After `SessionRestore` expires, normal config and window-rule placement owns newly discovered windows.
 - **Reactive Power Saving:** Systems should use Bevy's reactive scheduling to avoid CPU usage when no windows are moving or events are occurring.
@@ -101,7 +104,7 @@ during Bevy app setup.
 `src/ecs/restore.rs` owns startup restore. It keeps the loaded `SpoolState`
 alive in `SessionRestore` for the configured grace period so applications have
 time to reopen their windows. As windows arrive, `restore_window_state` builds a
-restore plan from the saved state and the currently managed ECS windows.
+restore plan from the saved state and the currently tracked ECS windows.
 
 Window matching prefers stable identity (`window_id`, `pid`, and `bundle_id`)
 and uses the conservative fallback identity only when it can do so
@@ -110,8 +113,8 @@ window identifier, role, and subrole. Saved windows that are missing at startup
 are ignored by default, and the restored layout is compacted around the matched
 windows.
 
-Restore rebuilds `LayoutStrip`s, virtual workspace rows, selected virtual
-workspace markers, and display associations. When the current macOS workspace
+Restore rebuilds one `LayoutStrip` per native Space and its display
+association. When the current macOS Space
 to display mapping conflicts with saved display data, the current mapping is
 preferred; otherwise restore falls back to the saved display, then the active
 display, then any available display. Matched startup windows skip static
@@ -140,6 +143,6 @@ graph TD
 
 1.  **Pure Unit Tests:** Located in `src/tests.rs` and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.
 2.  **ECS Integration Tests:** Use Bevy's `App` or `World` to drive systems in isolation. macOS APIs are typically mocked via the `WindowApi` and `WindowManagerApi` traits.
-3.  **Session Restore Tests:** `src/tests/session_restore.rs` covers restore planning, missing-window compaction, startup grace behavior, config precedence, virtual workspace restoration, and multi-display fallback.
+3.  **Session Restore Tests:** `src/tests/session_restore.rs` covers restore planning, missing-window compaction, startup grace behavior, config precedence, native Space restoration, and multi-display fallback.
 4.  **FFI Verification:** Manual or semi-automated tests on macOS to ensure the Accessibility API calls behave as expected with native windows.
 5.  **Agent Support:** The `AGENTS.md` file provides project-specific guidance for AI agents to ensure contributions follow these architectural patterns.

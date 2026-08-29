@@ -3,13 +3,12 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Populated, Res, Single};
+use bevy::ecs::system::{Commands, Populated, Res, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{Level, instrument};
 
-use crate::commands::{Command, Direction, Operation};
 use crate::config::Config;
 use crate::config::swipe::SwipeGestureDirection;
 use crate::ecs::layout::{Column, LayoutStrip};
@@ -50,22 +49,17 @@ impl Plugin for ScrollEventsPlugin {
         // the fingers stop sending events, since that's when they take over.
         app.add_systems(
             Update,
-            (
-                vertical_swipe_gesture
+            ((
+                swipe_gesture
                     .run_if(mission_control_inactive)
                     .run_if(on_message::<InputEvent>),
-                (
-                    swipe_gesture
-                        .run_if(mission_control_inactive)
-                        .run_if(on_message::<InputEvent>),
-                    apply_inertia,
-                    apply_snap_force,
-                    scrolling_integrator,
-                    apply_scrolling_constraints,
-                    swiping_timeout,
-                )
-                    .chain(),
-            ),
+                apply_inertia,
+                apply_snap_force,
+                scrolling_integrator,
+                apply_scrolling_constraints,
+                swiping_timeout,
+            )
+                .chain(),),
         );
     }
 }
@@ -369,78 +363,4 @@ where
             current_offset.clamp(viewport.min.x, viewport.max.x - total_strip_width)
         },
     )
-}
-
-#[derive(Default)]
-struct VerticalGestureState {
-    accumulated: f64,
-    last_event: Option<Instant>,
-    fired: bool,
-}
-
-#[instrument(level = Level::TRACE, skip_all)]
-fn vertical_swipe_gesture(
-    mut messages: MessageReader<InputEvent>,
-    active_display: ActiveDisplay,
-    config: Res<Config>,
-    mut commands: Commands,
-    mut state: Local<VerticalGestureState>,
-) {
-    const GESTURE_TIMEOUT: Duration = Duration::from_millis(150);
-
-    if active_display.fullscreen().is_some() {
-        return;
-    }
-
-    // Reset state when the gesture times out (fingers lifted).
-    if let Some(last) = state.last_event
-        && last.elapsed() > GESTURE_TIMEOUT
-    {
-        state.accumulated = 0.0;
-        state.fired = false;
-    }
-
-    for InputEvent(event) in messages.read() {
-        match event {
-            Event::VerticalScrollTick { delta } => {
-                switch_virtual_workspace(*delta, &config, &mut commands);
-            }
-            Event::VerticalSwipe { delta, fingers }
-                if config
-                    .swipe_gesture_fingers()
-                    .is_some_and(|fingers_configured| fingers_configured == *fingers) =>
-            {
-                state.last_event = Some(Instant::now());
-
-                if !state.fired {
-                    state.accumulated += delta;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Threshold needs to be high enough that incidental vertical movement
-    // during horizontal swipes doesn't trigger a workspace switch.
-    let threshold = 0.15 / config.swipe_sensitivity();
-    if state.accumulated.abs() >= threshold {
-        switch_virtual_workspace(state.accumulated, &config, &mut commands);
-        state.accumulated = 0.0;
-        state.fired = true;
-    }
-}
-
-fn switch_virtual_workspace(delta: f64, config: &Config, commands: &mut Commands) {
-    let physical_finger_direction = if delta > 0.0 {
-        Direction::South
-    } else {
-        Direction::North
-    };
-    let direction = match config.swipe_gesture_direction() {
-        SwipeGestureDirection::Natural => physical_finger_direction.reverse(),
-        SwipeGestureDirection::Reversed => physical_finger_direction,
-    };
-    commands.trigger(SendMessageTrigger(Event::Command {
-        command: Command::Window(Operation::Virtual(direction)),
-    }));
 }

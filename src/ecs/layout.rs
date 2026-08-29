@@ -110,7 +110,6 @@ impl Plugin for LayoutEventsPlugin {
                 )
                     .chain()
                     .after(super::systems::finish_setup)
-                    .before(super::workspace::show_active_workspace)
                     .run_if(not(resource_exists::<Initializing>)),
             ),
         );
@@ -296,15 +295,13 @@ impl Iterator for ColumnWindowIter<'_> {
 #[derive(Component, Debug, Default)]
 pub struct LayoutStrip {
     id: WorkspaceId,
-    pub virtual_index: u32,
     columns: VecDeque<Column>,
 }
 
 impl LayoutStrip {
-    pub fn new(id: WorkspaceId, virtual_index: u32) -> Self {
+    pub fn new(id: WorkspaceId) -> Self {
         Self {
             id,
-            virtual_index,
             columns: VecDeque::new(),
         }
     }
@@ -312,11 +309,7 @@ impl LayoutStrip {
     pub fn fullscreen(id: WorkspaceId, entity: Entity) -> Self {
         let mut columns = VecDeque::new();
         columns.push_back(Column::Fullscren(entity));
-        Self {
-            id,
-            virtual_index: 0,
-            columns,
-        }
+        Self { id, columns }
     }
 
     /// Finds the index of a window within the pane.
@@ -1374,7 +1367,7 @@ fn position_layout_windows(
             // window's target converges back to its old visual position as the strip settles, while
             // the other window slides past.
             let offscreen_move = position.0.y.abs_diff(frame.min.y) > vertical_move_threshold;
-            if context.swiping || offscreen_move && !config.virtual_workspace_animations() {
+            if context.swiping || offscreen_move {
                 position.0 = frame.min;
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_remove::<RepositionMarker>();

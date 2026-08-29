@@ -21,6 +21,9 @@ pub enum Error {
     InvalidInput(String),
     /// Represents an I/O error, typically from `std::io::Error`.
     IO(String),
+    /// A macOS API returned a status code. Keep the code structured so callers
+    /// can distinguish expected transient states from actionable failures.
+    MacOS { place: String, code: i32 },
     /// A generic error with a descriptive message.
     Generic(String),
 }
@@ -39,6 +42,20 @@ impl Error {
         debug!("{message}");
         Error::InvalidWindow
     }
+
+    pub fn macos(place: impl Into<String>, code: i32) -> Self {
+        Self::MacOS {
+            place: place.into(),
+            code,
+        }
+    }
+
+    pub fn macos_code(&self) -> Option<i32> {
+        match self {
+            Self::MacOS { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
 }
 
 impl Display for Error {
@@ -52,6 +69,7 @@ impl Display for Error {
             Error::PermissionDenied(msg) => format!("Permission denied: {msg}"),
             Error::InvalidInput(msg) => format!("Invalid input: {msg}"),
             Error::IO(msg) => format!("IO error: {msg}"),
+            Error::MacOS { place, code } => format!("{place}: MacOS Error Code: {code}"),
             Error::Generic(msg) => format!("Generic error: {msg}"),
         };
         write!(f, "{msg}")

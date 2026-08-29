@@ -339,7 +339,7 @@ fn reparent_existing_workspaces(
             // New workspace.
             let origin = display_bounds.min;
             debug!("new workspace {id} on display {display_entity}");
-            commands.spawn_layout_strip(LayoutStrip::new(id, 0), origin, display_entity, false);
+            commands.spawn_layout_strip(LayoutStrip::new(id), origin, display_entity, false);
         }
     }
 }

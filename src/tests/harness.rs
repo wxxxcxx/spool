@@ -103,6 +103,21 @@ impl TestHarness {
         self
     }
 
+    pub(crate) fn with_app_window<F>(mut self, pid: Pid, id: WinID, f: F) -> Self
+    where
+        F: FnOnce(&mut MockWindowData),
+    {
+        let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+        let window = self
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, id, frame);
+        self.mock_state.update_window(id, f);
+        self.app
+            .world_mut()
+            .trigger(SpawnWindowTrigger(vec![window]));
+        self
+    }
+
     pub(crate) fn with_workspace_window<F>(
         mut self,
         id: WinID,

@@ -20,9 +20,9 @@ use crate::rights::{RecvRight, SendRight};
 ///
 /// # Errors
 ///
-/// Returns [`Error::NotRunning`] if launchd has no such service — which, when
-/// this is called by the daemon, means it was started outside launchd and
-/// should fall back to [`register`].
+/// Returns [`Error::NotRunning`] if launchd has no such service, or
+/// [`Error::NotPrivileged`] when a shell-launched process is not the launchd
+/// job authorized to claim it. Both mean the daemon should try [`register`].
 pub fn check_in(name: &str) -> Result<RecvRight> {
     let cname = CString::new(name).map_err(|_| Error::InvalidName)?;
     let mut port: mach_port_t = MACH_PORT_NULL;
@@ -40,8 +40,10 @@ pub fn check_in(name: &str) -> Result<RecvRight> {
 
 /// Publishes a fresh port under `name`, for a daemon started outside launchd.
 ///
-/// `bootstrap_register` is deprecated by Apple in favour of XPC but remains
-/// functional; this is why [`check_in`] is tried first.
+/// `bootstrap_register` is deprecated by Apple in favour of XPC and recent
+/// macOS versions may reject it for shell-launched processes; this is why
+/// [`check_in`] is tried first and callers must handle
+/// [`Error::NotPrivileged`].
 ///
 /// # Errors
 ///

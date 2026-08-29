@@ -16,13 +16,14 @@ use crate::config::Config;
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
+use crate::ecs::native_space::VisibleNativeSpaceMarker;
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
-    FullWidthMarker, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
-    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, Floating, FocusedMarker,
+    FullWidthMarker, NativeFullscreenMarker, RaiseWindow, SendMessageTrigger, SpawnCommandsExt,
+    Timeout,
 };
-use crate::events::Event;
+use crate::events::{Event, ReconcileScope};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 use crate::util::round_px;
@@ -33,18 +34,18 @@ pub use spool_shared_types::commands::{
     Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
 };
 
-/// The strips that are selected on their display but not the one on screen —
-/// the parked virtual workspaces a window can be handed off to.
+/// The visible Space on every display except the focused one.
 type OffscreenStrips<'w, 's> = Query<
     'w,
     's,
     (&'static mut LayoutStrip, &'static ChildOf),
-    (With<SelectedVirtualMarker>, Without<ActiveWorkspaceMarker>),
+    (
+        With<VisibleNativeSpaceMarker>,
+        Without<ActiveWorkspaceMarker>,
+    ),
 >;
 
-/// Every strip alongside the two flags that say where it sits: whether it is the
-/// one currently on screen, and whether it is its display's selected virtual
-/// workspace.
+/// Every strip alongside whether it is focused and visible on its display.
 type StripsWithVisibility<'w, 's> = Query<
     'w,
     's,
@@ -53,7 +54,7 @@ type StripsWithVisibility<'w, 's> = Query<
         &'static LayoutStrip,
         Entity,
         Has<ActiveWorkspaceMarker>,
-        Has<SelectedVirtualMarker>,
+        Has<VisibleNativeSpaceMarker>,
     ),
 >;
 
@@ -74,6 +75,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_quit_handler,
             command_restart_handler,
             print_internal_state_handler,
+            reconcile_windows_handler,
             mouse_to_next_display,
             resize_window,
             command_center_window,
@@ -81,17 +83,32 @@ pub fn register_commands(app: &mut bevy::app::App) {
             to_next_display,
             equalize_column,
             balance_strip,
-            manage_window,
+            toggle_floating_window,
             stack_windows_handler,
             command_move_focus,
-            command_focus_unmanaged,
-            command_focus_managed,
+            command_focus_floating,
+            command_focus_tiled,
             command_raise_floating,
             command_toggle_floating_layer,
             command_swap_focus,
             snap_window,
         ),
     );
+}
+
+fn reconcile_windows_handler(mut messages: MessageReader<Event>, mut commands: Commands) {
+    if messages.read().any(|event| {
+        matches!(
+            event,
+            Event::Command {
+                command: Command::ReconcileWindows,
+            }
+        )
+    }) {
+        commands.trigger(SendMessageTrigger(Event::ReconcileWindows {
+            scope: ReconcileScope::All,
+        }));
+    }
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -206,9 +223,10 @@ fn visible_floating_entities(
     windows
         .iter()
         .filter_map(|(_, entity)| {
-            let (window, _, Some(Unmanaged::Floating)) = windows.get_managed(entity)? else {
+            let (window, _, state) = windows.get_tracked(entity)?;
+            if !state.is_floating() || !state.is_visible() {
                 return None;
-            };
+            }
             if !workspace_window_ids.contains(&window.id()) {
                 return None;
             }
@@ -293,7 +311,9 @@ fn command_move_focus(
         return;
     };
 
-    if let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(focused_entity)
+    if windows
+        .get_tracked(focused_entity)
+        .is_some_and(|(_, _, state)| state.is_floating() && state.is_visible())
         && !matches!(direction, Direction::Nth(_))
     {
         if let Some(entity) = nearest_float_in_direction(
@@ -370,7 +390,7 @@ fn command_move_focus(
     }
 }
 
-fn command_focus_unmanaged(
+fn command_focus_floating(
     mut messages: MessageReader<Event>,
     windows: Windows,
     active_display: ActiveDisplay,
@@ -378,7 +398,7 @@ fn command_focus_unmanaged(
     focus_history: Res<FocusHistory>,
     mut commands: Commands,
 ) {
-    if filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusUnmanaged))
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusFloating))
         .next()
         .is_none()
     {
@@ -401,13 +421,13 @@ fn command_focus_unmanaged(
     }
 }
 
-fn command_focus_managed(
+fn command_focus_tiled(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
     focus_history: Res<FocusHistory>,
     mut commands: Commands,
 ) {
-    if filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusManaged))
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusTiled))
         .next()
         .is_none()
     {
@@ -418,7 +438,7 @@ fn command_focus_managed(
     let workspace_id = active_strip.id();
 
     let target = focus_history
-        .last_managed(workspace_id)
+        .last_tiled(workspace_id)
         .filter(|entity| active_strip.contains(*entity))
         .or_else(|| active_strip.all_columns().into_iter().next());
 
@@ -523,7 +543,7 @@ fn command_toggle_floating_layer(
             .or_else(|| visible_floats.iter().copied().find(|e| visible_float(*e)))
     } else {
         focus_history
-            .last_managed(workspace_id)
+            .last_tiled(workspace_id)
             .filter(|entity| active_strip.contains(*entity))
             .or_else(|| active_strip.all_columns().into_iter().next())
     };
@@ -821,55 +841,51 @@ fn full_width_window(
     }
 }
 
-/// Toggles the managed state of the focused window.
-/// If the window is currently unmanaged, it becomes managed. If managed, it becomes unmanaged (floating).
-///
-/// # Arguments
-///
-/// * `focused_entity` - The `Entity` of the currently focused window.
-/// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
-/// * `commands` - Bevy commands to modify entities.
-fn manage_window(
+/// Toggles the focused window between the tiling layout and floating mode.
+fn toggle_floating_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut commands: Commands,
 ) {
-    if filter_window_operations(&mut messages, |op| matches!(op, Operation::Manage))
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::ToggleFloating))
         .next()
         .is_none()
     {
         return;
     }
 
-    let Some((window, entity, unmanaged)) = windows
+    let Some((window, entity, state)) = windows
         .focused()
-        .and_then(|(_, entity)| windows.get_managed(entity))
+        .and_then(|(_, entity)| windows.get_tracked(entity))
     else {
         return;
     };
     debug!(
-        "window: {} {entity} unmanaged: {}.",
+        "window: {} {entity} floating: {}.",
         window.id(),
-        unmanaged.is_some()
+        state.is_floating()
     );
-    let was_unmanaged = unmanaged.is_some();
+    if !state.is_visible() {
+        return;
+    }
+    let was_floating = state.is_floating();
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        if was_unmanaged {
-            entity_commands.try_remove::<Unmanaged>();
+        if was_floating {
+            entity_commands.try_remove::<Floating>();
         } else {
-            entity_commands.try_insert(Unmanaged::Floating);
+            entity_commands.try_insert(Floating);
         }
     }
 
-    // Going floating -> managed only flips the component. Nothing else in
+    // Going floating -> tiled only flips the component. Nothing else in
     // the pipeline reinserts the window into a strip, so if it had been
-    // stripped of membership (spawn-floating path in window_unmanaged_trigger
+    // stripped of membership (spawn-floating path in window_floating_trigger
     // strip.removes; orphan rescue in find_orphaned_workspaces despawns the
     // strip) the toggle is invisible — the window stays where it floated
     // and the user thinks the keybind is broken. Append to the active
     // strip and reshuffle so the layout pipeline tiles it.
-    if was_unmanaged
+    if was_floating
         && !workspaces.iter().any(|(strip, _)| strip.contains(entity))
         && let Some(mut strip) = workspaces
             .iter_mut()
@@ -885,10 +901,6 @@ fn manage_window(
 ///
 /// # Arguments
 ///
-/// * `focused_entity` - The `Entity` of the currently focused window.
-/// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
-/// * `active_display` - A mutable reference to the `ActiveDisplayMut` resource.
-/// * `commands` - Bevy commands to modify entities and trigger events.
 fn to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -907,13 +919,13 @@ fn to_next_display(
         return;
     };
 
-    let Some((window, entity, unmanaged)) = windows
+    let Some((window, entity, state)) = windows
         .focused()
-        .and_then(|(_, entity)| windows.get_managed(entity))
+        .and_then(|(_, entity)| windows.get_tracked(entity))
     else {
         return;
     };
-    if unmanaged.is_some() {
+    if !state.is_visible() {
         return;
     }
 
@@ -948,6 +960,10 @@ fn to_next_display(
 
     if matches!(move_focus, MoveFocus::Follow) {
         window_manager.warp_mouse(other.bounds().center());
+    }
+
+    if state.is_floating() {
+        return;
     }
 
     // Remove the window from the source strip.
@@ -1206,10 +1222,11 @@ pub fn stack_windows_handler(
         return;
     };
 
-    if let Some((_, entity, unmanaged)) = windows
+    if let Some((_, entity, state)) = windows
         .focused()
-        .and_then(|(_, entity)| windows.get_managed(entity))
-        && unmanaged.is_none()
+        .and_then(|(_, entity)| windows.get_tracked(entity))
+        && state.is_tiled()
+        && state.is_visible()
     {
         if windows.full_width(entity).is_some()
             && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -1238,7 +1255,7 @@ pub fn stack_windows_handler(
 /// # Arguments
 ///
 /// * `trigger` - The `On<CommandTrigger>` event trigger containing the command to process.
-/// * `windows` - A query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
+/// * `windows` - A query for tracked window components.
 /// * `active_display` - A mutable reference to the `ActiveDisplayMut` resource.
 /// * `window_manager` - The `WindowManager` resource for interacting with the window management logic.
 /// * `commands` - Bevy commands to trigger events and modify entities.
@@ -1279,7 +1296,7 @@ pub fn command_restart_handler(mut messages: MessageReader<Event>) {
 fn print_internal_state_handler(
     mut messages: MessageReader<Event>,
     focused: Query<(&Window, Entity), With<FocusedMarker>>,
-    windows: Query<(&Window, Entity, &ChildOf, Option<&Unmanaged>)>,
+    windows: Query<(&Window, Entity, &ChildOf, Has<Floating>)>,
     apps: Query<&Application>,
     workspaces: StripsWithVisibility,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
@@ -1296,12 +1313,7 @@ fn print_internal_state_handler(
     }
 
     let focused = focused.single().ok();
-    let print_window = |(window, entity, child, unmanaged): (
-        &Window,
-        Entity,
-        &ChildOf,
-        Option<_>,
-    )| {
+    let print_window = |(window, entity, child, floating): (&Window, Entity, &ChildOf, bool)| {
         let bundle_id = apps
             .get(child.parent())
             .ok()
@@ -1319,7 +1331,7 @@ fn print_internal_state_handler(
             } else {
                 ""
             },
-            unmanaged.map(|m| format!(", {m:?}")).unwrap_or_default(),
+            if floating { ", Floating" } else { "" },
             bundle_id,
             window.role().unwrap_or_default(),
             window.subrole().unwrap_or_default(),
@@ -1330,7 +1342,7 @@ fn print_internal_state_handler(
     let mut seen = EntityHashSet::new();
 
     for (display, display_entity, active) in displays {
-        for (_, strip, strip_entity, active_workspace, selected) in workspaces
+        for (_, strip, strip_entity, active_workspace, visible) in workspaces
             .iter()
             .filter(|child| child.0.parent() == display_entity)
         {
@@ -1346,11 +1358,11 @@ fn print_internal_state_handler(
 
             let display_id = display.id();
             info!(
-                "Display {display_id}{}, workspace id {} ({strip_entity}){}{}: {strip}:\n{}",
+                "Display {display_id}{}, space id {} ({strip_entity}){}{}: {strip}:\n{}",
                 if active { ", active" } else { "" },
                 strip.id(),
                 if active_workspace { ", active" } else { "" },
-                if selected { ", selected" } else { "" },
+                if visible { ", visible" } else { "" },
                 windows.join("\n")
             );
         }

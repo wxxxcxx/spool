@@ -3,13 +3,14 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::With;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Query, Res, Single};
+use bevy::ecs::system::{Commands, Local, Query, Res, ResMut, Single, SystemParam};
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
-use super::{MouseHeldMarker, Timeout};
+use super::{FocusedMarker, MouseHeldMarker, Timeout};
 use crate::config::Config;
+use crate::ecs::focus::FocusResolution;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
 use crate::ecs::{
@@ -25,8 +26,9 @@ use crate::util::round_px;
 
 /// Bottom-right corner region (`NxN` pixels) where focus events are suppressed.
 /// Sized to a representative macOS title bar height — see karinushka/paneru#233:
-/// macOS prevents windows from being moved further down than a fully visible title bar,
-/// so the parked sliver of a hidden virtual workspace lives within this region.
+/// macOS prevents windows from being moved further down than a fully visible
+/// title bar, so an off-screen strip window's horizontal sliver can overlap
+/// this region.
 const CORNER_DEAD_ZONE_PX: i32 = 30;
 
 pub struct MouseEventsPlugin;
@@ -111,8 +113,8 @@ fn mouse_moved_trigger(
         }
 
         // Corner dead zone: suppress focus events when the cursor sits in
-        // the bottom-right of any display (where hidden virtual workspace
-        // slivers park). See is_in_corner_dead_zone for details.
+        // the bottom-right of any display where an off-screen strip sliver can
+        // remain. See is_in_corner_dead_zone for details.
         let cursor = origin_from(*point);
         if displays.iter().any(|(display, dock)| {
             display.bounds().contains(cursor)
@@ -204,52 +206,65 @@ fn mouse_moved_trigger(
 /// * `active_display` - A query for the active display.
 /// * `main_cid` - The main connection ID resource.
 /// * `commands` - Bevy commands to trigger a reshuffle.
-fn mouse_down_trigger(
-    mut messages: MessageReader<InputEvent>,
-    windows: Windows,
-    active_workspace: Query<(Entity, Option<&Scrolling>), With<ActiveWorkspaceMarker>>,
-    window_manager: Res<WindowManager>,
-    config: Res<Config>,
-    mouse_held: Query<Entity, With<MouseHeldMarker>>,
-    mut commands: Commands,
-) {
+#[derive(SystemParam)]
+struct MouseDownCtx<'w, 's> {
+    windows: Windows<'w, 's>,
+    active_workspace:
+        Query<'w, 's, (Entity, Option<&'static Scrolling>), With<ActiveWorkspaceMarker>>,
+    window_manager: Res<'w, WindowManager>,
+    config: Res<'w, Config>,
+    mouse_held: Query<'w, 's, Entity, With<MouseHeldMarker>>,
+    focused: Query<'w, 's, Entity, With<FocusedMarker>>,
+    focus_resolution: ResMut<'w, FocusResolution>,
+    commands: Commands<'w, 's>,
+}
+
+fn mouse_down_trigger(mut messages: MessageReader<InputEvent>, mut ctx: MouseDownCtx) {
     for InputEvent(event) in messages.read() {
         let Event::MouseDown { point, .. } = event else {
             continue;
         };
         trace!("{point:?}");
 
-        let Some((_, entity)) = window_manager
-            .find_window_at_point(point)
-            .ok()
-            .and_then(|window_id| windows.find(window_id))
-        else {
+        let Ok(window_id) = ctx.window_manager.find_window_at_point(point) else {
             continue;
         };
+        let Some((window, entity)) = ctx.windows.find(window_id) else {
+            let generation = ctx.focus_resolution.begin_pending(None, Some(window_id));
+            ctx.focus_resolution.mark_outside(generation);
+            for entity in &ctx.focused {
+                if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
+                    entity_commands.try_remove::<FocusedMarker>();
+                }
+            }
+            continue;
+        };
+        ctx.focus_resolution
+            .begin_pending(window.pid().ok(), Some(window_id));
 
         // Stop any ongoing scroll.
-        for (entity, scroll) in active_workspace {
+        for (entity, scroll) in &ctx.active_workspace {
             if scroll.is_some()
-                && let Ok(mut entity_commands) = commands.get_entity(entity)
+                && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
             {
                 entity_commands.try_remove::<Scrolling>();
             }
         }
 
         // Clean up any stale marker from a previous click.
-        for held in &mouse_held {
-            if let Ok(mut entity_commands) = commands.get_entity(held) {
+        for held in &ctx.mouse_held {
+            if let Ok(mut entity_commands) = ctx.commands.get_entity(held) {
                 entity_commands.try_despawn();
             }
         }
 
-        if config.window_hidden_ratio() >= 1.0 {
+        if ctx.config.window_hidden_ratio() >= 1.0 {
             // At max hidden ratio, never reshuffle on click.
         } else {
             // Defer reshuffle until mouse-up so the window doesn't shift
             // mid-click. The Timeout auto-despawns if mouse-up is lost.
-            let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
-            commands.spawn((MouseHeldMarker(entity), timeout));
+            let timeout = Timeout::new(Duration::from_secs(5), None, &mut ctx.commands);
+            ctx.commands.spawn((MouseHeldMarker(entity), timeout));
         }
     }
 }

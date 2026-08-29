@@ -12,7 +12,7 @@ use std::sync::{LazyLock, Mutex};
 
 use mlua::prelude::*;
 use spool_mach_ipc::{RecvPort, SendPort, Sender};
-use spool_shared_types::commands::Command;
+use spool_shared_types::commands::{Command, MoveFocus};
 use spool_shared_types::script_state::ScriptStateWrite;
 use spool_shared_types::script_value::ScriptValue;
 use spool_shared_types::state::{StateEvent, StateQueryKind};
@@ -61,6 +61,37 @@ fn send(request: &Request) -> LuaResult<()> {
 }
 
 fn dispatch(_: &Lua, command: Command) -> LuaResult<bool> {
+    if matches!(
+        command,
+        Command::FocusSpace { .. }
+            | Command::MoveWindowToSpace { .. }
+            | Command::CreateSpace { .. }
+            | Command::DeleteSpace { .. }
+    ) {
+        let Response::Query(spool_shared_types::wire::QueryPayload::State(state)) =
+            call(&Request::Query(StateQueryKind::State))?
+        else {
+            return Err(LuaError::RuntimeError(
+                "spool.space: daemon did not return a state document".to_string(),
+            ));
+        };
+        let available = match command {
+            Command::FocusSpace { .. } => state.capabilities.focus,
+            Command::MoveWindowToSpace {
+                move_focus: MoveFocus::Follow,
+                ..
+            } => state.capabilities.move_windows && state.capabilities.focus,
+            Command::MoveWindowToSpace { .. } => state.capabilities.move_windows,
+            Command::CreateSpace { .. } => state.capabilities.create,
+            Command::DeleteSpace { .. } => state.capabilities.delete,
+            _ => true,
+        };
+        if !available {
+            return Err(LuaError::RuntimeError(format!(
+                "native Space capability unavailable for '{command:?}'"
+            )));
+        }
+    }
     send(&Request::Command(command))?;
     Ok(true)
 }

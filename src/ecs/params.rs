@@ -2,22 +2,22 @@ use bevy::{
     ecs::{
         entity::Entity,
         hierarchy::ChildOf,
-        query::{With, Without},
+        query::{Has, With, Without},
         system::{Commands, Query, Res, ResMut, Single, SystemParam},
         world::Mut,
     },
     math::IRect,
 };
-use objc2_core_graphics::CGDirectDisplayID;
 use tracing::warn;
 
 use super::{ActiveDisplayMarker, FocusFollowsMouse, SkipReshuffle};
 use crate::{
     config::Config,
     ecs::{
-        ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, FocusedMarker, FullWidthMarker,
-        Initializing, LayoutPosition, NativeFullscreenMarker, Position, RepositionMarker,
-        ResizeMarker, Scrolling, Unmanaged, WidthRatio, layout::LayoutStrip,
+        ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, Floating, FocusedMarker,
+        FullWidthMarker, Initializing, LayoutPosition, NativeFullscreenMarker, Position,
+        RepositionMarker, ResizeMarker, Scrolling, WidthRatio, WindowVisibility,
+        layout::LayoutStrip, reconcile::WindowUnavailable,
     },
     manager::{Application, Display, Origin, Size, Window},
     platform::{ProcessSerialNumber, WinID},
@@ -107,11 +107,6 @@ impl ActiveDisplay<'_, '_> {
     /// Returns an immutable reference to the active `Display`.
     pub fn display(&self) -> &Display {
         self.display.0
-    }
-
-    /// Returns the `CGDirectDisplayID` of the active display.
-    pub fn id(&self) -> CGDirectDisplayID {
-        self.display.0.id()
     }
 
     pub fn entity(&self) -> Entity {
@@ -244,19 +239,39 @@ type WindowPlacements<'w, 's> = Query<
     With<Window>,
 >;
 
+type AvailableWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Window,
+        Entity,
+        &'static ChildOf,
+        Has<Floating>,
+        Option<&'static WindowVisibility>,
+    ),
+    Without<WindowUnavailable>,
+>;
+
+type AllWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Window,
+        Entity,
+        &'static ChildOf,
+        Has<Floating>,
+        Option<&'static WindowVisibility>,
+    ),
+>;
+
+type FocusedWindows<'w, 's> =
+    Query<'w, 's, (&'static Window, Entity), (With<FocusedMarker>, Without<WindowUnavailable>)>;
+
 #[derive(SystemParam)]
 pub struct Windows<'w, 's> {
-    all: Query<
-        'w,
-        's,
-        (
-            &'static Window,
-            Entity,
-            &'static ChildOf,
-            Option<&'static Unmanaged>,
-        ),
-    >,
-    focus: Query<'w, 's, (&'static Window, Entity), With<FocusedMarker>>,
+    all: AllWindows<'w, 's>,
+    available: AvailableWindows<'w, 's>,
+    focus: FocusedWindows<'w, 's>,
     previous_size: Query<
         'w,
         's,
@@ -271,40 +286,83 @@ pub struct Windows<'w, 's> {
     positions: WindowPlacements<'w, 's>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct TrackedWindowState<'a> {
+    floating: bool,
+    visibility: Option<&'a WindowVisibility>,
+}
+
+impl<'a> TrackedWindowState<'a> {
+    pub fn is_floating(self) -> bool {
+        self.floating
+    }
+
+    pub fn is_tiled(self) -> bool {
+        !self.floating
+    }
+
+    pub fn is_visible(self) -> bool {
+        self.visibility.is_none()
+    }
+
+    pub fn visibility(self) -> Option<&'a WindowVisibility> {
+        self.visibility
+    }
+}
+
 impl Windows<'_, '_> {
-    fn get_all(&self, entity: Entity) -> Option<(&Window, Entity, &ChildOf, Option<&Unmanaged>)> {
-        self.all
+    pub fn get_tracked(&self, entity: Entity) -> Option<(&Window, Entity, TrackedWindowState<'_>)> {
+        self.available
             .get(entity)
             .inspect_err(|err| warn!("unable to find window: {err}"))
             .ok()
-    }
-
-    pub fn get_managed(&self, entity: Entity) -> Option<(&Window, Entity, Option<&Unmanaged>)> {
-        self.get_all(entity)
-            .map(|(window, entity, _, unmanaged)| (window, entity, unmanaged))
+            .map(|(window, entity, _, floating, visibility)| {
+                (
+                    window,
+                    entity,
+                    TrackedWindowState {
+                        floating,
+                        visibility,
+                    },
+                )
+            })
     }
 
     pub fn get(&self, entity: Entity) -> Option<&Window> {
-        self.get_all(entity).map(|(window, _, _, _)| window)
+        self.available
+            .get(entity)
+            .ok()
+            .map(|(window, _, _, _, _)| window)
     }
 
     pub fn find(&self, window_id: WinID) -> Option<(&Window, Entity)> {
-        self.all
+        self.available
             .into_iter()
-            .find(|(window, _, _, _)| window.id() == window_id)
-            .map(|(window, entity, _, _)| (window, entity))
+            .find(|(window, _, _, _, _)| window.id() == window_id)
+            .map(|(window, entity, _, _, _)| (window, entity))
     }
 
     pub fn find_parent(&self, window_id: WinID) -> Option<(&Window, Entity, Entity)> {
-        self.all.iter().find_map(|(window, entity, childof, _)| {
+        self.available
+            .iter()
+            .find_map(|(window, entity, childof, _, _)| {
+                (window.id() == window_id).then_some((window, entity, childof.parent()))
+            })
+    }
+
+    pub fn find_parent_any(&self, window_id: WinID) -> Option<(&Window, Entity, Entity)> {
+        self.all.iter().find_map(|(window, entity, childof, _, _)| {
             (window.id() == window_id).then_some((window, entity, childof.parent()))
         })
     }
 
-    pub fn find_managed(&self, window_id: WinID) -> Option<(&Window, Entity)> {
-        self.all.iter().find_map(|(window, entity, _, unmanaged)| {
-            (unmanaged.is_none() && window.id() == window_id).then_some((window, entity))
-        })
+    pub fn find_tiled(&self, window_id: WinID) -> Option<(&Window, Entity)> {
+        self.available
+            .iter()
+            .find_map(|(window, entity, _, floating, visibility)| {
+                (!floating && visibility.is_none() && window.id() == window_id)
+                    .then_some((window, entity))
+            })
     }
 
     pub fn focused(&self) -> Option<(&Window, Entity)> {
@@ -312,16 +370,16 @@ impl Windows<'_, '_> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Window, Entity)> {
-        self.all
+        self.available
             .iter()
-            .map(|(window, entity, _, _)| (window, entity))
+            .map(|(window, entity, _, _, _)| (window, entity))
     }
 
-    pub fn managed_iter(&self) -> impl Iterator<Item = (&Window, Entity, &ChildOf)> {
-        self.all
+    pub fn tiled_iter(&self) -> impl Iterator<Item = (&Window, Entity, &ChildOf)> {
+        self.available
             .iter()
-            .filter_map(|(window, entity, childof, unmanaged)| {
-                unmanaged.is_none().then_some((window, entity, childof))
+            .filter_map(|(window, entity, childof, floating, visibility)| {
+                (!floating && visibility.is_none()).then_some((window, entity, childof))
             })
     }
 

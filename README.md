@@ -43,7 +43,7 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
   workspaces to stay organized within each context.
 - **Menu bar workspace indicator:** Shows the currently active virtual
   workspace in the macOS menu bar.
-- **Startup session restore:** Restores managed window layouts, virtual
+- **Startup session restore:** Restores tracked window layouts, virtual
   workspaces, and display assignments from the last saved state when Spool
   starts.
 - **Focus follows mouse on MacOS:** Very useful for people who would like to
@@ -81,7 +81,7 @@ inspired by [Niri] and [PaperWM.spoon].
   Security -> Accessibility".
 
 - Check your System Settings for "Displays have separate spaces" option. It
-  should be enabled - this allows Spool to manage the workspaces independently.
+  should be enabled so Spool can track each display's Spaces independently.
 
 - **Multiple displays**. Spool is moving the windows off-screen, hiding them
   to the left or right. If you have multiple displays, for example your laptop
@@ -180,11 +180,11 @@ settings without restarting the application.
 
 ### Startup session restore
 
-Spool saves managed window layout state to the user state directory
+Spool saves tracked window layout state to the user state directory
 (`$XDG_STATE_HOME/spool/state.json`, usually
 `~/.local/state/spool/state.json`) and loads it when Spool starts. During the
 startup restore window, Spool matches reopened windows to the saved session and
-restores their layout placement, virtual workspace row, and display assignment
+restores their layout placement, Space, and display assignment
 where possible.
 
 Restore is startup-only. After the configured startup grace period expires, new
@@ -194,6 +194,17 @@ layout is compacted around the windows that were found. The behavior is
 configured with `[restore]`; see the
 **[Session Restore](./CONFIGURATION.md#session-restore)** section in the
 configuration guide.
+
+When upgrading a v2 state file, inspect the safe fold first, then apply it:
+
+```shell
+$ spool migrate-state
+$ spool migrate-state --apply
+```
+
+The dry run does not write. `--apply` first creates the adjacent
+`state.v2.backup.json`, then folds each old virtual row into its owning native
+Space in row order. It never creates, deletes, or moves a macOS Space.
 
 ### Running as a service
 
@@ -239,26 +250,24 @@ $ spool send-cmd <command> [args...]
 
 | Command                    | Description                                      |
 | -------------------------- | ------------------------------------------------ |
-| `window focus <direction\|number\|managed\|unmanaged>` | Move focus by direction, column number, managed or unmanaged |
+| `window focus <direction\|number\|tiled\|floating>` | Move focus by direction, column number, tiled or floating |
 | `window swap <direction>`  | Swap the focused window with a neighbour         |
 | `window center`            | Center the focused window on screen              |
 | `window resize`            | Cycle through `preset_column_widths`             |
 | `window grow`              | Grow to the next preset width                    |
 | `window shrink`            | Shrink to the previous preset width              |
 | `window fullwidth`         | Toggle full-width mode for the focused window    |
-| `window manage`            | Toggle managed/floating state                    |
+| `window togglefloating`    | Toggle between tiled and floating state          |
 | `window equalize`          | Distribute equal heights in the focused stack    |
 | `window balance`           | Make all columns match the focused window width  |
 | `window stack`             | Stack the focused window onto its left neighbour |
 | `window unstack`           | Unstack the focused window into its own column   |
 | `window nextdisplay`       | Move the focused window to the next display      |
 | `window nextdisplaysend`   | Move the window to the next display but stay here |
-| `window virtual <dir>`     | Switch to the previous/next virtual workspace     |
-| `window virtualnum <n>`    | Switch directly to numbered virtual workspace    |
-| `window virtualmove <dir>` | Move the window to a different virtual workspace  |
-| `window virtualmovenum <n>` | Move the window to numbered virtual workspace and follow it |
-| `window virtualsend <dir>` | Send the window to a virtual workspace but stay  |
-| `window virtualsendnum <n>` | Send the window to numbered virtual workspace but stay |
+| `window move-to-space <window-id> <space-id> stay` | Experimentally move a window to a user Space |
+| `window move-to-space <window-id> <space-id> follow` | Move a window, switch to its Space, and focus it after reconciliation |
+| `space focus <space-id>` | Focus a Space when the runtime reports support |
+| `space create <display-id>` / `space delete <space-id>` | Space lifecycle commands when supported |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
 | `printstate`               | Print the internal ECS state to the debug log    |
@@ -292,17 +301,17 @@ $ spool send-cmd window focus first
 # Jump to the second window from the left.
 $ spool send-cmd window focus 2
 
-# Switch directly to virtual workspace 3.
-$ spool send-cmd window virtualnum 3
-
-# Send the focused window to virtual workspace 3 without following it.
-$ spool send-cmd window virtualsendnum 3
-
 # Focus an exact Spool-known window id.
 $ spool send-cmd window focusid 321
 
-# Select virtual workspace 3 on display 1.
-$ spool send-cmd workspace select 1 3
+# Move that window to a stable Space ID without following it.
+$ spool send-cmd window move-to-space 321 42 stay
+
+# Move that window, switch to its Space, and focus it.
+$ spool send-cmd window move-to-space 321 42 follow
+
+# Focus a stable Space ID on the active display.
+$ spool send-cmd space focus 42
 ```
 
 ### Querying and Subscribing to State
@@ -311,14 +320,14 @@ Spool also exposes structured JSON state for scripts and status bars:
 
 ```shell
 $ spool query state --json
-$ spool query virtual-workspaces --json
+$ spool query spaces --json
 $ spool query active --json
 $ spool subscribe --json
 ```
 
 `query` prints a JSON snapshot and exits. `subscribe --json` keeps the channel
 open and emits line-delimited JSON events for changes that integrations usually
-care about, including focus changes, virtual workspace changes, window-list
+care about, including focus changes, Space changes, window-list
 changes, title changes, and display changes. See
 [`QUERY_AND_SUBSCRIBE_FORMAT.md`](./QUERY_AND_SUBSCRIBE_FORMAT.md) for the
 full payload contract.

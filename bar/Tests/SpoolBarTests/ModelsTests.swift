@@ -109,7 +109,7 @@ final class ModelsTests: XCTestCase {
     ])
     let view = WorkspaceBarView(
       displayID: 7,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(),
       client: controller,
       iconProvider: AppIconProvider()
@@ -138,7 +138,7 @@ final class ModelsTests: XCTestCase {
       (number: 2, windowIDs: [], selected: false),
       (number: 3, windowIDs: [], selected: false),
     ])
-    view.update(workspaces: first.virtualWorkspaces)
+    view.update(workspaces: first.spaces)
     XCTAssertFalse(view.renderedPreviousWorkspaceNavigationVisible)
     XCTAssertTrue(view.renderedNextWorkspaceNavigationVisible)
 
@@ -147,7 +147,7 @@ final class ModelsTests: XCTestCase {
       (number: 2, windowIDs: [], selected: false),
       (number: 3, windowIDs: [], selected: true),
     ])
-    view.update(workspaces: last.virtualWorkspaces)
+    view.update(workspaces: last.spaces)
     XCTAssertTrue(view.renderedPreviousWorkspaceNavigationVisible)
     XCTAssertFalse(view.renderedNextWorkspaceNavigationVisible)
   }
@@ -161,7 +161,7 @@ final class ModelsTests: XCTestCase {
     ])
     let view = WorkspaceBarView(
       displayID: 7,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(),
       client: controller,
       iconProvider: AppIconProvider()
@@ -184,7 +184,7 @@ final class ModelsTests: XCTestCase {
     ])
     let view = WorkspaceBarView(
       displayID: 7,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(),
       client: controller,
       iconProvider: AppIconProvider()
@@ -218,7 +218,7 @@ final class ModelsTests: XCTestCase {
     ])
     let view = WorkspaceBarView(
       displayID: 7,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(),
       client: controller,
       iconProvider: AppIconProvider()
@@ -242,7 +242,7 @@ final class ModelsTests: XCTestCase {
     ])
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(animationStyle: .none),
       client: RecordingSpoolController(),
       iconProvider: AppIconProvider()
@@ -279,8 +279,17 @@ final class ModelsTests: XCTestCase {
       """#.utf8)
 
     let state = try JSONDecoder().decode(SpoolStateDocument.self, from: data)
-    XCTAssertEqual(state.visibleWorkspaces(on: state.displays[0]).map(\.number), [1, 2])
-    XCTAssertEqual(state.visibleWorkspaces(on: state.displays[1]).map(\.number), [1])
+    XCTAssertEqual(state.spaces(on: state.displays[0]).map(\.number), [1, 2])
+    XCTAssertEqual(state.spaces(on: state.displays[1]).map(\.number), [1])
+  }
+
+  func testV3ActiveAndDisplaySpaceIDsDecode() throws {
+    let data = Data(
+      #"{"version":3,"timestamp":1,"active":{"display_id":1,"space_id":42},"capabilities":{"move_windows":false,"focus":false,"create":false,"delete":false},"displays":[{"display_id":1,"active":true,"visible_space_id":42}],"spaces":[]}"#.utf8)
+
+    let state = try JSONDecoder().decode(SpoolStateDocument.self, from: data)
+    XCTAssertEqual(state.active.spaceID, 42)
+    XCTAssertEqual(state.displays.first?.visibleSpaceID, 42)
   }
 
   func testPlannerUsesGapBetweenNotchAndTray() {
@@ -386,7 +395,7 @@ final class ModelsTests: XCTestCase {
     let document = try state(windowIDs: [10])
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(),
       client: SpoolClient(),
       iconProvider: AppIconProvider(),
@@ -431,7 +440,7 @@ final class ModelsTests: XCTestCase {
     let document = try state(windowIDs: [10])
     let content = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: preferences,
       client: SpoolClient(),
       iconProvider: AppIconProvider()
@@ -464,7 +473,7 @@ final class ModelsTests: XCTestCase {
     let document = try state(windowIDs: [10])
     let content = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(),
       client: SpoolClient(),
       iconProvider: AppIconProvider()
@@ -515,7 +524,7 @@ final class ModelsTests: XCTestCase {
     let document = try state(windowIDs: [10])
     let content = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(),
       client: SpoolClient(),
       iconProvider: AppIconProvider()
@@ -541,7 +550,7 @@ final class ModelsTests: XCTestCase {
     let document = try state(windowIDs: [10])
     let content = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(),
       client: SpoolClient(),
       iconProvider: AppIconProvider()
@@ -737,7 +746,7 @@ final class ModelsTests: XCTestCase {
     let document = try state(windowIDs: [], selected: true)
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(),
       client: SpoolClient(),
       iconProvider: AppIconProvider()
@@ -758,7 +767,7 @@ final class ModelsTests: XCTestCase {
     )
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: active.virtualWorkspaces,
+      workspaces: active.spaces,
       preferences: preferences,
       client: SpoolClient(),
       iconProvider: AppIconProvider()
@@ -775,7 +784,7 @@ final class ModelsTests: XCTestCase {
     let first = try state(windowIDs: [20, 10])
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: first.virtualWorkspaces,
+      workspaces: first.spaces,
       preferences: BarPreferences(
         barHeight: 28,
         itemSpacing: 5,
@@ -787,7 +796,7 @@ final class ModelsTests: XCTestCase {
     XCTAssertEqual(view.renderedWindowIDs, [20, 10])
 
     let reordered = try state(windowIDs: [10, 20])
-    view.update(workspaces: reordered.virtualWorkspaces)
+    view.update(workspaces: reordered.spaces)
     XCTAssertEqual(view.renderedWindowIDs, [10, 20])
   }
 
@@ -798,7 +807,7 @@ final class ModelsTests: XCTestCase {
     )
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(
         barHeight: 28,
         itemSpacing: 5,
@@ -815,7 +824,7 @@ final class ModelsTests: XCTestCase {
     let document = try state(windowIDs: [10, 20, 30, 40, 50])
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(
         barHeight: 28,
         itemSpacing: 5,
@@ -862,7 +871,7 @@ final class ModelsTests: XCTestCase {
     let preferences = BarPreferences(animationStyle: .smooth, animationDuration: 0.24)
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: preferences,
       client: SpoolClient(),
       iconProvider: AppIconProvider(),
@@ -906,7 +915,7 @@ final class ModelsTests: XCTestCase {
     ])
     let view = WorkspaceBarView(
       displayID: 7,
-      workspaces: first.virtualWorkspaces,
+      workspaces: first.spaces,
       preferences: BarPreferences(animationStyle: .spring, animationDuration: 0.24),
       client: controller,
       iconProvider: AppIconProvider(),
@@ -920,7 +929,7 @@ final class ModelsTests: XCTestCase {
       (number: 1, windowIDs: [10], selected: false),
       (number: 2, windowIDs: [20], selected: true),
     ])
-    view.update(workspaces: second.virtualWorkspaces)
+    view.update(workspaces: second.spaces)
 
     XCTAssertEqual(view.renderedWorkspaceMotionDirection, .forward)
     XCTAssertTrue(
@@ -933,7 +942,7 @@ final class ModelsTests: XCTestCase {
     let first = try state(windowIDs: [10, 20], focusedWindowID: 10)
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: first.virtualWorkspaces,
+      workspaces: first.spaces,
       preferences: BarPreferences(animationStyle: .smooth),
       client: SpoolClient(),
       iconProvider: AppIconProvider(),
@@ -944,7 +953,7 @@ final class ModelsTests: XCTestCase {
     let firstFrame = try XCTUnwrap(view.renderedFocusRingFrame)
 
     let second = try state(windowIDs: [10, 20], focusedWindowID: 20)
-    view.update(workspaces: second.virtualWorkspaces)
+    view.update(workspaces: second.spaces)
 
     XCTAssertNotNil(view.renderedFocusTransition as? CAAnimationGroup)
     XCTAssertGreaterThan(try XCTUnwrap(view.renderedFocusRingFrame).minX, firstFrame.minX)
@@ -954,7 +963,7 @@ final class ModelsTests: XCTestCase {
     let first = try state(windowIDs: [10, 20, 30, 40, 50], focusedWindowID: 10)
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: first.virtualWorkspaces,
+      workspaces: first.spaces,
       preferences: BarPreferences(animationStyle: .smooth),
       client: SpoolClient(),
       iconProvider: AppIconProvider(),
@@ -965,7 +974,7 @@ final class ModelsTests: XCTestCase {
     XCTAssertEqual(view.renderedVisibleWindowIDs, [10, 20])
 
     let last = try state(windowIDs: [10, 20, 30, 40, 50], focusedWindowID: 50)
-    view.update(workspaces: last.virtualWorkspaces)
+    view.update(workspaces: last.spaces)
 
     XCTAssertEqual(view.renderedVisibleWindowIDs, [40, 50])
     XCTAssertEqual(view.renderedWindowMotionDirection, .forward)
@@ -980,7 +989,7 @@ final class ModelsTests: XCTestCase {
     let document = try state(windowIDs: [10, 20, 30, 40, 50])
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: BarPreferences(animationStyle: .spring),
       client: SpoolClient(),
       iconProvider: AppIconProvider(),
@@ -1032,7 +1041,7 @@ final class ModelsTests: XCTestCase {
     let preferences = BarPreferences(animationStyle: .none)
     let view = WorkspaceBarView(
       displayID: 1,
-      workspaces: document.virtualWorkspaces,
+      workspaces: document.spaces,
       preferences: preferences,
       client: SpoolClient(),
       iconProvider: AppIconProvider()

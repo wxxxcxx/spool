@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use bevy::prelude::*;
@@ -6,7 +7,8 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, MouseMove, MoveFocus, Operation};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{ActiveWorkspaceMarker, DockPosition, RefreshWindowSizes, Timeout};
+use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
+use crate::ecs::{ActiveWorkspaceMarker, DockPosition, Floating, RefreshWindowSizes, Timeout};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size};
 use crate::{assert_not_on_workspace, assert_on_workspace, assert_window_at, assert_window_size};
@@ -238,6 +240,53 @@ fn test_next_display_inserts_into_target_strip() {
         .on_iteration(2, move |world, _state| {
             assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
             assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_floating_window_moves_to_next_display_without_becoming_tiled() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+        },
+    ];
+
+    let config = Config::try_from(
+        r#"
+[options]
+
+[bindings]
+
+[windows.test]
+title = ".*"
+floating = true
+"#,
+    )
+    .expect("floating test config should parse");
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(1, move |world, _state| {
+            let entity = find_window_entity(0, world);
+            assert!(world.entity(entity).contains::<Floating>());
+
+            let mut strips = world.query::<&LayoutStrip>();
+            assert!(strips.iter(world).all(|strip| !strip.contains(entity)));
+
+            assert_window_at!(
+                world,
+                0,
+                (EXT_DISPLAY_WIDTH - TEST_WINDOW_WIDTH) / 2,
+                -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT
+            );
         })
         .run(commands);
 }
@@ -476,4 +525,85 @@ fn test_wake_refreshes_active_workspace() {
             );
         })
         .run(commands);
+}
+
+#[test]
+fn native_spaces_track_one_visible_space_per_display_at_startup() {
+    const EXT_DISPLAY_ID: u32 = TEST_DISPLAY_ID + 1;
+    const EXT_SPACE_A: WorkspaceId = TEST_WORKSPACE_ID + 10;
+    const EXT_SPACE_B: WorkspaceId = TEST_WORKSPACE_ID + 11;
+
+    TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(
+                TEST_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH * 2,
+                TEST_DISPLAY_HEIGHT,
+            ),
+            vec![EXT_SPACE_A, EXT_SPACE_B],
+        )
+        .on_iteration(0, |world, _state| {
+            let visible = world
+                .query_filtered::<(&LayoutStrip, &NativeSpace), With<VisibleNativeSpaceMarker>>()
+                .iter(world)
+                .map(|(strip, native)| (strip.id(), native.ordinal))
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                visible,
+                HashSet::from([(TEST_WORKSPACE_ID, 0), (EXT_SPACE_A, 0)])
+            );
+
+            let active = world
+                .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
+                .single(world)
+                .expect("one globally active layout strip");
+            assert_eq!(active.id(), TEST_WORKSPACE_ID);
+        })
+        .run(vec![Event::Command {
+            command: Command::PrintState,
+        }]);
+}
+
+#[test]
+fn native_spaces_observe_switches_on_an_inactive_display() {
+    const EXT_DISPLAY_ID: u32 = TEST_DISPLAY_ID + 1;
+    const EXT_SPACE_A: WorkspaceId = TEST_WORKSPACE_ID + 10;
+    const EXT_SPACE_B: WorkspaceId = TEST_WORKSPACE_ID + 11;
+
+    TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(
+                TEST_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH * 2,
+                TEST_DISPLAY_HEIGHT,
+            ),
+            vec![EXT_SPACE_A, EXT_SPACE_B],
+        )
+        .on_iteration(0, |_world, state| {
+            state.activate_workspace(EXT_DISPLAY_ID, EXT_SPACE_B, false);
+        })
+        .on_iteration(1, |world, _state| {
+            let visible = world
+                .query_filtered::<&LayoutStrip, With<VisibleNativeSpaceMarker>>()
+                .iter(world)
+                .map(LayoutStrip::id)
+                .collect::<HashSet<_>>();
+            assert_eq!(visible, HashSet::from([TEST_WORKSPACE_ID, EXT_SPACE_B]));
+
+            let active = world
+                .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
+                .single(world)
+                .expect("one globally active layout strip");
+            assert_eq!(active.id(), TEST_WORKSPACE_ID);
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+        ]);
 }

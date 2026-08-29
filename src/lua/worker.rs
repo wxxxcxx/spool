@@ -483,9 +483,9 @@ impl Task<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecs::state::{SpoolActiveState, SpoolVirtualWorkspaceState, SpoolWindowState};
+    use crate::ecs::state::{SpaceKind, SpoolActiveState, SpoolSpaceState, SpoolWindowState};
     use crate::lua::convert::WindowSpawnPayload;
-    use spool_shared_types::windowset::{LayoutOp, WinID};
+    use spool_shared_types::windowset::LayoutOp;
 
     /// How long a test waits for the worker before calling it wedged. Generous:
     /// it only ever elapses on failure.
@@ -605,20 +605,22 @@ mod tests {
     /// A canned state document to answer round-trips with.
     fn test_state() -> SpoolQueryState {
         SpoolQueryState {
-            version: 2,
+            version: 3,
             timestamp: 0,
             active: SpoolActiveState {
                 focused_window_id: Some(7),
                 focused_app_name: Some("Test App".to_string()),
                 ..SpoolActiveState::default()
             },
+            capabilities: spool_shared_types::state::SpaceCapabilities::default(),
             displays: Vec::new(),
-            virtual_workspaces: vec![SpoolVirtualWorkspaceState {
-                number: 1,
-                native_workspace_id: 10,
-                display_id: Some(1),
-                selected: true,
-                active: true,
+            spaces: vec![SpoolSpaceState {
+                space_id: 10,
+                display_id: 1,
+                ordinal: 0,
+                kind: SpaceKind::User,
+                visible: true,
+                focused: true,
                 windows: vec![SpoolWindowState {
                     window_id: 7,
                     bundle_id: "com.example.app".to_string(),
@@ -793,108 +795,8 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
-    /// The canned layout with its window on workspace 1.
+    /// The canned layout with its window on one Space.
     fn test_window_set() -> WindowSet {
-        test_window_set_on(1)
-    }
-
-    /// A layout built from `(id, app, workspace)` triples, over workspaces 1
-    /// (on screen) and 9 (the stash). Each window gets a column of its own.
-    fn layout(windows: &[(WinID, &str, u32)]) -> WindowSet {
-        use spool_shared_types::state::Frame;
-
-        layout_on(
-            1,
-            Frame {
-                x: 0,
-                y: 0,
-                width: 1920,
-                height: 1080,
-            },
-            windows,
-        )
-    }
-
-    /// The same layout, on a display of a given id and geometry — what a
-    /// proportional placement has to be resolved against.
-    fn layout_on(
-        display_id: u32,
-        display_frame: spool_shared_types::state::Frame,
-        windows: &[(WinID, &str, u32)],
-    ) -> WindowSet {
-        use spool_shared_types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
-
-        let workspaces = [1, 9]
-            .map(|number| WorkspaceSet {
-                number,
-                native_id: 10,
-                active: number == 1,
-                columns: Arc::new(
-                    windows
-                        .iter()
-                        .filter(|(_, _, on)| *on == number)
-                        .map(|(id, app, _)| {
-                            ColumnSet::single(
-                                WindowRec {
-                                    id: *id,
-                                    app_name: (*app).to_string(),
-                                    bundle_id: format!("com.example.{app}"),
-                                    title: format!("{app} window"),
-                                    frame: None,
-                                    floating: false,
-                                    managed: true,
-                                    visible: number == 1,
-                                    focused: false,
-                                },
-                                1.0,
-                            )
-                        })
-                        .collect(),
-                ),
-                floating: Arc::new(Vec::new()),
-            })
-            .to_vec();
-
-        WindowSet::new(
-            vec![DisplaySet {
-                id: display_id,
-                frame: display_frame,
-                active: true,
-                workspaces: Arc::new(workspaces),
-            }],
-            None,
-        )
-    }
-
-    /// Answers the next window-set request with `set`.
-    fn serve(worker: &LuaWorker, set: WindowSet) {
-        match next_world_request(worker, "the window set") {
-            WorldRequest::WindowSet { reply } => {
-                let _ = reply.try_send(Ok(Arc::new(set)));
-            }
-            WorldRequest::State { .. } => panic!("expected a window-set request"),
-        }
-    }
-
-    /// The ops of the next layout command.
-    fn next_ops(worker: &LuaWorker, what: &str) -> Vec<LayoutOp> {
-        match next_effect(worker, what) {
-            FromLua::Command(Command::Layout(ops)) => ops,
-            other => match other {
-                FromLua::Flash { message, .. } => panic!("expected ops, got flash {message:?}"),
-                FromLua::Command(command) => panic!("expected ops, got {command:?}"),
-                FromLua::ConfigChanged => panic!("expected ops, got a config change"),
-            },
-        }
-    }
-
-    /// The canned layout with its window on `holding`: one display, workspace 1
-    /// on screen and workspace 9 as somewhere to stash things.
-    ///
-    /// Built directly rather than by transforming, because a transform would
-    /// record an op — and a set handed to a handler has asked for nothing yet,
-    /// which is what the real extractor produces.
-    fn test_window_set_on(holding: u32) -> WindowSet {
         use spool_shared_types::state::Frame;
         use spool_shared_types::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
 
@@ -905,7 +807,6 @@ mod tests {
             title: "window".to_string(),
             frame: None,
             floating: false,
-            managed: true,
             visible: true,
             focused: true,
         };
@@ -919,21 +820,13 @@ mod tests {
                     height: 1080,
                 },
                 active: true,
-                workspaces: Arc::new(
-                    [1, 9]
-                        .map(|number| WorkspaceSet {
-                            number,
-                            native_id: 10,
-                            active: number == 1,
-                            columns: Arc::new(if number == holding {
-                                vec![ColumnSet::single(window.clone(), 1.0)]
-                            } else {
-                                Vec::new()
-                            }),
-                            floating: Arc::new(Vec::new()),
-                        })
-                        .to_vec(),
-                ),
+                workspaces: Arc::new(vec![WorkspaceSet {
+                    space_id: 1,
+                    ordinal: 0,
+                    active: true,
+                    columns: Arc::new(vec![ColumnSet::single(window, 1.0)]),
+                    floating: Arc::new(Vec::new()),
+                }]),
             }],
             Some(7),
         )
@@ -1081,7 +974,7 @@ mod tests {
                 },
                 LayoutOp::MoveToWorkspace {
                     window: 7,
-                    workspace: 2,
+                    space_id: 2,
                     follow: false
                 },
             ]
@@ -1192,378 +1085,6 @@ mod tests {
         );
     }
 
-    /// The scratchpad module documented in CONFIGURATION.md, kept here so the
-    /// documented code is the code under test. Modelled on xmonad's
-    /// `XMonad.Util.NamedScratchpad`.
-    const SCRATCHPAD: &str = r#"
-        scratchpad = { stash = 9, pads = {}, order = {} }
-
-        function scratchpad.define(name, spec)
-          scratchpad.pads[name] = spec
-          table.insert(scratchpad.order, name)
-        end
-
-        -- The pad a window belongs to, if any. Declaration order decides ties.
-        function scratchpad.pad_of(window)
-          for _, name in ipairs(scratchpad.order) do
-            if scratchpad.pads[name].match(window) then
-              return name, scratchpad.pads[name]
-            end
-          end
-        end
-
-        -- Park every pad in `names` that is currently on screen.
-        function scratchpad.hide(ws, names)
-          for _, name in ipairs(names) do
-            local window = ws:find(scratchpad.pads[name].match)
-            if window and ws:workspace_of(window.id) == ws:current() then
-              ws = ws:shift(window.id, scratchpad.stash)
-            end
-          end
-          return ws
-        end
-
-        function scratchpad.hide_all(ws)
-          return scratchpad.hide(ws, scratchpad.order)
-        end
-
-        -- Everything declared in the same group as `name`, except itself.
-        function scratchpad.group_of(name)
-          local group, mine = {}, scratchpad.pads[name].group
-          if not mine then return group end
-          for _, other in ipairs(scratchpad.order) do
-            if other ~= name and scratchpad.pads[other].group == mine then
-              table.insert(group, other)
-            end
-          end
-          return group
-        end
-
-        function scratchpad.toggle(name)
-          return function(ws)
-            local pad = scratchpad.pads[name]
-            local window = ws:find(pad.match)
-            if not window then
-              os.execute(pad.spawn .. " &")
-              return
-            end
-            if ws:workspace_of(window.id) == ws:current() then
-              return ws:shift(window.id, scratchpad.stash)
-            end
-            ws = scratchpad.hide(ws, scratchpad.group_of(name))
-            return ws:shift(window.id, ws:current(), true):focus(window.id)
-          end
-        end
-
-        -- The manage hook: place a pad window the first time we see it. What
-        -- has been seen goes in the store, not a global, so a reload does not
-        -- re-run the hook on every open window.
-        spool.on("window_focused", function(event, ws)
-          local first_time = false
-          spool.state.mutate("scratchpad.seen", function(seen)
-            seen = seen or {}
-            first_time = not seen[tostring(event.window_id)]
-            seen[tostring(event.window_id)] = true
-            return seen
-          end)
-          if not first_time then return end
-          local window = ws:window(event.window_id)
-          if not window then return end
-          local _, pad = scratchpad.pad_of(window)
-          if pad and pad.float and window.managed then
-            return ws:float(window.id, pad.float)
-          end
-        end)
-
-        -- Hide a pad when the focus leaves it.
-        spool.on("window_focused", function(event, ws)
-          local previous = spool.state.get("scratchpad.focused")
-          spool.state.set("scratchpad.focused", event.window_id)
-          if not previous or previous == event.window_id then return end
-          local window = ws:window(previous)
-          if window and scratchpad.pad_of(window) then
-            return ws:shift(previous, scratchpad.stash)
-          end
-        end)
-
-        scratchpad.define("terminal", {
-          match = spool.match{ app = "Alacritty" },
-          spawn = "true", group = "console",
-          float = { x = 0.1, y = 0.05, width = 0.8, height = 0.5 },
-        })
-        scratchpad.define("notes", {
-          match = spool.match{ app = "Obsidian" },
-          spawn = "true", group = "console",
-        })
-
-        spool.bind("alt - s", scratchpad.toggle("terminal"))
-        spool.bind("alt - n", scratchpad.toggle("notes"))
-        spool.bind("alt - 0", scratchpad.hide_all)
-
-        -- A sentinel for the tests: touches nothing, so anything queued ahead
-        -- of its flash is something a handler actually asked for.
-        spool.bind("alt - z", function() spool.flash("sentinel") end)
-    "#;
-
-    /// Asserts nothing was queued: dispatches a handler that only flashes, and
-    /// requires that flash to be the very next thing out of the outbox.
-    ///
-    /// A bare `try_recv` would race the worker, which may not have finished the
-    /// dispatch under test yet.
-    fn assert_nothing_queued(worker: &LuaWorker) {
-        worker.send_binds(vec![4]);
-        assert_eq!(
-            next_flash(worker, "the sentinel"),
-            "sentinel",
-            "a handler queued something it should not have"
-        );
-    }
-
-    #[test]
-    fn a_scratchpad_on_screen_is_parked() {
-        let worker = worker(SCRATCHPAD);
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(7, "Alacritty", 1)]));
-
-        assert_eq!(
-            next_ops(&worker, "the stash"),
-            vec![LayoutOp::MoveToWorkspace {
-                window: 7,
-                workspace: 9,
-                follow: false
-            }]
-        );
-    }
-
-    #[test]
-    fn a_stashed_scratchpad_is_summoned_and_focused() {
-        let worker = worker(SCRATCHPAD);
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(7, "Alacritty", 9)]));
-
-        assert_eq!(
-            next_ops(&worker, "the summons"),
-            vec![
-                LayoutOp::MoveToWorkspace {
-                    window: 7,
-                    workspace: 1,
-                    follow: true
-                },
-                LayoutOp::Focus(7),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_scratchpad_that_is_not_running_is_spawned_and_nothing_moves() {
-        let worker = worker(SCRATCHPAD);
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(3, "Something Else", 1)]));
-
-        // `spawn` is `true`, so the only observable effect is that no layout
-        // command is issued.
-        assert_nothing_queued(&worker);
-    }
-
-    #[test]
-    fn summoning_a_scratchpad_hides_its_exclusive_group() {
-        let worker = worker(SCRATCHPAD);
-        // Notes is on screen; summoning the terminal from the stash should put
-        // notes away first.
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(7, "Alacritty", 9), (8, "Obsidian", 1)]));
-
-        assert_eq!(
-            next_ops(&worker, "the exclusive swap"),
-            vec![
-                LayoutOp::MoveToWorkspace {
-                    window: 8,
-                    workspace: 9,
-                    follow: false
-                },
-                LayoutOp::MoveToWorkspace {
-                    window: 7,
-                    workspace: 1,
-                    follow: true
-                },
-                LayoutOp::Focus(7),
-            ]
-        );
-    }
-
-    #[test]
-    fn hide_all_parks_every_visible_scratchpad() {
-        let worker = worker(SCRATCHPAD);
-        worker.send_binds(vec![3]);
-        serve(
-            &worker,
-            layout(&[(7, "Alacritty", 1), (8, "Obsidian", 1), (9, "Mail", 1)]),
-        );
-
-        assert_eq!(
-            next_ops(&worker, "the sweep"),
-            vec![
-                LayoutOp::MoveToWorkspace {
-                    window: 7,
-                    workspace: 9,
-                    follow: false
-                },
-                LayoutOp::MoveToWorkspace {
-                    window: 8,
-                    workspace: 9,
-                    follow: false
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn the_manage_hook_floats_a_pad_window_once() {
-        let worker = worker(SCRATCHPAD);
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 7 }]);
-        serve(&worker, layout(&[(7, "Alacritty", 1)]));
-
-        assert_eq!(
-            next_ops(&worker, "the float"),
-            vec![
-                LayoutOp::SetFloating {
-                    window: 7,
-                    floating: true
-                },
-                // 0.1/0.05/0.8/0.5 of the fixture's 1920x1080 display.
-                LayoutOp::SetFrame {
-                    window: 7,
-                    frame: spool_shared_types::state::Frame {
-                        x: 192,
-                        y: 54,
-                        width: 1536,
-                        height: 540
-                    }
-                },
-            ]
-        );
-
-        // Focusing it again is neither a new window nor a focus change, so
-        // both handlers bail before touching the set — which is why this needs
-        // no second `serve`: nothing asks for one.
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 7 }]);
-        assert_nothing_queued(&worker);
-    }
-
-    #[test]
-    fn a_pad_with_no_rect_is_not_placed_at_all() {
-        // `notes` declares no `float`, so the manage hook leaves it tiled: no
-        // float, and above all no frame invented for it.
-        let worker = worker(SCRATCHPAD);
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 8 }]);
-        serve(&worker, layout(&[(8, "Obsidian", 1)]));
-        assert_nothing_queued(&worker);
-    }
-
-    #[test]
-    fn a_pad_is_placed_on_the_display_it_is_on() {
-        // The same fractions, resolved against a second display: proportional
-        // placement is what makes one pad definition work on both.
-        let worker = worker(SCRATCHPAD);
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 7 }]);
-        serve(
-            &worker,
-            layout_on(
-                2,
-                spool_shared_types::state::Frame {
-                    x: 1920,
-                    y: -200,
-                    width: 1280,
-                    height: 800,
-                },
-                &[(7, "Alacritty", 1)],
-            ),
-        );
-
-        assert_eq!(
-            next_ops(&worker, "the float"),
-            vec![
-                LayoutOp::SetFloating {
-                    window: 7,
-                    floating: true
-                },
-                // 0.1/0.05/0.8/0.5 of 1280x800, offset by the display origin.
-                LayoutOp::SetFrame {
-                    window: 7,
-                    frame: spool_shared_types::state::Frame {
-                        x: 2048,
-                        y: -160,
-                        width: 1024,
-                        height: 400
-                    }
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn a_placed_pad_still_stashes_and_summons() {
-        // The placement is a manage-hook concern; toggling it in and out of
-        // view stays a workspace move, and does not re-place the window.
-        let worker = worker(SCRATCHPAD);
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 7 }]);
-        serve(&worker, layout(&[(7, "Alacritty", 1)]));
-        assert_eq!(next_ops(&worker, "the float").len(), 2, "float then place");
-
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(7, "Alacritty", 1)]));
-        assert_eq!(
-            next_ops(&worker, "the stash"),
-            vec![LayoutOp::MoveToWorkspace {
-                window: 7,
-                workspace: 9,
-                follow: false
-            }]
-        );
-
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(7, "Alacritty", 9)]));
-        assert_eq!(
-            next_ops(&worker, "the summons"),
-            vec![
-                LayoutOp::MoveToWorkspace {
-                    window: 7,
-                    workspace: 1,
-                    follow: true
-                },
-                LayoutOp::Focus(7),
-            ]
-        );
-    }
-
-    #[test]
-    fn losing_focus_parks_a_scratchpad() {
-        let worker = worker(SCRATCHPAD);
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 7 }]);
-        serve(&worker, layout(&[(7, "Alacritty", 1), (8, "Mail", 1)]));
-        assert_eq!(
-            next_ops(&worker, "the float").first(),
-            Some(&LayoutOp::SetFloating {
-                window: 7,
-                floating: true
-            })
-        );
-
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 8 }]);
-        serve(&worker, layout(&[(7, "Alacritty", 1), (8, "Mail", 1)]));
-        // Two handlers are registered for this event and each commits its own
-        // result: the manage hook passes on a non-pad window, the focus-loss
-        // hook parks the one that lost it.
-        assert_eq!(
-            next_ops(&worker, "the park"),
-            vec![LayoutOp::MoveToWorkspace {
-                window: 7,
-                workspace: 9,
-                follow: false
-            }]
-        );
-    }
-
     #[test]
     fn dropping_the_handle_stops_the_thread() {
         let mut worker = worker("");
@@ -1602,7 +1123,6 @@ mod tests {
                 height: 600,
             },
             floating: false,
-            managed: true,
         });
         worker.send_events(vec![event]);
         assert_eq!(
@@ -1633,7 +1153,6 @@ mod tests {
                 height: 600,
             },
             floating: false,
-            managed: true,
         });
         let libreoffice_event = LuaEvent::WindowSpawned(WindowSpawnPayload {
             window_id: 2,
@@ -1648,7 +1167,6 @@ mod tests {
                 height: 300,
             },
             floating: false,
-            managed: true,
         });
 
         // Non-matching event should not trigger flash

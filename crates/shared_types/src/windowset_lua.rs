@@ -9,8 +9,8 @@
 //!
 //! # Indices
 //!
-//! Lua counts from one. Column indices and workspace numbers here do too, and
-//! are translated at this boundary rather than anywhere deeper.
+//! Lua counts column indices from one. Native Space IDs are opaque `u64`
+//! identities and are never translated at this boundary.
 
 use mlua::{Function, LuaSerdeExt, UserData, UserDataMethods, Value};
 
@@ -69,21 +69,21 @@ impl UserData for WindowSet {
             None => Ok(Value::Nil),
         });
 
-        // The active workspace of the active display — "here", for a script.
+        // The focused native Space — "here", for a script.
         methods.add_method("current", |_, this, ()| {
-            Ok(this.current().map(|workspace| workspace.number))
+            Ok(this.current().map(|space| space.space_id))
         });
 
-        methods.add_method("workspaces", |_, this, ()| {
+        methods.add_method("spaces", |_, this, ()| {
             Ok(this
                 .workspaces()
-                .map(|workspace| workspace.number)
-                .collect::<Vec<u32>>())
+                .map(|space| space.space_id)
+                .collect::<Vec<u64>>())
         });
 
-        // Every window on a workspace, tiled first then floating.
-        methods.add_method("workspace_windows", |lua, this, number: u32| {
-            let Some(workspace) = this.workspace(number) else {
+        // Every window on a Space, tiled first then floating.
+        methods.add_method("space_windows", |lua, this, space_id: u64| {
+            let Some(workspace) = this.workspace(space_id) else {
                 return Ok(Vec::new());
             };
             workspace
@@ -92,10 +92,10 @@ impl UserData for WindowSet {
                 .collect::<mlua::Result<Vec<Value>>>()
         });
 
-        // The workspace's columns, each a list of window ids, left to right.
-        methods.add_method("columns", |_, this, number: Option<u32>| {
-            let workspace = match number {
-                Some(number) => this.workspace(number),
+        // The Space's columns, each a list of window ids, left to right.
+        methods.add_method("columns", |_, this, space_id: Option<u64>| {
+            let workspace = match space_id {
+                Some(space_id) => this.workspace(space_id),
                 None => this.current(),
             };
             let Some(workspace) = workspace else {
@@ -113,8 +113,8 @@ impl UserData for WindowSet {
             Ok(this.column_of(id).map(|index| index + 1))
         });
 
-        methods.add_method("workspace_of", |_, this, id: WinID| {
-            Ok(this.workspace_of(id).map(|workspace| workspace.number))
+        methods.add_method("space_of", |_, this, id: WinID| {
+            Ok(this.workspace_of(id).map(|space| space.space_id))
         });
 
         // The whole display record, so a script can work out pixel geometry
@@ -175,12 +175,12 @@ impl UserData for WindowSet {
 
         methods.add_method(
             "shift",
-            |_, this, (id, workspace, follow): (WinID, u32, Option<bool>)| {
-                Ok(this.shift_following(id, workspace, follow.unwrap_or(false)))
+            |_, this, (id, space_id, follow): (WinID, u64, Option<bool>)| {
+                Ok(this.shift_following(id, space_id, follow.unwrap_or(false)))
             },
         );
 
-        methods.add_method("view", |_, this, workspace: u32| Ok(this.view(workspace)));
+        methods.add_method("view", |_, this, space_id: u64| Ok(this.view(space_id)));
 
         // `ws:float(id)` leaves the window where it is (defaultFloating);
         // `ws:float(id, rect)` places it (customFloating). The rect is given as
@@ -196,10 +196,6 @@ impl UserData for WindowSet {
         );
 
         methods.add_method("sink", |_, this, id: WinID| Ok(this.sink(id)));
-
-        methods.add_method("manage", |_, this, id: WinID| Ok(this.manage(id)));
-
-        methods.add_method("unmanage", |_, this, id: WinID| Ok(this.unmanage(id)));
 
         methods.add_method("width", |_, this, (id, ratio): (WinID, f64)| {
             Ok(this.width(id, ratio))

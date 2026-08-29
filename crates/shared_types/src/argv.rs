@@ -4,10 +4,7 @@
 //! TOML `[bindings]` keys are split into, so parsing and formatting live
 //! together here and are checked against each other by round-trip tests.
 
-use crate::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
-    parse_virtual_workspace_number,
-};
+use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection};
 
 /// Why an argv vector is not a command. Consumers wrap this in their own error
 /// type; the message is already user-facing.
@@ -44,8 +41,9 @@ pub fn parse_command(argv: &[&str]) -> Result<Command> {
     let command = *argv.first().unwrap_or(&"");
     Ok(match command {
         "printstate" => Command::PrintState,
+        "reconcile-windows" => Command::ReconcileWindows,
         "window" => parse_window_command(&argv[1..])?,
-        "workspace" => parse_workspace_command(&argv[1..])?,
+        "space" => parse_space_command(&argv[1..])?,
         "mouse" => Command::Mouse(parse_mouse_move(&argv[1..])?),
         "quit" => Command::Quit,
         "restart" => Command::Restart,
@@ -65,13 +63,19 @@ fn parse_u32(input: &str, what: &str) -> Result<u32> {
         .map_err(|_| ParseError::new(format!("invalid {what} '{input}'")))
 }
 
+fn parse_u64(input: &str, what: &str) -> Result<u64> {
+    input
+        .parse()
+        .map_err(|_| ParseError::new(format!("invalid {what} '{input}'")))
+}
+
 fn parse_window_command(argv: &[&str]) -> Result<Command> {
     match *argv.first().unwrap_or(&"") {
         "focusid" if argv.len() == 2 => Ok(Command::FocusWindow {
             window_id: parse_i32(argv[1], "window id")?,
         }),
-        "move-to-workspace" if argv.len() == 5 => {
-            let move_focus = match argv[4] {
+        "move-to-space" if argv.len() == 4 => {
+            let move_focus = match argv[3] {
                 "follow" => MoveFocus::Follow,
                 "stay" => MoveFocus::Stay,
                 other => {
@@ -80,10 +84,9 @@ fn parse_window_command(argv: &[&str]) -> Result<Command> {
                     )));
                 }
             };
-            Ok(Command::MoveWindowToVirtualWorkspace {
+            Ok(Command::MoveWindowToSpace {
                 window_id: parse_i32(argv[1], "window id")?,
-                display_id: parse_u32(argv[2], "display id")?,
-                virtual_index: parse_virtual_workspace_number(argv[3])?,
+                space_id: parse_u64(argv[2], "space id")?,
                 move_focus,
             })
         }
@@ -91,14 +94,19 @@ fn parse_window_command(argv: &[&str]) -> Result<Command> {
     }
 }
 
-fn parse_workspace_command(argv: &[&str]) -> Result<Command> {
-    if argv.len() != 3 || argv[0] != "select" {
-        return Err(ParseError::invalid(argv));
+fn parse_space_command(argv: &[&str]) -> Result<Command> {
+    match argv {
+        ["focus", space_id] => Ok(Command::FocusSpace {
+            space_id: parse_u64(space_id, "space id")?,
+        }),
+        ["create", display_id] => Ok(Command::CreateSpace {
+            display_id: parse_u32(display_id, "display id")?,
+        }),
+        ["delete", space_id] => Ok(Command::DeleteSpace {
+            space_id: parse_u64(space_id, "space id")?,
+        }),
+        _ => Err(ParseError::invalid(argv)),
     }
-    Ok(Command::SelectVirtualWorkspace {
-        display_id: parse_u32(argv[1], "display id")?,
-        virtual_index: parse_virtual_workspace_number(argv[2])?,
-    })
 }
 
 /// Parses a window operation (e.g. `["focus", "east"]`).
@@ -108,11 +116,9 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
     let argument = || argv.get(1).ok_or_else(err).copied();
 
     Ok(match command {
-        // The bindings key splits on `_`, so `window_focus_unmanaged` arrives
-        // here as ["focus", "unmanaged"] and the suffix tells us the variant.
         "focus" => match argument()? {
-            "unmanaged" => Operation::FocusUnmanaged,
-            "managed" => Operation::FocusManaged,
+            "floating" => Operation::FocusFloating,
+            "tiled" => Operation::FocusTiled,
             direction => Operation::Focus(Direction::parse_positional(direction)?),
         },
         "raise" => match argument()? {
@@ -129,7 +135,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "grow" => Operation::Resize(ResizeDirection::Grow),
         "shrink" => Operation::Resize(ResizeDirection::Shrink),
         "fullwidth" => Operation::FullWidth,
-        "manage" => Operation::Manage,
+        "togglefloating" => Operation::ToggleFloating,
         "equalize" => Operation::Equalize,
         "balance" => Operation::Balance,
         "stack" => Operation::Stack(true),
@@ -137,44 +143,8 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
         "snap" => Operation::Snap,
-        // The `virtual*` verbs take either a direction or a workspace number,
-        // and `num` variants that only take a number.
-        "virtual" => virtual_target(argument()?, Operation::Virtual, Operation::VirtualNumber)?,
-        "virtualnum" => Operation::VirtualNumber(parse_virtual_workspace_number(argument()?)?),
-        "virtualadd" => Operation::VirtualAdd,
-        "virtualmove" => virtual_target(
-            argument()?,
-            |direction| Operation::VirtualMove(direction, MoveFocus::Follow),
-            |index| Operation::VirtualMoveNumber(index, MoveFocus::Follow),
-        )?,
-        "virtualmovenum" => Operation::VirtualMoveNumber(
-            parse_virtual_workspace_number(argument()?)?,
-            MoveFocus::Follow,
-        ),
-        "virtualsend" => virtual_target(
-            argument()?,
-            |direction| Operation::VirtualMove(direction, MoveFocus::Stay),
-            |index| Operation::VirtualMoveNumber(index, MoveFocus::Stay),
-        )?,
-        "virtualsendnum" => Operation::VirtualMoveNumber(
-            parse_virtual_workspace_number(argument()?)?,
-            MoveFocus::Stay,
-        ),
         _ => return Err(err()),
     })
-}
-
-/// Resolves a `virtual*` argument that may be a direction or a 1-based number.
-fn virtual_target(
-    target: &str,
-    directional: impl Fn(Direction) -> Operation,
-    numbered: impl Fn(u32) -> Operation,
-) -> Result<Operation> {
-    if target.parse::<u32>().is_ok() {
-        Ok(numbered(parse_virtual_workspace_number(target)?))
-    } else {
-        Ok(directional(Direction::parse(target)?))
-    }
 }
 
 /// Parses a mouse command (e.g. `["nextdisplay"]`).
@@ -208,35 +178,40 @@ impl Command {
                     window_id.to_string(),
                 ]
             }
-            Command::SelectVirtualWorkspace {
-                display_id,
-                virtual_index,
-            } => vec![
-                "workspace".to_string(),
-                "select".to_string(),
-                display_id.to_string(),
-                (virtual_index + 1).to_string(),
+            Command::FocusSpace { space_id } => vec![
+                "space".to_string(),
+                "focus".to_string(),
+                space_id.to_string(),
             ],
-            Command::MoveWindowToVirtualWorkspace {
+            Command::MoveWindowToSpace {
                 window_id,
-                display_id,
-                virtual_index,
+                space_id,
                 move_focus,
             } => vec![
                 "window".to_string(),
-                "move-to-workspace".to_string(),
+                "move-to-space".to_string(),
                 window_id.to_string(),
-                display_id.to_string(),
-                (virtual_index + 1).to_string(),
+                space_id.to_string(),
                 match move_focus {
                     MoveFocus::Follow => "follow",
                     MoveFocus::Stay => "stay",
                 }
                 .to_string(),
             ],
+            Command::CreateSpace { display_id } => vec![
+                "space".to_string(),
+                "create".to_string(),
+                display_id.to_string(),
+            ],
+            Command::DeleteSpace { space_id } => vec![
+                "space".to_string(),
+                "delete".to_string(),
+                space_id.to_string(),
+            ],
             Command::Quit => vec!["quit".to_string()],
             Command::Restart => vec!["restart".to_string()],
             Command::PrintState => vec!["printstate".to_string()],
+            Command::ReconcileWindows => vec!["reconcile-windows".to_string()],
             Command::Lua(_) | Command::Layout(_) => return None,
         };
         Some(argv)
@@ -259,29 +234,12 @@ impl Operation {
             Operation::ToNextDisplay(MoveFocus::Stay) => owned(&["nextdisplaysend"]),
             Operation::Equalize => owned(&["equalize"]),
             Operation::Balance => owned(&["balance"]),
-            Operation::Manage => owned(&["manage"]),
+            Operation::ToggleFloating => owned(&["togglefloating"]),
             Operation::Stack(true) => owned(&["stack"]),
             Operation::Stack(false) => owned(&["unstack"]),
             Operation::Snap => owned(&["snap"]),
-            Operation::Virtual(direction) => vec!["virtual".to_string(), direction.token()],
-            Operation::VirtualNumber(index) => {
-                vec!["virtualnum".to_string(), (index + 1).to_string()]
-            }
-            Operation::VirtualAdd => owned(&["virtualadd"]),
-            Operation::VirtualMove(direction, MoveFocus::Follow) => {
-                vec!["virtualmove".to_string(), direction.token()]
-            }
-            Operation::VirtualMove(direction, MoveFocus::Stay) => {
-                vec!["virtualsend".to_string(), direction.token()]
-            }
-            Operation::VirtualMoveNumber(index, MoveFocus::Follow) => {
-                vec!["virtualmovenum".to_string(), (index + 1).to_string()]
-            }
-            Operation::VirtualMoveNumber(index, MoveFocus::Stay) => {
-                vec!["virtualsendnum".to_string(), (index + 1).to_string()]
-            }
-            Operation::FocusUnmanaged => owned(&["focus", "unmanaged"]),
-            Operation::FocusManaged => owned(&["focus", "managed"]),
+            Operation::FocusFloating => owned(&["focus", "floating"]),
+            Operation::FocusTiled => owned(&["focus", "tiled"]),
             Operation::RaiseFloating => owned(&["raise", "floating"]),
             Operation::ToggleFloatingLayer => owned(&["togglefloatlayer"]),
         }
@@ -311,18 +269,12 @@ mod tests {
             Operation::ToNextDisplay(MoveFocus::Stay),
             Operation::Equalize,
             Operation::Balance,
-            Operation::Manage,
+            Operation::ToggleFloating,
             Operation::Stack(true),
             Operation::Stack(false),
             Operation::Snap,
-            Operation::Virtual(Direction::First),
-            Operation::VirtualNumber(2),
-            Operation::VirtualMove(Direction::East, MoveFocus::Follow),
-            Operation::VirtualMove(Direction::East, MoveFocus::Stay),
-            Operation::VirtualMoveNumber(0, MoveFocus::Follow),
-            Operation::VirtualMoveNumber(0, MoveFocus::Stay),
-            Operation::FocusUnmanaged,
-            Operation::FocusManaged,
+            Operation::FocusFloating,
+            Operation::FocusTiled,
             Operation::RaiseFloating,
             Operation::ToggleFloatingLayer,
         ];
@@ -344,18 +296,17 @@ mod tests {
             Command::Quit,
             Command::Restart,
             Command::PrintState,
+            Command::ReconcileWindows,
             Command::Mouse(MouseMove::ToNextDisplay),
             Command::FocusWindow { window_id: 42 },
-            Command::SelectVirtualWorkspace {
-                display_id: 7,
-                virtual_index: 2,
-            },
-            Command::MoveWindowToVirtualWorkspace {
+            Command::FocusSpace { space_id: 99 },
+            Command::MoveWindowToSpace {
                 window_id: 42,
-                display_id: 7,
-                virtual_index: 2,
+                space_id: 99,
                 move_focus: MoveFocus::Follow,
             },
+            Command::CreateSpace { display_id: 7 },
+            Command::DeleteSpace { space_id: 99 },
         ] {
             assert_eq!(
                 format!("{:?}", round_trip(&command)),
@@ -377,6 +328,13 @@ mod tests {
             "the first window is number 1"
         );
         assert!(Direction::parse_positional("0").is_err());
+    }
+
+    #[test]
+    fn legacy_managed_command_names_are_rejected() {
+        assert!(parse_command(&["window", "manage"]).is_err());
+        assert!(parse_command(&["window", "focus", "unmanaged"]).is_err());
+        assert!(parse_command(&["window", "focus", "managed"]).is_err());
     }
 
     #[test]

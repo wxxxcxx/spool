@@ -276,7 +276,7 @@ fn test_floating_window_does_not_hold_a_slot_in_the_strip() {
             command: Command::PrintState,
         }, // 0
         Event::Command {
-            command: Command::Window(Operation::Manage),
+            command: Command::Window(Operation::ToggleFloating),
         }, // 1 — float the focused window
         Event::Command {
             command: Command::PrintState,
@@ -387,6 +387,233 @@ fn test_closing_window_of_live_app_closes_the_gap() {
                 window_x(world, 2) - window_x(world, 0),
                 TEST_WINDOW_WIDTH,
                 "surviving windows must close the gap left by window 1"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_window_server_close_of_live_app_closes_the_gap() {
+    use crate::events::DestroySource;
+
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::WindowDestroyed {
+            window_id: 1,
+            source: DestroySource::WindowServer,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert!(
+                !window_exists(world, 1),
+                "WindowServer close must remove the tracked window"
+            );
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                TEST_WINDOW_WIDTH,
+                "surviving windows must close the WindowServer-confirmed gap"
+            );
+        })
+        .run(commands);
+}
+
+/// Reconciliation is the recovery path for applications which withdraw a
+/// window without emitting either `AXUIElementDestroyed` or an SLS destroy event.
+#[test]
+fn test_reconcile_removes_a_vanished_window_and_closes_the_gap() {
+    use crate::events::ReconcileScope;
+
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::ReconcileWindows {
+            scope: ReconcileScope::Application(TEST_PROCESS_ID),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |world, state| {
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                2 * TEST_WINDOW_WIDTH
+            );
+            state.os_vanish_window(1);
+        })
+        .on_iteration(1, |world, _state| {
+            assert!(
+                !window_exists(world, 1),
+                "reconciliation must remove a window missing from the OS inventory"
+            );
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                TEST_WINDOW_WIDTH,
+                "surviving windows must close the reconciled gap"
+            );
+        })
+        .run(commands);
+}
+
+/// A cached AX element can keep answering after its window has disappeared
+/// from both the application's inventory and `WindowServer`. That stale handle
+/// must not keep a navigable layout slot alive indefinitely.
+#[test]
+fn test_reconcile_removes_vanished_window_with_responsive_stale_ax_handle() {
+    use crate::events::ReconcileScope;
+
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::ReconcileWindows {
+            scope: ReconcileScope::Application(TEST_PROCESS_ID),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |world, state| {
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                2 * TEST_WINDOW_WIDTH
+            );
+            state.os_vanish_window_with_stale_ax_handle(1);
+        })
+        .on_iteration(1, |world, _state| {
+            assert!(
+                !window_exists(world, 1),
+                "a responsive stale AX handle must not keep a vanished window alive"
+            );
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                TEST_WINDOW_WIDTH,
+                "surviving windows must close the vanished window's gap"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_reconcile_filters_ax_withdrawn_window_before_cg_surface_disappears() {
+    use crate::events::ReconcileScope;
+
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::ReconcileWindows {
+            scope: ReconcileScope::Application(TEST_PROCESS_ID),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.os_withdraw_window(1))
+        .on_iteration(1, |world, _state| {
+            assert!(
+                window_exists(world, 1),
+                "CG-retained surface must not be destroyed immediately"
+            );
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                TEST_WINDOW_WIDTH,
+                "AX-withdrawn window must leave layout immediately"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_reconcile_restores_a_temporarily_withdrawn_window() {
+    use crate::events::ReconcileScope;
+
+    let reconcile = || Event::ReconcileWindows {
+        scope: ReconcileScope::Application(TEST_PROCESS_ID),
+    };
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        reconcile(),
+        reconcile(),
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.os_withdraw_window(1))
+        .on_iteration(1, |world, state| {
+            assert_eq!(window_x(world, 2) - window_x(world, 0), TEST_WINDOW_WIDTH);
+            state.os_restore_withdrawn_window(1);
+        })
+        .on_iteration(2, |world, _state| {
+            assert!(window_exists(world, 1));
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                2 * TEST_WINDOW_WIDTH
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_reconcile_destroys_withdrawn_window_after_cg_confirmation() {
+    use crate::events::ReconcileScope;
+
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::ReconcileWindows {
+            scope: ReconcileScope::Application(TEST_PROCESS_ID),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.os_withdraw_window(1))
+        .on_iteration(1, |world, state| {
+            assert!(window_exists(world, 1));
+            state.os_settle_withdrawn_surface(1);
+        })
+        .on_iteration(2, |world, _state| {
+            assert!(
+                !window_exists(world, 1),
+                "window must be destroyed after AX and CG agree"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_reconcile_discovers_window_missing_from_ecs() {
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::ReconcileWindows,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, |_world, state| {
+            let frame = bevy::math::IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            _ = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 99, frame);
+        })
+        .on_iteration(1, |world, _state| {
+            assert!(
+                window_exists(world, 99),
+                "full reconciliation must discover an OS-only window"
             );
         })
         .run(commands);

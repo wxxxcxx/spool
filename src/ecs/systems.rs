@@ -2,10 +2,11 @@ use bevy::app::AppExit;
 use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
+use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
 use bevy::ecs::system::{
-    Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
+    Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single, SystemParam,
 };
 use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
@@ -25,19 +26,41 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
+use crate::ecs::focus::FocusResolution;
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
     LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, WidthRatio, WindowProperties,
+    WindowVisibility,
 };
-use crate::events::{Event, InputEvent};
+use crate::events::{Event, FocusSource, InputEvent};
 use crate::manager::{
     Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{PlatformCallbacks, WinID};
+
+/// Keeps `WindowServer`'s per-window close notification subscription aligned
+/// with the ECS inventory on macOS versions that require explicit requests.
+pub(super) fn refresh_window_notifications(
+    windows: Query<&Window>,
+    added: Query<(), Added<Window>>,
+    mut removed: RemovedComponents<Window>,
+    window_manager: Res<WindowManager>,
+) {
+    let inventory_changed = !added.is_empty() || removed.read().next().is_some();
+    if !inventory_changed {
+        return;
+    }
+
+    let window_ids = windows.iter().map(|window| window.id()).collect::<Vec<_>>();
+    _ = window_manager
+        .request_window_notifications(&window_ids)
+        .inspect_err(|error| warn!(%error, "unable to refresh WindowServer notifications"));
+}
 
 /// Processes and applications still inside their spawn grace period, with the
 /// `FreshMarker` that says whether the spawn actually completed in time.
@@ -57,7 +80,7 @@ type MovableWindows<'w, 's> = Query<
         &'static mut Window,
         &'static mut Position,
         &'static Bounds,
-        Option<&'static Unmanaged>,
+        Option<&'static WindowVisibility>,
         Has<RepositionMarker>,
     ),
     Without<LayoutStrip>,
@@ -74,7 +97,7 @@ type ResizableWindows<'w, 's> = Query<
         Entity,
         &'static Position,
         &'static mut Bounds,
-        Option<&'static Unmanaged>,
+        Option<&'static WindowVisibility>,
         Has<ResizeMarker>,
     ),
     Without<LayoutStrip>,
@@ -110,8 +133,9 @@ pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Command
         return;
     };
     for (display, workspaces) in window_manager.present_displays() {
+        let display_id = display.id();
         let origin = Position(display.bounds().min);
-        let entity = if display.id() == active_display_id {
+        let entity = if display_id == active_display_id {
             commands.spawn((display, ActiveDisplayMarker))
         } else {
             commands.spawn(display)
@@ -120,46 +144,25 @@ pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Command
 
         commands.trigger(ReadDisplayProperties(entity));
 
-        let Ok(active_space) = window_manager.active_display_space(active_display_id) else {
-            return;
+        let Ok(visible_space) = window_manager.active_display_space(display_id) else {
+            error!(display_id, "Unable to get visible Space id");
+            continue;
         };
 
-        for id in workspaces {
-            let active = id == active_space;
-            commands.spawn_layout_strip(LayoutStrip::new(id, 0), origin.0, entity, active);
+        for (ordinal, id) in workspaces.into_iter().enumerate() {
+            let visible = id == visible_space;
+            let active = display_id == active_display_id && visible;
+            let mut strip =
+                commands.spawn_layout_strip(LayoutStrip::new(id), origin.0, entity, active);
+            strip.insert(NativeSpace::new(
+                id,
+                ordinal,
+                window_manager.workspace_is_fullscreen(id),
+            ));
+            if visible {
+                strip.insert(VisibleNativeSpaceMarker);
+            }
             commands.spawn((FloatingLayer::new(id), ChildOf(entity)));
-        }
-    }
-}
-
-/// Pre-creates additional (empty) virtual workspaces on every physical space,
-/// so that `config.default_workspaces()` virtual workspaces exist right after
-/// startup instead of only being created on first use.
-///
-/// Must run after [`gather_displays`], which spawns the `virtual_index: 0`
-/// strip for every physical space.
-pub fn initialise_workspaces(
-    strips: Query<(&LayoutStrip, &ChildOf, &Position)>,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    let wanted = config.default_workspaces();
-    if wanted <= 1 {
-        return;
-    }
-
-    let mut seen = HashSet::new();
-    for (strip, child_of, origin) in &strips {
-        if strip.virtual_index != 0 || !seen.insert((strip.id(), child_of.parent())) {
-            continue;
-        }
-        for virtual_index in 1..wanted {
-            commands.spawn_layout_strip(
-                LayoutStrip::new(strip.id(), virtual_index),
-                origin.0,
-                child_of.parent(),
-                false,
-            );
         }
     }
 }
@@ -244,11 +247,11 @@ pub(crate) fn add_existing_application(
 
 /// Finishes the initialization process once all initial windows are loaded.
 /// This system refreshes displays, assigns the `FocusedMarker` to the first window of the active space,
-/// and logs the total number of managed windows.
+/// and logs the total number of tracked windows.
 ///
 /// # Arguments
 ///
-/// * `windows` - A mutable query for all `Window` components, their `Entity`, and `Has<Unmanaged>` status.
+/// * `windows` - A mutable query for all tracked window components.
 /// * `displays` - A query for all `Display` entities, including whether they have the `ActiveDisplayMarker`.
 /// * `window_manager` - The `WindowManager` resource for refreshing displays and getting active space information.
 /// * `commands` - Bevy commands to insert components like `FocusedMarker`.
@@ -286,7 +289,7 @@ pub(crate) fn finish_setup(
         windows.iter().size_hint()
     );
 
-    let mut focused_managed_window = false;
+    let mut focused_tiled_window = false;
     for (mut strip, active_strip, _) in &mut workspaces {
         debug!("space {}: before refresh {strip:?}", strip.id());
         let workspace_windows = window_manager
@@ -298,11 +301,11 @@ pub(crate) fn finish_setup(
             .map(|workspace_windows| {
                 workspace_windows
                     .into_iter()
-                    .filter_map(|window_id| windows.find_managed(window_id))
+                    .filter_map(|window_id| windows.find_tiled(window_id))
                     .filter(|(window, entity)| {
                         if window.is_minimized() {
                             if let Ok(mut entity_commands) = commands.get_entity(*entity) {
-                                entity_commands.try_insert(Unmanaged::Minimized);
+                                entity_commands.try_insert(WindowVisibility::Minimized);
                             }
                             false
                         } else {
@@ -330,14 +333,14 @@ pub(crate) fn finish_setup(
 
         if active_strip && let Some(entity) = strip.first().ok().and_then(|column| column.top()) {
             commands.focus_entity(entity, true);
-            focused_managed_window = true;
+            focused_tiled_window = true;
         }
     }
 
     // An all-floating workspace has no strip member to receive the initial
     // focus marker. Mirror the frontmost app's AX focus so menu actions such as
-    // Toggle Managed work immediately after launch.
-    if !focused_managed_window
+    // Make Toggle Floating work immediately after launch.
+    if !focused_tiled_window
         && let Some(focused_window_id) = applications
             .iter()
             .find(|app| app.is_frontmost())
@@ -379,12 +382,12 @@ pub(super) fn add_launched_process(
             continue;
         }
 
-        if config.should_force_manage_process(process) {
+        if config.should_force_track_process(process) {
             debug!(
-                "Forcing management of launched process '{}' despite unobservable policy.",
+                "Forcing tracking of launched process '{}' despite unobservable policy.",
                 process.name()
             );
-            process.force_manage(true);
+            process.force_track(true);
         }
 
         if !process.ready() {
@@ -515,13 +518,26 @@ pub(super) fn timeout_ticker(
 /// Retries querying the focused window for applications that had a transient AX error
 /// during `ApplicationFrontSwitched`. Runs each frame until success or timeout.
 pub(super) fn retry_front_switch(
-    retries: Populated<(Entity, &RetryFrontSwitch)>,
+    retries: Populated<(Entity, &mut RetryFrontSwitch)>,
     applications: Query<&Application>,
+    clock: Res<Time>,
+    mut focus_resolution: ResMut<FocusResolution>,
     mut commands: Commands,
 ) {
-    for (entity, retry) in retries.iter() {
-        let Ok(app) = applications.get(retry.0) else {
+    for (entity, mut retry) in retries {
+        if !focus_resolution.is_current(retry.generation) {
+            debug!(
+                "Discarding stale focus retry from generation {}.",
+                retry.generation
+            );
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_despawn();
+            }
+            continue;
+        }
+        let Ok(app) = applications.get(retry.app_entity) else {
             // Application entity no longer exists, clean up.
+            focus_resolution.mark_unknown(retry.generation);
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_despawn();
             }
@@ -530,6 +546,7 @@ pub(super) fn retry_front_switch(
         if !app.is_frontmost() {
             // App is no longer frontmost — this retry is stale.
             debug!("Discarding stale front switch retry (app no longer frontmost).");
+            focus_resolution.mark_unknown(retry.generation);
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_despawn();
             }
@@ -537,14 +554,28 @@ pub(super) fn retry_front_switch(
         }
         if let Ok(focused_id) = app.focused_window_id() {
             debug!("Front switch retry succeeded for window {focused_id}.");
-            commands.trigger(SendMessageTrigger(Event::WindowFocused {
-                window_id: focused_id,
-            }));
+            commands.trigger(SendMessageTrigger(Event::resolved_focus(
+                focused_id,
+                app.pid(),
+                FocusSource::Retry,
+                retry.generation,
+            )));
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_despawn();
+            }
+            continue;
+        }
+        retry.timer.tick(clock.delta());
+        if retry.timer.is_finished() {
+            warn!(
+                "Focused-window query for '{}' timed out; actual focus remains unknown.",
+                app.name()
+            );
+            focus_resolution.mark_unknown(retry.generation);
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_despawn();
             }
         }
-        // Otherwise, let timeout_ticker handle expiry.
     }
 }
 
@@ -764,13 +795,13 @@ pub(super) fn window_resized_update_frame(
             continue;
         };
 
-        let Some((mut window, entity, position, mut bounds, unmanaged, resizing)) = windows
+        let Some((mut window, entity, position, mut bounds, visibility, resizing)) = windows
             .iter_mut()
             .find(|window| window.0.id() == *window_id)
         else {
             continue;
         };
-        if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
+        if visibility.is_some() {
             continue;
         }
         // Our own resize, echoed back: `commit_window_size` requested this size
@@ -839,13 +870,13 @@ pub(crate) fn window_moved_update_frame(
             continue;
         };
 
-        let Some((mut window, mut position, bounds, unmanaged, repositioning)) = windows
+        let Some((mut window, mut position, bounds, visibility, repositioning)) = windows
             .iter_mut()
             .find(|window| window.0.id() == *window_id)
         else {
             continue;
         };
-        if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
+        if visibility.is_some() {
             continue;
         }
         // Our own move, echoed back: `animate_entities` lerps from the current
@@ -897,7 +928,7 @@ pub(crate) fn gather_initial_processes(
 
     // A Lua `spool.setup{...}` config is inserted at build time and wins; the
     // TOML config drained from the channel is only the fallback. Use whichever
-    // is authoritative for the force-manage and menubar decisions below.
+    // is authoritative for the force-track and menubar decisions below.
     let effective = existing_config
         .as_deref()
         .cloned()
@@ -913,15 +944,15 @@ pub(crate) fn gather_initial_processes(
     while let Some(mut process) = initial_processes.pop() {
         let forced = effective
             .as_ref()
-            .is_some_and(|c| c.should_force_manage_process(&**process));
+            .is_some_and(|c| c.should_force_track_process(&**process));
 
         if process.is_observable() || forced {
             if forced {
                 debug!(
-                    "Forcing management of existing process '{}' despite unobservable policy.",
+                    "Forcing tracking of existing process '{}' despite unobservable policy.",
                     process.name()
                 );
-                process.force_manage(true);
+                process.force_track(true);
             } else {
                 debug!("Adding existing process {}", process.name());
             }
@@ -957,15 +988,85 @@ pub(super) struct OverlayWindowConfigCache {
     detected_border_radius: Option<f64>,
 }
 
+#[derive(Clone, Copy)]
+enum OverlayLayoutMode {
+    Tiled,
+    Floating,
+}
+
+#[derive(Clone, Copy)]
+struct OverlayTargetState {
+    mode: OverlayLayoutMode,
+    eligible: bool,
+    in_active_strip: bool,
+    in_active_space: bool,
+}
+
+fn is_overlay_target(state: OverlayTargetState) -> bool {
+    state.eligible
+        && if matches!(state.mode, OverlayLayoutMode::Floating) {
+            state.in_active_space
+        } else {
+            state.in_active_strip
+        }
+}
+
+#[cfg(test)]
+mod overlay_target_tests {
+    use super::{OverlayLayoutMode, OverlayTargetState, is_overlay_target};
+
+    #[test]
+    fn accepts_visible_tiled_or_floating_focus_in_active_space() {
+        assert!(is_overlay_target(OverlayTargetState {
+            mode: OverlayLayoutMode::Tiled,
+            eligible: true,
+            in_active_strip: true,
+            in_active_space: true,
+        }));
+        assert!(is_overlay_target(OverlayTargetState {
+            mode: OverlayLayoutMode::Floating,
+            eligible: true,
+            in_active_strip: false,
+            in_active_space: true,
+        }));
+    }
+
+    #[test]
+    fn rejects_hidden_fullscreen_and_off_space_focus() {
+        let mut state = OverlayTargetState {
+            mode: OverlayLayoutMode::Floating,
+            eligible: false,
+            in_active_strip: false,
+            in_active_space: true,
+        };
+        assert!(!is_overlay_target(state));
+        state.eligible = false;
+        assert!(!is_overlay_target(state));
+        state.eligible = true;
+        state.in_active_space = false;
+        assert!(!is_overlay_target(state));
+        state.mode = OverlayLayoutMode::Tiled;
+        state.in_active_space = true;
+        assert!(!is_overlay_target(state));
+    }
+}
+
+#[derive(SystemParam)]
+pub(super) struct OverlayInputs<'w, 's> {
+    windows: Windows<'w, 's>,
+    focus_resolution: Res<'w, FocusResolution>,
+    applications: Query<'w, 's, &'static Application>,
+    window_manager: Res<'w, WindowManager>,
+    mission_control_active: Res<'w, MissionControlActive>,
+    config: Res<'w, Config>,
+}
+
 pub(super) fn update_overlays(
     // Gating lives in the `overlay_dirty` run condition (strip change *or*
     // focus change); this query just resolves the current active workspace.
     active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
-    windows: Windows,
-    applications: Query<&Application>,
+    inputs: OverlayInputs,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
-    mission_control_active: Res<MissionControlActive>,
-    config: Res<Config>,
     mut window_config_cache: Local<OverlayWindowConfigCache>,
 ) {
     use crate::overlay::BorderParams;
@@ -975,8 +1076,8 @@ pub(super) fn update_overlays(
         return;
     };
 
-    let dim_opacity = config.dim_inactive_opacity();
-    let border_enabled = config.border_active_window();
+    let dim_opacity = inputs.config.dim_inactive_opacity();
+    let border_enabled = inputs.config.border_active_window();
 
     // Hide overlays during swipe, mission control, native fullscreen spaces,
     // or briefly after a space change (macOS space-switch animation).
@@ -984,7 +1085,7 @@ pub(super) fn update_overlays(
         return;
     };
 
-    if swiping || mission_control_active.0 || active_strip.is_fullscreen() {
+    if swiping || inputs.mission_control_active.0 || active_strip.is_fullscreen() {
         overlay_mgr.hide_all();
         return;
     }
@@ -994,15 +1095,30 @@ pub(super) fn update_overlays(
         return;
     }
 
-    // Find the focused managed window's absolute CG frame.
-    // Skip floating/unmanaged windows — no overlay or border for those.
-    let (focused_abs_cg, focused_window_id) = if let Some((window, entity, unmanaged)) = windows
-        .focused()
-        .and_then(|(_, entity)| windows.get_managed(entity))
-        && unmanaged.is_none()
-        && !window.is_full_screen()
-        && active_strip.contains(entity)
-    {
+    let active_space_windows = inputs
+        .window_manager
+        .windows_in_workspace(active_strip.id())
+        .unwrap_or_default();
+
+    // Resolve the focused tracked window. Tiled membership belongs to ECS;
+    // floating Space membership belongs to macOS.
+    let visual_focus = inputs
+        .focus_resolution
+        .visual_window_id()
+        .and_then(|window_id| inputs.windows.find(window_id))
+        .or_else(|| inputs.windows.focused());
+    let (focused_abs_cg, focused_window_id) = if let Some((window, entity, state)) =
+        visual_focus.and_then(|(_, entity)| inputs.windows.get_tracked(entity))
+        && is_overlay_target(OverlayTargetState {
+            mode: if state.is_floating() {
+                OverlayLayoutMode::Floating
+            } else {
+                OverlayLayoutMode::Tiled
+            },
+            eligible: state.is_visible() && !window.is_full_screen(),
+            in_active_strip: active_strip.contains(entity),
+            in_active_space: active_space_windows.contains(&window.id()),
+        }) {
         let frame = window.frame();
         let h_pad = window.horizontal_padding();
         let v_pad = window.vertical_padding();
@@ -1019,35 +1135,35 @@ pub(super) fn update_overlays(
 
         (focused_abs_cg, window.id())
     } else {
-        // No managed window on the active workspace has focus — hide the overlay rather than
+        // No tracked window on the active Space has focus: hide the overlay rather than
         // dimming everything or drawing a ghost border around an off-screen window.
         overlay_mgr.hide_all();
         return;
     };
 
     let border_params = if border_enabled {
-        if window_config_cache.window_id != Some(focused_window_id) || config.is_changed() {
-            let Some((window, _, parent)) = windows.find_parent(focused_window_id) else {
+        if window_config_cache.window_id != Some(focused_window_id) || inputs.config.is_changed() {
+            let Some((window, _, parent)) = inputs.windows.find_parent(focused_window_id) else {
                 return;
             };
-            let Ok(app) = applications.get(parent) else {
+            let Ok(app) = inputs.applications.get(parent) else {
                 return;
             };
-            let properties = WindowProperties::new(app, window, &config);
+            let properties = WindowProperties::new(app, window, &inputs.config);
             window_config_cache.window_id = Some(focused_window_id);
             window_config_cache.focused_border_radius = properties.border_radius();
             window_config_cache.detected_border_radius = window.border_radius();
         }
 
-        let calculated_radius = match config.border_radius() {
+        let calculated_radius = match inputs.config.border_radius() {
             BorderRadiusOption::Auto => window_config_cache.detected_border_radius.unwrap_or(10.0),
             BorderRadiusOption::Value(value) => value.max(0.0),
         };
 
         Some(BorderParams {
-            color: config.border_color(),
-            opacity: config.border_opacity(),
-            width: config.border_width(),
+            color: inputs.config.border_color(),
+            opacity: inputs.config.border_opacity(),
+            width: inputs.config.border_width(),
             radius: window_config_cache
                 .focused_border_radius
                 .unwrap_or(calculated_radius),
@@ -1057,7 +1173,7 @@ pub(super) fn update_overlays(
         None
     };
 
-    let dim_color = config.dim_inactive_color();
+    let dim_color = inputs.config.dim_inactive_color();
     overlay_mgr.update(
         dim_opacity,
         dim_color,
@@ -1117,7 +1233,7 @@ pub(super) fn commit_window_size(
 
 /// Restores user-visible window state before Spool shuts down: clears any
 /// brightness dim, removes the dim/border overlay window, and centers every
-/// managed window on the display its frame center falls in.
+/// tracked window on the display its frame center falls in.
 pub(super) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
     mut all_windows: Query<&mut Window>,

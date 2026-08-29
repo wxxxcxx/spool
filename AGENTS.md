@@ -6,7 +6,7 @@ This document provides project-specific guidance for AI agents contributing to S
 
 Spool is built on Bevy and follows a strict Data-Driven Design (ECS).
 
-*   **Marker Components:** Use markers extensively for filtering and state tracking (e.g., `ActiveWorkspaceMarker`, `FocusedMarker`, `FreshMarker`, `Unmanaged`). Most markers are found in `src/ecs.rs` or `src/ecs/mod.rs`.
+*   **Marker Components:** Use markers extensively for filtering and state tracking (e.g., `ActiveWorkspaceMarker`, `FocusedMarker`, `FreshMarker`, `Floating`, `WindowVisibility`). Most markers are found in `src/ecs.rs` or `src/ecs/mod.rs`.
 *   **Triggers & Observers:** Prefer Bevy's observer pattern for reactive logic. See `src/ecs/triggers.rs` and `src/ecs/workspace.rs` for examples like `SpawnWindowTrigger` and `WMEventTrigger`.
 *   **System Grouping:** Systems are registered in `src/ecs.rs` via `register_systems`. Follow the existing schedule-based organization (`PreUpdate`, `Update`, `PostUpdate`).
 *   **System Params:** Use custom system parameters like `Windows` and `ActiveDisplay` (defined in `src/ecs/params.rs`) to simplify queries.
@@ -22,7 +22,7 @@ Spool is built on Bevy and follows a strict Data-Driven Design (ECS).
 ## 3. Layout & Workspace Logic
 
 *   **LayoutStrip:** The core layout data structure is `LayoutStrip` (in `src/ecs/layout.rs`). It manages columns, stacks, and tabs.
-*   **Virtual Workspaces:** Spool manages virtual workspaces that map to macOS "Spaces". See `src/ecs/workspace.rs` for how window movement and workspace switching are handled.
+*   **Native Spaces:** Spool owns exactly one `LayoutStrip` per macOS Space. macOS owns topology and visibility; see `src/ecs/native_space.rs` for observation, optional private commands, and reconciliation.
 *   **Coordinate Systems:** Be aware of the difference between Bevy's coordinate system (often Y-up) and macOS/AppKit (Y-down). Use the `Position` and `Size` abstractions to handle conversions.
 
 ## 4. Coding Standards & Idioms

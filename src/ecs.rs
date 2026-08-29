@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
+use bevy::ecs::change_detection::DetectChanges as _;
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
@@ -43,7 +45,9 @@ pub mod layout;
 #[cfg(feature = "lua")]
 pub mod layout_ops;
 pub mod mouse;
+pub mod native_space;
 pub mod params;
+pub(crate) mod reconcile;
 pub(crate) mod restore;
 pub mod script_state;
 pub mod scroll;
@@ -79,31 +83,32 @@ pub fn register_systems(app: &mut bevy::app::App) {
             .is_some_and(|config| config.has_dim_inactive_color() || config.border_active_window())
     };
     // The overlay must refresh not just when the active strip's layout changes,
-    // but also whenever focus moves — including focus *loss* (e.g. switching to
-    // an empty virtual workspace), which otherwise leaves a stale outline.
+    // but also whenever focus moves, including focus loss, which otherwise
+    // leaves a stale outline.
     // Position changes on the focused window also dirty the overlay so that
     // dragging a floating window moves the highlight with it.
-    let vw_indicator_dirty =
+    let overlay_dirty =
         |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
          focus_gained: Query<(), Added<FocusedMarker>>,
          workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
-         focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>| {
+         focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>,
+         focused_resized: Query<(), (With<FocusedMarker>, Changed<Bounds>)>,
+         focus_resolution: Option<Res<focus::FocusResolution>>,
+         mut focus_lost: RemovedComponents<FocusedMarker>| {
             !strip_changed.is_empty()
                 || !focus_gained.is_empty()
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
+                || !focused_resized.is_empty()
+                || focus_resolution.is_some_and(|resolution| resolution.is_changed())
+                || focus_lost.read().next().is_some()
         };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
 
     app.add_systems(
         Startup,
-        (
-            systems::gather_displays,
-            systems::gather_initial_processes,
-            systems::initialise_workspaces,
-        )
-            .chain(),
+        (systems::gather_displays, systems::gather_initial_processes).chain(),
     );
     // Registered with `add_message`, not `init_resource`, so the buffer is
     // double-buffered and dropped after a frame like any other message stream.
@@ -136,7 +141,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::add_launched_application,
             systems::fresh_marker_cleanup,
             systems::timeout_ticker,
-            systems::retry_front_switch,
+            systems::retry_front_switch.after(triggers::front_switched_trigger),
             systems::update_low_power_state
                 .run_if(resource_exists::<LowPowerMode>)
                 .run_if(on_timer(Duration::from_secs(LOW_POWER_MODE_CHECK_SEC))),
@@ -147,6 +152,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .chain()
                 .run_if(not_swiping),
             systems::cleanup_on_exit,
+            reconcile::reconcile_windows,
+            reconcile::confirm_unavailable_windows,
+            systems::refresh_window_notifications,
             restore::tick_restore_grace,
             state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
             state::cleanup_on_exit,
@@ -173,11 +181,11 @@ pub fn register_systems(app: &mut bevy::app::App) {
                     .after(systems::animate_entities)
                     .after(systems::animate_resize_entities)
                     .run_if(dimming_enabled)
-                    .run_if(vw_indicator_dirty),
+                    .run_if(overlay_dirty),
                 systems::update_flash_messages,
             )
                 .chain(),
-            crate::menubar::update_menu_bar.run_if(vw_indicator_dirty),
+            crate::menubar::update_menu_bar.run_if(overlay_dirty),
         ),
     );
 }
@@ -188,7 +196,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         Update,
         (
             triggers::front_switched_trigger,
-            triggers::window_focused_trigger,
+            triggers::window_focused_trigger.after(triggers::front_switched_trigger),
             triggers::mission_control_trigger,
             triggers::application_event_trigger,
             triggers::dispatch_application_messages,
@@ -199,9 +207,11 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::window_resize_verifier,
         ),
     );
-    app.add_observer(triggers::window_unmanaged_trigger)
-        .add_observer(triggers::window_managed_trigger)
-        .add_observer(triggers::window_minimized_trigger)
+    app.add_observer(triggers::window_floating_trigger)
+        .add_observer(triggers::window_floating_removed_trigger)
+        .add_observer(triggers::window_visibility_trigger)
+        .add_observer(triggers::window_visibility_removed_trigger)
+        .add_observer(triggers::retile_window_trigger)
         .add_observer(triggers::spawn_window_trigger)
         .add_observer(triggers::send_message_trigger)
         .add_observer(triggers::window_removal_trigger)
@@ -215,9 +225,6 @@ pub struct FocusedMarker;
 
 #[derive(Component)]
 pub struct ActiveWorkspaceMarker;
-
-#[derive(Component)]
-pub struct SelectedVirtualMarker;
 
 #[derive(Component)]
 pub struct FlashMessage(pub String);
@@ -293,21 +300,25 @@ pub struct FullWidthMarker {
     pub width_ratio: f64,
 }
 
-/// Enum component indicating the unmanaged state of a window.
+/// Marks a tracked window that does not participate in the tiling layout.
 #[derive(Component, Debug)]
-pub enum Unmanaged {
-    /// The window is floating and not part of the tiling layout.
-    Floating,
+pub struct Floating;
+
+/// Visibility state for a tracked window that is not currently visible.
+#[derive(Component, Debug)]
+pub enum WindowVisibility {
     /// The window is minimized.
     Minimized,
     /// The window is hidden.
     Hidden,
 }
 
+#[derive(BevyEvent)]
+pub struct RetileWindow(pub Entity);
+
 #[derive(Clone, Component, Copy, Debug)]
-pub struct PreviousManagedStrip {
+pub struct PreviousTiledStrip {
     pub workspace_id: WorkspaceId,
-    pub virtual_index: u32,
     pub index: usize,
 }
 
@@ -370,7 +381,21 @@ pub struct StrayFocusEvent(pub WinID);
 /// Component used as a retry mechanism when `focused_window_id()` fails during
 /// an `ApplicationFrontSwitched` event (e.g. transient `kAXErrorCannotComplete`).
 #[derive(Component)]
-pub struct RetryFrontSwitch(pub Entity);
+pub struct RetryFrontSwitch {
+    pub app_entity: Entity,
+    pub generation: u64,
+    pub timer: Timer,
+}
+
+impl RetryFrontSwitch {
+    pub fn new(app_entity: Entity, generation: u64, duration: Duration) -> Self {
+        Self {
+            app_entity,
+            generation,
+            timer: Timer::from_seconds(duration.as_secs_f32(), bevy::time::TimerMode::Once),
+        }
+    }
+}
 
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);
@@ -544,8 +569,6 @@ impl SpawnCommandsExt for Commands<'_, '_> {
         let mut spawned = self.spawn((layout_strip, Position(origin), ChildOf(display_entity)));
         if active {
             spawned.insert(ActiveWorkspaceMarker);
-        } else {
-            spawned.insert(SelectedVirtualMarker);
         }
         spawned
     }

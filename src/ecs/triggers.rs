@@ -1,3 +1,4 @@
+use accessibility_sys::kAXErrorNoValue;
 use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
@@ -14,22 +15,21 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive,
-    PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme,
-    Timeout, Unmanaged,
+    ActiveDisplayMarker, BProcess, Floating, FocusedMarker, FreshMarker, MissionControlActive,
+    PreviousTiledStrip, RetileWindow, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent,
+    SystemTheme, Timeout, WindowVisibility,
 };
 use crate::config::Config;
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::{FocusHistory, FocusResolution};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::SpoolState;
-use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
     ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
     VerifyWindowPosition, WidthRatio, WindowProperties,
 };
-use crate::events::{DestroySource, Event};
+use crate::events::{DestroySource, Event, FocusObservation, FocusSource};
 use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
 };
@@ -46,6 +46,22 @@ type ActiveDisplayViewport<'w, 's> =
 fn update_passthrough(window: &Window, app: &Application, config: &Config) {
     let properties = WindowProperties::new(app, window, config);
     crate::platform::input::set_focused_passthrough(properties.passthrough_keys());
+}
+
+fn focus_query_failure_level(error: &crate::errors::Error) -> Level {
+    if error.macos_code() == Some(kAXErrorNoValue) {
+        Level::DEBUG
+    } else {
+        Level::WARN
+    }
+}
+
+fn log_focus_query_failure(error: &crate::errors::Error) {
+    if focus_query_failure_level(error) == Level::DEBUG {
+        debug!("focused window is not available yet: {error}");
+    } else {
+        warn!("can not get current focus: {error}");
+    }
 }
 
 /// Re-applies the configuration side effects that must follow any config change:
@@ -86,42 +102,62 @@ pub(crate) fn apply_config_side_effects(
 pub(super) fn front_switched_trigger(
     mut messages: MessageReader<Event>,
     processes: Query<(&BProcess, &Children)>,
-    applications: Query<&Application>,
+    applications: Query<(Entity, &Application)>,
     window_manager: Res<WindowManager>,
+    mut focus_resolution: ResMut<FocusResolution>,
     mut config: GlobalState,
     mut commands: Commands,
 ) {
     const FRONT_SWITCH_RETRY_SEC: u64 = 2;
     for event in messages.read() {
-        let Event::ApplicationFrontSwitched { psn } = event else {
-            continue;
+        let (app_entity, app, app_name, source, front_switched) = match event {
+            Event::ApplicationFrontSwitched { psn } => {
+                let Some((BProcess(process), children)) =
+                    processes.iter().find(|process| &process.0.psn() == psn)
+                else {
+                    debug!("Unable to find process with PSN {psn:?}");
+                    continue;
+                };
+
+                if children.len() > 1 {
+                    warn!("Multiple apps registered to process '{}'.", process.name());
+                }
+                let Some(&app_entity) = children.first() else {
+                    error!("No application for process '{}'.", process.name());
+                    continue;
+                };
+                let Ok((_, app)) = applications.get(app_entity) else {
+                    error!("No application for process '{}'.", process.name());
+                    continue;
+                };
+                (
+                    app_entity,
+                    app,
+                    process.name().to_string(),
+                    FocusSource::ApplicationFrontSwitch,
+                    true,
+                )
+            }
+            Event::FocusRevalidationRequested { pid, source } => {
+                let Some((app_entity, app)) =
+                    applications.iter().find(|(_, app)| app.pid() == *pid)
+                else {
+                    debug!("Unable to revalidate focus for pid {pid} from {source:?}");
+                    continue;
+                };
+                (app_entity, app, app.name().to_string(), *source, false)
+            }
+            _ => continue,
         };
 
-        let Some((BProcess(process), children)) =
-            processes.iter().find(|process| &process.0.psn() == psn)
-        else {
-            debug!("Unable to find process with PSN {psn:?}");
-            continue;
-        };
-
-        if children.len() > 1 {
-            warn!("Multiple apps registered to process '{}'.", process.name());
-        }
-        let Some(&app_entity) = children.first() else {
-            error!("No application for process '{}'.", process.name());
-            continue;
-        };
-        let Some(app) = applications.get(app_entity).ok() else {
-            error!("No application for process '{}'.", process.name());
-            continue;
-        };
-
-        debug!("front switching process: {}", process.name());
+        debug!("resolving focused window for application: {app_name}");
+        let generation = focus_resolution.begin_pending(Some(app.pid()), None);
 
         if let Ok(focused_id) = app.focused_window_id().inspect_err(|err| {
-            warn!("can not get current focus: {err}");
+            log_focus_query_failure(err);
         }) {
-            if let Some(point) = window_manager.cursor_position()
+            if front_switched
+                && let Some(point) = window_manager.cursor_position()
                 && window_manager
                     .find_window_at_point(&point)
                     .is_ok_and(|window_id| window_id != focused_id)
@@ -131,21 +167,20 @@ pub(super) fn front_switched_trigger(
                 config.set_skip_reshuffle(false);
                 config.set_ffm_flag(None);
             }
-            commands.trigger(SendMessageTrigger(Event::WindowFocused {
-                window_id: focused_id,
-            }));
+            commands.trigger(SendMessageTrigger(Event::resolved_focus(
+                focused_id,
+                app.pid(),
+                source,
+                generation,
+            )));
         } else {
             // Transient AX error (e.g. kAXErrorCannotComplete during app transitions).
             // Schedule a retry to query the focused window once the app is ready.
-            let timeout = Timeout::new(
+            commands.spawn(RetryFrontSwitch::new(
+                app_entity,
+                generation,
                 Duration::from_secs(FRONT_SWITCH_RETRY_SEC),
-                Some(format!(
-                    "Front switch retry for '{}' timed out.",
-                    process.name()
-                )),
-                &mut commands,
-            );
-            commands.spawn((timeout, RetryFrontSwitch(app_entity)));
+            ));
         }
     }
 }
@@ -199,34 +234,82 @@ pub(super) fn theme_change_trigger(
 /// * `messages` - The event stream carrying the window focused event.
 /// * `applications` - A query for all applications.
 /// * `workspaces` - A query for the layout strips, to reorder the focused column.
-/// * `restore_guards` - Guards absorbing the OS acknowledgment of a restored focus.
 /// * `focus_history` - Per-workspace record of what was focused last.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `ctx` - Window queries, configuration and the command buffer.
+fn confirm_tracked_focus_observation(
+    observation: FocusObservation,
+    app: &Application,
+    focus_resolution: &mut FocusResolution,
+) -> bool {
+    if !app.is_frontmost()
+        || app
+            .focused_window_id()
+            .is_ok_and(|id| id != observation.window_id)
+    {
+        return false;
+    }
+    let Some(generation) = focus_resolution.accept_candidate(
+        observation.generation,
+        observation.pid,
+        observation.window_id,
+    ) else {
+        return false;
+    };
+    focus_resolution.confirm(generation, observation.window_id)
+}
+
+fn queue_untracked_focus_observation(
+    observation: FocusObservation,
+    focus_resolution: &mut FocusResolution,
+    commands: &mut Commands,
+) {
+    const RETRY_SEC: u64 = 2;
+    if focus_resolution
+        .accept_candidate(
+            observation.generation,
+            observation.pid,
+            observation.window_id,
+        )
+        .is_some()
+    {
+        let timeout = Timeout::new(Duration::from_secs(RETRY_SEC), None, commands);
+        commands.spawn((timeout, StrayFocusEvent(observation.window_id)));
+    }
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
     applications: Query<&Application>,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    restore_guards: Query<(Entity, &RestoreFocusMarker)>,
     mut focus_history: ResMut<FocusHistory>,
+    mut focus_resolution: ResMut<FocusResolution>,
     global_state: GlobalState,
     mut ctx: WindowCtx,
 ) {
-    const STRAY_FOCUS_RETRY_SEC: u64 = 2;
-
     for event in messages.read() {
-        let Event::WindowFocused { window_id } = *event else {
+        let Event::WindowFocused(observation) = *event else {
             continue;
         };
+        let window_id = observation.window_id;
+        if observation
+            .generation
+            .is_some_and(|generation| !focus_resolution.is_current(generation))
+        {
+            debug!(
+                "Discarding stale focus observation for window {window_id} from {:?}.",
+                observation.source
+            );
+            continue;
+        }
 
         let Some((window, entity, parent)) = ctx.windows.find_parent(window_id) else {
-            let timeout = Timeout::new(
-                Duration::from_secs(STRAY_FOCUS_RETRY_SEC),
-                None,
+            queue_untracked_focus_observation(
+                observation,
+                &mut focus_resolution,
                 &mut ctx.commands,
             );
-            ctx.commands.spawn((timeout, StrayFocusEvent(window_id)));
             continue;
         };
 
@@ -235,46 +318,37 @@ pub(super) fn window_focused_trigger(
             continue;
         };
 
-        // Always keep passthrough in sync. An internal focus_entity call races
-        // with the OS WindowFocused event; without this the passthrough keys
-        // remain stale from a previously focused window.
-        update_passthrough(window, app, &ctx.config);
-
         let already_focused = ctx
             .windows
             .focused()
             .is_some_and(|(focused, _)| focused.id() == window_id);
 
-        // Guard against stale focus events. Without these checks, delayed
-        // events (e.g. from RetryFrontSwitch or dont_focus re-assertions)
-        // can pull FocusedMarker back to an old window after focus has moved on.
-        //
-        // 1. Cross-app: skip if the window's app is no longer frontmost.
-        // 2. Same-app: skip if the app's current focused window differs from
-        //    this event's window_id (the event is outdated).
-        if !app.is_frontmost() {
-            continue;
-        }
-        if app.focused_window_id().is_ok_and(|id| id != window_id) {
+        // Delayed cross-app and same-app events must not overwrite a newer
+        // focus observation or its passthrough configuration.
+        if !confirm_tracked_focus_observation(observation, app, &mut focus_resolution) {
             continue;
         }
 
-        let managed = ctx
-            .windows
-            .get_managed(entity)
-            .and_then(|(_, _, managed)| managed);
-        if matches!(managed, Some(Unmanaged::Hidden)) {
+        // Always keep passthrough in sync. An internal focus_entity call races
+        // with the OS WindowFocused event; without this the passthrough keys
+        // remain stale from a previously focused window.
+        update_passthrough(window, app, &ctx.config);
+
+        let Some((_, _, window_state)) = ctx.windows.get_tracked(entity) else {
+            continue;
+        };
+        if matches!(window_state.visibility(), Some(WindowVisibility::Hidden)) {
             if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-                entity_commands.try_remove::<Unmanaged>();
+                entity_commands.try_remove::<WindowVisibility>();
             }
             ctx.commands
-                .trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
+                .trigger(SendMessageTrigger(Event::window_focused(window_id)));
             continue;
         }
 
         // Handle tab switching: if the focused window is a tab, make it the leader.
-        // Also reactivate the owning virtual strip before treating duplicate
-        // focus as a no-op; the focus marker can be stale on a hidden strip.
+        // Reactivate the owning Space before treating duplicate focus
+        // as a no-op; the focus marker can lag a system Space transition.
         // Track the active workspace as a fallback so focus_history can record
         // a workspace id even when the entity hasn't been routed into a strip.
         let mut owner = None;
@@ -295,7 +369,7 @@ pub(super) fn window_focused_trigger(
             }
         }
 
-        if owner.is_none() && managed.is_none() {
+        if owner.is_none() && window_state.is_tiled() {
             // The window just spawned and has not yet been inserted into the strip.
             continue;
         }
@@ -310,28 +384,18 @@ pub(super) fn window_focused_trigger(
         // Record before the already-focused short-circuit below: focus_entity
         // sets FocusedMarker synchronously, so OS-confirmed events for the
         // same entity would otherwise skip the write.
-        if let Some(workspace_id) = owning_workspace_id.or(active_workspace_id) {
-            let unmanaged = ctx.windows.get_managed(entity).and_then(|(_, _, u)| u);
-            focus_history.record(workspace_id, entity, unmanaged);
-        }
-
-        // The restore guard absorbs the OS focus acknowledgment from a restore;
-        // reshuffling on it would slide the strip away from where the restore
-        // placed it. It may fire twice (front_switched_trigger synthesizes a
-        // duplicate), so a match keeps the guard; focus moving elsewhere despawns it.
-        let mut restored_focus = false;
-        for (guard_entity, guard) in &restore_guards {
-            if guard.entity == entity {
-                restored_focus = true;
-            } else if let Ok(mut entity_commands) = ctx.commands.get_entity(guard_entity) {
-                entity_commands.try_despawn();
-            }
+        if let Some(workspace_id) = owning_workspace_id.or(active_workspace_id)
+            && let Some((_, _, state)) = ctx.windows.get_tracked(entity)
+        {
+            focus_history.record(
+                workspace_id,
+                entity,
+                state.is_floating(),
+                state.is_visible(),
+            );
         }
 
         if already_focused {
-            if restored_focus {
-                continue;
-            }
             if !global_state.skip_reshuffle() && !global_state.initializing() {
                 ctx.commands.reshuffle_around(entity);
             }
@@ -475,7 +539,7 @@ pub(super) fn dispatch_application_messages(
     mut messages: MessageReader<Event>,
     windows: Windows,
     applications: Query<(&Application, &Children)>,
-    unmanaged_query: Query<&Unmanaged>,
+    visibility_query: Query<&WindowVisibility>,
     mut commands: Commands,
 ) {
     let find_window = |window_id| windows.find(window_id);
@@ -486,16 +550,19 @@ pub(super) fn dispatch_application_messages(
                 if let Some((_, entity)) = find_window(*window_id)
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
-                    entity_commands.try_insert(Unmanaged::Minimized);
+                    entity_commands.try_insert(WindowVisibility::Minimized);
                 }
             }
 
             Event::WindowDeminimized { window_id } => {
                 if let Some((_, entity)) = find_window(*window_id)
-                    && matches!(unmanaged_query.get(entity), Ok(Unmanaged::Minimized))
+                    && matches!(
+                        visibility_query.get(entity),
+                        Ok(WindowVisibility::Minimized)
+                    )
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
-                    entity_commands.try_remove::<Unmanaged>();
+                    entity_commands.try_remove::<WindowVisibility>();
                 }
             }
 
@@ -506,12 +573,11 @@ pub(super) fn dispatch_application_messages(
                     continue;
                 };
                 for entity in children {
-                    // Only hide windows that are currently managed (no Unmanaged component).
-                    // Preserve existing Floating, Minimized, and Hidden states.
-                    if unmanaged_query.get(*entity).is_err()
+                    // Preserve a minimized state; layout mode is independent.
+                    if visibility_query.get(*entity).is_err()
                         && let Ok(mut entity_commands) = commands.get_entity(*entity)
                     {
-                        entity_commands.try_insert(Unmanaged::Hidden);
+                        entity_commands.try_insert(WindowVisibility::Hidden);
                     }
                 }
             }
@@ -524,11 +590,11 @@ pub(super) fn dispatch_application_messages(
                 };
                 for entity in children {
                     // Only restore windows that were hidden by the app hide/show cycle.
-                    // Preserve Floating and Minimized states.
-                    if matches!(unmanaged_query.get(*entity), Ok(Unmanaged::Hidden))
+                    // Preserve layout mode and minimized state.
+                    if matches!(visibility_query.get(*entity), Ok(WindowVisibility::Hidden))
                         && let Ok(mut entity_commands) = commands.get_entity(*entity)
                     {
-                        entity_commands.try_remove::<Unmanaged>();
+                        entity_commands.try_remove::<WindowVisibility>();
                     }
                 }
             }
@@ -538,8 +604,8 @@ pub(super) fn dispatch_application_messages(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-pub(super) fn window_unmanaged_trigger(
-    trigger: On<Add, Unmanaged>,
+pub(super) fn window_floating_trigger(
+    trigger: On<Add, Floating>,
     apps: Query<(Entity, &Application)>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     // `Option<Single>` rather than `Single`: an unresolvable display would skip the
@@ -548,9 +614,9 @@ pub(super) fn window_unmanaged_trigger(
     initializing: Option<Res<Initializing>>,
     mut ctx: WindowCtx,
 ) {
-    const UNMANAGED_MAX_SCREEN_RATIO_NUM: i32 = 4;
-    const UNMANAGED_MAX_SCREEN_RATIO_DEN: i32 = 5;
-    const UNMANAGED_POP_OFFSET: i32 = 32;
+    const FLOATING_MAX_SCREEN_RATIO_NUM: i32 = 4;
+    const FLOATING_MAX_SCREEN_RATIO_DEN: i32 = 5;
+    const FLOATING_POP_OFFSET: i32 = 32;
 
     fn clamp_origin_to_bounds(origin: IRect, size: Size, bounds: IRect) -> IRect {
         let max = (bounds.max - size).max(bounds.min);
@@ -588,9 +654,12 @@ pub(super) fn window_unmanaged_trigger(
     }
 
     let entity = trigger.event().entity;
-    let Some((_, _, Some(Unmanaged::Floating))) = ctx.windows.get_managed(entity) else {
+    let Some((_, _, state)) = ctx.windows.get_tracked(entity) else {
         return;
     };
+    if !state.is_floating() {
+        return;
+    }
 
     debug!("Entity {entity} is floating.");
 
@@ -640,10 +709,10 @@ pub(super) fn window_unmanaged_trigger(
         ctx.commands.reposition_entity(entity, Origin::new(x, y));
         ctx.commands.resize_entity(entity, Size::new(w, h));
     } else if initializing.is_none() && !properties.floating() {
-        let max_width = display_bounds.width() * UNMANAGED_MAX_SCREEN_RATIO_NUM
-            / UNMANAGED_MAX_SCREEN_RATIO_DEN;
-        let max_height = display_bounds.height() * UNMANAGED_MAX_SCREEN_RATIO_NUM
-            / UNMANAGED_MAX_SCREEN_RATIO_DEN;
+        let max_width =
+            display_bounds.width() * FLOATING_MAX_SCREEN_RATIO_NUM / FLOATING_MAX_SCREEN_RATIO_DEN;
+        let max_height =
+            display_bounds.height() * FLOATING_MAX_SCREEN_RATIO_NUM / FLOATING_MAX_SCREEN_RATIO_DEN;
         let new_width = frame.width().min(max_width);
         let new_height = frame.height().min(max_height);
 
@@ -651,7 +720,7 @@ pub(super) fn window_unmanaged_trigger(
             IRect::from_corners(frame.min, frame.min + Origin::new(new_width, new_height));
         target_frame = clamp_origin_to_bounds(target_frame, target_frame.size(), display_bounds);
         target_frame =
-            offset_frame_within_bounds(target_frame, display_bounds, UNMANAGED_POP_OFFSET);
+            offset_frame_within_bounds(target_frame, display_bounds, FLOATING_POP_OFFSET);
 
         if target_frame.size() != frame.size() {
             ctx.commands.resize_entity(
@@ -665,19 +734,18 @@ pub(super) fn window_unmanaged_trigger(
     }
 }
 
-fn remember_managed_strip(entity: Entity, strip: &LayoutStrip, commands: &mut Commands) {
+fn remember_tiled_strip(entity: Entity, strip: &LayoutStrip, commands: &mut Commands) {
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_insert(PreviousManagedStrip {
+        entity_commands.try_insert(PreviousTiledStrip {
             workspace_id: strip.id(),
-            virtual_index: strip.virtual_index,
             index: strip.index_of(entity).unwrap_or(strip.len()),
         });
     }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-pub(super) fn window_minimized_trigger(
-    trigger: On<Add, Unmanaged>,
+pub(super) fn window_visibility_trigger(
+    trigger: On<Add, WindowVisibility>,
     windows: Windows,
     workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     active_display: Single<&Display, With<ActiveDisplayMarker>>,
@@ -685,9 +753,7 @@ pub(super) fn window_minimized_trigger(
     mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
-    if let Some((_, _, Some(Unmanaged::Minimized | Unmanaged::Hidden))) =
-        windows.get_managed(entity)
-    {
+    if windows.get_tracked(entity).is_some() {
         debug!("Entity {entity} is minimized or hidden.");
         let display_bounds = active_display.bounds();
 
@@ -703,7 +769,7 @@ pub(super) fn window_minimized_trigger(
                 );
             }
             if strip.contains(entity) {
-                remember_managed_strip(entity, &strip, &mut commands);
+                remember_tiled_strip(entity, &strip, &mut commands);
                 strip.remove(entity);
             }
         }
@@ -711,8 +777,28 @@ pub(super) fn window_minimized_trigger(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-pub(super) fn window_managed_trigger(
-    trigger: On<Remove, Unmanaged>,
+pub(super) fn window_floating_removed_trigger(
+    trigger: On<Remove, Floating>,
+    mut commands: Commands,
+) {
+    commands.trigger(RetileWindow(trigger.event().entity));
+}
+
+pub(super) fn window_visibility_removed_trigger(
+    trigger: On<Remove, WindowVisibility>,
+    windows: Query<Has<Floating>, With<Window>>,
+    mut commands: Commands,
+) {
+    if windows
+        .get(trigger.event().entity)
+        .is_ok_and(|floating| !floating)
+    {
+        commands.trigger(RetileWindow(trigger.event().entity));
+    }
+}
+
+pub(super) fn retile_window_trigger(
+    trigger: On<RetileWindow>,
     active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
     apps: Query<(Entity, &Application)>,
     mut workspaces: Query<
@@ -724,7 +810,7 @@ pub(super) fn window_managed_trigger(
         ),
         Without<Window>,
     >,
-    previous_strips: Query<&PreviousManagedStrip>,
+    previous_strips: Query<&PreviousTiledStrip>,
     initializing: Option<Res<Initializing>>,
     mut ctx: WindowCtx,
 ) {
@@ -732,7 +818,7 @@ pub(super) fn window_managed_trigger(
     if initializing.is_some() {
         return;
     }
-    let entity = trigger.event().entity;
+    let entity = trigger.event().0;
 
     if ctx
         .windows
@@ -743,7 +829,7 @@ pub(super) fn window_managed_trigger(
         return;
     }
 
-    debug!("Entity {entity} is managed again.");
+    debug!("Entity {entity} is tiled again.");
     let (display, dock) = *active_display;
     let display_bounds = display.actual_display_bounds(dock, &ctx.config);
     let mut insert_at = previous_strips
@@ -780,8 +866,7 @@ pub(super) fn window_managed_trigger(
     let mut landed_in = None;
     if let Some(previous) = previous {
         for (strip_entity, mut strip, _, active) in &mut workspaces {
-            if strip.id() == previous.workspace_id && strip.virtual_index == previous.virtual_index
-            {
+            if strip.id() == previous.workspace_id {
                 strip.insert_at(insert_at.unwrap_or(previous.index), entity);
                 landed_in = Some((strip_entity, active));
                 break;
@@ -813,12 +898,12 @@ pub(super) fn window_managed_trigger(
     }
 
     if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-        entity_commands.try_remove::<PreviousManagedStrip>();
+        entity_commands.try_remove::<PreviousTiledStrip>();
     }
 
     if let Some((strip_entity, false)) = landed_in {
         // This strip isn't on screen, so the window's current frame (possibly
-        // popped onto the active display while unmanaged) must not be kept.
+        // popped onto the active display while floating) must not be kept.
         // Marking the strip's position changed forces the layout to re-derive
         // this window's frame from the strip's off-screen origin, instead of
         // painting it over the active row while it still belongs to the hidden one.
@@ -864,7 +949,7 @@ pub(super) fn window_destroyed_trigger(
             continue;
         };
 
-        let Some((window, entity, parent)) = windows.find_parent(*window_id) else {
+        let Some((window, entity, parent)) = windows.find_parent_any(*window_id) else {
             debug!("Duplicate event: window {window_id} already destroyed.");
             continue;
         };
@@ -1070,7 +1155,6 @@ pub(super) fn spawn_window_trigger(
             title,
             frame: window_frame,
             floating: false,
-            managed: true,
         }));
     }
 
@@ -1186,7 +1270,7 @@ pub(super) fn apply_window_positions(
             }
             if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
                 // Avoid managing window if it's floating.
-                entity_commands.try_insert(Unmanaged::Floating);
+                entity_commands.try_insert(Floating);
             }
             continue;
         }
@@ -1239,9 +1323,7 @@ pub(super) fn apply_window_positions(
             } else {
                 debug!("Synthesizing WindowFocused for newly spawned window {entity}");
                 ctx.commands
-                    .trigger(SendMessageTrigger(Event::WindowFocused {
-                        window_id: window.id(),
-                    }));
+                    .trigger(SendMessageTrigger(Event::window_focused(window.id())));
             }
         }
     }
@@ -1446,5 +1528,26 @@ where
         Ordering::Greater
     } else {
         Ordering::Equal
+    }
+}
+
+#[cfg(test)]
+mod focus_query_logging_tests {
+    use accessibility_sys::{kAXErrorCannotComplete, kAXErrorNoValue};
+
+    use super::*;
+    use crate::util::MacResult as _;
+
+    #[test]
+    fn no_value_is_debug_but_other_ax_errors_still_warn() {
+        let no_value = kAXErrorNoValue
+            .to_result("focused window")
+            .expect_err("NoValue must remain an error so focus is retried");
+        let cannot_complete = kAXErrorCannotComplete
+            .to_result("focused window")
+            .expect_err("CannotComplete must remain an error so focus is retried");
+
+        assert_eq!(focus_query_failure_level(&no_value), Level::DEBUG);
+        assert_eq!(focus_query_failure_level(&cannot_complete), Level::WARN);
     }
 }

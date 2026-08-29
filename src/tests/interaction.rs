@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
 
@@ -7,11 +5,11 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveWorkspaceMarker, FocusedMarker, NativeFullscreenMarker, Position, Unmanaged,
-    layout::LayoutStrip,
+    ActiveWorkspaceMarker, Floating, FocusedMarker, NativeFullscreenMarker, Position,
+    WindowVisibility, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
-use crate::events::Event;
+use crate::events::{Event, FocusSource};
 use crate::manager::{Origin, Size, Window};
 use crate::platform::Modifiers;
 use crate::{assert_focused, assert_window_at, assert_window_size};
@@ -98,6 +96,158 @@ fn native_fullscreen_transition_removes_window_from_original_strip_without_focus
 }
 
 #[test]
+fn native_window_move_submits_stable_space_intent_and_reconciles_os_membership() {
+    const TARGET_SPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+    let config: Config = (
+        MainOptions {
+            experimental_space_control: Some(true),
+            ..MainOptions::default()
+        },
+        Vec::new(),
+    )
+        .into();
+    let harness = TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, TARGET_SPACE_ID],
+        )
+        .with_config(config)
+        .with_windows(1);
+    harness.mock_state.enable_native_space_control();
+
+    harness
+        .on_iteration(1, |world, state| {
+            assert_eq!(
+                state.native_space_intents(),
+                vec![crate::manager::NativeSpaceIntent::MoveWindows {
+                    window_ids: vec![0],
+                    space_id: TARGET_SPACE_ID,
+                }]
+            );
+            assert_eq!(state.window_workspace(0), Some(TARGET_SPACE_ID));
+
+            let window_entity = find_window_entity(0, world);
+            let mut strips = world.query::<&LayoutStrip>();
+            let source = strips
+                .iter(world)
+                .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+                .expect("source Space strip");
+            assert!(!source.contains(window_entity));
+            let target = strips
+                .iter(world)
+                .find(|strip| strip.id() == TARGET_SPACE_ID)
+                .expect("target Space strip");
+            assert!(target.contains(window_entity));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::MoveWindowToSpace {
+                    window_id: 0,
+                    space_id: TARGET_SPACE_ID,
+                    move_focus: MoveFocus::Stay,
+                },
+            },
+        ]);
+}
+
+#[test]
+fn native_window_move_follow_switches_space_and_refocuses_window() {
+    const TARGET_SPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+    let config: Config = (
+        MainOptions {
+            experimental_space_control: Some(true),
+            space_switch_animation: Some(true),
+            ..MainOptions::default()
+        },
+        Vec::new(),
+    )
+        .into();
+    let harness = TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, TARGET_SPACE_ID],
+        )
+        .with_config(config)
+        .with_windows(1);
+    harness.mock_state.enable_native_space_control();
+
+    harness
+        .on_iteration(1, |world, state| {
+            assert_eq!(
+                state.native_space_intents(),
+                vec![
+                    crate::manager::NativeSpaceIntent::MoveWindows {
+                        window_ids: vec![0],
+                        space_id: TARGET_SPACE_ID,
+                    },
+                    crate::manager::NativeSpaceIntent::Focus {
+                        space_id: TARGET_SPACE_ID,
+                        animate: true,
+                    },
+                ]
+            );
+            assert_eq!(state.window_workspace(0), Some(TARGET_SPACE_ID));
+            let active_space = world
+                .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
+                .single(world)
+                .expect("one active Space");
+            assert_eq!(active_space.id(), TARGET_SPACE_ID);
+            assert_focused!(world, 0);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::MoveWindowToSpace {
+                    window_id: 0,
+                    space_id: TARGET_SPACE_ID,
+                    move_focus: MoveFocus::Follow,
+                },
+            },
+        ]);
+}
+
+#[test]
+fn native_space_focus_submits_stable_space_id() {
+    const TARGET_SPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+    let config: Config = (
+        MainOptions {
+            experimental_space_control: Some(true),
+            space_switch_animation: Some(true),
+            ..MainOptions::default()
+        },
+        Vec::new(),
+    )
+        .into();
+    let harness = TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, TARGET_SPACE_ID],
+        )
+        .with_config(config);
+    harness.mock_state.enable_native_space_control();
+
+    harness
+        .on_iteration(0, |_world, state| {
+            assert_eq!(
+                state.native_space_intents(),
+                vec![crate::manager::NativeSpaceIntent::Focus {
+                    space_id: TARGET_SPACE_ID,
+                    animate: true,
+                }]
+            );
+        })
+        .run(vec![Event::Command {
+            command: Command::FocusSpace {
+                space_id: TARGET_SPACE_ID,
+            },
+        }]);
+}
+
+#[test]
 fn frontmost_floating_window_is_focused_after_setup() {
     let mut params = WindowParams::new(".*", None);
     params.floating = Some(true);
@@ -110,9 +260,43 @@ fn frontmost_floating_window_is_focused_after_setup() {
         .on_iteration(0, |world, _state| {
             assert_focused!(world, 0);
             let entity = find_window_entity(0, world);
-            assert!(world.entity(entity).contains::<Unmanaged>());
+            assert!(world.entity(entity).contains::<Floating>());
         })
         .run(vec![Event::MenuOpened { window_id: 0 }]);
+}
+
+#[test]
+fn floating_window_stays_floating_after_minimize_restore() {
+    let mut params = WindowParams::new(".*", None);
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .on_iteration(0, |world, _state| {
+            let entity = find_window_entity(0, world);
+            assert!(world.entity(entity).contains::<Floating>());
+        })
+        .on_iteration(1, |world, _state| {
+            let entity = find_window_entity(0, world);
+            let window = world.entity(entity);
+            assert!(window.contains::<Floating>());
+            assert!(window.contains::<WindowVisibility>());
+        })
+        .on_iteration(2, |world, _state| {
+            let entity = find_window_entity(0, world);
+            let window = world.entity(entity);
+            assert!(window.contains::<Floating>());
+            assert!(!window.contains::<WindowVisibility>());
+            let mut strips = world.query::<&LayoutStrip>();
+            assert!(strips.iter(world).all(|strip| !strip.contains(entity)));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::WindowMinimized { window_id: 0 },
+            Event::WindowDeminimized { window_id: 0 },
+        ]);
 }
 
 /// Regression: a floating window placed by a grid rule must land at the active
@@ -220,7 +404,7 @@ fn test_focus_window_by_number() {
                 command: command.clone(),
             },
             Event::Command {
-                command: Command::Window(Operation::Manage),
+                command: Command::Window(Operation::ToggleFloating),
             },
             Event::Command { command },
         ]);
@@ -553,7 +737,7 @@ fn test_stale_focus_event_ignored() {
         Event::Command {
             command: Command::Window(Operation::Focus(Direction::East)),
         },
-        Event::WindowFocused { window_id: 4 },
+        Event::window_focused(4),
         Event::Command {
             command: Command::PrintState,
         },
@@ -566,6 +750,209 @@ fn test_stale_focus_event_ignored() {
         })
         .on_iteration(2, |world, _state| {
             assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+#[test]
+fn stale_known_focus_event_does_not_leave_resolution_pending() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::window_focused(4),
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 1);
+            let focused = world
+                .query_filtered::<Entity, With<FocusedMarker>>()
+                .single(world)
+                .expect("focus anchor before simulated marker loss");
+            world.entity_mut(focused).remove::<FocusedMarker>();
+        })
+        .on_iteration(5, |world, _state| {
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+#[test]
+fn unknown_focus_event_preserves_the_tracked_focus_anchor() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::window_focused(999),
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 0);
+        })
+        .on_iteration(4, |world, _state| {
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+#[test]
+fn ui_element_focus_notification_revalidates_the_app_focused_window() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::FocusRevalidationRequested {
+            pid: TEST_PROCESS_ID,
+            source: FocusSource::AccessibilityUiElement,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |_world, state| {
+            state.update_app(TEST_PROCESS_ID, |app| {
+                app.focused_window_id = Some(1);
+            });
+        })
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+#[test]
+fn stale_focus_retry_cannot_override_a_newer_app_focus_resolution() {
+    const SECOND_PID: i32 = TEST_PROCESS_ID + 1;
+    const SECOND_WINDOW_ID: i32 = 10;
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::FocusRevalidationRequested {
+            pid: TEST_PROCESS_ID,
+            source: FocusSource::ApplicationFrontSwitch,
+        },
+        Event::FocusRevalidationRequested {
+            pid: SECOND_PID,
+            source: FocusSource::AccessibilityUiElement,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_app(SECOND_PID, "test.second", "SecondApp", |app| {
+            app.focused_window_id = Some(SECOND_WINDOW_ID);
+        })
+        .with_windows(1)
+        .with_app_window(SECOND_PID, SECOND_WINDOW_ID, |_| {})
+        .on_iteration(0, |_world, state| {
+            state.update_app(TEST_PROCESS_ID, |app| {
+                app.focused_window_id = None;
+            });
+        })
+        .on_iteration(2, |world, state| {
+            assert_focused!(world, SECOND_WINDOW_ID);
+            state.update_app(TEST_PROCESS_ID, |app| {
+                app.focused_window_id = Some(0);
+            });
+        })
+        .on_iteration(3, |world, _state| {
+            assert_focused!(world, SECOND_WINDOW_ID);
+        })
+        .run(commands);
+}
+
+#[test]
+fn mouse_hit_on_an_untracked_window_confirms_focus_outside_spool() {
+    const EXTERNAL_WINDOW_ID: i32 = 999;
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, |_world, state| {
+            state.spawn_window(
+                TEST_PROCESS_ID,
+                TEST_WORKSPACE_ID,
+                EXTERNAL_WINDOW_ID,
+                IRect::new(800, 100, 900, 200),
+            );
+            state.simulate_window_click(EXTERNAL_WINDOW_ID);
+        })
+        .on_iteration(1, |world, _state| {
+            let mut focused = world.query_filtered::<Entity, With<FocusedMarker>>();
+            assert_eq!(focused.iter(world).count(), 0);
+        })
+        .on_iteration(2, |world, _state| {
+            let mut focused = world.query_filtered::<Entity, With<FocusedMarker>>();
+            assert_eq!(
+                focused.iter(world).count(),
+                0,
+                "confirmed external focus must suppress tiled-focus recovery"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn focus_query_timeout_does_not_suppress_later_focus_recovery() {
+    let mut commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::FocusRevalidationRequested {
+            pid: TEST_PROCESS_ID,
+            source: FocusSource::AccessibilityWindow,
+        },
+    ];
+    commands.extend((0..7).map(|_| Event::Command {
+        command: Command::PrintState,
+    }));
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, |_world, state| {
+            state.update_app(TEST_PROCESS_ID, |app| {
+                app.focused_window_id = None;
+            });
+        })
+        .on_iteration(6, |world, _state| {
+            let focused = world
+                .query_filtered::<Entity, With<FocusedMarker>>()
+                .single(world)
+                .expect("focus anchor before simulated marker loss");
+            world.entity_mut(focused).remove::<FocusedMarker>();
+        })
+        .on_iteration(8, |world, _state| {
+            assert_focused!(world, 0);
         })
         .run(commands);
 }
@@ -609,45 +996,6 @@ fn test_repeated_external_focus_reshuffles_already_focused_window() {
         .on_iteration(4, |world, _state| {
             assert_focused!(world, 0);
             assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-        })
-        .run(commands);
-}
-
-#[test]
-fn test_external_focus_reactivates_hidden_virtual_strip_when_marker_is_stale() {
-    let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(1)),
-        },
-        Event::WindowFocused { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
-
-    TestHarness::new()
-        .with_windows(1)
-        .on_iteration(1, |world, _state| {
-            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
-            let active = query
-                .iter(world)
-                .find_map(|(strip, active)| active.then_some(strip.virtual_index))
-                .expect("an active virtual strip");
-            assert_eq!(active, 1);
-            assert_focused!(world, 0);
-        })
-        .on_iteration(3, |world, _state| {
-            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
-            let active = query
-                .iter(world)
-                .find_map(|(strip, active)| active.then_some(strip.virtual_index))
-                .expect("an active virtual strip");
-            assert_eq!(active, 0);
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_focused!(world, 0);
         })
         .run(commands);
 }
@@ -776,94 +1124,6 @@ fn test_focus_west_from_outside_strip_enters_at_last_column() {
 }
 
 #[test]
-fn test_external_focus_restores_app_hidden_window_to_original_virtual_strip() {
-    let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
-        },
-        Event::ApplicationHidden {
-            pid: TEST_PROCESS_ID,
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(1)),
-        },
-        Event::ApplicationVisible {
-            pid: TEST_PROCESS_ID,
-        },
-        Event::WindowFocused { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
-
-    TestHarness::new()
-        .with_windows(1)
-        .on_iteration(2, |world, _state| {
-            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
-            let active = query
-                .iter(world)
-                .find_map(|(strip, active)| active.then_some(strip.virtual_index))
-                .expect("an active virtual strip");
-            assert_eq!(active, 1);
-        })
-        .on_iteration(5, |world, _state| {
-            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
-            let active = query
-                .iter(world)
-                .find_map(|(strip, active)| active.then_some(strip.virtual_index))
-                .expect("an active virtual strip");
-            assert_eq!(active, 0);
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_focused!(world, 0);
-        })
-        .run(commands);
-}
-
-#[test]
-fn test_external_focus_restores_hidden_window_without_visible_event() {
-    let ignored_repositions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
-        },
-        Event::ApplicationHidden {
-            pid: TEST_PROCESS_ID,
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(1)),
-        },
-        Event::WindowFocused { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
-
-    TestHarness::new()
-        .with_windows(1)
-        .on_iteration(1, move |world, _state| {
-            let mut query = world.query::<&mut Window>();
-            let mut window = query
-                .iter_mut(world)
-                .find(|window| window.id() == 0)
-                .expect("window 0");
-            window.reposition(Origin::new(0, TEST_DISPLAY_HEIGHT));
-            ignored_repositions.store(1, std::sync::atomic::Ordering::SeqCst);
-        })
-        .on_iteration(4, |world, _state| {
-            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
-            let active = query
-                .iter(world)
-                .find_map(|(strip, active)| active.then_some(strip.virtual_index))
-                .expect("an active virtual strip");
-            assert_eq!(active, 0);
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_focused!(world, 0);
-        })
-        .run(commands);
-}
-
-#[test]
 fn mouse_in_bottom_right_corner_does_not_change_focus() {
     // Focus window 2 explicitly, then move cursor into the bottom-right 30x30
     // dead zone. The corner gate should suppress the focus-follow-mouse event,
@@ -968,37 +1228,7 @@ fn toggle_floating_layer_flips_state() {
 }
 
 #[test]
-fn test_unfloat_after_virtual_switch_uses_active_workspace() {
-    let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
-        },
-        Event::Command {
-            command: Command::Window(Operation::Manage),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(1)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::Manage),
-        },
-    ];
-
-    TestHarness::new()
-        .with_windows(2)
-        .on_iteration(3, |world, _state| {
-            let entity = find_window_entity(0, world);
-            let mut query = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
-            let strip = query.single(world).expect("an active virtual workspace");
-
-            assert_eq!(strip.virtual_index, 1);
-            assert!(strip.contains(entity));
-        })
-        .run(commands);
-}
-
-#[test]
-fn focus_unmanaged_ignores_floats_from_other_workspaces() {
+fn focus_floating_ignores_floats_from_other_spaces() {
     let workspaces = vec![TEST_WORKSPACE_ID, TEST_WORKSPACE_ID + 1];
     let harness = TestHarness::new()
         .with_display(
@@ -1014,7 +1244,7 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
-            command: Command::Window(Operation::FocusUnmanaged),
+            command: Command::Window(Operation::FocusFloating),
         },
         Event::Command {
             command: Command::PrintState,
@@ -1027,14 +1257,12 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
     harness
         .on_iteration(2, |world, _state| {
             let off_workspace_float = find_window_entity(99, world);
-            world
-                .entity_mut(off_workspace_float)
-                .insert(Unmanaged::Floating);
+            world.entity_mut(off_workspace_float).insert(Floating);
             assert_focused!(world, 0);
         })
         .on_iteration(3, |world, _state| {
             let active_float = find_window_entity(0, world);
-            world.entity_mut(active_float).insert(Unmanaged::Floating);
+            world.entity_mut(active_float).insert(Floating);
             assert_focused!(world, 0);
         })
         .on_iteration(4, |world, _state| {
@@ -1043,607 +1271,13 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
         .run(commands);
 }
 
-/// With `insert_windows_mid_strip` enabled, following a window into another
-/// virtual workspace keeps it at its exact on-screen x — even when the
-/// destination strip is scrolled and not grid-aligned. The rest of the strip
-/// shifts to make room.
-#[test]
-fn test_mid_strip_insertion_preserves_window_x() {
-    let config: Config = (
-        MainOptions {
-            insert_windows_mid_strip: Some(true),
-            swipe_gesture_fingers: Some(3),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    let harness = TestHarness::new().with_config(config).with_windows(8);
-
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        // Build VW1 with four windows (scrollable), leaving four on VW0.
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        // Scroll VW0 slightly to randomize the positions.
-        Event::Swipe {
-            delta: 0.3,
-            fingers: 3,
-        },
-        // Used as a noop to let the scroll settle.
-        Event::MenuOpened { window_id: 0 },
-        // Change to VW1 and scroll it slightly as well.
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(1)),
-        },
-        Event::Swipe {
-            delta: 0.2,
-            fingers: 3,
-        },
-        Event::MenuOpened { window_id: 0 },
-        // Change back to VW0 and send one window over to VW1.
-        Event::Command {
-            command: Command::Window(Operation::VirtualNumber(0)),
-        },
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
-
-    let previous_offset = std::rc::Rc::new(std::cell::RefCell::new(0));
-    let previous_offset2 = previous_offset.clone();
-    harness
-        .on_iteration(10, move |world, _state| {
-            let mut q =
-                world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
-            let (_, position) = q.single(world).expect("a focused window");
-
-            previous_offset.replace(position.x);
-            assert_ne!(position.x, 0);
-        })
-        .on_iteration(11, move |world, _state| {
-            let mut q =
-                world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
-            let (_, position) = q.single(world).expect("a focused window");
-
-            assert_eq!(position.x, previous_offset2.take());
-        })
-        .run(commands);
-}
-
-/// Without the flag (the default), a moved window is appended to the end of the
-/// destination strip, preserving arrival order.
-#[test]
-fn test_move_appends_to_end_by_default() {
-    let mut h = TestHarness::new().with_windows(3);
-
-    let pump = |h: &mut TestHarness, cmd: Command| {
-        h.app
-            .world_mut()
-            .write_message::<Event>(Event::Command { command: cmd });
-        for _ in 0..6 {
-            h.app.update();
-            for event in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(event);
-            }
-        }
-    };
-
-    // Seed VW1 with one window, keeping us on VW0.
-    pump(
-        &mut h,
-        Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-    );
-
-    // Whatever window is focused now is the one the follow-move will carry.
-    let mover = focused_window_id(h.app.world_mut());
-
-    pump(
-        &mut h,
-        Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
-    );
-
-    // Default behaviour: the moved window is appended, i.e. it is the last
-    // column of the (now active) destination strip.
-    let last = {
-        let world = h.app.world_mut();
-        let mut q = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
-        let entity = q
-            .iter(world)
-            .find_map(|(s, a)| a.then(|| s.all_windows()))
-            .and_then(|windows| windows.last().copied())
-            .expect("active strip with windows");
-        let mut wq = world.query::<(Entity, &Window)>();
-        wq.iter(world)
-            .find_map(|(ent, w)| (ent == entity).then_some(w.id()))
-            .expect("window id")
-    };
-    assert_eq!(
-        last, mover,
-        "default move should append to the end of the strip"
-    );
-}
-
-/// A follow-move that appends the window to an already-populated destination
-/// strip must bring it fully on-screen. Regression test: the moved window
-/// keeps focus, so no `Added<FocusedMarker>` fires to trigger the reshuffle,
-/// and it used to land off the right edge until manually centered.
-#[test]
-fn test_follow_move_brings_appended_window_on_screen() {
-    // Enough windows that the destination strip overflows the display width
-    // (each window is 400px wide, display is 1024px), so an appended window
-    // lands off the right edge unless the strip scrolls to expose it.
-    let mut h = TestHarness::new().with_windows(5);
-
-    let pump = |h: &mut TestHarness, cmd: Command| {
-        h.app
-            .world_mut()
-            .write_message::<Event>(Event::Command { command: cmd });
-        for _ in 0..8 {
-            h.app.update();
-            for event in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(event);
-            }
-        }
-    };
-
-    // Seed VW1 with three windows (Stay keeps us on VW0), making the
-    // destination strip wider than the display before the follow-move appends
-    // to it.
-    for _ in 0..3 {
-        pump(
-            &mut h,
-            Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        );
-    }
-
-    let mover = focused_window_id(h.app.world_mut());
-
-    pump(
-        &mut h,
-        Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
-    );
-
-    assert_focused!(h.app.world_mut(), mover);
-    let frame = {
-        let world = h.app.world_mut();
-        let mut q = world.query::<&Window>();
-        q.iter(world)
-            .find(|w| w.id() == mover)
-            .expect("moved window")
-            .frame()
-    };
-    assert!(
-        frame.min.x >= 0 && frame.max.x <= TEST_DISPLAY_WIDTH,
-        "moved window must be fully on-screen, got frame x {}..{} (display width {})",
-        frame.min.x,
-        frame.max.x,
-        TEST_DISPLAY_WIDTH,
-    );
-}
-
-/// With `insert_windows_mid_strip` enabled and a smooth `animation_speed`, moving
-/// a window to another virtual workspace must not animate: every window snaps to
-/// its final spot. Checked per-update, since markers created and consumed
-/// mid-move would be invisible to a settle-then-check.
-#[test]
-fn test_mid_strip_move_does_not_animate() {
-    let config: Config = (
-        MainOptions {
-            insert_windows_mid_strip: Some(true),
-            animation_speed: Some(12.0),
-            virtual_workspace_animations: Some(false),
-            swipe_gesture_fingers: Some(3),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    let mut h = TestHarness::new().with_config(config).with_windows(8);
-    let pump = |h: &mut TestHarness, c: Command| {
-        h.app
-            .world_mut()
-            .write_message::<Event>(Event::Command { command: c });
-        for _ in 0..8 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
-
-    // Build a scrolled VW1 and scroll VW0 too, so the move is off the grid.
-    for _ in 0..4 {
-        pump(
-            &mut h,
-            Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        );
-    }
-    pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
-    h.app.world_mut().write_message::<Event>(Event::Swipe {
-        delta: 0.3,
-        fingers: 3,
-    });
-    for _ in 0..6 {
-        h.app.update();
-        for e in h.mock_state.drain_events() {
-            h.app.world_mut().write_message::<Event>(e);
-        }
-    }
-    pump(&mut h, Command::Window(Operation::VirtualNumber(0)));
-    h.app.world_mut().write_message::<Event>(Event::Swipe {
-        delta: 0.3,
-        fingers: 3,
-    });
-    for _ in 0..6 {
-        h.app.update();
-        for e in h.mock_state.drain_events() {
-            h.app.world_mut().write_message::<Event>(e);
-        }
-    }
-
-    // Follow-move into the existing VW1, checking every update for animation.
-    h.app.world_mut().write_message::<Event>(Event::Command {
-        command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
-    });
-    for step in 0..10 {
-        h.app.update();
-        for e in h.mock_state.drain_events() {
-            h.app.world_mut().write_message::<Event>(e);
-        }
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<&Window, With<RepositionMarker>>();
-        let animating: Vec<i32> = q.iter(world).map(|w| w.id()).collect();
-        assert!(
-            animating.is_empty(),
-            "step {step}: no window should animate during a mid-strip move, got {animating:?}",
-        );
-    }
-}
-
-/// Switching virtual workspaces with `virtual_workspace_animations = false` must
-/// never cause the active strip to slide left or right. The strip position must
-/// snap directly to its saved scroll position without any `RepositionMarker`
-/// animating it further. Regression test: after VW2 → VW1, a stale
-/// `reshuffle_layout_strip` was computing an incorrect strip target from
-/// un-updated window positions, inserting a `RepositionMarker` that animated
-/// the strip sideways.
-///
-/// Setup: VW0 has 5 windows (scrollable), scrolled so the focused window sits
-/// at a non-zero strip offset. We then switch to VW1 and back to VW0, and
-/// verify that no `RepositionMarker` is ever placed on the strip (which would
-/// cause horizontal sliding).
-#[test]
-fn test_virtual_workspace_switch_no_horizontal_slide_no_animations() {
-    let config: Config = (
-        MainOptions {
-            virtual_workspace_animations: Some(false),
-            animation_speed: Some(12.0),
-            swipe_gesture_fingers: Some(3),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    // 5 windows: strip width = 5 * 400 = 2000, display = 1024 → scrollable.
-    let mut h = TestHarness::new().with_config(config).with_windows(5);
-
-    let pump_event = |h: &mut TestHarness, ev: Event| {
-        h.app.world_mut().write_message::<Event>(ev);
-        for _ in 0..8 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
-    let pump = |h: &mut TestHarness, c: Command| pump_event(h, Event::Command { command: c });
-
-    // Boot the strip and focus window 0.
-    pump(&mut h, Command::PrintState);
-
-    // Scroll the strip so it sits at a non-zero x offset.
-    pump_event(
-        &mut h,
-        Event::Swipe {
-            delta: 0.3,
-            fingers: 3,
-        },
-    );
-
-    // Remember the settled strip x after scrolling.
-    let strip_x_after_scroll = {
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
-        q.single(world)
-            .expect("exactly one active strip after scroll")
-            .0
-            .x
-    };
-    assert_ne!(
-        strip_x_after_scroll, 0,
-        "test setup: strip should be scrolled to a non-zero position, got 0"
-    );
-
-    // Switch to VW1 (spawned on the fly, empty).
-    pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
-
-    // Switch back to VW0. This is where the bug triggers: the strip should
-    // snap to `strip_x_after_scroll` with no RepositionMarker causing further
-    // horizontal motion.
-    h.app.world_mut().write_message::<Event>(Event::Command {
-        command: Command::Window(Operation::VirtualNumber(0)),
-    });
-
-    // After the VW switch back to VW0, pump frames and assert the active strip's
-    // x position settles exactly at the pre-switch scroll value. Any deviation
-    // means a stale reshuffle slid the strip sideways.
-    for _ in 0..10 {
-        h.app.update();
-        for e in h.mock_state.drain_events() {
-            h.app.world_mut().write_message::<Event>(e);
-        }
-    }
-
-    let strip_x_final = {
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
-        q.single(world)
-            .expect("exactly one active strip after switch-back")
-            .0
-            .x
-    };
-
-    assert_eq!(
-        strip_x_final, strip_x_after_scroll,
-        "strip x must equal the pre-switch scroll position after VW switch-back (no sideways slide). \
-         Expected {strip_x_after_scroll}, got {strip_x_final}"
-    );
-}
-
-/// When a strip is mid-animation (has a `RepositionMarker`) at the moment the
-/// user switches to another virtual workspace, the animation must stop
-/// immediately. Previously the `RepositionMarker` was left on the hidden strip
-/// so `animate_entities` kept updating its position while it was off-screen,
-/// making the two strips briefly visible at the same time (the hidden one still
-/// sliding) and corrupting the saved restore position.
-#[test]
-fn test_virtual_workspace_switch_stops_in_flight_strip_animation() {
-    let config: Config = (
-        MainOptions {
-            virtual_workspace_animations: Some(false),
-            animation_speed: Some(12.0),
-            swipe_gesture_fingers: Some(3),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    let mut h = TestHarness::new().with_config(config).with_windows(5);
-
-    let pump_n = |h: &mut TestHarness, n: usize, ev: Event| {
-        h.app.world_mut().write_message::<Event>(ev);
-        for _ in 0..n {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
-    let pump = |h: &mut TestHarness, c: Command| {
-        pump_n(h, 8, Event::Command { command: c });
-    };
-
-    pump(&mut h, Command::PrintState);
-
-    // Scroll and then switch to VW1 mid-animation (only 1 frame so animation
-    // is still in progress when the switch fires).
-    h.app.world_mut().write_message::<Event>(Event::Swipe {
-        delta: 0.3,
-        fingers: 3,
-    });
-    // One frame to start the animation.
-    h.app.update();
-    for e in h.mock_state.drain_events() {
-        h.app.world_mut().write_message::<Event>(e);
-    }
-
-    // Switch to VW1 while the strip may still have a RepositionMarker.
-    pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
-
-    // VW0's strip must have no RepositionMarker (animation stopped on hide).
-    {
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<Entity, (
-            With<crate::ecs::layout::LayoutStrip>,
-            Without<ActiveWorkspaceMarker>,
-        )>();
-        for entity in q.iter(world) {
-            assert!(
-                world.get::<RepositionMarker>(entity).is_none(),
-                "hidden strip {entity:?} must not have RepositionMarker after VW switch"
-            );
-        }
-    }
-
-    // Switch back to VW0. The strip should restore to the saved position,
-    // not to wherever the mid-flight animation would have taken it.
-    let saved_x = {
-        // The saved position is snapped to what it was at switch time; just
-        // record where VW0's strip ends up after restoring.
-        h.app.world_mut().write_message::<Event>(Event::Command {
-            command: Command::Window(Operation::VirtualNumber(0)),
-        });
-        for _ in 0..10 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
-        q.single(world)
-            .expect("exactly one active strip after restore")
-            .0
-            .x
-    };
-
-    // After restoring the strip must also have no RepositionMarker — it
-    // should have snapped directly, not started a new animation.
-    {
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<Entity, (
-            With<crate::ecs::layout::LayoutStrip>,
-            With<ActiveWorkspaceMarker>,
-        )>();
-        for entity in q.iter(world) {
-            assert!(
-                world.get::<RepositionMarker>(entity).is_none(),
-                "restored strip {entity:?} must not have RepositionMarker (no animation after no-anim VW switch)"
-            );
-        }
-    }
-
-    // The final position must be stable (no further drift).
-    for _ in 0..5 {
-        h.app.update();
-        for e in h.mock_state.drain_events() {
-            h.app.world_mut().write_message::<Event>(e);
-        }
-    }
-    let world = h.app.world_mut();
-    let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
-    let final_x = q.single(world).expect("exactly one active strip").0.x;
-    assert_eq!(
-        final_x, saved_x,
-        "strip x drifted after restore: was {saved_x}, now {final_x}"
-    );
-}
-
-/// A virtual-workspace switch restores the strip's saved scroll position and
-/// refocuses the remembered window. macOS acknowledges that focus several
-/// ticks later, after `reshuffle_layout_strip`'s guards have expired; with
-/// `auto_center` on, that late acknowledgment used to re-center the strip and
-/// undo the restore — a "wiggle" on every switch.
-#[test]
-fn test_virtual_workspace_switch_focus_echo_does_not_recenter_strip() {
-    let config: Config = (
-        MainOptions {
-            auto_center: Some(true),
-            virtual_workspace_animations: Some(false),
-            animation_speed: Some(12.0),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    let mut h = TestHarness::new().with_config(config).with_windows(6);
-
-    let settle = |h: &mut TestHarness| {
-        for _ in 0..10 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
-    let pump = |h: &mut TestHarness, c: Command| {
-        h.app
-            .world_mut()
-            .write_message::<Event>(Event::Command { command: c });
-        settle(h);
-    };
-    let strip_x = |h: &mut TestHarness| -> i32 {
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
-        q.single(world).expect("exactly one active strip").0.x
-    };
-
-    pump(&mut h, Command::PrintState);
-
-    // Seed VW1 with one window so focus genuinely moves across the switch.
-    h.mock_state.focus_window(5);
-    settle(&mut h);
-    pump(
-        &mut h,
-        Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-    );
-
-    // Focus window 0 and let auto-center settle the strip on it.
-    h.mock_state.focus_window(0);
-    settle(&mut h);
-    let centered_x = strip_x(&mut h);
-
-    // Displace the strip directly instead of swiping: the swipe pipeline's
-    // finger-lift threshold is wall-clock based, which makes event order
-    // load-dependent and the test flaky.
-    let saved_x = centered_x - 250;
-    {
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<&mut Position, With<ActiveWorkspaceMarker>>();
-        q.single_mut(world).expect("exactly one active strip").0.x = saved_x;
-    }
-    settle(&mut h);
-    assert_eq!(
-        strip_x(&mut h),
-        saved_x,
-        "test setup: the displaced strip position must stick"
-    );
-
-    // Switch to VW1; deliver the OS focus acknowledgment for its window.
-    pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
-    h.mock_state.focus_window(5);
-    settle(&mut h);
-
-    // Switch back to VW0.
-    pump(&mut h, Command::Window(Operation::VirtualNumber(0)));
-    assert_eq!(
-        strip_x(&mut h),
-        saved_x,
-        "strip must restore to its saved position on switch-back"
-    );
-
-    // Delayed focus acknowledgment for the remembered window.
-    h.mock_state.focus_window(0);
-    settle(&mut h);
-    let final_x = strip_x(&mut h);
-    assert_eq!(
-        final_x, saved_x,
-        "late focus acknowledgment re-centered the strip (wiggle): \
-         restored to {saved_x}, ended at {final_x} (centered would be {centered_x})"
-    );
-}
-
 /// With `auto_center` off, a reshuffle around the leftmost window of a
 /// scrollable strip must pin the strip to the left edge — the leftmost
 /// window's left edge must touch the display's left edge, never leaving empty
 /// space to its left.
 ///
-/// Regression: after a virtual-workspace switch parks the inactive strip at
-/// `bounds.max - 10`, every window's on-screen frame is momentarily stale at
-/// the right-edge sliver. A focus-driven `reshuffle_layout_strip` that read
-/// that stale frame computed a large positive strip offset and pushed column 0
-/// away from the left edge (leftmost window ended up right-aligned). This test
-/// injects the stale right-edge frame directly (the real trigger is a delayed
-/// duplicate OS focus event that the mock platform doesn't emit) and asserts
+/// A delayed OS frame can still show a window at the right-edge sliver after
+/// its Space becomes visible. This test injects that stale frame and verifies
 /// the reshuffle clamps the strip back to the left edge.
 #[test]
 fn test_reshuffle_leftmost_pins_strip_to_left_edge_with_stale_frame() {
@@ -1680,7 +1314,7 @@ fn test_reshuffle_leftmost_pins_strip_to_left_edge_with_stale_frame() {
 
     let leftmost = find_window_entity(0, h.app.world_mut());
 
-    // Simulate the stale post-VW-switch state: the leftmost window's on-screen
+    // Simulate a stale Space-transition frame: the leftmost window's on-screen
     // frame is parked at the right-edge sliver while its layout position is
     // still 0. Clear any in-flight animation so moving_frame reads the origin.
     {
@@ -1711,142 +1345,6 @@ fn test_reshuffle_leftmost_pins_strip_to_left_edge_with_stale_frame() {
     assert_eq!(
         strip_x, 0,
         "reshuffle around leftmost window must pin strip to left edge (offset 0), got {strip_x}"
-    );
-}
-
-/// With `virtual_workspace_animations = true`, switching away from a scrolled
-/// strip and back must restore its saved scroll position, not reset it.
-///
-/// Regression: the animated restore branch of `show_active_workspace` called
-/// `reshuffle_around(focus)` in addition to animating the strip to its saved
-/// origin. That reshuffle read stale mid-animation window frames a frame later
-/// and overwrote the restore target with a different offset, discarding the
-/// saved scroll (the strip jumped back to 0). The animated branch now restores
-/// the origin without reshuffling, mirroring the non-animated branch.
-#[test]
-fn test_virtual_workspace_switch_preserves_scroll_with_animations() {
-    use Position;
-
-    let config: Config = (
-        MainOptions {
-            auto_center: Some(false),
-            animation_speed: Some(30.0),
-            swipe_gesture_fingers: Some(3),
-            virtual_workspace_animations: Some(true),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
-    let mut h = TestHarness::new().with_config(config).with_windows(5);
-
-    let pump_event = |h: &mut TestHarness, ev: Event| {
-        h.app.world_mut().write_message::<Event>(ev);
-        for _ in 0..14 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
-    let pump = |h: &mut TestHarness, c: Command| pump_event(h, Event::Command { command: c });
-
-    // Boot and scroll the strip off the left edge to a non-zero offset.
-    pump(&mut h, Command::PrintState);
-    pump_event(
-        &mut h,
-        Event::Swipe {
-            delta: 0.4,
-            fingers: 3,
-        },
-    );
-
-    let strip_x_after_scroll = {
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
-        q.single(world).expect("active strip after scroll").0.x
-    };
-    assert_ne!(
-        strip_x_after_scroll, 0,
-        "test setup: strip should be scrolled off the left edge, got 0"
-    );
-
-    // Switch to an empty VW and back.
-    pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
-    pump(&mut h, Command::Window(Operation::VirtualNumber(0)));
-
-    let strip_x_restored = {
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
-        q.single(world).expect("active strip after restore").0.x
-    };
-    assert_eq!(
-        strip_x_restored, strip_x_after_scroll,
-        "animated VW restore must preserve the saved scroll position. \
-         Expected {strip_x_after_scroll}, got {strip_x_restored}"
-    );
-}
-
-/// With `virtual_workspace_animations = true`, switching to another virtual
-/// workspace must move the previously-active strip (and therefore its windows)
-/// off-screen. Regression: `show_active_workspace` queued a `RepositionMarker`
-/// to animate the old strip to `bounds.max - 10`, but a cleanup block right
-/// after removed the very same marker in the same command flush — so the strip
-/// never moved and all of the old workspace's windows stayed visible on top of
-/// the workspace we switched to. The cleanup now runs before the hide
-/// reposition is queued.
-#[test]
-fn test_virtual_workspace_switch_hides_old_strip_with_animations() {
-    use crate::ecs::{Position, layout::LayoutStrip};
-
-    let config: Config = (
-        MainOptions {
-            auto_center: Some(false),
-            animation_speed: Some(30.0),
-            swipe_gesture_fingers: Some(3),
-            virtual_workspace_animations: Some(true),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    let mut h = TestHarness::new().with_config(config).with_windows(5);
-
-    let pump = |h: &mut TestHarness, c: Command| {
-        h.app
-            .world_mut()
-            .write_message::<Event>(Event::Command { command: c });
-        for _ in 0..14 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
-
-    pump(&mut h, Command::PrintState);
-    // Leave a window on VW0 (Stay) and spawn VW1 with one window, then switch.
-    pump(
-        &mut h,
-        Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-    );
-    pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
-
-    // The inactive VW0 strip must have moved off-screen (its origin parked at
-    // bounds.max - 10 = 1014), taking its windows with it.
-    let world = h.app.world_mut();
-    let mut q = world.query::<(&LayoutStrip, &Position, Has<ActiveWorkspaceMarker>)>();
-    let inactive_x = q
-        .iter(world)
-        .find_map(|(_, pos, active)| (!active).then_some(pos.0.x))
-        .expect("an inactive strip exists after switching workspaces");
-    assert!(
-        inactive_x >= TEST_DISPLAY_WIDTH - 10,
-        "inactive strip must be parked off-screen (>= {}), got {inactive_x}",
-        TEST_DISPLAY_WIDTH - 10
     );
 }
 
@@ -1928,76 +1426,10 @@ fn test_stack_unstack_brings_focused_window_into_view() {
 
 /// A window parked on a hidden virtual row must stay parked when its app
 /// hides and re-shows itself (e.g. 1Password self-activating periodically),
-/// which runs the whole unmanage/remanage cycle unprompted. Regression: the
-/// remanage path used to reshuffle around the window's popped frame, dragging
+/// which runs the whole hide/show cycle unprompted. Regression: the restore
+/// path used to reshuffle around the window's popped frame, dragging
 /// the hidden strip back on screen and making the window unreachable to
 /// commands that only act on the active strip.
-#[test]
-fn test_app_self_activation_keeps_window_parked_on_hidden_virtual_row() {
-    /// Position of the parked window and of the hidden strip holding it.
-    fn parked_state(world: &mut World) -> (Origin, Origin) {
-        let entity = find_window_entity(0, world);
-        let mut strips = world.query::<(&LayoutStrip, &Position, Has<ActiveWorkspaceMarker>)>();
-        let (strip_position, active) = strips
-            .iter(world)
-            .find_map(|(strip, position, active)| {
-                (strip.virtual_index == 1 && strip.contains(entity)).then_some((position.0, active))
-            })
-            .expect("window 0 parked on the hidden virtual row");
-        assert!(!active, "virtual row 1 must not be the active one");
-
-        let mut windows = world.query_filtered::<&Position, With<Window>>();
-        let window_position = windows.get(world, entity).expect("window 0 position").0;
-        (window_position, strip_position)
-    }
-
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        // Park the focused window on VW1 while VW0 stays on screen.
-        Event::Command {
-            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-        // The app hides and re-shows itself, unmanaging and remanaging the
-        // parked window.
-        Event::ApplicationHidden {
-            pid: TEST_PROCESS_ID,
-        },
-        Event::ApplicationVisible {
-            pid: TEST_PROCESS_ID,
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
-
-    let parked = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let parked_after = parked.clone();
-
-    TestHarness::new()
-        .with_windows(2)
-        .on_iteration(2, move |world, _state| {
-            parked.replace(Some(parked_state(world)));
-        })
-        .on_iteration(5, move |world, _state| {
-            let (window_before, strip_before) =
-                parked_after.borrow().expect("parked state was captured");
-            let (window_after, strip_after) = parked_state(world);
-
-            assert_eq!(
-                window_after, window_before,
-                "parked window must keep its off-screen frame across the hide/show cycle"
-            );
-            assert_eq!(
-                strip_after, strip_before,
-                "hidden virtual row must not be dragged back on screen"
-            );
-        })
-        .run(commands);
-}
-
 /// A `WindowMoved` notification for a window spool is not currently moving is
 /// the app (or the user) moving it, and the layout must take that new origin on
 /// board.
@@ -2082,82 +1514,6 @@ fn test_own_window_move_echo_is_ignored() {
 }
 
 #[test]
-fn test_virtual_directions_first_last_east_west() {
-    use crate::config::{Config, MainOptions};
-
-    let config: Config = (
-        MainOptions {
-            reap_empty_workspaces: Some(false),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    let commands = vec![
-        // iteration 0: Create VW1
-        Event::Command {
-            command: Command::Window(Operation::VirtualAdd),
-        },
-        // iteration 1: Create VW2
-        Event::Command {
-            command: Command::Window(Operation::VirtualAdd),
-        },
-        // iteration 2: Switch First -> VW0
-        Event::Command {
-            command: Command::Window(Operation::Virtual(Direction::First)),
-        },
-        // iteration 3: Switch East (alias for South/next) -> VW1
-        Event::Command {
-            command: Command::Window(Operation::Virtual(Direction::East)),
-        },
-        // iteration 4: Switch Last -> VW2
-        Event::Command {
-            command: Command::Window(Operation::Virtual(Direction::Last)),
-        },
-        // iteration 5: Switch West (alias for North/prev) -> VW1
-        Event::Command {
-            command: Command::Window(Operation::Virtual(Direction::West)),
-        },
-        // iteration 6: Switch First -> VW0
-        Event::Command {
-            command: Command::Window(Operation::Virtual(Direction::First)),
-        },
-        // iteration 7: Move focused window to Last with Follow -> moves to VW2 & follows to VW2
-        Event::Command {
-            command: Command::Window(Operation::VirtualMove(Direction::Last, MoveFocus::Follow)),
-        },
-        // iteration 8: Move focused window to First with Follow -> moves to VW0 & follows to VW0
-        Event::Command {
-            command: Command::Window(Operation::VirtualMove(Direction::First, MoveFocus::Follow)),
-        },
-    ];
-
-    let assert_active_vw = |expected: u32| {
-        move |world: &mut World, _state: MockState| {
-            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
-            let active = query
-                .iter(world)
-                .find_map(|(strip, active)| active.then_some(strip.virtual_index))
-                .expect("an active virtual strip");
-            assert_eq!(active, expected);
-        }
-    };
-
-    TestHarness::new()
-        .with_config(config)
-        .with_windows(6)
-        .on_iteration(2, assert_active_vw(0))
-        .on_iteration(3, assert_active_vw(1))
-        .on_iteration(4, assert_active_vw(2))
-        .on_iteration(5, assert_active_vw(1))
-        .on_iteration(6, assert_active_vw(0))
-        .on_iteration(7, assert_active_vw(2))
-        .on_iteration(8, assert_active_vw(0))
-        .run(commands);
-}
-
-#[test]
 fn targeted_window_focus_uses_window_id() {
     TestHarness::new()
         .with_windows(2)
@@ -2168,56 +1524,6 @@ fn targeted_window_focus_uses_window_id() {
             Event::MenuOpened { window_id: 0 },
             Event::Command {
                 command: Command::FocusWindow { window_id: 1 },
-            },
-        ]);
-}
-
-#[test]
-fn targeted_workspace_selection_uses_display_and_virtual_index() {
-    TestHarness::new()
-        .with_windows(2)
-        .on_iteration(1, |world, _state| {
-            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
-            let active = query
-                .iter(world)
-                .find_map(|(strip, active)| active.then_some(strip.virtual_index))
-                .expect("an active virtual strip");
-            assert_eq!(active, 2);
-        })
-        .run(vec![
-            Event::MenuOpened { window_id: 0 },
-            Event::Command {
-                command: Command::SelectVirtualWorkspace {
-                    display_id: TEST_DISPLAY_ID,
-                    virtual_index: 2,
-                },
-            },
-        ]);
-}
-
-#[test]
-fn targeted_window_move_uses_window_and_destination_ids() {
-    TestHarness::new()
-        .with_windows(2)
-        .on_iteration(1, |world, _state| {
-            let moved = find_window_entity(1, world);
-            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
-            let target = query
-                .iter(world)
-                .find_map(|(strip, active)| (active && strip.virtual_index == 2).then_some(strip))
-                .expect("the destination virtual strip is active");
-            assert!(target.contains(moved));
-            assert_focused!(world, 1);
-        })
-        .run(vec![
-            Event::MenuOpened { window_id: 0 },
-            Event::Command {
-                command: Command::MoveWindowToVirtualWorkspace {
-                    window_id: 1,
-                    display_id: TEST_DISPLAY_ID,
-                    virtual_index: 2,
-                    move_focus: MoveFocus::Follow,
-                },
             },
         ]);
 }

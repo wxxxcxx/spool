@@ -15,13 +15,12 @@ use bevy::platform::collections::HashSet;
 use spool_shared_types::windowset::LayoutOp;
 use tracing::debug;
 
-use crate::commands::{Command, MoveFocus, Operation};
+use crate::commands::{Command, MoveFocus};
 use crate::ecs::focus::FocusWindow;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
-use crate::ecs::workspace::VirtualMoveMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, Window,
+    ActiveWorkspaceMarker, Floating, SendMessageTrigger, SpawnCommandsExt, WidthRatio, Window,
 };
 use crate::events::Event;
 use crate::manager::{Origin, Size};
@@ -44,7 +43,7 @@ pub(crate) fn apply_layout_ops(
         .collect();
 
     for ops in batches {
-        // `Unmanaged` inserts don't take effect until commands flush, so track
+        // `Floating` inserts don't take effect until commands flush, so track
         // what this batch floated to tell a just-floated window from one still
         // genuinely tiled (needed by `SetFrame`).
         let mut floated: HashSet<Entity> = HashSet::new();
@@ -108,34 +107,28 @@ fn apply(
         }
 
         LayoutOp::MoveToWorkspace {
-            workspace, follow, ..
+            space_id, follow, ..
         } => {
             let entity = entity.expect("MoveToWorkspace names a window");
-            // Virtual workspaces are numbered from one for a script and from
-            // zero inside the layout.
-            let Some(target_virtual_index) = workspace.checked_sub(1) else {
-                debug!(target: "spool::lua", "skipping {op:?}: workspaces are numbered from 1");
+            let Some(window) = windows.get(entity) else {
                 return;
             };
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_insert(VirtualMoveMarker {
-                    target_virtual_index,
+            commands.trigger(SendMessageTrigger(Event::Command {
+                command: Command::MoveWindowToSpace {
+                    window_id: window.id(),
+                    space_id,
                     move_focus: if follow {
                         MoveFocus::Follow
                     } else {
                         MoveFocus::Stay
                     },
-                });
-            }
+                },
+            }));
         }
 
-        LayoutOp::View { workspace } => {
-            let Some(index) = workspace.checked_sub(1) else {
-                debug!(target: "spool::lua", "skipping {op:?}: workspaces are numbered from 1");
-                return;
-            };
+        LayoutOp::View { space_id } => {
             commands.trigger(SendMessageTrigger(Event::Command {
-                command: Command::Window(Operation::VirtualNumber(index)),
+                command: Command::FocusSpace { space_id },
             }));
         }
 
@@ -147,16 +140,6 @@ fn apply(
                 floated.remove(&entity);
             }
             set_floating(entity, floating, workspaces, commands);
-        }
-
-        LayoutOp::SetManaged { managed, .. } => {
-            let entity = entity.expect("SetManaged names a window");
-            if managed {
-                floated.remove(&entity);
-            } else {
-                floated.insert(entity);
-            }
-            set_floating(entity, !managed, workspaces, commands);
         }
 
         LayoutOp::SetWidth { ratio, .. } => {
@@ -194,8 +177,8 @@ fn apply(
             // it back, so warn if the target isn't floated.
             if !floated.contains(&entity)
                 && windows
-                    .get_managed(entity)
-                    .is_some_and(|(_, _, unmanaged)| unmanaged.is_none())
+                    .get_tracked(entity)
+                    .is_some_and(|(_, _, state)| state.is_tiled())
             {
                 debug!(
                     target: "spool::lua",
@@ -246,7 +229,7 @@ fn apply(
 }
 
 /// Takes a window out of the tiling layout or puts it back. Mirrors
-/// `manage_window`: floating→tiled has to re-append the window to a strip
+/// `toggle_floating_window`: floating→tiled has to re-append the window to a strip
 /// itself, since nothing downstream does it automatically.
 fn set_floating(
     entity: Entity,
@@ -256,9 +239,9 @@ fn set_floating(
 ) {
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         if floating {
-            entity_commands.try_insert(Unmanaged::Floating);
+            entity_commands.try_insert(Floating);
         } else {
-            entity_commands.try_remove::<Unmanaged>();
+            entity_commands.try_remove::<Floating>();
         }
     }
 

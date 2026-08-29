@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 pub enum StateQueryKind {
     /// The complete state document.
     State,
-    /// Just the virtual workspace rows.
-    VirtualWorkspaces,
+    /// Native macOS Spaces and their tracked windows.
+    Spaces,
     /// Just the active display/workspace/focus state.
     Active,
     /// Just the windows currently visible on screen.
@@ -27,7 +27,7 @@ impl StateQueryKind {
     /// Every query kind, in the order the CLI lists them.
     pub const ALL: [StateQueryKind; 4] = [
         StateQueryKind::State,
-        StateQueryKind::VirtualWorkspaces,
+        StateQueryKind::Spaces,
         StateQueryKind::Active,
         StateQueryKind::OnScreen,
     ];
@@ -38,8 +38,8 @@ impl StateQueryKind {
     /// kind it maps to are defined exactly once.
     pub const SHORTHANDS: [(&'static str, StateQueryKind); 4] = [
         ("query_state", StateQueryKind::State),
+        ("query_spaces", StateQueryKind::Spaces),
         ("query_active", StateQueryKind::Active),
-        ("query_workspaces", StateQueryKind::VirtualWorkspaces),
         ("query_on_screen", StateQueryKind::OnScreen),
     ];
 
@@ -48,7 +48,7 @@ impl StateQueryKind {
     pub fn token(self) -> &'static str {
         match self {
             StateQueryKind::State => "state",
-            StateQueryKind::VirtualWorkspaces => "virtual-workspaces",
+            StateQueryKind::Spaces => "spaces",
             StateQueryKind::Active => "active",
             StateQueryKind::OnScreen => "on-screen",
         }
@@ -78,8 +78,45 @@ pub struct QueryState {
     pub timestamp: u64,
     pub active: ActiveState,
     #[serde(default)]
+    pub capabilities: SpaceCapabilities,
+    #[serde(default)]
     pub displays: Vec<DisplayState>,
-    pub virtual_workspaces: Vec<VirtualWorkspaceState>,
+    /// Native Space state. This is the v3 workspace interface.
+    #[serde(default)]
+    pub spaces: Vec<SpaceState>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent wire capabilities"
+)]
+pub struct SpaceCapabilities {
+    pub move_windows: bool,
+    pub focus: bool,
+    pub create: bool,
+    pub delete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpaceKind {
+    User,
+    Fullscreen,
+}
+
+/// One native macOS Space and the windows Spool tracks there.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SpaceState {
+    pub space_id: u64,
+    pub display_id: u32,
+    /// Current per-display order. This is presentation metadata, not identity.
+    pub ordinal: u32,
+    pub kind: SpaceKind,
+    pub visible: bool,
+    /// Whether this Space belongs to Spool's globally focused display.
+    pub focused: bool,
+    pub windows: Vec<WindowState>,
 }
 
 /// The native Space and Spool row currently visible on one physical display.
@@ -88,8 +125,7 @@ pub struct DisplayState {
     pub display_id: u32,
     /// Whether this is the display Spool currently considers active.
     pub active: bool,
-    pub native_workspace_id: Option<u64>,
-    pub virtual_workspace_number: Option<u32>,
+    pub visible_space_id: Option<u64>,
 }
 
 /// The active display, workspace and focused window.
@@ -97,29 +133,11 @@ pub struct DisplayState {
 pub struct ActiveState {
     #[serde(default)]
     pub display_id: Option<u32>,
-    pub native_workspace_id: Option<u64>,
-    pub virtual_workspace_number: Option<u32>,
+    pub space_id: Option<u64>,
     pub focused_window_id: Option<i32>,
     pub focused_bundle_id: Option<String>,
     pub focused_app_name: Option<String>,
     pub focused_window_title: Option<String>,
-}
-
-/// One virtual workspace row and the windows on it.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct VirtualWorkspaceState {
-    pub number: u32,
-    pub native_workspace_id: u64,
-    /// Physical display that owns this row. `None` only represents an
-    /// inconsistent or partially restored ECS hierarchy.
-    pub display_id: Option<u32>,
-    /// The remembered Spool row for this native Space. Consumers should pair
-    /// this with `QueryState.displays[].native_workspace_id` to find the row
-    /// currently visible on each display.
-    #[serde(default)]
-    pub selected: bool,
-    pub active: bool,
-    pub windows: Vec<WindowState>,
 }
 
 /// A window frame in global display coordinates.
@@ -157,9 +175,9 @@ impl QueryState {
     #[must_use]
     pub fn on_screen(&self) -> Vec<&WindowState> {
         let mut on_screen = self
-            .virtual_workspaces
+            .spaces
             .iter()
-            .flat_map(|workspace| workspace.windows.iter())
+            .flat_map(|space| space.windows.iter())
             .filter(|window| window.visible)
             .collect::<Vec<_>>();
         on_screen.sort_by_key(|window| {
@@ -181,7 +199,7 @@ impl QueryState {
     pub fn to_query_json(&self, kind: StateQueryKind) -> serde_json::Result<String> {
         match kind {
             StateQueryKind::State => serde_json::to_string(self),
-            StateQueryKind::VirtualWorkspaces => serde_json::to_string(&self.virtual_workspaces),
+            StateQueryKind::Spaces => serde_json::to_string(&self.spaces),
             StateQueryKind::Active => serde_json::to_string(&self.active),
             StateQueryKind::OnScreen => serde_json::to_string(&self.on_screen()),
         }
@@ -196,9 +214,7 @@ impl QueryState {
         use crate::wire::QueryPayload;
         match kind {
             StateQueryKind::State => QueryPayload::State(Box::new(self.clone())),
-            StateQueryKind::VirtualWorkspaces => {
-                QueryPayload::VirtualWorkspaces(self.virtual_workspaces.clone())
-            }
+            StateQueryKind::Spaces => QueryPayload::Spaces(self.spaces.clone()),
             StateQueryKind::Active => QueryPayload::Active(Box::new(self.active.clone())),
             StateQueryKind::OnScreen => {
                 QueryPayload::OnScreen(self.on_screen().into_iter().cloned().collect())
@@ -218,7 +234,7 @@ impl QueryState {
     pub fn to_query_value(&self, kind: StateQueryKind) -> serde_json::Result<serde_json::Value> {
         match kind {
             StateQueryKind::State => serde_json::to_value(self),
-            StateQueryKind::VirtualWorkspaces => serde_json::to_value(&self.virtual_workspaces),
+            StateQueryKind::Spaces => serde_json::to_value(&self.spaces),
             StateQueryKind::Active => serde_json::to_value(&self.active),
             StateQueryKind::OnScreen => serde_json::to_value(self.on_screen()),
         }
@@ -233,11 +249,11 @@ impl QueryState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum StateEvent {
-    /// The visible workspace changed (native Space or Spool virtual row).
-    VirtualWorkspaceChanged { active: ActiveState },
-    /// The managed window list of the current workspace changed.
+    /// The visible native Space changed.
+    SpaceChanged { active: ActiveState },
+    /// The tracked window list of the current Space changed.
     WindowsChanged {
-        virtual_workspace_number: Option<u32>,
+        space_id: Option<u64>,
         active: ActiveState,
     },
     /// Focus moved to another window.
@@ -245,7 +261,7 @@ pub enum StateEvent {
         window_id: Option<i32>,
         bundle_id: Option<String>,
         title: Option<String>,
-        virtual_workspace_number: Option<u32>,
+        space_id: Option<u64>,
     },
     /// The set of windows actually visible on screen changed — including plain
     /// moves and resizes, which no other event covers.
@@ -283,7 +299,7 @@ mod tests {
     fn query_kinds_round_trip_through_their_tokens() {
         for kind in [
             StateQueryKind::State,
-            StateQueryKind::VirtualWorkspaces,
+            StateQueryKind::Spaces,
             StateQueryKind::Active,
             StateQueryKind::OnScreen,
         ] {
@@ -346,21 +362,22 @@ mod tests {
         };
 
         let state = QueryState {
-            version: 2,
+            version: 3,
             timestamp: 0,
             active: ActiveState::default(),
+            capabilities: SpaceCapabilities::default(),
             displays: vec![DisplayState {
                 display_id: 1,
                 active: true,
-                native_workspace_id: Some(1),
-                virtual_workspace_number: Some(1),
+                visible_space_id: Some(1),
             }],
-            virtual_workspaces: vec![VirtualWorkspaceState {
-                number: 1,
-                native_workspace_id: 1,
-                display_id: Some(1),
-                selected: true,
-                active: true,
+            spaces: vec![SpaceState {
+                space_id: 1,
+                display_id: 1,
+                ordinal: 0,
+                kind: SpaceKind::User,
+                visible: true,
+                focused: true,
                 windows: vec![
                     window(1, 500, true),
                     window(2, 0, false),

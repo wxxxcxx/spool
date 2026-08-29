@@ -3,6 +3,7 @@
     reason = "Bevy system and mlua callback signatures are by-value by contract"
 )]
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use clap::{Parser, Subcommand};
@@ -129,6 +130,16 @@ pub enum SubCmd {
         #[clap(subcommand)]
         state: StateCmd,
     },
+
+    /// Inspects or applies the one-time v2-to-v3 Space state migration.
+    MigrateState {
+        /// State file to inspect; defaults to Spool's normal state path.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Write the v3 file after creating the adjacent v2 backup.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -156,8 +167,8 @@ pub enum QueryCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Prints the virtual workspace list.
-    VirtualWorkspaces {
+    /// Prints native macOS Spaces and their tracked windows.
+    Spaces {
         #[arg(long)]
         json: bool,
     },
@@ -208,7 +219,7 @@ fn main() -> Result<()> {
                 let _ = sender_c.send(events::Event::Exit); // just drop the err. we are exiting anyway.
             })
             .expect("setting Ctrl-C handler should succeed");
-            CommandReader::new(sender.clone()).start()?;
+            let _command_reader = CommandReader::new(sender.clone()).start()?;
             if !check_ax_privilege() && !wait_for_accessibility(sender.clone(), &receiver) {
                 return Ok(());
             }
@@ -236,6 +247,11 @@ fn main() -> Result<()> {
         SubCmd::Query { query } => client::run(ClientCommand::Query(query.kind()))?,
         SubCmd::Subscribe { json: _ } => client::run(ClientCommand::Subscribe)?,
         SubCmd::State { state } => client::run(ClientCommand::ScriptState(state.request()?))?,
+        SubCmd::MigrateState { path, apply } => {
+            let path = path.unwrap_or_else(ecs::state::SpoolState::default_state_file_path);
+            let report = ecs::state::SpoolState::migrate_file(&path, apply)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
     }
     Ok(())
 }
@@ -283,7 +299,7 @@ impl QueryCmd {
     fn kind(&self) -> StateQueryKind {
         match self {
             QueryCmd::State { json: _ } => StateQueryKind::State,
-            QueryCmd::VirtualWorkspaces { json: _ } => StateQueryKind::VirtualWorkspaces,
+            QueryCmd::Spaces { json: _ } => StateQueryKind::Spaces,
             QueryCmd::Active { json: _ } => StateQueryKind::Active,
             QueryCmd::OnScreen { json: _ } => StateQueryKind::OnScreen,
         }

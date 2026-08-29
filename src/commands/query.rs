@@ -13,10 +13,10 @@ use tracing::warn;
 use super::{Command, Operation};
 
 use crate::ecs::state::{
-    QueryStateParams, SpoolActiveState, SpoolQueryState, SpoolVirtualWorkspaceState,
-    SpoolWindowState, StateEvent,
+    QueryStateParams, SpoolActiveState, SpoolQueryState, SpoolSpaceState, SpoolWindowState,
+    StateEvent,
 };
-use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker, Unmanaged};
+use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker};
 use crate::events::Event;
 use crate::platform::WinID;
 use spool_shared_types::wire::Response;
@@ -41,7 +41,7 @@ struct StateSubscribers {
 struct StateBroadcastCache {
     workspace: Option<WorkspaceBroadcastSnapshot>,
     focus: Option<FocusBroadcastSnapshot>,
-    virtual_workspaces: Option<Vec<SpoolVirtualWorkspaceState>>,
+    spaces: Option<Vec<SpoolSpaceState>>,
     on_screen: Option<Vec<SpoolWindowState>>,
     titles: BTreeMap<WinID, String>,
 }
@@ -49,16 +49,14 @@ struct StateBroadcastCache {
 #[derive(Clone, Debug, PartialEq)]
 struct WorkspaceBroadcastSnapshot {
     display_id: Option<u32>,
-    native_workspace_id: Option<u64>,
-    virtual_workspace_number: Option<u32>,
+    space_id: Option<u64>,
 }
 
 impl From<&SpoolActiveState> for WorkspaceBroadcastSnapshot {
     fn from(active: &SpoolActiveState) -> Self {
         Self {
             display_id: active.display_id,
-            native_workspace_id: active.native_workspace_id,
-            virtual_workspace_number: active.virtual_workspace_number,
+            space_id: active.space_id,
         }
     }
 }
@@ -68,7 +66,7 @@ struct FocusBroadcastSnapshot {
     window_id: Option<WinID>,
     bundle_id: Option<String>,
     title: Option<String>,
-    virtual_workspace_number: Option<u32>,
+    space_id: Option<u64>,
 }
 
 impl From<&SpoolActiveState> for FocusBroadcastSnapshot {
@@ -77,14 +75,14 @@ impl From<&SpoolActiveState> for FocusBroadcastSnapshot {
             window_id: active.focused_window_id,
             bundle_id: active.focused_bundle_id.clone(),
             title: active.focused_window_title.clone(),
-            virtual_workspace_number: active.virtual_workspace_number,
+            space_id: active.space_id,
         }
     }
 }
 
 #[derive(Clone, Copy, Default)]
 struct StateBroadcastSignals {
-    virtual_workspace_changed: bool,
+    space_changed: bool,
     windows_changed: bool,
     window_focused: bool,
 }
@@ -92,7 +90,7 @@ struct StateBroadcastSignals {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default, PartialEq)]
 struct StateBroadcastIntent {
-    virtual_workspace_changed: bool,
+    space_changed: bool,
     windows_changed: bool,
     window_focused: bool,
     on_screen_changed: bool,
@@ -107,7 +105,7 @@ impl StateBroadcastIntent {
         signals: StateBroadcastSignals,
     ) -> Self {
         let mut intent = Self {
-            virtual_workspace_changed: signals.virtual_workspace_changed,
+            space_changed: signals.space_changed,
             windows_changed: signals.windows_changed,
             window_focused: signals.window_focused,
             ..Self::default()
@@ -115,31 +113,16 @@ impl StateBroadcastIntent {
 
         for event in events {
             match event {
-                Event::SpaceChanged
-                | Event::Command {
-                    command:
-                        Command::Window(
-                            Operation::Virtual(_)
-                            | Operation::VirtualNumber(_)
-                            | Operation::VirtualAdd,
-                        )
-                        | Command::SelectVirtualWorkspace { .. },
-                } => intent.virtual_workspace_changed = true,
+                Event::SpaceChanged => intent.space_changed = true,
                 Event::WindowCreated { .. }
                 | Event::WindowSpawned { .. }
                 | Event::WindowDestroyed { .. }
                 | Event::WindowMinimized { .. }
                 | Event::WindowDeminimized { .. }
                 | Event::Command {
-                    command:
-                        Command::Window(
-                            Operation::VirtualMove(_, _)
-                            | Operation::VirtualMoveNumber(_, _)
-                            | Operation::Swap(_),
-                        )
-                        | Command::MoveWindowToVirtualWorkspace { .. },
+                    command: Command::Window(Operation::Swap(_)) | Command::MoveWindowToSpace { .. },
                 } => intent.windows_changed = true,
-                Event::WindowFocused { .. } => intent.window_focused = true,
+                Event::WindowFocused(_) => intent.window_focused = true,
                 // Geometry alone decides what's on screen, so plain moves and
                 // resizes can change the visible set on their own.
                 Event::WindowMoved { .. } | Event::WindowResized { .. } => {
@@ -168,7 +151,7 @@ impl StateBroadcastIntent {
         // Anything that rearranges windows, rows or displays also rearranges
         // what is on screen; titles ride along in the on-screen payload.
         intent.on_screen_changed |= intent.windows_changed
-            || intent.virtual_workspace_changed
+            || intent.space_changed
             || intent.active_display_changed
             || !intent.title_changes.is_empty();
 
@@ -176,7 +159,7 @@ impl StateBroadcastIntent {
     }
 
     fn requires_state(&self) -> bool {
-        self.virtual_workspace_changed
+        self.space_changed
             || self.windows_changed
             || self.window_focused
             || self.on_screen_changed
@@ -301,27 +284,22 @@ fn collect_state_broadcast_events_for_intent(
 
     let mut outgoing = Vec::new();
 
-    if intent.virtual_workspace_changed {
+    if intent.space_changed {
         let workspace = WorkspaceBroadcastSnapshot::from(&state.active);
-        if cache.workspace.as_ref() != Some(&workspace)
-            && (workspace.native_workspace_id.is_some()
-                || workspace.virtual_workspace_number.is_some())
-        {
-            outgoing.push(StateEvent::VirtualWorkspaceChanged {
+        if cache.workspace.as_ref() != Some(&workspace) && workspace.space_id.is_some() {
+            outgoing.push(StateEvent::SpaceChanged {
                 active: state.active.clone(),
             });
             cache.workspace = Some(workspace);
         }
     }
 
-    if intent.windows_changed
-        && cache.virtual_workspaces.as_ref() != Some(&state.virtual_workspaces)
-    {
+    if intent.windows_changed && cache.spaces.as_ref() != Some(&state.spaces) {
         outgoing.push(StateEvent::WindowsChanged {
-            virtual_workspace_number: state.active.virtual_workspace_number,
+            space_id: state.active.space_id,
             active: state.active.clone(),
         });
-        cache.virtual_workspaces = Some(state.virtual_workspaces.clone());
+        cache.spaces = Some(state.spaces.clone());
     }
 
     if intent.on_screen_changed {
@@ -342,7 +320,7 @@ fn collect_state_broadcast_events_for_intent(
                 window_id: focus.window_id,
                 bundle_id: focus.bundle_id.clone(),
                 title: focus.title.clone(),
-                virtual_workspace_number: focus.virtual_workspace_number,
+                space_id: focus.space_id,
             });
             cache.focus = Some(focus);
         }
@@ -381,7 +359,7 @@ fn state_event_broadcast_handler(
     }
 
     let signals = StateBroadcastSignals {
-        virtual_workspace_changed: !active_workspace_changes.is_empty(),
+        space_changed: !active_workspace_changes.is_empty(),
         windows_changed: events.iter().any(|event| {
             let Event::WindowMoved { window_id } = event else {
                 return false;
@@ -389,8 +367,8 @@ fn state_event_broadcast_handler(
             state
                 .windows()
                 .find(*window_id)
-                .and_then(|(_, entity)| state.windows().get_managed(entity))
-                .is_some_and(|(_, _, unmanaged)| matches!(unmanaged, Some(Unmanaged::Floating)))
+                .and_then(|(_, entity)| state.windows().get_tracked(entity))
+                .is_some_and(|(_, _, window_state)| window_state.is_floating())
         }),
         window_focused: !focused_changes.is_empty(),
     };
@@ -457,7 +435,7 @@ fn state_event_broadcast_handler(
 mod tests {
     use super::*;
     use crate::ecs::state::{
-        Frame, SpoolDisplayState, SpoolVirtualWorkspaceState, SpoolWindowState,
+        Frame, SpaceKind, SpoolDisplayState, SpoolSpaceState, SpoolWindowState,
     };
     use crate::events::Event as SpoolEvent;
 
@@ -465,13 +443,12 @@ mod tests {
         window_id: WinID,
         bundle_id: &str,
         title: &str,
-        virtual_workspace_number: u32,
+        space_id: u32,
         window_ids: Vec<WinID>,
     ) -> SpoolQueryState {
         let active = SpoolActiveState {
             display_id: Some(1),
-            native_workspace_id: Some(10),
-            virtual_workspace_number: Some(virtual_workspace_number),
+            space_id: Some(u64::from(space_id)),
             focused_window_id: Some(window_id),
             focused_bundle_id: Some(bundle_id.to_string()),
             focused_app_name: Some("Test App".to_string()),
@@ -498,21 +475,22 @@ mod tests {
             .collect();
 
         SpoolQueryState {
-            version: 2,
+            version: 3,
             timestamp: 123,
             active,
+            capabilities: spool_shared_types::state::SpaceCapabilities::default(),
             displays: vec![SpoolDisplayState {
                 display_id: 1,
                 active: true,
-                native_workspace_id: Some(10),
-                virtual_workspace_number: Some(virtual_workspace_number),
+                visible_space_id: Some(u64::from(space_id)),
             }],
-            virtual_workspaces: vec![SpoolVirtualWorkspaceState {
-                number: virtual_workspace_number,
-                native_workspace_id: 10,
-                display_id: Some(1),
-                selected: true,
-                active: true,
+            spaces: vec![SpoolSpaceState {
+                space_id: u64::from(space_id),
+                display_id: 1,
+                ordinal: 0,
+                kind: SpaceKind::User,
+                visible: true,
+                focused: true,
                 windows,
             }],
         }
@@ -529,9 +507,9 @@ mod tests {
         );
         let mut cache = StateBroadcastCache::default();
         let events = [
-            SpoolEvent::WindowFocused { window_id: 18_639 },
-            SpoolEvent::WindowFocused { window_id: 26_261 },
-            SpoolEvent::WindowFocused { window_id: 26_261 },
+            SpoolEvent::window_focused(18_639),
+            SpoolEvent::window_focused(26_261),
+            SpoolEvent::window_focused(26_261),
         ];
 
         let outgoing = collect_state_broadcast_events(
@@ -549,7 +527,7 @@ mod tests {
                 window_id: Some(26_261),
                 bundle_id: Some("com.cmuxterm.app".to_string()),
                 title: Some("aicommit2 ~/P/nixos-config".to_string()),
-                virtual_workspace_number: Some(2),
+                space_id: Some(2),
             }
         );
 
@@ -580,14 +558,10 @@ mod tests {
 
         // A move republishes both the window list and the on-screen set.
         assert_eq!(outgoing.len(), 2);
-        let StateEvent::WindowsChanged {
-            virtual_workspace_number,
-            active,
-        } = &outgoing[0]
-        else {
+        let StateEvent::WindowsChanged { space_id, active } = &outgoing[0] else {
             panic!("expected a windows_changed event, got {:?}", outgoing[0]);
         };
-        assert_eq!(*virtual_workspace_number, Some(2));
+        assert_eq!(*space_id, Some(2));
         assert_eq!(active.focused_window_id, Some(26_261));
         let StateEvent::OnScreenChanged { windows, .. } = &outgoing[1] else {
             panic!("expected an on_screen_changed event, got {:?}", outgoing[1]);
@@ -702,7 +676,7 @@ mod tests {
                 window_id: Some(26_262),
                 bundle_id: Some("com.openai.codex".to_string()),
                 title: Some("Codex".to_string()),
-                virtual_workspace_number: Some(2),
+                space_id: Some(2),
             }
         );
     }
@@ -735,7 +709,7 @@ mod tests {
             [
                 SpoolEvent::SpaceChanged,
                 SpoolEvent::WindowMinimized { window_id: 10 },
-                SpoolEvent::WindowFocused { window_id: 11 },
+                SpoolEvent::window_focused(11),
                 SpoolEvent::WindowTitleChanged { window_id: 12 },
                 SpoolEvent::DisplayResized { display_id: 2 },
             ]
@@ -743,7 +717,7 @@ mod tests {
             StateBroadcastSignals::default(),
         );
 
-        assert!(intent.virtual_workspace_changed);
+        assert!(intent.space_changed);
         assert!(intent.windows_changed);
         assert!(intent.window_focused);
         assert_eq!(intent.title_changes, [12].into());

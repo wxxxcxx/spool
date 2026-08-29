@@ -106,7 +106,7 @@ final class WorkspaceBarController {
       return
     }
     configurationPanel.updateWorkspaceNumbers(
-      Array(Set(state.virtualWorkspaces.map(\.number))).sorted()
+      Array(Set(state.spaces.map(\.number))).sorted()
     )
 
     var retained = Set<PanelKey>()
@@ -115,7 +115,10 @@ final class WorkspaceBarController {
       guard let displayID = screen.displayID,
         let display = state.display(displayID)
       else { continue }
-      let visibleWorkspaces = state.visibleWorkspaces(on: display)
+      let displaySpaces = state.spaces(on: display)
+      let visibleWorkspaces = state.capabilities.focus
+        ? displaySpaces
+        : displaySpaces.filter(\.visible)
       guard let activeWorkspace = visibleWorkspaces.first(where: \.selected) else { continue }
       let geometry = ScreenGeometry(
         frame: screen.frame,

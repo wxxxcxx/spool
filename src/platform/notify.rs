@@ -9,7 +9,7 @@ use tracing::{Level, debug, error, instrument};
 
 use crate::errors::Result;
 use crate::events::{DestroySource, Event, EventSender};
-use crate::platform::{ConnID, OSStatus, WinID, WorkspaceId};
+use crate::platform::{ConnID, OSStatus, WinID, WorkspaceId, macos_major_version};
 use crate::util::MacResult;
 
 unsafe extern "C" {
@@ -46,12 +46,15 @@ impl NotifyHandler {
         let cid = self.conn;
         let mut pinned = Box::pin(self);
         let this = unsafe { NonNull::new_unchecked(pinned.as_mut().get_unchecked_mut()) }.as_ptr();
-        let events = [
+        let mut events = vec![
             KnownCGSEvent::SpaceCreated,
             KnownCGSEvent::SpaceCurrentChanged,
             KnownCGSEvent::SpaceDestroyed,
             KnownCGSEvent::SpaceWindowDestroyed,
         ];
+        if macos_major_version() >= 15 {
+            events.push(KnownCGSEvent::WindowClosed);
+        }
         for event in events {
             unsafe {
                 SLSRegisterConnectionNotifyProc(cid, Self::callback, event.into(), this.cast())
@@ -124,8 +127,17 @@ impl NotifyHandler {
                 }
             }
 
+            KnownCGSEvent::WindowClosed => {
+                if let Some(window_id) = from_bytes::<WinID>(data, len) {
+                    debug!("{event} window_id = {window_id}");
+                    _ = self.events.send(Event::WindowDestroyed {
+                        window_id,
+                        source: DestroySource::WindowServer,
+                    });
+                }
+            }
+
             KnownCGSEvent::SpaceWindowCreated
-            | KnownCGSEvent::WindowClosed
             | KnownCGSEvent::WindowMoved
             | KnownCGSEvent::WindowResized
             | KnownCGSEvent::WindowReordered
@@ -263,5 +275,39 @@ impl std::fmt::Display for CGSEventType {
             CGSEventType::Known(k) => write!(f, "{k}"),
             CGSEventType::Unknown(v) => write!(f, "Unknown({v})"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::marker::PhantomPinned;
+
+    use super::{KnownCGSEvent, NotifyHandler};
+    use crate::events::{DestroySource, Event, EventSender};
+
+    #[test]
+    fn window_server_close_notification_reports_definitive_destruction() {
+        let (events, receiver) = EventSender::new();
+        let handler = NotifyHandler {
+            events,
+            conn: 0,
+            _pin: PhantomPinned,
+        };
+        let window_id = 42;
+
+        handler.notify_handler(
+            KnownCGSEvent::WindowClosed as u32,
+            std::ptr::from_ref(&window_id).cast_mut().cast(),
+            std::mem::size_of_val(&window_id),
+            0,
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::WindowDestroyed {
+                window_id: 42,
+                source: DestroySource::WindowServer,
+            })
+        ));
     }
 }

@@ -72,7 +72,7 @@ unsafe extern "C" {
 #[automock]
 pub trait ProcessApi: Send + Sync {
     /// Checks if the process is observable (i.e., has a regular activation policy).
-    /// This typically means the application is a standard GUI application that can be managed by the window manager.
+    /// This typically means the application is a standard GUI application whose windows can be tracked.
     ///
     /// # Returns
     ///
@@ -91,21 +91,21 @@ pub trait ProcessApi: Send + Sync {
     ///
     /// `Some(Retained<NSRunningApplication>)` if an `NSRunningApplication` is available, otherwise `None`.
     fn application(&self) -> Option<Retained<NSRunningApplication>>;
-    /// Checks if the process is ready for full window management.
+    /// Checks if the process is ready for window tracking.
     /// This typically involves ensuring the application has finished launching and is observable.
     ///
     /// # Returns
     ///
     /// `true` if the process is ready, `false` otherwise.
     fn ready(&mut self) -> bool;
-    /// Forces the process to be treated as manageable even if macOS reports it as
+    /// Forces the process to be tracked even if macOS reports it as
     /// unobservable. This is used for user-configured apps such as `LSUIElement`
     /// background apps that still create standard windows.
     ///
     /// # Arguments
     ///
     /// * `force` - If `true`, skip the observable check in `ready()`.
-    fn force_manage(&mut self, force: bool);
+    fn force_track(&mut self, force: bool);
 }
 
 /// `ProcessOS` is a concrete implementation of the `ProcessApi` trait for macOS.
@@ -146,9 +146,9 @@ impl ProcessApi for ProcessOS {
         self.inner.ready()
     }
 
-    /// Sets the force-manage flag on the inner `Process`.
-    fn force_manage(&mut self, force: bool) {
-        self.inner.force_manage(force);
+    /// Sets the force-track flag on the inner `Process`.
+    fn force_track(&mut self, force: bool) {
+        self.inner.force_track(force);
     }
 }
 
@@ -180,8 +180,8 @@ pub struct Process {
     observing_launched: AtomicBool,
     /// Atomic boolean to track if "activationPolicy" is being observed.
     observing_activated: AtomicBool,
-    /// When `true`, the process is treated as manageable regardless of its activation policy.
-    force_manage: bool,
+    /// When `true`, the process is tracked regardless of its activation policy.
+    force_track: bool,
 }
 
 impl Drop for Process {
@@ -228,7 +228,7 @@ impl Process {
             observer,
             observing_launched: AtomicBool::new(false),
             observing_activated: AtomicBool::new(false),
-            force_manage: false,
+            force_track: false,
         })
     }
 
@@ -248,13 +248,13 @@ impl Process {
         }
     }
 
-    /// Forces the process to be treated as manageable regardless of its activation policy.
+    /// Forces the process to be tracked regardless of its activation policy.
     ///
     /// # Arguments
     ///
     /// * `force` - If `true`, `ready()` will skip the observable check.
-    pub fn force_manage(&mut self, force: bool) {
-        self.force_manage = force;
+    pub fn force_track(&mut self, force: bool) {
+        self.force_track = force;
     }
 
     /// Checks if the application associated with this process has finished launching.
@@ -365,7 +365,7 @@ impl Process {
         }
     }
 
-    /// Checks if the process is ready for window management (finished launching and is observable).
+    /// Checks if the process is ready for window tracking (finished launching and observable).
     /// It subscribes to and unsubscribes from observers as needed to ensure the ready state.
     ///
     /// # Returns
@@ -386,7 +386,7 @@ impl Process {
         }
         self.unobserve_finished_launching();
 
-        if !self.force_manage && !self.is_observable() {
+        if !self.force_track && !self.is_observable() {
             debug!(
                 "{} ({}) is not observable, subscribing to activationPolicy changes",
                 self.name, self.pid

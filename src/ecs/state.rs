@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,14 +17,27 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
+use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
 use crate::ecs::params::Windows;
-use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
+use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker};
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use spool_shared_types::windowset::WindowSet;
 
 pub const STATE_FILE_NAME: &str = "state.json";
-const SUPPORTED_STATE_VERSION: u32 = 2;
+const LEGACY_STATE_VERSION: u32 = 2;
+const SUPPORTED_STATE_VERSION: u32 = 3;
+const LEGACY_BACKUP_FILE_NAME: &str = "state.v2.backup.json";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StateMigrationReport {
+    pub source_version: u32,
+    pub needs_migration: bool,
+    pub native_spaces: usize,
+    pub virtual_rows: usize,
+    pub backup_path: PathBuf,
+    pub applied: bool,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Resource)]
 pub struct SpoolState {
@@ -33,7 +46,7 @@ pub struct SpoolState {
     pub active_display_id: Option<CGDirectDisplayID>,
     #[serde(default)]
     pub displays: Vec<SavedDisplay>,
-    pub workspaces: Vec<SavedWorkspace>,
+    pub spaces: Vec<SavedSpace>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -41,7 +54,7 @@ pub struct SavedDisplay {
     pub display_id: CGDirectDisplayID,
     pub bounds: SavedRect,
     pub active: bool,
-    pub workspace_ids: Vec<WorkspaceId>,
+    pub space_ids: Vec<WorkspaceId>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,17 +66,47 @@ pub struct SavedRect {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct SavedWorkspace {
-    pub workspace_id: WorkspaceId,
+pub struct SavedSpace {
+    pub space_id: WorkspaceId,
     pub display_id: Option<CGDirectDisplayID>,
-    pub active_virtual_index: Option<u32>,
-    pub strips: Vec<SavedStrip>,
+    /// Per-display order at save time; a restore hint, never a stable key.
+    pub ordinal: Option<u32>,
+    pub kind: SpaceKind,
+    pub active: bool,
+    pub columns: Vec<SavedColumn>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct SavedStrip {
-    pub virtual_index: u32,
-    pub columns: Vec<SavedColumn>,
+#[derive(Clone, Debug, Deserialize)]
+struct LegacySpoolStateV2 {
+    version: u32,
+    timestamp: u64,
+    active_display_id: Option<CGDirectDisplayID>,
+    #[serde(default)]
+    displays: Vec<LegacySavedDisplayV2>,
+    workspaces: Vec<LegacySavedWorkspaceV2>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LegacySavedDisplayV2 {
+    display_id: CGDirectDisplayID,
+    bounds: SavedRect,
+    active: bool,
+    workspace_ids: Vec<WorkspaceId>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LegacySavedWorkspaceV2 {
+    workspace_id: WorkspaceId,
+    display_id: Option<CGDirectDisplayID>,
+    #[allow(dead_code)]
+    active_virtual_index: Option<u32>,
+    strips: Vec<LegacySavedStripV2>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LegacySavedStripV2 {
+    virtual_index: u32,
+    columns: Vec<SavedColumn>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -99,8 +142,8 @@ pub struct SavedWindow {
 // aliased here to the names the rest of the daemon already uses.
 pub use spool_shared_types::state::{
     ActiveState as SpoolActiveState, DisplayState as SpoolDisplayState, Frame,
-    QueryState as SpoolQueryState, StateEvent, StateQueryKind,
-    VirtualWorkspaceState as SpoolVirtualWorkspaceState, WindowState as SpoolWindowState,
+    QueryState as SpoolQueryState, SpaceCapabilities, SpaceKind, SpaceState as SpoolSpaceState,
+    StateEvent, StateQueryKind, WindowState as SpoolWindowState,
 };
 
 /// Resolves which display a window frame is on and whether more than a sliver of
@@ -165,14 +208,19 @@ impl SavedWindow {
 impl SpoolState {
     #[allow(clippy::too_many_lines)]
     pub fn extract(
-        workspaces: &Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+        workspaces: &Query<(
+            Option<&ChildOf>,
+            &LayoutStrip,
+            &NativeSpace,
+            Has<ActiveWorkspaceMarker>,
+        )>,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
         windows: &Windows,
         apps: &Query<&Application>,
     ) -> Self {
         let mut display_entity_ids = HashMap::new();
-        let mut display_workspace_ids: HashMap<Entity, Vec<WorkspaceId>> = HashMap::new();
-        let mut workspace_map: HashMap<WorkspaceId, SavedWorkspaceBuilder> = HashMap::new();
+        let mut display_space_ids: HashMap<Entity, Vec<WorkspaceId>> = HashMap::new();
+        let mut space_map: HashMap<WorkspaceId, SavedSpaceBuilder> = HashMap::new();
         let active_display_id = displays
             .iter()
             .find(|(_, _, active)| *active)
@@ -180,18 +228,18 @@ impl SpoolState {
 
         for (display, entity, _) in displays {
             display_entity_ids.insert(entity, display.id());
-            display_workspace_ids.insert(entity, Vec::new());
+            display_space_ids.insert(entity, Vec::new());
         }
 
-        for (child, strip, active_workspace) in workspaces {
+        for (child, strip, native_space, active_workspace) in workspaces {
             let display_entity = child.map(ChildOf::parent);
             let display_id =
                 display_entity.and_then(|entity| display_entity_ids.get(&entity).copied());
             if let Some(entity) = display_entity
-                && let Some(workspace_ids) = display_workspace_ids.get_mut(&entity)
-                && !workspace_ids.contains(&strip.id())
+                && let Some(space_ids) = display_space_ids.get_mut(&entity)
+                && !space_ids.contains(&strip.id())
             {
-                workspace_ids.push(strip.id());
+                space_ids.push(strip.id());
             }
 
             let mut saved_columns = Vec::new();
@@ -247,36 +295,33 @@ impl SpoolState {
                 }
             }
 
-            let workspace =
-                workspace_map
-                    .entry(strip.id())
-                    .or_insert_with(|| SavedWorkspaceBuilder {
-                        display_id,
-                        active_virtual_index: None,
-                        strips: Vec::new(),
-                    });
-            if workspace.display_id.is_none() {
-                workspace.display_id = display_id;
+            let space = space_map
+                .entry(strip.id())
+                .or_insert_with(|| SavedSpaceBuilder {
+                    display_id,
+                    ordinal: native_space.ordinal,
+                    kind: native_space.kind,
+                    active: false,
+                    columns: Vec::new(),
+                });
+            if space.display_id.is_none() {
+                space.display_id = display_id;
             }
             if active_workspace {
-                workspace.active_virtual_index = Some(strip.virtual_index);
+                space.active = true;
             }
-            workspace.strips.push(SavedStrip {
-                virtual_index: strip.virtual_index,
-                columns: saved_columns,
-            });
+            space.columns.extend(saved_columns);
         }
 
-        let workspaces = workspace_map
+        let spaces = space_map
             .into_iter()
-            .map(|(workspace_id, mut workspace)| {
-                workspace.strips.sort_by_key(|s| s.virtual_index);
-                SavedWorkspace {
-                    workspace_id,
-                    display_id: workspace.display_id,
-                    active_virtual_index: workspace.active_virtual_index,
-                    strips: workspace.strips,
-                }
+            .map(|(space_id, space)| SavedSpace {
+                space_id,
+                display_id: space.display_id,
+                ordinal: Some(space.ordinal),
+                kind: space.kind,
+                active: space.active,
+                columns: space.columns,
             })
             .collect();
         let displays = displays
@@ -285,7 +330,7 @@ impl SpoolState {
                 display_id: display.id(),
                 bounds: display.bounds().into(),
                 active,
-                workspace_ids: display_workspace_ids.remove(&entity).unwrap_or_default(),
+                space_ids: display_space_ids.remove(&entity).unwrap_or_default(),
             })
             .collect();
 
@@ -294,7 +339,7 @@ impl SpoolState {
             timestamp: now_timestamp(),
             active_display_id,
             displays,
-            workspaces,
+            spaces,
         }
     }
 
@@ -314,8 +359,30 @@ impl SpoolState {
 
     pub fn load_from_file(path: &Path) -> Option<Self> {
         let data = fs::read_to_string(path).ok()?;
-        let state: Self = serde_json::from_str(&data).ok()?;
-        (state.version == SUPPORTED_STATE_VERSION).then_some(state)
+        let version = serde_json::from_str::<serde_json::Value>(&data)
+            .ok()?
+            .get("version")?
+            .as_u64()?;
+        match u32::try_from(version).ok()? {
+            SUPPORTED_STATE_VERSION => serde_json::from_str(&data).ok(),
+            LEGACY_STATE_VERSION => {
+                let backup = path.with_file_name(LEGACY_BACKUP_FILE_NAME);
+                if !backup.exists()
+                    && let Err(error) = fs::write(&backup, &data)
+                {
+                    error!(%error, path = %backup.display(), "unable to back up v2 state");
+                    return None;
+                }
+                let legacy: LegacySpoolStateV2 = serde_json::from_str(&data).ok()?;
+                let state = migrate_v2_state(legacy);
+                info!(
+                    backup = %backup.display(),
+                    "loaded v2 state using safe Space fold"
+                );
+                Some(state)
+            }
+            _ => None,
+        }
     }
 
     pub fn default_state_file_path() -> PathBuf {
@@ -324,87 +391,122 @@ impl SpoolState {
             .expect("XDG state directory should be available")
     }
 
-    #[cfg(test)]
-    pub fn find_match(
-        &self,
-        window_id: WinID,
-        pid: Pid,
-        bundle_id: &str,
-    ) -> Option<(WorkspaceId, u32, usize, SavedWindow)> {
-        for workspace in &self.workspaces {
-            for strip in &workspace.strips {
-                for (col_idx, column) in strip.columns.iter().enumerate() {
-                    let match_in_col = |sw: &SavedWindow| {
-                        if sw.hard_match(window_id, pid, bundle_id) {
-                            return Some(sw.clone());
-                        }
-                        None
-                    };
-
-                    match column {
-                        SavedColumn::Single(sw) | SavedColumn::Fullscreen(sw) => {
-                            if let Some(matched) = match_in_col(sw) {
-                                return Some((
-                                    workspace.workspace_id,
-                                    strip.virtual_index,
-                                    col_idx,
-                                    matched,
-                                ));
-                            }
-                        }
-                        SavedColumn::Stack(items) => {
-                            for item in items {
-                                match item {
-                                    SavedStackItem::Single(sw) => {
-                                        if let Some(matched) = match_in_col(sw) {
-                                            return Some((
-                                                workspace.workspace_id,
-                                                strip.virtual_index,
-                                                col_idx,
-                                                matched,
-                                            ));
-                                        }
-                                    }
-                                    SavedStackItem::Tabs(tabs) => {
-                                        for sw in tabs {
-                                            if let Some(matched) = match_in_col(sw) {
-                                                return Some((
-                                                    workspace.workspace_id,
-                                                    strip.virtual_index,
-                                                    col_idx,
-                                                    matched,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        SavedColumn::Tabs(tabs) => {
-                            for sw in tabs {
-                                if let Some(matched) = match_in_col(sw) {
-                                    return Some((
-                                        workspace.workspace_id,
-                                        strip.virtual_index,
-                                        col_idx,
-                                        matched,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    pub fn migrate_file(path: &Path, apply: bool) -> crate::errors::Result<StateMigrationReport> {
+        let data = fs::read_to_string(path)?;
+        let version = serde_json::from_str::<serde_json::Value>(&data)?
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .ok_or_else(|| crate::errors::Error::InvalidInput("state version is missing".into()))?;
+        let backup_path = path.with_file_name(LEGACY_BACKUP_FILE_NAME);
+        if version == SUPPORTED_STATE_VERSION {
+            let state: Self = serde_json::from_str(&data)?;
+            return Ok(StateMigrationReport {
+                source_version: version,
+                needs_migration: false,
+                native_spaces: state.spaces.len(),
+                virtual_rows: 0,
+                backup_path,
+                applied: false,
+            });
         }
-        None
+        if version != LEGACY_STATE_VERSION {
+            return Err(crate::errors::Error::InvalidInput(format!(
+                "unsupported state version {version}"
+            )));
+        }
+        let legacy: LegacySpoolStateV2 = serde_json::from_str(&data)?;
+        let native_spaces = legacy.workspaces.len();
+        let virtual_rows = legacy
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.strips.len())
+            .sum();
+        if apply {
+            if !backup_path.exists() {
+                fs::write(&backup_path, &data)?;
+            }
+            migrate_v2_state(legacy).save_to_file(path)?;
+        }
+        Ok(StateMigrationReport {
+            source_version: version,
+            needs_migration: true,
+            native_spaces,
+            virtual_rows,
+            backup_path,
+            applied: apply,
+        })
     }
 }
 
-#[derive(Default)]
-struct SavedWorkspaceBuilder {
+fn migrate_v2_state(legacy: LegacySpoolStateV2) -> SpoolState {
+    debug_assert_eq!(legacy.version, LEGACY_STATE_VERSION);
+    let displays = legacy
+        .displays
+        .iter()
+        .map(|display| SavedDisplay {
+            display_id: display.display_id,
+            bounds: display.bounds,
+            active: display.active,
+            space_ids: display.workspace_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    let spaces = legacy
+        .workspaces
+        .into_iter()
+        .map(|workspace| {
+            let ordinal = workspace.display_id.and_then(|display_id| {
+                legacy
+                    .displays
+                    .iter()
+                    .find(|display| display.display_id == display_id)
+                    .and_then(|display| {
+                        display
+                            .workspace_ids
+                            .iter()
+                            .position(|space_id| *space_id == workspace.workspace_id)
+                    })
+                    .and_then(|ordinal| ordinal.try_into().ok())
+            });
+            let mut strips = workspace.strips;
+            strips.sort_by_key(|strip| strip.virtual_index);
+            let columns = strips
+                .into_iter()
+                .flat_map(|strip| strip.columns)
+                .collect::<Vec<_>>();
+            let kind = if columns
+                .iter()
+                .any(|column| matches!(column, SavedColumn::Fullscreen(_)))
+            {
+                SpaceKind::Fullscreen
+            } else {
+                SpaceKind::User
+            };
+            SavedSpace {
+                space_id: workspace.workspace_id,
+                display_id: workspace.display_id,
+                ordinal,
+                kind,
+                active: workspace.active_virtual_index.is_some(),
+                columns,
+            }
+        })
+        .collect();
+    SpoolState {
+        version: SUPPORTED_STATE_VERSION,
+        timestamp: legacy.timestamp,
+        active_display_id: legacy.active_display_id,
+        displays,
+        spaces,
+    }
+}
+
+struct SavedSpaceBuilder {
     display_id: Option<CGDirectDisplayID>,
-    active_virtual_index: Option<u32>,
-    strips: Vec<SavedStrip>,
+    ordinal: u32,
+    kind: SpaceKind,
+    active: bool,
+    columns: Vec<SavedColumn>,
 }
 
 /// The world access [`QueryState::extract`] needs, bundled so callers (the
@@ -419,7 +521,7 @@ pub struct QueryStateParams<'w, 's> {
             &'static ChildOf,
             &'static LayoutStrip,
             Has<ActiveWorkspaceMarker>,
-            Has<SelectedVirtualMarker>,
+            Has<VisibleNativeSpaceMarker>,
         ),
     >,
     displays: Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
@@ -471,16 +573,15 @@ impl QueryStateParams<'_, '_> {
         // Group the workspace strips by the display entity that owns them, so
         // each display can be built with its own workspaces in one pass.
         let mut strips_by_display: HashMap<Entity, Vec<WorkspaceSet>> = HashMap::new();
-        for (child, strip, active_workspace, selected_workspace) in self.workspaces {
+        for (child, strip, active_workspace, visible_space) in self.workspaces {
             // Only ask for floating windows on a workspace that's actually
             // showing, since this read goes out to the window server.
-            let floating_entities = if active_workspace
-                || selected_workspace && active_workspace_id != Some(strip.id())
-            {
-                self.window_manager.windows_in_workspace(strip.id())?
-            } else {
-                Vec::new()
-            };
+            let floating_entities =
+                if active_workspace || visible_space && active_workspace_id != Some(strip.id()) {
+                    self.window_manager.windows_in_workspace(strip.id())?
+                } else {
+                    Vec::new()
+                };
 
             // A window stays tracked by the strip after it's floated (so it can
             // be re-tiled later), so it's the `Floating` marker — not strip
@@ -526,8 +627,8 @@ impl QueryStateParams<'_, '_> {
                     .into_iter()
                     .filter_map(|window_id| {
                         let (_, entity) = self.windows.find(window_id)?;
-                        let (_, _, unmanaged) = self.windows.get_managed(entity)?;
-                        (matches!(unmanaged, Some(Unmanaged::Floating)) && !strip.contains(entity))
+                        let (_, _, state) = self.windows.get_tracked(entity)?;
+                        (state.is_floating() && state.is_visible() && !strip.contains(entity))
                             .then_some(entity)
                     })
                     .filter_map(|entity| self.window_record(entity, focused_entity, sliver_width)),
@@ -537,8 +638,8 @@ impl QueryStateParams<'_, '_> {
                 .entry(child.parent())
                 .or_default()
                 .push(WorkspaceSet {
-                    number: strip.virtual_index + 1,
-                    native_id: strip.id(),
+                    space_id: strip.id(),
+                    ordinal: 0,
                     active: active_workspace,
                     columns: std::sync::Arc::new(columns),
                     floating: std::sync::Arc::new(floating),
@@ -551,7 +652,7 @@ impl QueryStateParams<'_, '_> {
             .map(|(display, entity, active)| {
                 let bounds = display.bounds();
                 let mut workspaces = strips_by_display.remove(&entity).unwrap_or_default();
-                workspaces.sort_by_key(|workspace| workspace.number);
+                workspaces.sort_by_key(|workspace| workspace.ordinal);
                 DisplaySet {
                     id: display.id(),
                     frame: Frame {
@@ -580,13 +681,13 @@ impl QueryStateParams<'_, '_> {
         focused: Option<Entity>,
         sliver_width: i32,
     ) -> Option<spool_shared_types::windowset::WindowRec> {
-        let (window, _, unmanaged) = self.windows.get_managed(entity)?;
+        let (window, _, state) = self.windows.get_tracked(entity)?;
         let (_, _, app_entity) = self.windows.find_parent(window.id())?;
         let app = self.apps.get(app_entity).ok()?;
         let frame = self.windows.frame(entity);
         // Minimized and hidden windows are never on screen, whatever their last
         // known frame says.
-        let hidden = matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+        let hidden = !state.is_visible();
         let visible = frame
             .and_then(|frame| window_visibility(frame, &self.displays, sliver_width))
             .is_some_and(|(_, visible)| visible && !hidden);
@@ -602,8 +703,7 @@ impl QueryStateParams<'_, '_> {
                 width: frame.width(),
                 height: frame.height(),
             }),
-            floating: matches!(unmanaged, Some(Unmanaged::Floating)),
-            managed: unmanaged.is_none(),
+            floating: state.is_floating(),
             visible,
             focused: focused == Some(entity),
         })
@@ -627,7 +727,7 @@ pub trait QueryState: std::marker::Sized {
             &ChildOf,
             &LayoutStrip,
             Has<ActiveWorkspaceMarker>,
-            Has<SelectedVirtualMarker>,
+            Has<VisibleNativeSpaceMarker>,
         )>,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
         windows: &Windows,
@@ -648,7 +748,7 @@ impl QueryState for SpoolQueryState {
             &ChildOf,
             &LayoutStrip,
             Has<ActiveWorkspaceMarker>,
-            Has<SelectedVirtualMarker>,
+            Has<VisibleNativeSpaceMarker>,
         )>,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
         windows: &Windows,
@@ -666,43 +766,32 @@ impl QueryState for SpoolQueryState {
             .iter()
             .find_map(|(_, strip, active, _)| active.then_some(strip.id()));
 
-        let mut virtual_workspaces = Vec::new();
-        let mut workspace_max_numbers: HashMap<WorkspaceId, u32> = HashMap::new();
-        let mut workspace_display_ids: HashMap<WorkspaceId, Option<CGDirectDisplayID>> =
-            HashMap::new();
-        let display_ids = displays
-            .iter()
-            .map(|(display, entity, active)| (entity, (display.id(), active)))
-            .collect::<HashMap<_, _>>();
+        let mut windows_by_space: HashMap<WorkspaceId, Vec<SpoolWindowState>> = HashMap::new();
         let mut active = SpoolActiveState {
             display_id: active_display.map(|(display_id, _)| display_id),
             ..SpoolActiveState::default()
         };
 
-        for (child, strip, active_workspace, selected_workspace) in workspaces {
-            let display_id = display_ids
-                .get(&child.parent())
-                .map(|(display_id, _)| *display_id);
-            let floating = if active_workspace
-                || selected_workspace && active_workspace_id != Some(strip.id())
-            {
-                window_manager.windows_in_workspace(strip.id())?
-            } else {
-                Vec::new()
-            }
-            .into_iter()
-            .filter_map(|window_id| {
-                let (_, entity) = windows.find(window_id)?;
-                let (_, _, unmanaged) = windows.get_managed(entity)?;
-                (matches!(unmanaged, Some(Unmanaged::Floating)) && !strip.contains(entity))
-                    .then_some(entity)
-            });
+        for (child, strip, active_workspace, visible_space) in workspaces {
+            let floating =
+                if active_workspace || visible_space && active_workspace_id != Some(strip.id()) {
+                    window_manager.windows_in_workspace(strip.id())?
+                } else {
+                    Vec::new()
+                }
+                .into_iter()
+                .filter_map(|window_id| {
+                    let (_, entity) = windows.find(window_id)?;
+                    let (_, _, state) = windows.get_tracked(entity)?;
+                    (state.is_floating() && state.is_visible() && !strip.contains(entity))
+                        .then_some(entity)
+                });
             let row_windows = strip
                 .all_windows()
                 .into_iter()
                 .chain(floating)
                 .filter_map(|entity| {
-                    let (window, _, unmanaged) = windows.get_managed(entity)?;
+                    let (window, _, state) = windows.get_tracked(entity)?;
                     let (_, _, app_entity) = windows.find_parent(window.id())?;
                     let app = apps.get(app_entity).ok()?;
                     let bundle_id = app.bundle_id().unwrap_or_default().clone();
@@ -711,8 +800,7 @@ impl QueryState for SpoolQueryState {
                     let frame = windows.frame(entity);
                     // Minimized and hidden windows are never on screen, whatever
                     // their last known frame says.
-                    let hidden =
-                        matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+                    let hidden = !state.is_visible();
                     let visibility = frame
                         .and_then(|frame| window_visibility(frame, displays, sliver_width))
                         .map(|(display_id, visible)| (display_id, visible && !hidden));
@@ -722,7 +810,7 @@ impl QueryState for SpoolQueryState {
                         app_name,
                         title,
                         focused: focused_entity == Some(entity),
-                        floating: matches!(unmanaged, Some(Unmanaged::Floating)),
+                        floating: state.is_floating(),
                         display_id: visibility.map(|(display_id, _)| display_id),
                         frame: frame.map(|frame| Frame {
                             x: frame.min.x,
@@ -735,17 +823,8 @@ impl QueryState for SpoolQueryState {
                 })
                 .collect::<Vec<_>>();
 
-            let number = strip.virtual_index + 1;
-            workspace_max_numbers
-                .entry(strip.id())
-                .and_modify(|max| *max = (*max).max(number))
-                .or_insert(number);
-            workspace_display_ids
-                .entry(strip.id())
-                .or_insert(display_id);
             if active_workspace {
-                active.native_workspace_id = Some(strip.id());
-                active.virtual_workspace_number = Some(number);
+                active.space_id = Some(strip.id());
             }
 
             if active_workspace
@@ -757,14 +836,10 @@ impl QueryState for SpoolQueryState {
                 active.focused_window_title = Some(window.title.clone());
             }
 
-            virtual_workspaces.push(SpoolVirtualWorkspaceState {
-                number,
-                native_workspace_id: strip.id(),
-                display_id,
-                selected: selected_workspace,
-                active: active_workspace,
-                windows: row_windows,
-            });
+            windows_by_space
+                .entry(strip.id())
+                .or_default()
+                .extend(row_windows);
 
             if active_workspace
                 && let Some((display_id, display_entity)) = active_display
@@ -774,55 +849,56 @@ impl QueryState for SpoolQueryState {
             }
         }
 
-        let present_numbers = virtual_workspaces
+        let mut display_states = displays
             .iter()
-            .map(|workspace| (workspace.native_workspace_id, workspace.number))
-            .collect::<HashSet<_>>();
-        for (workspace_id, max_number) in workspace_max_numbers {
-            for number in 1..=max_number {
-                if !present_numbers.contains(&(workspace_id, number)) {
-                    virtual_workspaces.push(SpoolVirtualWorkspaceState {
-                        number,
-                        native_workspace_id: workspace_id,
-                        display_id: workspace_display_ids.get(&workspace_id).copied().flatten(),
-                        selected: false,
-                        active: false,
-                        windows: Vec::new(),
-                    });
-                }
-            }
-        }
-
-        virtual_workspaces.sort_by_key(|workspace| {
-            (
-                workspace.display_id,
-                workspace.native_workspace_id,
-                workspace.number,
-            )
-        });
-
-        let mut display_states = display_ids
-            .into_values()
-            .map(|(display_id, display_active)| {
-                let selected = virtual_workspaces.iter().find(|workspace| {
-                    workspace.display_id == Some(display_id) && workspace.selected
-                });
-                SpoolDisplayState {
-                    display_id,
-                    active: display_active,
-                    native_workspace_id: selected.map(|workspace| workspace.native_workspace_id),
-                    virtual_workspace_number: selected.map(|workspace| workspace.number),
-                }
+            .map(|(display, _, display_active)| SpoolDisplayState {
+                display_id: display.id(),
+                active: display_active,
+                visible_space_id: window_manager.active_display_space(display.id()).ok(),
             })
             .collect::<Vec<_>>();
         display_states.sort_by_key(|display| display.display_id);
 
+        let mut spaces = Vec::new();
+        for (display, space_ids) in window_manager.present_displays() {
+            let visible_id = window_manager.active_display_space(display.id()).ok();
+            for (ordinal, space_id) in space_ids.into_iter().enumerate() {
+                let mut space_windows = windows_by_space.remove(&space_id).unwrap_or_default();
+                space_windows.sort_by_key(|window| window.window_id);
+                space_windows.dedup_by_key(|window| window.window_id);
+                spaces.push(SpoolSpaceState {
+                    space_id,
+                    display_id: display.id(),
+                    ordinal: ordinal.try_into().unwrap_or(u32::MAX),
+                    kind: if window_manager.workspace_is_fullscreen(space_id) {
+                        SpaceKind::Fullscreen
+                    } else {
+                        SpaceKind::User
+                    },
+                    visible: visible_id == Some(space_id),
+                    focused: active.space_id == Some(space_id),
+                    windows: space_windows,
+                });
+            }
+        }
+        spaces.sort_by_key(|space| (space.display_id, space.ordinal));
+
         Ok(SpoolQueryState {
-            version: 2,
+            version: 3,
             timestamp: now_timestamp(),
             active,
+            capabilities: {
+                let capabilities = window_manager.native_space_capabilities();
+                let enabled = config.space_control_enabled();
+                SpaceCapabilities {
+                    move_windows: enabled && capabilities.move_windows,
+                    focus: enabled && capabilities.focus,
+                    create: enabled && capabilities.create,
+                    delete: enabled && capabilities.delete,
+                }
+            },
             displays: display_states,
-            virtual_workspaces,
+            spaces,
         })
     }
 }
@@ -835,7 +911,12 @@ fn now_timestamp() -> u64 {
 }
 
 pub fn periodic_state_save(
-    workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    workspaces: Query<(
+        Option<&ChildOf>,
+        &LayoutStrip,
+        &NativeSpace,
+        Has<ActiveWorkspaceMarker>,
+    )>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
@@ -851,7 +932,12 @@ pub fn periodic_state_save(
 
 pub fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    workspaces: Query<(
+        Option<&ChildOf>,
+        &LayoutStrip,
+        &NativeSpace,
+        Has<ActiveWorkspaceMarker>,
+    )>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,

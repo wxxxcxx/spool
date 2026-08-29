@@ -9,30 +9,29 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Populated, Query, Res, Single};
+use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, error, instrument, trace, warn};
 
-use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Unmanaged};
+use super::{FocusedMarker, MouseHeldMarker, SystemTheme};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
-use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, Scrolling, SendMessageTrigger,
     SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
-use crate::platform::WorkspaceId;
+use crate::platform::{Pid, WinID, WorkspaceId};
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
 
 #[derive(Default)]
 pub struct TierMemory {
-    pub last_managed: Option<Entity>,
+    pub last_tiled: Option<Entity>,
     pub last_floating: Option<Entity>,
 }
 
@@ -50,20 +49,22 @@ impl FocusHistory {
         &mut self,
         workspace: WorkspaceId,
         entity: Entity,
-        unmanaged: Option<&Unmanaged>,
+        floating: bool,
+        visible: bool,
     ) {
+        if !visible {
+            return;
+        }
         let slot = self.by_workspace.entry(workspace).or_default();
-        match unmanaged {
-            None => slot.last_managed = Some(entity),
-            Some(Unmanaged::Floating) => slot.last_floating = Some(entity),
-            Some(_) => {}
+        if floating {
+            slot.last_floating = Some(entity);
+        } else {
+            slot.last_tiled = Some(entity);
         }
     }
 
-    pub fn last_managed(&self, workspace: WorkspaceId) -> Option<Entity> {
-        self.by_workspace
-            .get(&workspace)
-            .and_then(|t| t.last_managed)
+    pub fn last_tiled(&self, workspace: WorkspaceId) -> Option<Entity> {
+        self.by_workspace.get(&workspace).and_then(|t| t.last_tiled)
     }
 
     pub fn last_floating(&self, workspace: WorkspaceId) -> Option<Entity> {
@@ -74,8 +75,8 @@ impl FocusHistory {
 
     pub fn forget(&mut self, entity: Entity) {
         for slot in self.by_workspace.values_mut() {
-            if slot.last_managed == Some(entity) {
-                slot.last_managed = None;
+            if slot.last_tiled == Some(entity) {
+                slot.last_tiled = None;
             }
             if slot.last_floating == Some(entity) {
                 slot.last_floating = None;
@@ -88,11 +89,112 @@ impl FocusHistory {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ActualFocus {
+    #[default]
+    Unknown,
+    Pending {
+        generation: u64,
+        pid: Option<Pid>,
+        candidate: Option<WinID>,
+    },
+    Tracked(WinID),
+    Outside,
+}
+
+/// Resolves asynchronous macOS focus signals without letting an older query
+/// overwrite a newer application transition. `FocusedMarker` remains the
+/// immediate navigation target while this resource records the confidence of
+/// the OS-facing observation.
+#[derive(Default, Resource)]
+pub struct FocusResolution {
+    generation: u64,
+    actual: ActualFocus,
+}
+
+impl FocusResolution {
+    pub(super) fn begin_pending(&mut self, pid: Option<Pid>, candidate: Option<WinID>) -> u64 {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.actual = ActualFocus::Pending {
+            generation: self.generation,
+            pid,
+            candidate,
+        };
+        self.generation
+    }
+
+    pub(super) fn accept_candidate(
+        &mut self,
+        generation: Option<u64>,
+        pid: Option<Pid>,
+        candidate: WinID,
+    ) -> Option<u64> {
+        let generation = if let Some(generation) = generation {
+            if generation != self.generation {
+                return None;
+            }
+            generation
+        } else {
+            self.begin_pending(pid, Some(candidate))
+        };
+        self.actual = ActualFocus::Pending {
+            generation,
+            pid,
+            candidate: Some(candidate),
+        };
+        Some(generation)
+    }
+
+    pub(super) fn confirm(&mut self, generation: u64, window_id: WinID) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.actual = ActualFocus::Tracked(window_id);
+        true
+    }
+
+    pub(super) fn is_current(&self, generation: u64) -> bool {
+        generation == self.generation
+    }
+
+    pub(super) fn mark_unknown(&mut self, generation: u64) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.actual = ActualFocus::Unknown;
+        true
+    }
+
+    pub(super) fn mark_outside(&mut self, generation: u64) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.actual = ActualFocus::Outside;
+        true
+    }
+
+    pub(super) fn suppresses_recovery(&self) -> bool {
+        matches!(
+            self.actual,
+            ActualFocus::Pending { .. } | ActualFocus::Outside
+        )
+    }
+
+    pub(super) fn visual_window_id(&self) -> Option<WinID> {
+        match self.actual {
+            ActualFocus::Pending { candidate, .. } => candidate,
+            ActualFocus::Tracked(window_id) => Some(window_id),
+            ActualFocus::Unknown | ActualFocus::Outside => None,
+        }
+    }
+}
+
 pub struct FocusEventsPlugin;
 
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
+        app.init_resource::<FocusResolution>();
         app.add_systems(
             PostUpdate,
             (
@@ -150,19 +252,11 @@ fn maintain_focus_singleton(
 fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
-    restored: Query<&RestoreFocusMarker>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     mut ctx: WindowCtx,
 ) {
     let entity = *focused;
-
-    // Skip auto-centering when this focus came from a workspace restore, since
-    // the strip is already at its saved origin. window_focused_trigger and
-    // timeout_ticker are responsible for clearing the marker.
-    if restored.iter().any(|marker| marker.entity == entity) {
-        return;
-    }
 
     if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
         return;
@@ -171,7 +265,10 @@ fn autocenter_window_on_focus(
         return;
     }
     if ctx.config.auto_center()
-        && let Some((_, _, None)) = ctx.windows.get_managed(entity)
+        && ctx
+            .windows
+            .get_tracked(entity)
+            .is_some_and(|(_, _, state)| state.is_tiled() && state.is_visible())
         && let Some(size) = ctx.windows.size(entity)
         && let Some(mut origin) = ctx.windows.origin(entity)
     {
@@ -262,15 +359,23 @@ fn dim_remove_window_trigger(
     config: Res<Config>,
     theme: Option<Res<SystemTheme>>,
 ) {
-    let Some((window, _, None)) = windows.get_managed(trigger.event().entity) else {
+    let Some((window, _, state)) = windows.get_tracked(trigger.event().entity) else {
         return;
     };
+    if !state.is_visible() {
+        return;
+    }
 
-    let same_display = active_display
-        .active_strip()
-        .contains(trigger.event().entity);
-    if !same_display {
-        // Do not dim the window loosing focus on another display.
+    let active_strip = active_display.active_strip();
+    let same_space = if state.is_floating() {
+        window_manager
+            .windows_in_workspace(active_strip.id())
+            .is_ok_and(|ids| ids.contains(&window.id()))
+    } else {
+        active_strip.contains(trigger.event().entity)
+    };
+    if !same_space {
+        // Do not dim the window losing focus on another display or Space.
         return;
     }
 
@@ -296,7 +401,12 @@ fn virtual_strip_activated(
     }
 }
 
-fn focus_window_trigger(trigger: On<FocusWindow>, windows: Windows, apps: Query<&Application>) {
+fn focus_window_trigger(
+    trigger: On<FocusWindow>,
+    windows: Windows,
+    apps: Query<&Application>,
+    mut focus_resolution: ResMut<FocusResolution>,
+) {
     let FocusWindow { entity, raise } = *trigger.event();
     let Some(window) = windows.get(entity) else {
         return;
@@ -304,6 +414,7 @@ fn focus_window_trigger(trigger: On<FocusWindow>, windows: Windows, apps: Query<
     let Some(psn) = windows.psn(window.id(), &apps) else {
         return;
     };
+    focus_resolution.begin_pending(window.pid().ok(), Some(window.id()));
     if !raise
         && let Some((focused_window, _)) = windows.focused()
         && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
@@ -356,9 +467,10 @@ fn raise_window_trigger(
 fn recover_lost_focus(
     windows: Windows,
     active_workspace: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
+    focus_resolution: Res<FocusResolution>,
     mut commands: Commands,
 ) {
-    if windows.focused().is_some() {
+    if windows.focused().is_some() || focus_resolution.suppresses_recovery() {
         return;
     }
     error!("Lost focus marker, recovering!");
@@ -387,7 +499,7 @@ pub(super) fn stray_focus_observer(
         .filter(|(_, stray_focus)| stray_focus.0 == window_id)
         .for_each(|(timeout_entity, _)| {
             debug!("Re-queueing lost focus event for window id {window_id}.");
-            commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
+            commands.trigger(SendMessageTrigger(Event::window_focused(window_id)));
             if let Ok(mut entity_commands) = commands.get_entity(timeout_entity) {
                 entity_commands.try_despawn();
             }
@@ -402,14 +514,14 @@ mod tests {
     #[test]
     fn record_and_read_per_tier() {
         let mut world = World::new();
-        let managed = world.spawn(()).id();
+        let tiled = world.spawn(()).id();
         let floating = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, managed, None);
-        history.record(1, floating, Some(&Unmanaged::Floating));
+        history.record(1, tiled, false, true);
+        history.record(1, floating, true, true);
 
-        assert_eq!(history.last_managed(1), Some(managed));
+        assert_eq!(history.last_tiled(1), Some(tiled));
         assert_eq!(history.last_floating(1), Some(floating));
     }
 
@@ -419,10 +531,10 @@ mod tests {
         let entity = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, entity, Some(&Unmanaged::Minimized));
-        history.record(1, entity, Some(&Unmanaged::Hidden));
+        history.record(1, entity, false, false);
+        history.record(1, entity, true, false);
 
-        assert_eq!(history.last_managed(1), None);
+        assert_eq!(history.last_tiled(1), None);
         assert_eq!(history.last_floating(1), None);
     }
 
@@ -433,11 +545,11 @@ mod tests {
         let b = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, a, None);
-        history.record(2, b, None);
+        history.record(1, a, false, true);
+        history.record(2, b, false, true);
 
-        assert_eq!(history.last_managed(1), Some(a));
-        assert_eq!(history.last_managed(2), Some(b));
+        assert_eq!(history.last_tiled(1), Some(a));
+        assert_eq!(history.last_tiled(2), Some(b));
     }
 
     #[test]
@@ -447,15 +559,15 @@ mod tests {
         let other = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, target, None);
-        history.record(2, target, Some(&Unmanaged::Floating));
-        history.record(2, other, None);
+        history.record(1, target, false, true);
+        history.record(2, target, true, true);
+        history.record(2, other, false, true);
 
         history.forget(target);
 
-        assert_eq!(history.last_managed(1), None);
+        assert_eq!(history.last_tiled(1), None);
         assert_eq!(history.last_floating(2), None);
-        assert_eq!(history.last_managed(2), Some(other));
+        assert_eq!(history.last_tiled(2), Some(other));
     }
 
     #[test]
@@ -464,9 +576,9 @@ mod tests {
         let entity = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, entity, None);
+        history.record(1, entity, false, true);
         history.forget_workspace(1);
 
-        assert_eq!(history.last_managed(1), None);
+        assert_eq!(history.last_tiled(1), None);
     }
 }
