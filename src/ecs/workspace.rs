@@ -15,7 +15,7 @@ use tracing::{Level, debug, error, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
 use crate::config::Config;
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::FocusCoordinator;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_space;
 use crate::ecs::params::{WindowCtx, Windows};
@@ -69,6 +69,7 @@ impl Plugin for WorkspaceEventsPlugin {
                 .chain(),
         );
         app.add_observer(cleanup_active_workspace_marker);
+        app.add_observer(restore_focus_on_space_activation);
     }
 }
 
@@ -284,14 +285,14 @@ fn detect_moved_windows(
 fn workspace_destroyed_handler(
     mut messages: MessageReader<Event>,
     mut workspaces: Populated<(&mut LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
-    mut focus_history: ResMut<FocusHistory>,
+    mut focus: ResMut<FocusCoordinator>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::SpaceDestroyed { space_id } = event else {
             continue;
         };
-        focus_history.forget_workspace(*space_id);
+        focus.forget_workspace(*space_id);
 
         let Some((entity, fullscreen)) =
             workspaces.iter().find_map(|(strip, entity, fullscreen)| {
@@ -530,4 +531,51 @@ fn cleanup_active_workspace_marker(
             entity_commands.try_remove::<ActiveWorkspaceMarker>();
         }
     });
+}
+
+#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+fn restore_focus_on_space_activation(
+    trigger: On<Add, ActiveWorkspaceMarker>,
+    workspaces: Query<&LayoutStrip>,
+    windows: Windows,
+    window_manager: Res<WindowManager>,
+    focus: Res<FocusCoordinator>,
+    mut commands: Commands,
+) {
+    let Ok(strip) = workspaces.get(trigger.entity) else {
+        return;
+    };
+    let workspace_id = strip.id();
+    let workspace_window_ids = window_manager.windows_in_workspace(workspace_id).ok();
+    let eligible = |entity| {
+        let Some((window, _, state)) = windows.get_tracked(entity) else {
+            return false;
+        };
+        if !state.is_visible() {
+            return false;
+        }
+        if state.is_floating() {
+            workspace_window_ids
+                .as_ref()
+                .is_some_and(|window_ids| window_ids.contains(&window.id()))
+        } else {
+            strip.contains(entity)
+        }
+    };
+
+    let snapshot = focus.snapshot();
+    if snapshot.requested_entity().is_some_and(eligible)
+        || snapshot.confirmed_entity().is_some_and(eligible)
+    {
+        return;
+    }
+
+    if let Some(entity) = focus.restoration_entity(workspace_id, eligible) {
+        debug!(
+            workspace_id,
+            ?entity,
+            "restoring the Space's previous focus"
+        );
+        commands.focus_entity(entity, true);
+    }
 }

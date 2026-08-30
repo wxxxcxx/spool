@@ -5,15 +5,15 @@ use bevy::ecs::component::Component;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::Without;
-use bevy::ecs::system::{Commands, Query, Res, SystemParam};
+use bevy::ecs::system::{Commands, Query, Res, ResMut, SystemParam};
 use bevy::time::{Time, Timer, TimerMode};
 use tracing::{debug, warn};
 
 use crate::config::Config;
+use crate::ecs::focus::{FocusCoordinator, FocusSignal};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{
-    FocusedMarker, PreviousTiledStrip, RepositionMarker, ResizeMarker, SendMessageTrigger,
-    SpawnWindowTrigger,
+    PreviousTiledStrip, RepositionMarker, ResizeMarker, SendMessageTrigger, SpawnWindowTrigger,
 };
 use crate::events::{DestroySource, Event, ReconcileScope};
 use crate::manager::{Application, Window, WindowManager};
@@ -51,6 +51,7 @@ pub(super) struct ReconcileState<'w, 's> {
     >,
     previous_strips: Query<'w, 's, &'static PreviousTiledStrip>,
     workspaces: Query<'w, 's, &'static mut LayoutStrip, Without<Window>>,
+    focus: ResMut<'w, FocusCoordinator>,
 }
 
 /// Reconciles the macOS window inventory with ECS. Query failures are
@@ -68,6 +69,7 @@ pub(super) fn reconcile_windows(
         mut windows,
         previous_strips,
         mut workspaces,
+        mut focus,
     } = state;
     let mut all = false;
     let mut pids = HashSet::new();
@@ -123,7 +125,7 @@ pub(super) fn reconcile_windows(
                 if let Some(unavailable) = unavailable.as_mut() {
                     unavailable.confirmation.reset();
                 } else {
-                    isolate_window(entity, &mut workspaces, &mut commands);
+                    isolate_window(entity, &mut workspaces, &mut focus, &mut commands);
                 }
                 continue;
             }
@@ -164,8 +166,10 @@ pub(super) fn reconcile_windows(
 fn isolate_window(
     entity: bevy::ecs::entity::Entity,
     workspaces: &mut Query<&mut LayoutStrip, Without<Window>>,
+    focus: &mut FocusCoordinator,
     commands: &mut Commands,
 ) {
+    focus.observe(FocusSignal::Invalidated { entity });
     for mut strip in workspaces.iter_mut() {
         if !strip.contains(entity) {
             continue;
@@ -177,7 +181,7 @@ fn isolate_window(
         strip.remove(entity);
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert((WindowUnavailable::new(), previous));
-            entity_commands.remove::<(FocusedMarker, RepositionMarker, ResizeMarker)>();
+            entity_commands.remove::<(RepositionMarker, ResizeMarker)>();
         }
         debug!(?entity, "isolated unavailable window from layout and focus");
         return;
@@ -185,7 +189,7 @@ fn isolate_window(
 
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_insert(WindowUnavailable::new());
-        entity_commands.remove::<(FocusedMarker, RepositionMarker, ResizeMarker)>();
+        entity_commands.remove::<(RepositionMarker, ResizeMarker)>();
     }
 }
 

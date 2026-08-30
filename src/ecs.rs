@@ -93,14 +93,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
          workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
          focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>,
          focused_resized: Query<(), (With<FocusedMarker>, Changed<Bounds>)>,
-         focus_resolution: Option<Res<focus::FocusResolution>>,
+         focus: Option<Res<focus::FocusCoordinator>>,
          mut focus_lost: RemovedComponents<FocusedMarker>| {
             !strip_changed.is_empty()
                 || !focus_gained.is_empty()
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
                 || !focused_resized.is_empty()
-                || focus_resolution.is_some_and(|resolution| resolution.is_changed())
+                || focus.is_some_and(|focus| focus.is_changed())
                 || focus_lost.read().next().is_some()
         };
     let native_tabs_enabled =
@@ -219,7 +219,8 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         .add_observer(restore::restore_window_state);
 }
 
-/// Marker component for the currently focused window.
+/// Projection of the tracked window most recently confirmed focused by macOS.
+/// Only the focus coordinator's projection system may add or remove it.
 #[derive(Component)]
 pub struct FocusedMarker;
 
@@ -240,6 +241,11 @@ pub struct FreshMarker;
 /// Marker component used to gather existing processes and windows during initialization.
 #[derive(Component)]
 pub struct ExistingMarker;
+
+/// Marks a window discovered during startup so deferred default application
+/// cannot mistake it for a newly opened window after initialization ends.
+#[derive(Component)]
+pub struct InitialWindowMarker;
 
 /// Component representing a request to reposition a window.
 #[derive(Component, Debug, Deref, DerefMut)]
@@ -546,8 +552,7 @@ impl SpawnCommandsExt for Commands<'_, '_> {
 
     #[instrument(level = Level::TRACE, skip(self))]
     fn focus_entity(&mut self, entity: Entity, raise: bool) {
-        if let Ok(mut entity_commands) = self.get_entity(entity) {
-            entity_commands.try_insert(FocusedMarker);
+        if self.get_entity(entity).is_ok() {
             self.trigger(focus::FocusWindow { entity, raise });
         }
     }

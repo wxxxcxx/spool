@@ -96,6 +96,7 @@ struct MockStateInner {
     withdrawn_surfaces: HashMap<WinID, MockWindowData>,
     native_space_control: bool,
     native_space_intents: Vec<crate::manager::NativeSpaceIntent>,
+    focus_requests: Vec<WinID>,
 }
 
 #[derive(Clone)]
@@ -119,6 +120,7 @@ impl MockState {
                 withdrawn_surfaces: HashMap::new(),
                 native_space_control: false,
                 native_space_intents: Vec::new(),
+                focus_requests: Vec::new(),
             })),
         }
     }
@@ -200,6 +202,15 @@ impl MockState {
                 inner.event_queue.push_back(Event::window_focused(id));
             }
         }
+    }
+
+    pub(crate) fn take_focus_requests(&self) -> Vec<WinID> {
+        std::mem::take(&mut self.inner.force_write().focus_requests)
+    }
+
+    fn request_focus(&self, id: WinID) {
+        self.inner.force_write().focus_requests.push(id);
+        self.focus_window(id);
     }
 
     pub fn add_display(&mut self, id: u32, bounds: IRect, workspaces: Vec<WorkspaceId>) {
@@ -486,7 +497,7 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_focus_with_raise().returning(move |_psn| {
-            s.focus_window(id);
+            s.request_focus(id);
         });
 
         let s = self.clone();
@@ -605,7 +616,11 @@ impl MockState {
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
         mw.expect_raise_without_focus().return_const(());
-        mw.expect_focus_without_raise().return_const(());
+        let s = self.clone();
+        mw.expect_focus_without_raise()
+            .returning(move |_psn, _focused_window, _focused_psn| {
+                s.request_focus(id);
+            });
         mw.expect_set_padding().return_const(());
 
         Window::new(Box::new(mw))

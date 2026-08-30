@@ -8,9 +8,9 @@ use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
-use super::{FocusedMarker, MouseHeldMarker, Timeout};
+use super::{MouseHeldMarker, Timeout};
 use crate::config::Config;
-use crate::ecs::focus::FocusResolution;
+use crate::ecs::focus::{FocusCoordinator, FocusSignal};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
 use crate::ecs::{
@@ -214,8 +214,7 @@ struct MouseDownCtx<'w, 's> {
     window_manager: Res<'w, WindowManager>,
     config: Res<'w, Config>,
     mouse_held: Query<'w, 's, Entity, With<MouseHeldMarker>>,
-    focused: Query<'w, 's, Entity, With<FocusedMarker>>,
-    focus_resolution: ResMut<'w, FocusResolution>,
+    focus: ResMut<'w, FocusCoordinator>,
     commands: Commands<'w, 's>,
 }
 
@@ -230,17 +229,17 @@ fn mouse_down_trigger(mut messages: MessageReader<InputEvent>, mut ctx: MouseDow
             continue;
         };
         let Some((window, entity)) = ctx.windows.find(window_id) else {
-            let generation = ctx.focus_resolution.begin_pending(None, Some(window_id));
-            ctx.focus_resolution.mark_outside(generation);
-            for entity in &ctx.focused {
-                if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-                    entity_commands.try_remove::<FocusedMarker>();
-                }
-            }
+            ctx.focus.observe(FocusSignal::Untracked {
+                generation: None,
+                pid: None,
+                window_id: Some(window_id),
+            });
             continue;
         };
-        ctx.focus_resolution
-            .begin_pending(window.pid().ok(), Some(window_id));
+        ctx.focus.observe(FocusSignal::Resolve {
+            pid: window.pid().ok(),
+            candidate: Some(window_id),
+        });
 
         // Stop any ongoing scroll.
         for (entity, scroll) in &ctx.active_workspace {

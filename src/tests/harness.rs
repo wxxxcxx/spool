@@ -83,7 +83,19 @@ impl TestHarness {
             })
             .collect::<Vec<_>>();
         self.app.world_mut().trigger(SpawnWindowTrigger(windows));
+        if count > 0 {
+            self.mock_state.update_app(pid, |app| {
+                app.focused_window_id.get_or_insert(0);
+            });
+        }
 
+        self
+    }
+
+    pub(crate) fn without_focused_window(self) -> Self {
+        self.mock_state.update_app(TEST_PROCESS_ID, |app| {
+            app.focused_window_id = None;
+        });
         self
     }
 

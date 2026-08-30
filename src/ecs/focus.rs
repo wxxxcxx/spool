@@ -1,7 +1,5 @@
-use std::collections::HashMap;
-use std::time::Duration;
-
 use bevy::app::{App, Plugin, PostUpdate};
+use bevy::ecs::change_detection::DetectChanges as _;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
@@ -12,8 +10,8 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
-use bevy::time::common_conditions::on_timer;
-use tracing::{Level, debug, error, instrument, trace, warn};
+use std::collections::HashMap;
+use tracing::{Level, debug, instrument, trace, warn};
 
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme};
 use crate::config::Config;
@@ -27,25 +25,275 @@ use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
 
-const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
-
 #[derive(Default)]
-pub struct TierMemory {
-    pub last_tiled: Option<Entity>,
-    pub last_floating: Option<Entity>,
+struct FocusOrder(Vec<Entity>);
+
+impl FocusOrder {
+    fn record(&mut self, entity: Entity) {
+        self.0.retain(|candidate| *candidate != entity);
+        self.0.push(entity);
+    }
+
+    fn last(&self) -> Option<Entity> {
+        self.0.last().copied()
+    }
+
+    fn newest_matching(&self, mut eligible: impl FnMut(Entity) -> bool) -> Option<Entity> {
+        self.0
+            .iter()
+            .rev()
+            .copied()
+            .find(|entity| eligible(*entity))
+    }
+
+    fn forget(&mut self, entity: Entity) {
+        self.0.retain(|candidate| *candidate != entity);
+    }
 }
 
-/// Keyed by `WorkspaceId` so toggling on one Space can't reach a window last
-/// focused on another. Cleared on entity despawn (`forget`) so recycled
-/// Entity IDs can't resolve to the wrong window, and on workspace despawn
-/// (`forget_workspace`) to bound the map.
+#[derive(Default)]
+struct TierMemory {
+    any: FocusOrder,
+    tiled: FocusOrder,
+    floating: FocusOrder,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ObservedFocus {
+    #[default]
+    Unresolved,
+    Resolving {
+        generation: u64,
+        pid: Option<Pid>,
+        candidate: Option<WinID>,
+    },
+    Tracked {
+        entity: Entity,
+        window_id: WinID,
+    },
+    Untracked {
+        pid: Option<Pid>,
+        window_id: Option<WinID>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FocusRequest {
+    pub entity: Entity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FocusSnapshot {
+    observed: ObservedFocus,
+    requested: Option<FocusRequest>,
+}
+
+impl FocusSnapshot {
+    pub(crate) fn confirmed_entity(self) -> Option<Entity> {
+        match self.observed {
+            ObservedFocus::Tracked { entity, .. } => Some(entity),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn confirmed_window_id(self) -> Option<WinID> {
+        match self.observed {
+            ObservedFocus::Tracked { window_id, .. } => Some(window_id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn requested_entity(self) -> Option<Entity> {
+        self.requested.map(|request| request.entity)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FocusSignal {
+    Resolve {
+        pid: Option<Pid>,
+        candidate: Option<WinID>,
+    },
+    Candidate {
+        generation: Option<u64>,
+        pid: Option<Pid>,
+        window_id: WinID,
+    },
+    Tracked {
+        generation: u64,
+        entity: Entity,
+        window_id: WinID,
+    },
+    Untracked {
+        generation: Option<u64>,
+        pid: Option<Pid>,
+        window_id: Option<WinID>,
+    },
+    Unresolved {
+        generation: u64,
+    },
+    Invalidated {
+        entity: Entity,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FocusUpdate {
+    Started(u64),
+    Accepted(u64),
+    Stale,
+}
+
+impl FocusUpdate {
+    pub fn generation(self) -> Option<u64> {
+        match self {
+            Self::Started(generation) | Self::Accepted(generation) => Some(generation),
+            Self::Stale => None,
+        }
+    }
+
+    pub fn accepted(self) -> bool {
+        !matches!(self, Self::Stale)
+    }
+}
+
+/// Owns the distinction between macOS-confirmed focus, an explicit in-flight
+/// request, and the last tracked window used for keyboard navigation.
 #[derive(Default, Resource)]
-pub struct FocusHistory {
+pub struct FocusCoordinator {
+    generation: u64,
+    observed: ObservedFocus,
+    requested: Option<FocusRequest>,
     by_workspace: HashMap<WorkspaceId, TierMemory>,
 }
 
-impl FocusHistory {
-    pub fn record(
+impl FocusCoordinator {
+    fn next_generation(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.generation
+    }
+
+    fn begin_resolution(&mut self, pid: Option<Pid>, candidate: Option<WinID>) -> u64 {
+        let generation = self.next_generation();
+        self.observed = ObservedFocus::Resolving {
+            generation,
+            pid,
+            candidate,
+        };
+        self.generation
+    }
+
+    fn accepts(&self, generation: u64, pid: Option<Pid>) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        match self.observed {
+            ObservedFocus::Resolving {
+                pid: expected_pid, ..
+            } => expected_pid.is_none() || pid.is_none() || expected_pid == pid,
+            _ => false,
+        }
+    }
+
+    pub(super) fn observe(&mut self, signal: FocusSignal) -> FocusUpdate {
+        match signal {
+            FocusSignal::Resolve { pid, candidate } => {
+                FocusUpdate::Started(self.begin_resolution(pid, candidate))
+            }
+            FocusSignal::Candidate {
+                generation,
+                pid,
+                window_id,
+            } => {
+                let generation =
+                    generation.unwrap_or_else(|| self.begin_resolution(pid, Some(window_id)));
+                if !self.accepts(generation, pid) {
+                    return FocusUpdate::Stale;
+                }
+                self.observed = ObservedFocus::Resolving {
+                    generation,
+                    pid,
+                    candidate: Some(window_id),
+                };
+                FocusUpdate::Accepted(generation)
+            }
+            FocusSignal::Tracked {
+                generation,
+                entity,
+                window_id,
+            } => {
+                if !self.accepts(generation, None) {
+                    return FocusUpdate::Stale;
+                }
+                self.observed = ObservedFocus::Tracked { entity, window_id };
+                self.requested = None;
+                FocusUpdate::Accepted(generation)
+            }
+            FocusSignal::Untracked {
+                generation,
+                pid,
+                window_id,
+            } => {
+                let generation =
+                    generation.unwrap_or_else(|| self.begin_resolution(pid, window_id));
+                if !self.accepts(generation, pid) {
+                    return FocusUpdate::Stale;
+                }
+                self.observed = ObservedFocus::Untracked { pid, window_id };
+                self.requested = None;
+                FocusUpdate::Accepted(generation)
+            }
+            FocusSignal::Unresolved { generation } => {
+                if generation != self.generation {
+                    return FocusUpdate::Stale;
+                }
+                self.observed = ObservedFocus::Unresolved;
+                self.requested = None;
+                FocusUpdate::Accepted(generation)
+            }
+            FocusSignal::Invalidated { entity } => {
+                let observed_matches = matches!(
+                    self.observed,
+                    ObservedFocus::Tracked {
+                        entity: focused, ..
+                    } if focused == entity
+                );
+                let requested_matches = self
+                    .requested
+                    .is_some_and(|request| request.entity == entity);
+                if !observed_matches && !requested_matches {
+                    return FocusUpdate::Stale;
+                }
+                let generation = self.next_generation();
+                if observed_matches {
+                    self.observed = ObservedFocus::Unresolved;
+                }
+                if requested_matches {
+                    self.requested = None;
+                }
+                FocusUpdate::Accepted(generation)
+            }
+        }
+    }
+
+    pub(super) fn request(&mut self, entity: Entity) -> u64 {
+        let generation = self.next_generation();
+        self.requested = Some(FocusRequest { entity });
+        generation
+    }
+
+    pub(crate) fn snapshot(&self) -> FocusSnapshot {
+        FocusSnapshot {
+            observed: self.observed,
+            requested: self.requested,
+        }
+    }
+
+    pub(super) fn is_current(&self, generation: u64) -> bool {
+        generation == self.generation
+    }
+
+    pub(super) fn record_navigation(
         &mut self,
         workspace: WorkspaceId,
         entity: Entity,
@@ -55,137 +303,54 @@ impl FocusHistory {
         if !visible {
             return;
         }
-        let slot = self.by_workspace.entry(workspace).or_default();
+        let memory = self.by_workspace.entry(workspace).or_default();
+        memory.any.record(entity);
         if floating {
-            slot.last_floating = Some(entity);
+            memory.floating.record(entity);
         } else {
-            slot.last_tiled = Some(entity);
+            memory.tiled.record(entity);
         }
     }
 
-    pub fn last_tiled(&self, workspace: WorkspaceId) -> Option<Entity> {
-        self.by_workspace.get(&workspace).and_then(|t| t.last_tiled)
-    }
-
-    pub fn last_floating(&self, workspace: WorkspaceId) -> Option<Entity> {
+    pub(crate) fn last_tiled(&self, workspace: WorkspaceId) -> Option<Entity> {
         self.by_workspace
             .get(&workspace)
-            .and_then(|t| t.last_floating)
+            .and_then(|memory| memory.tiled.last())
     }
 
-    pub fn forget(&mut self, entity: Entity) {
-        for slot in self.by_workspace.values_mut() {
-            if slot.last_tiled == Some(entity) {
-                slot.last_tiled = None;
-            }
-            if slot.last_floating == Some(entity) {
-                slot.last_floating = None;
-            }
+    pub(crate) fn last_floating(&self, workspace: WorkspaceId) -> Option<Entity> {
+        self.by_workspace
+            .get(&workspace)
+            .and_then(|memory| memory.floating.last())
+    }
+
+    pub(crate) fn navigation_entity(&self, workspace: WorkspaceId) -> Option<Entity> {
+        self.requested
+            .map(|request| request.entity)
+            .or_else(|| self.by_workspace.get(&workspace)?.any.last())
+    }
+
+    pub(crate) fn restoration_entity(
+        &self,
+        workspace: WorkspaceId,
+        eligible: impl FnMut(Entity) -> bool,
+    ) -> Option<Entity> {
+        self.by_workspace
+            .get(&workspace)?
+            .any
+            .newest_matching(eligible)
+    }
+
+    pub(super) fn forget(&mut self, entity: Entity) {
+        for memory in self.by_workspace.values_mut() {
+            memory.tiled.forget(entity);
+            memory.floating.forget(entity);
+            memory.any.forget(entity);
         }
     }
 
-    pub fn forget_workspace(&mut self, workspace: WorkspaceId) {
+    pub(super) fn forget_workspace(&mut self, workspace: WorkspaceId) {
         self.by_workspace.remove(&workspace);
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ActualFocus {
-    #[default]
-    Unknown,
-    Pending {
-        generation: u64,
-        pid: Option<Pid>,
-        candidate: Option<WinID>,
-    },
-    Tracked(WinID),
-    Outside,
-}
-
-/// Resolves asynchronous macOS focus signals without letting an older query
-/// overwrite a newer application transition. `FocusedMarker` remains the
-/// immediate navigation target while this resource records the confidence of
-/// the OS-facing observation.
-#[derive(Default, Resource)]
-pub struct FocusResolution {
-    generation: u64,
-    actual: ActualFocus,
-}
-
-impl FocusResolution {
-    pub(super) fn begin_pending(&mut self, pid: Option<Pid>, candidate: Option<WinID>) -> u64 {
-        self.generation = self.generation.wrapping_add(1).max(1);
-        self.actual = ActualFocus::Pending {
-            generation: self.generation,
-            pid,
-            candidate,
-        };
-        self.generation
-    }
-
-    pub(super) fn accept_candidate(
-        &mut self,
-        generation: Option<u64>,
-        pid: Option<Pid>,
-        candidate: WinID,
-    ) -> Option<u64> {
-        let generation = if let Some(generation) = generation {
-            if generation != self.generation {
-                return None;
-            }
-            generation
-        } else {
-            self.begin_pending(pid, Some(candidate))
-        };
-        self.actual = ActualFocus::Pending {
-            generation,
-            pid,
-            candidate: Some(candidate),
-        };
-        Some(generation)
-    }
-
-    pub(super) fn confirm(&mut self, generation: u64, window_id: WinID) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-        self.actual = ActualFocus::Tracked(window_id);
-        true
-    }
-
-    pub(super) fn is_current(&self, generation: u64) -> bool {
-        generation == self.generation
-    }
-
-    pub(super) fn mark_unknown(&mut self, generation: u64) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-        self.actual = ActualFocus::Unknown;
-        true
-    }
-
-    pub(super) fn mark_outside(&mut self, generation: u64) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-        self.actual = ActualFocus::Outside;
-        true
-    }
-
-    pub(super) fn suppresses_recovery(&self) -> bool {
-        matches!(
-            self.actual,
-            ActualFocus::Pending { .. } | ActualFocus::Outside
-        )
-    }
-
-    pub(super) fn visual_window_id(&self) -> Option<WinID> {
-        match self.actual {
-            ActualFocus::Pending { candidate, .. } => candidate,
-            ActualFocus::Tracked(window_id) => Some(window_id),
-            ActualFocus::Unknown | ActualFocus::Outside => None,
-        }
     }
 }
 
@@ -193,17 +358,15 @@ pub struct FocusEventsPlugin;
 
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<FocusHistory>();
-        app.init_resource::<FocusResolution>();
+        app.init_resource::<FocusCoordinator>();
         app.add_systems(
             PostUpdate,
             (
+                project_confirmed_focus,
                 autocenter_window_on_focus.after(super::systems::animate_resize_entities),
                 mouse_follows_focus.after(super::systems::animate_resize_entities),
-                recover_lost_focus.run_if(on_timer(Duration::from_millis(
-                    REFRESH_WINDOW_CHECK_FREQ_MS,
-                ))),
-            ),
+            )
+                .chain(),
         );
         app.add_observer(dim_remove_window_trigger)
             .add_observer(dim_window_trigger)
@@ -222,30 +385,39 @@ pub(super) struct FocusWindow {
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn maintain_focus_singleton(
-    trigger: On<Add, FocusedMarker>,
-    windows: Query<(Entity, Has<FocusedMarker>), With<Window>>,
-    mut config: GlobalState,
-    mut commands: Commands,
-) {
-    let focused_entity = trigger.event().entity;
-
-    for (entity, focused) in windows {
-        if focused
-            && entity != focused_entity
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
-        {
-            debug!("window {entity} lost focus.");
-            entity_commands.try_remove::<FocusedMarker>();
-        }
-    }
-
+fn maintain_focus_singleton(_trigger: On<Add, FocusedMarker>, mut config: GlobalState) {
     // Check if the reshuffle was caused by a keyboard switch or mouse move.
     // Skip reshuffle if caused by mouse - because then it won't center.
     if config.ffm_flag().is_none() {
         config.set_skip_reshuffle(false);
     }
     config.set_ffm_flag(None);
+}
+
+fn project_confirmed_focus(
+    coordinator: Res<FocusCoordinator>,
+    windows: Query<(Entity, Has<FocusedMarker>), With<Window>>,
+    mut commands: Commands,
+) {
+    if !coordinator.is_changed() {
+        return;
+    }
+
+    let target = coordinator.snapshot().confirmed_entity();
+    let mut target_has_marker = false;
+    for (entity, focused) in &windows {
+        if Some(entity) == target {
+            target_has_marker = focused;
+        } else if focused && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<FocusedMarker>();
+        }
+    }
+    if let Some(entity) = target
+        && !target_has_marker
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_insert(FocusedMarker);
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
@@ -405,7 +577,7 @@ fn focus_window_trigger(
     trigger: On<FocusWindow>,
     windows: Windows,
     apps: Query<&Application>,
-    mut focus_resolution: ResMut<FocusResolution>,
+    mut focus: ResMut<FocusCoordinator>,
 ) {
     let FocusWindow { entity, raise } = *trigger.event();
     let Some(window) = windows.get(entity) else {
@@ -414,7 +586,7 @@ fn focus_window_trigger(
     let Some(psn) = windows.psn(window.id(), &apps) else {
         return;
     };
-    focus_resolution.begin_pending(window.pid().ok(), Some(window.id()));
+    focus.request(entity);
     if !raise
         && let Some((focused_window, _)) = windows.focused()
         && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
@@ -463,26 +635,6 @@ fn raise_window_trigger(
     window.raise_without_focus();
 }
 
-#[instrument(level = Level::DEBUG, skip_all)]
-fn recover_lost_focus(
-    windows: Windows,
-    active_workspace: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
-    focus_resolution: Res<FocusResolution>,
-    mut commands: Commands,
-) {
-    if windows.focused().is_some() || focus_resolution.suppresses_recovery() {
-        return;
-    }
-    error!("Lost focus marker, recovering!");
-    if let Ok(strip) = active_workspace
-        .single()
-        .inspect_err(|err| error!("Unable to get current workspace: {err}"))
-        && let Some(entity) = strip.first().ok().and_then(|col| col.top())
-    {
-        commands.focus_entity(entity, false);
-    }
-}
-
 pub(super) fn stray_focus_observer(
     trigger: On<Add, Window>,
     focus_events: Populated<(Entity, &StrayFocusEvent)>,
@@ -516,26 +668,26 @@ mod tests {
         let mut world = World::new();
         let tiled = world.spawn(()).id();
         let floating = world.spawn(()).id();
-        let mut history = FocusHistory::default();
+        let mut focus = FocusCoordinator::default();
 
-        history.record(1, tiled, false, true);
-        history.record(1, floating, true, true);
+        focus.record_navigation(1, tiled, false, true);
+        focus.record_navigation(1, floating, true, true);
 
-        assert_eq!(history.last_tiled(1), Some(tiled));
-        assert_eq!(history.last_floating(1), Some(floating));
+        assert_eq!(focus.last_tiled(1), Some(tiled));
+        assert_eq!(focus.last_floating(1), Some(floating));
     }
 
     #[test]
     fn record_ignores_minimized_and_hidden() {
         let mut world = World::new();
         let entity = world.spawn(()).id();
-        let mut history = FocusHistory::default();
+        let mut focus = FocusCoordinator::default();
 
-        history.record(1, entity, false, false);
-        history.record(1, entity, true, false);
+        focus.record_navigation(1, entity, false, false);
+        focus.record_navigation(1, entity, true, false);
 
-        assert_eq!(history.last_tiled(1), None);
-        assert_eq!(history.last_floating(1), None);
+        assert_eq!(focus.last_tiled(1), None);
+        assert_eq!(focus.last_floating(1), None);
     }
 
     #[test]
@@ -543,13 +695,13 @@ mod tests {
         let mut world = World::new();
         let a = world.spawn(()).id();
         let b = world.spawn(()).id();
-        let mut history = FocusHistory::default();
+        let mut focus = FocusCoordinator::default();
 
-        history.record(1, a, false, true);
-        history.record(2, b, false, true);
+        focus.record_navigation(1, a, false, true);
+        focus.record_navigation(2, b, false, true);
 
-        assert_eq!(history.last_tiled(1), Some(a));
-        assert_eq!(history.last_tiled(2), Some(b));
+        assert_eq!(focus.last_tiled(1), Some(a));
+        assert_eq!(focus.last_tiled(2), Some(b));
     }
 
     #[test]
@@ -557,28 +709,80 @@ mod tests {
         let mut world = World::new();
         let target = world.spawn(()).id();
         let other = world.spawn(()).id();
-        let mut history = FocusHistory::default();
+        let mut focus = FocusCoordinator::default();
 
-        history.record(1, target, false, true);
-        history.record(2, target, true, true);
-        history.record(2, other, false, true);
+        focus.record_navigation(1, target, false, true);
+        focus.record_navigation(2, target, true, true);
+        focus.record_navigation(2, other, false, true);
 
-        history.forget(target);
+        focus.forget(target);
 
-        assert_eq!(history.last_tiled(1), None);
-        assert_eq!(history.last_floating(2), None);
-        assert_eq!(history.last_tiled(2), Some(other));
+        assert_eq!(focus.last_tiled(1), None);
+        assert_eq!(focus.last_floating(2), None);
+        assert_eq!(focus.last_tiled(2), Some(other));
     }
 
     #[test]
     fn forget_workspace_drops_entry() {
         let mut world = World::new();
         let entity = world.spawn(()).id();
-        let mut history = FocusHistory::default();
+        let mut focus = FocusCoordinator::default();
 
-        history.record(1, entity, false, true);
-        history.forget_workspace(1);
+        focus.record_navigation(1, entity, false, true);
+        focus.forget_workspace(1);
 
-        assert_eq!(history.last_tiled(1), None);
+        assert_eq!(focus.last_tiled(1), None);
+    }
+
+    #[test]
+    fn invalidating_requested_target_preserves_confirmed_focus() {
+        let mut world = World::new();
+        let confirmed = world.spawn(()).id();
+        let requested = world.spawn(()).id();
+        let mut focus = FocusCoordinator::default();
+        let generation = focus
+            .observe(FocusSignal::Resolve {
+                pid: None,
+                candidate: Some(10),
+            })
+            .generation()
+            .unwrap();
+        focus.observe(FocusSignal::Tracked {
+            generation,
+            entity: confirmed,
+            window_id: 10,
+        });
+        focus.request(requested);
+
+        focus.observe(FocusSignal::Invalidated { entity: requested });
+
+        assert_eq!(focus.snapshot().confirmed_entity(), Some(confirmed));
+        assert_eq!(focus.snapshot().requested_entity(), None);
+    }
+
+    #[test]
+    fn invalidating_confirmed_focus_preserves_another_request() {
+        let mut world = World::new();
+        let confirmed = world.spawn(()).id();
+        let requested = world.spawn(()).id();
+        let mut focus = FocusCoordinator::default();
+        let generation = focus
+            .observe(FocusSignal::Resolve {
+                pid: None,
+                candidate: Some(10),
+            })
+            .generation()
+            .unwrap();
+        focus.observe(FocusSignal::Tracked {
+            generation,
+            entity: confirmed,
+            window_id: 10,
+        });
+        focus.request(requested);
+
+        focus.observe(FocusSignal::Invalidated { entity: confirmed });
+
+        assert_eq!(focus.snapshot().confirmed_entity(), None);
+        assert_eq!(focus.snapshot().requested_entity(), Some(requested));
     }
 }

@@ -9,7 +9,7 @@ use crate::ecs::{
     WindowVisibility, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
-use crate::events::{Event, FocusSource};
+use crate::events::{DestroySource, Event, FocusSource};
 use crate::manager::{Origin, Size, Window};
 use crate::platform::Modifiers;
 use crate::{assert_focused, assert_window_at, assert_window_size};
@@ -248,6 +248,45 @@ fn native_space_focus_submits_stable_space_id() {
 }
 
 #[test]
+fn returning_to_a_space_focuses_its_previous_window() {
+    const TARGET_SPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 1;
+
+    TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, TARGET_SPACE_ID],
+        )
+        .with_windows(2)
+        .on_iteration(0, |_world, state| {
+            state.focus_window(1);
+        })
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 1);
+            state.update_window(1, |window| {
+                window.workspace_id = TARGET_SPACE_ID;
+            });
+            state.activate_workspace(TEST_DISPLAY_ID, TARGET_SPACE_ID, false);
+        })
+        .on_iteration(2, |_world, state| {
+            state.take_focus_requests();
+            state.activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, false);
+        })
+        .on_iteration(3, |world, state| {
+            assert_focused!(world, 0);
+            assert_eq!(state.take_focus_requests(), vec![0]);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+            Event::SpaceChanged,
+        ]);
+}
+
+#[test]
 fn frontmost_floating_window_is_focused_after_setup() {
     let mut params = WindowParams::new(".*", None);
     params.floating = Some(true);
@@ -261,6 +300,22 @@ fn frontmost_floating_window_is_focused_after_setup() {
             assert_focused!(world, 0);
             let entity = find_window_entity(0, world);
             assert!(world.entity(entity).contains::<Floating>());
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }]);
+}
+
+#[test]
+fn startup_without_confirmed_focus_does_not_focus_the_first_window() {
+    TestHarness::new()
+        .with_windows(1)
+        .without_focused_window()
+        .on_iteration(0, |world, state| {
+            let mut focused = world.query_filtered::<Entity, With<FocusedMarker>>();
+            assert_eq!(focused.iter(world).count(), 0);
+            assert!(
+                state.take_focus_requests().is_empty(),
+                "startup without an AX focus must not issue a focus request"
+            );
         })
         .run(vec![Event::MenuOpened { window_id: 0 }]);
 }
@@ -296,6 +351,49 @@ fn floating_window_stays_floating_after_minimize_restore() {
             Event::MenuOpened { window_id: 0 },
             Event::WindowMinimized { window_id: 0 },
             Event::WindowDeminimized { window_id: 0 },
+        ]);
+}
+
+#[test]
+fn minimizing_an_unfocused_window_does_not_change_focus() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| {
+            state.take_focus_requests();
+        })
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 0);
+            assert!(
+                state.take_focus_requests().is_empty(),
+                "minimizing an unfocused window must not request another focus"
+            );
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::WindowMinimized { window_id: 2 },
+        ]);
+}
+
+#[test]
+fn destroying_an_unfocused_window_does_not_change_focus() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| {
+            state.take_focus_requests();
+        })
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 0);
+            assert!(
+                state.take_focus_requests().is_empty(),
+                "destroying an unfocused window must not request another focus"
+            );
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::WindowDestroyed {
+                window_id: 2,
+                source: DestroySource::WindowServer,
+            },
         ]);
 }
 
@@ -727,6 +825,20 @@ fn test_rapid_focus_not_swallowed() {
         harness.app.update();
     }
 
+    let requested = harness
+        .world()
+        .resource::<crate::ecs::focus::FocusCoordinator>()
+        .navigation_entity(TEST_WORKSPACE_ID)
+        .expect("rapid commands retain their requested navigation target");
+    assert_eq!(entity_to_window_id(harness.world(), requested), 1);
+    assert_focused!(harness.world(), 4);
+
+    for _ in 0..5 {
+        for event in harness.mock_state.drain_events() {
+            harness.app.world_mut().write_message::<Event>(event);
+        }
+        harness.app.update();
+    }
     assert_focused!(harness.world(), 1);
 }
 
@@ -755,7 +867,7 @@ fn test_stale_focus_event_ignored() {
 }
 
 #[test]
-fn stale_known_focus_event_does_not_leave_resolution_pending() {
+fn stale_known_focus_event_does_not_trigger_automatic_recovery() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -775,43 +887,45 @@ fn stale_known_focus_event_does_not_leave_resolution_pending() {
 
     TestHarness::new()
         .with_windows(5)
-        .on_iteration(2, |world, _state| {
+        .on_iteration(2, |world, state| {
             assert_focused!(world, 1);
+            state.take_focus_requests();
             let focused = world
                 .query_filtered::<Entity, With<FocusedMarker>>()
                 .single(world)
                 .expect("focus anchor before simulated marker loss");
             world.entity_mut(focused).remove::<FocusedMarker>();
         })
-        .on_iteration(5, |world, _state| {
-            assert_focused!(world, 0);
+        .on_iteration(5, |world, state| {
+            let mut focused = world.query_filtered::<Entity, With<FocusedMarker>>();
+            assert_eq!(focused.iter(world).count(), 0);
+            assert!(state.take_focus_requests().is_empty());
         })
         .run(commands);
 }
 
 #[test]
-fn unknown_focus_event_preserves_the_tracked_focus_anchor() {
+fn unknown_focus_clears_confirmed_focus_but_preserves_navigation() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::window_focused(999),
         Event::Command {
-            command: Command::PrintState,
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-        Event::Command {
-            command: Command::PrintState,
+            command: Command::Window(Operation::Focus(Direction::East)),
         },
     ];
 
     TestHarness::new()
-        .with_windows(1)
+        .with_windows(3)
         .on_iteration(1, |world, _state| {
-            assert_focused!(world, 0);
+            let mut focused = world.query_filtered::<Entity, With<FocusedMarker>>();
+            assert_eq!(
+                focused.iter(world).count(),
+                0,
+                "an ignored window must not leave a tracked window confirmed"
+            );
         })
-        .on_iteration(4, |world, _state| {
-            assert_focused!(world, 0);
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 1);
         })
         .run(commands);
 }
@@ -925,7 +1039,7 @@ fn mouse_hit_on_an_untracked_window_confirms_focus_outside_spool() {
 }
 
 #[test]
-fn focus_query_timeout_does_not_suppress_later_focus_recovery() {
+fn focus_query_timeout_never_focuses_an_arbitrary_window() {
     let mut commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::FocusRevalidationRequested {
@@ -944,15 +1058,16 @@ fn focus_query_timeout_does_not_suppress_later_focus_recovery() {
                 app.focused_window_id = None;
             });
         })
-        .on_iteration(6, |world, _state| {
-            let focused = world
-                .query_filtered::<Entity, With<FocusedMarker>>()
-                .single(world)
-                .expect("focus anchor before simulated marker loss");
-            world.entity_mut(focused).remove::<FocusedMarker>();
+        .on_iteration(6, |_world, state| {
+            state.take_focus_requests();
         })
-        .on_iteration(8, |world, _state| {
-            assert_focused!(world, 0);
+        .on_iteration(8, |world, state| {
+            let mut focused = world.query_filtered::<Entity, With<FocusedMarker>>();
+            assert_eq!(focused.iter(world).count(), 0);
+            assert!(
+                state.take_focus_requests().is_empty(),
+                "an unresolved observation must not issue a focus request"
+            );
         })
         .run(commands);
 }
@@ -1239,7 +1354,8 @@ fn focus_floating_ignores_floats_from_other_spaces() {
         .with_workspace_window(0, TEST_WORKSPACE_ID, |_| {})
         .with_workspace_window(99, TEST_WORKSPACE_ID + 1, |w| {
             w.frame = IRect::new(600, 0, 600 + TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
-        });
+        })
+        .with_focused_window(0);
 
     let commands = vec![
         Event::MenuOpened { window_id: 0 },

@@ -310,6 +310,7 @@ fn test_send_next_display_stays_on_source() {
     harness
         .mock_state
         .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 100, frame);
+    harness.mock_state.focus_window(100);
 
     let commands = vec![
         Event::MenuOpened { window_id: 101 },
@@ -368,6 +369,7 @@ fn test_mouse_to_next_display() {
             data.workspace_id = TEST_WORKSPACE_ID;
             data.frame = frame;
         })
+        .with_focused_window(100)
         .on_iteration(1, move |world, state| {
             let entity = find_window_entity(100, world);
             let window = world.get::<Window>(entity).expect("need window");

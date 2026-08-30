@@ -26,15 +26,14 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::focus::FocusResolution;
+use crate::ecs::focus::{FocusCoordinator, FocusSignal};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, WidthRatio, WindowProperties,
-    WindowVisibility,
+    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, Initializing, LowPowerMode,
+    MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState, Scrolling,
+    SendMessageTrigger, SpawnCommandsExt, WidthRatio, WindowProperties, WindowVisibility,
 };
 use crate::events::{Event, FocusSource, InputEvent};
 use crate::manager::{
@@ -245,23 +244,22 @@ pub(crate) fn add_existing_application(
     }
 }
 
-/// Finishes the initialization process once all initial windows are loaded.
-/// This system refreshes displays, assigns the `FocusedMarker` to the first window of the active space,
-/// and logs the total number of tracked windows.
+/// Finishes initialization once all initial windows are loaded. The active
+/// application's AX focus is observed; startup never chooses a window itself.
 ///
 /// # Arguments
 ///
 /// * `windows` - A mutable query for all tracked window components.
 /// * `displays` - A query for all `Display` entities, including whether they have the `ActiveDisplayMarker`.
 /// * `window_manager` - The `WindowManager` resource for refreshing displays and getting active space information.
-/// * `commands` - Bevy commands to insert components like `FocusedMarker`.
+/// * `commands` - Bevy commands used to publish the observed AX focus.
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(crate) fn finish_setup(
     process_query: Query<Entity, With<ExistingMarker>>,
     windows: Windows,
     applications: Query<&Application>,
     mut bruteforce_tasks: Query<(Entity, &mut BruteforceWindows)>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>, &ChildOf)>,
+    mut workspaces: Query<&mut LayoutStrip>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
@@ -289,8 +287,7 @@ pub(crate) fn finish_setup(
         windows.iter().size_hint()
     );
 
-    let mut focused_tiled_window = false;
-    for (mut strip, active_strip, _) in &mut workspaces {
+    for mut strip in &mut workspaces {
         debug!("space {}: before refresh {strip:?}", strip.id());
         let workspace_windows = window_manager
             .windows_in_workspace(strip.id())
@@ -330,25 +327,14 @@ pub(crate) fn finish_setup(
             }
         }
         debug!("space {}: after refresh {strip:?}", strip.id());
-
-        if active_strip && let Some(entity) = strip.first().ok().and_then(|column| column.top()) {
-            commands.focus_entity(entity, true);
-            focused_tiled_window = true;
-        }
     }
 
-    // An all-floating workspace has no strip member to receive the initial
-    // focus marker. Mirror the frontmost app's AX focus so menu actions such as
-    // Make Toggle Floating work immediately after launch.
-    if !focused_tiled_window
-        && let Some(focused_window_id) = applications
-            .iter()
-            .find(|app| app.is_frontmost())
-            .and_then(|app| app.focused_window_id().ok())
-        && let Some((_, entity)) = windows.find(focused_window_id)
-        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    if let Some(focused_window_id) = applications
+        .iter()
+        .find(|app| app.is_frontmost())
+        .and_then(|app| app.focused_window_id().ok())
     {
-        entity_commands.try_insert(FocusedMarker);
+        commands.trigger(SendMessageTrigger(Event::window_focused(focused_window_id)));
     }
 
     commands.remove_resource::<Initializing>();
@@ -521,11 +507,11 @@ pub(super) fn retry_front_switch(
     retries: Populated<(Entity, &mut RetryFrontSwitch)>,
     applications: Query<&Application>,
     clock: Res<Time>,
-    mut focus_resolution: ResMut<FocusResolution>,
+    mut focus: ResMut<FocusCoordinator>,
     mut commands: Commands,
 ) {
     for (entity, mut retry) in retries {
-        if !focus_resolution.is_current(retry.generation) {
+        if !focus.is_current(retry.generation) {
             debug!(
                 "Discarding stale focus retry from generation {}.",
                 retry.generation
@@ -537,7 +523,9 @@ pub(super) fn retry_front_switch(
         }
         let Ok(app) = applications.get(retry.app_entity) else {
             // Application entity no longer exists, clean up.
-            focus_resolution.mark_unknown(retry.generation);
+            focus.observe(FocusSignal::Unresolved {
+                generation: retry.generation,
+            });
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_despawn();
             }
@@ -546,7 +534,9 @@ pub(super) fn retry_front_switch(
         if !app.is_frontmost() {
             // App is no longer frontmost — this retry is stale.
             debug!("Discarding stale front switch retry (app no longer frontmost).");
-            focus_resolution.mark_unknown(retry.generation);
+            focus.observe(FocusSignal::Unresolved {
+                generation: retry.generation,
+            });
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_despawn();
             }
@@ -571,7 +561,9 @@ pub(super) fn retry_front_switch(
                 "Focused-window query for '{}' timed out; actual focus remains unknown.",
                 app.name()
             );
-            focus_resolution.mark_unknown(retry.generation);
+            focus.observe(FocusSignal::Unresolved {
+                generation: retry.generation,
+            });
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_despawn();
             }
@@ -1054,7 +1046,7 @@ mod overlay_target_tests {
 #[derive(SystemParam)]
 pub(super) struct OverlayInputs<'w, 's> {
     windows: Windows<'w, 's>,
-    focus_resolution: Res<'w, FocusResolution>,
+    focus: Res<'w, FocusCoordinator>,
     applications: Query<'w, 's, &'static Application>,
     window_manager: Res<'w, WindowManager>,
     mission_control_active: Res<'w, MissionControlActive>,
@@ -1103,10 +1095,10 @@ pub(super) fn update_overlays(
     // Resolve the focused tracked window. Tiled membership belongs to ECS;
     // floating Space membership belongs to macOS.
     let visual_focus = inputs
-        .focus_resolution
-        .visual_window_id()
-        .and_then(|window_id| inputs.windows.find(window_id))
-        .or_else(|| inputs.windows.focused());
+        .focus
+        .snapshot()
+        .confirmed_window_id()
+        .and_then(|window_id| inputs.windows.find(window_id));
     let (focused_abs_cg, focused_window_id) = if let Some((window, entity, state)) =
         visual_focus.and_then(|(_, entity)| inputs.windows.get_tracked(entity))
         && is_overlay_target(OverlayTargetState {

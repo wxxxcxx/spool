@@ -530,6 +530,38 @@ fn test_reconcile_filters_ax_withdrawn_window_before_cg_surface_disappears() {
 }
 
 #[test]
+fn reconciling_a_withdrawn_focused_window_invalidates_confirmed_focus() {
+    use crate::ecs::focus::FocusCoordinator;
+    use crate::events::ReconcileScope;
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |_world, state| {
+            state.take_focus_requests();
+            state.os_withdraw_window(0);
+        })
+        .on_iteration(1, |world, state| {
+            assert!(
+                world
+                    .resource::<FocusCoordinator>()
+                    .snapshot()
+                    .confirmed_entity()
+                    .is_none(),
+                "an unavailable window cannot remain confirmed focus"
+            );
+            assert!(state.take_focus_requests().is_empty());
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::ReconcileWindows {
+                scope: ReconcileScope::Application(TEST_PROCESS_ID),
+            },
+        ]);
+}
+
+#[test]
 fn test_reconcile_restores_a_temporarily_withdrawn_window() {
     use crate::events::ReconcileScope;
 

@@ -14,7 +14,7 @@ mod query;
 
 use crate::config::Config;
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::FocusCoordinator;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
 use crate::ecs::native_space::VisibleNativeSpaceMarker;
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
@@ -273,6 +273,7 @@ fn command_move_focus(
     workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    focus: Res<FocusCoordinator>,
     mut commands: Commands,
 ) {
     let Some(Operation::Focus(direction)) =
@@ -307,7 +308,10 @@ fn command_move_focus(
         return;
     }
 
-    let Some((_, focused_entity)) = windows.focused() else {
+    let Some(focused_entity) = focus
+        .navigation_entity(active_strip.id())
+        .or_else(|| windows.focused().map(|(_, entity)| entity))
+    else {
         return;
     };
 
@@ -395,7 +399,7 @@ fn command_focus_floating(
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
-    focus_history: Res<FocusHistory>,
+    focus: Res<FocusCoordinator>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusFloating))
@@ -411,7 +415,7 @@ fn command_focus_floating(
         visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
     let is_visible_float = |entity: Entity| -> bool { visible_floats.contains(&entity) };
 
-    let target = focus_history
+    let target = focus
         .last_floating(workspace_id)
         .filter(|entity| is_visible_float(*entity))
         .or_else(|| visible_floats.into_iter().next());
@@ -424,7 +428,7 @@ fn command_focus_floating(
 fn command_focus_tiled(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
-    focus_history: Res<FocusHistory>,
+    focus: Res<FocusCoordinator>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusTiled))
@@ -437,7 +441,7 @@ fn command_focus_tiled(
     let active_strip = active_display.active_strip();
     let workspace_id = active_strip.id();
 
-    let target = focus_history
+    let target = focus
         .last_tiled(workspace_id)
         .filter(|entity| active_strip.contains(*entity))
         .or_else(|| active_strip.all_columns().into_iter().next());
@@ -453,7 +457,7 @@ fn command_raise_floating(
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
-    focus_history: Res<FocusHistory>,
+    focus: Res<FocusCoordinator>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::RaiseFloating))
@@ -469,7 +473,7 @@ fn command_raise_floating(
         visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
     let is_visible_float = |entity: Entity| -> bool { visible_floats.contains(&entity) };
 
-    let target = focus_history
+    let target = focus
         .last_floating(workspace_id)
         .filter(|entity| is_visible_float(*entity))
         .or_else(|| visible_floats.first().copied());
@@ -496,7 +500,7 @@ fn command_toggle_floating_layer(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
     mut floating_layers: Query<&mut FloatingLayer>,
-    focus_history: Res<FocusHistory>,
+    focus: Res<FocusCoordinator>,
     window_manager: Res<WindowManager>,
     windows: Windows,
     mut commands: Commands,
@@ -537,12 +541,12 @@ fn command_toggle_floating_layer(
     };
 
     let target = if floating_front {
-        focus_history
+        focus
             .last_floating(workspace_id)
             .filter(|entity| visible_float(*entity))
             .or_else(|| visible_floats.iter().copied().find(|e| visible_float(*e)))
     } else {
-        focus_history
+        focus
             .last_tiled(workspace_id)
             .filter(|entity| active_strip.contains(*entity))
             .or_else(|| active_strip.all_columns().into_iter().next())
