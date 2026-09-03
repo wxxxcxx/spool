@@ -11,7 +11,8 @@ use crate::config::Config;
 use crate::ecs::state::StateQueryKind;
 use crate::errors::Result;
 use crate::platform::{
-    EventLoopWaker, Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId, WorkspaceObserver,
+    EventLoopWaker, Modifiers, Pid, ProcessSerialNumber, WinID, WindowIncarnation, WorkspaceId,
+    WorkspaceObserver,
 };
 use crate::util::AXUIWrapper;
 
@@ -31,8 +32,8 @@ pub enum DestroySource {
     /// macOS 15 and newer. Unlike the Space notification, this identifies an
     /// actual `WindowServer` close.
     WindowServer,
-    /// A successful AX inventory query and CG on-screen snapshot both confirmed
-    /// that the tracked window disappeared without delivering a destroy event.
+    /// A complete AX plus `WindowServer` inventory audit confirmed that one
+    /// specific tracked incarnation disappeared.
     Reconciliation,
 }
 
@@ -54,6 +55,7 @@ pub enum FocusSource {
     AccessibilityWindow,
     AccessibilityUiElement,
     ApplicationFrontSwitch,
+    StateSync,
     Retry,
     Internal,
 }
@@ -64,6 +66,7 @@ pub enum FocusSource {
 pub struct FocusObservation {
     pub window_id: WinID,
     pub pid: Option<Pid>,
+    pub incarnation: Option<WindowIncarnation>,
     pub source: FocusSource,
     pub generation: Option<u64>,
 }
@@ -73,6 +76,7 @@ impl FocusObservation {
         Self {
             window_id,
             pid: None,
+            incarnation: None,
             source: FocusSource::Internal,
             generation: None,
         }
@@ -87,6 +91,7 @@ impl FocusObservation {
         Self {
             window_id,
             pid: Some(pid),
+            incarnation: None,
             source,
             generation: Some(generation),
         }
@@ -163,6 +168,10 @@ pub enum Event {
     WindowDestroyed {
         window_id: WinID,
         source: DestroySource,
+        /// Present for AX element teardown, whose observer is bound to one
+        /// concrete window incarnation. ID-only system notifications leave it
+        /// absent and are confirmed through inventory reconciliation.
+        incarnation: Option<WindowIncarnation>,
     },
     /// A window has gained focus.
     WindowFocused(FocusObservation),
@@ -170,15 +179,30 @@ pub enum Event {
     /// a trustworthy window id. Query the application's focused window.
     FocusRevalidationRequested { pid: Pid, source: FocusSource },
     /// A window has been moved.
-    WindowMoved { window_id: WinID },
+    WindowMoved {
+        window_id: WinID,
+        incarnation: WindowIncarnation,
+    },
     /// A window has been resized.
-    WindowResized { window_id: WinID },
+    WindowResized {
+        window_id: WinID,
+        incarnation: WindowIncarnation,
+    },
     /// A window has been minimized.
-    WindowMinimized { window_id: WinID },
+    WindowMinimized {
+        window_id: WinID,
+        incarnation: Option<WindowIncarnation>,
+    },
     /// A window has been de-minimized (restored).
-    WindowDeminimized { window_id: WinID },
+    WindowDeminimized {
+        window_id: WinID,
+        incarnation: Option<WindowIncarnation>,
+    },
     /// A window's title has changed.
-    WindowTitleChanged { window_id: WinID },
+    WindowTitleChanged {
+        window_id: WinID,
+        incarnation: Option<WindowIncarnation>,
+    },
     /// Requests that the current macOS window inventory be reconciled with ECS.
     ReconcileWindows { scope: ReconcileScope },
 
@@ -276,7 +300,7 @@ pub enum Event {
     /// A client has subscribed to state events. Carries the channel they are
     /// pushed to, which outlives the request that delivered it.
     StateSubscribe {
-        subscriber: Arc<spool_mach_ipc::Subscriber>,
+        subscriber: Arc<spool_local_ipc::Subscriber>,
     },
 
     /// A client has read or written the script state store. Answered

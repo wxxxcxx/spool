@@ -17,8 +17,9 @@ use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEvent,
     CGEventField, CGEventFlags, CGEventTapLocation, CGGetActiveDisplayList,
     CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
-    kCGWindowNumber,
+    kCGWindowNumber, kCGWindowOwnerPID,
 };
+use std::collections::HashMap;
 use std::path::Path;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
@@ -334,9 +335,9 @@ pub trait WindowManagerApi: Send + Sync {
 
     fn windows_on_screen(&self) -> Option<Vec<WinID>>;
 
-    /// Returns every `WindowServer` window in the current GUI session,
-    /// including off-screen and minimized windows.
-    fn windows_in_session(&self) -> Option<Vec<WinID>>;
+    /// Returns every `WindowServer` window in the current GUI session with
+    /// its owning process, including off-screen and minimized windows.
+    fn window_owners_in_session(&self) -> Option<HashMap<WinID, Pid>>;
 
     /// Refreshes the per-window `WindowServer` notification subscription.
     fn request_window_notifications(&self, window_ids: &[WinID]) -> Result<()>;
@@ -782,8 +783,8 @@ impl WindowManagerApi for WindowManagerOS {
         window_ids_matching(options)
     }
 
-    fn windows_in_session(&self) -> Option<Vec<WinID>> {
-        window_ids_matching(
+    fn window_owners_in_session(&self) -> Option<HashMap<WinID, Pid>> {
+        window_owners_matching(
             CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements,
         )
     }
@@ -818,6 +819,20 @@ fn window_ids_matching(options: CGWindowListOption) -> Option<Vec<WinID>> {
                     .and_then(|id| id.as_i32())
             })
             .collect::<Vec<_>>()
+    })
+}
+
+fn window_owners_matching(options: CGWindowListOption) -> Option<HashMap<WinID, Pid>> {
+    CGWindowListCopyWindowInfo(options, kCGNullWindowID).map(|window_info| {
+        let array = unsafe { window_info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
+        array
+            .iter()
+            .filter_map(|dict| {
+                let window_id = dict.get(unsafe { kCGWindowNumber })?.as_i32()?;
+                let owner_pid = dict.get(unsafe { kCGWindowOwnerPID })?.as_i32()?;
+                Some((window_id, owner_pid))
+            })
+            .collect()
     })
 }
 

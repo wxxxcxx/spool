@@ -1,8 +1,36 @@
 # Query and Subscribe Format (v3)
 
-Spool exposes its macOS Space model as JSON over its Mach service. A
-Space's `space_id` is the identity used by commands and integrations;
-`ordinal` is only its current zero-based order on one display.
+Spool exposes its macOS Space model over its local Unix socket. A Space's
+`space_id` is the identity used by commands and integrations; `ordinal` is only
+its current zero-based order on one display.
+
+## CLI output modes
+
+Without an option, `query` prints the main fields as tab-separated tables.
+`subscribe` prints this header once and then one tab-separated summary row per
+event:
+
+```text
+EVENT\tDISPLAY_ID\tSPACE_ID\tWINDOW_ID\tBUNDLE_ID\tTITLE\tDETAILS
+```
+
+Tabs, carriage returns, and line feeds inside textual values are replaced with
+spaces so every event remains exactly one row. Missing values are printed as
+`-`. The complete-state summary is split into `ACTIVE`, `CAPABILITIES`,
+`DISPLAYS`, `SPACES`, and `WINDOWS` sections. Partial queries print only their
+relevant table.
+
+```shell
+spool query state
+spool query spaces
+spool query active
+spool query on-screen
+spool subscribe
+```
+
+Pass `--json` for the complete machine-readable data model. Query results are
+one JSON value; subscriptions are newline-delimited JSON with one object per
+event:
 
 ```shell
 spool query state --json
@@ -11,6 +39,8 @@ spool query active --json
 spool query on-screen --json
 spool subscribe --json
 ```
+
+The remainder of this document defines that full JSON contract.
 
 ## Complete state
 
@@ -70,7 +100,8 @@ A window contains `window_id`, `bundle_id`, `app_name`, `title`, `focused`,
 
 ## Events
 
-`subscribe` prints one JSON object per line. Event names and payloads are:
+`subscribe --json` prints one JSON object per line. Event names and payloads
+are:
 
 ```json
 {"event":"space_changed","active":{"display_id":1,"space_id":42}}

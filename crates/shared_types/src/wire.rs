@@ -10,21 +10,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The Mach service name the daemon publishes and clients look up.
-///
-/// Matches the launchd job's `Label` and its `MachServices` key, which is what
-/// lets a service-started daemon check in with a port launchd already holds
-/// rather than registering one of its own.
+/// The logical name used to derive the daemon's Unix socket and lock paths.
 pub const SERVICE_NAME: &str = "com.wxxxcxx.spool";
 
-/// The environment variable that overrides [`SERVICE_NAME`], so a development
-/// build can run beside an installed one.
-pub const SERVICE_ENV: &str = "SPOOL_MACH_SERVICE";
-
-/// The service name to use, honouring [`SERVICE_ENV`].
+/// The one production instance name. It is deliberately not configurable:
+/// launchd and foreground launches must contend for the same singleton lock.
 #[must_use]
 pub fn service_name() -> String {
-    std::env::var(SERVICE_ENV).unwrap_or_else(|_| SERVICE_NAME.to_string())
+    SERVICE_NAME.to_string()
 }
 
 use crate::commands::Command;

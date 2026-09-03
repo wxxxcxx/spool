@@ -8,7 +8,6 @@ use bevy::ecs::query::{Added, Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
-use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use std::collections::HashMap;
 use tracing::{Level, debug, instrument, trace, warn};
@@ -18,10 +17,10 @@ use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, Scrolling, SendMessageTrigger,
-    SpawnCommandsExt, StrayFocusEvent,
+    ActiveWorkspaceMarker, ObservedWindowFrame, PresentedWindowFrame, RaiseWindow, Scrolling,
+    SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
-use crate::events::Event;
+use crate::events::{Event, FocusObservation};
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
 
@@ -84,6 +83,7 @@ pub(super) struct FocusRequest {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FocusSnapshot {
+    generation: u64,
     observed: ObservedFocus,
     requested: Option<FocusRequest>,
 }
@@ -96,6 +96,7 @@ impl FocusSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn confirmed_window_id(self) -> Option<WinID> {
         match self.observed {
             ObservedFocus::Tracked { window_id, .. } => Some(window_id),
@@ -105,6 +106,47 @@ impl FocusSnapshot {
 
     pub(crate) fn requested_entity(self) -> Option<Entity> {
         self.requested.map(|request| request.entity)
+    }
+
+    pub(crate) fn needs_revalidation(
+        self,
+        pid: Pid,
+        window_id: WinID,
+        tracked_entity: Option<Entity>,
+    ) -> bool {
+        if tracked_entity.is_some() && self.requested_entity() == tracked_entity {
+            return true;
+        }
+
+        !match self.observed {
+            ObservedFocus::Tracked {
+                entity,
+                window_id: observed_id,
+            } => tracked_entity == Some(entity) && observed_id == window_id,
+            ObservedFocus::Untracked {
+                pid: known_pid,
+                window_id: Some(known_window_id),
+            } => known_pid == Some(pid) && known_window_id == window_id,
+            ObservedFocus::Resolving {
+                pid: resolving_pid,
+                candidate,
+                ..
+            } => {
+                resolving_pid == Some(pid)
+                    && candidate.is_none_or(|candidate_id| candidate_id == window_id)
+            }
+            ObservedFocus::Unresolved | ObservedFocus::Untracked { .. } => false,
+        }
+    }
+
+    pub(crate) fn needs_resolution(self, pid: Pid) -> bool {
+        !matches!(
+            self.observed,
+            ObservedFocus::Resolving {
+                pid: Some(resolving_pid),
+                ..
+            } if resolving_pid == pid
+        )
     }
 }
 
@@ -284,6 +326,7 @@ impl FocusCoordinator {
 
     pub(crate) fn snapshot(&self) -> FocusSnapshot {
         FocusSnapshot {
+            generation: self.generation,
             observed: self.observed,
             requested: self.requested,
         }
@@ -580,18 +623,20 @@ fn focus_window_trigger(
     mut focus: ResMut<FocusCoordinator>,
 ) {
     let FocusWindow { entity, raise } = *trigger.event();
-    let Some(window) = windows.get(entity) else {
+    let Some((window, _, app_entity)) = windows.get_parent(entity) else {
         return;
     };
-    let Some(psn) = windows.psn(window.id(), &apps) else {
+    let Ok(app) = apps.get(app_entity) else {
         return;
     };
+    let psn = app.psn();
     focus.request(entity);
     if !raise
-        && let Some((focused_window, _)) = windows.focused()
-        && let Some(focused_psn) = windows.psn(focused_window.id(), &apps)
+        && let Some((focused_window, focused_entity)) = windows.focused()
+        && let Some((_, _, focused_app_entity)) = windows.get_parent(focused_entity)
+        && let Ok(focused_app) = apps.get(focused_app_entity)
     {
-        window.focus_without_raise(psn, focused_window, focused_psn);
+        window.focus_without_raise(psn, focused_window, focused_app.psn());
     } else {
         window.focus_with_raise(psn);
     }
@@ -599,7 +644,12 @@ fn focus_window_trigger(
 
 fn raise_window_trigger(
     trigger: On<RaiseWindow>,
-    windows: Query<(Entity, &Window, &Position, &Bounds)>,
+    windows: Query<(
+        Entity,
+        &Window,
+        Option<&ObservedWindowFrame>,
+        Option<&PresentedWindowFrame>,
+    )>,
     active_display: ActiveDisplay,
     config: Res<Config>,
 ) {
@@ -622,9 +672,11 @@ fn raise_window_trigger(
                     windows.get(entity).ok()
                 }
             })
-            .filter(|(_, _, origin, size)| {
-                let frame = IRect::from_corners(origin.0, origin.0 + size.0);
-                viewport.intersect(frame).width() > 50
+            .filter(|(_, _, observed, presented)| {
+                observed
+                    .map(|frame| frame.0)
+                    .or_else(|| presented.map(|frame| frame.0))
+                    .is_some_and(|frame| viewport.intersect(frame).width() > 50)
             })
             .for_each(|(_, window, _, _)| {
                 window.raise_without_focus();
@@ -639,19 +691,36 @@ pub(super) fn stray_focus_observer(
     trigger: On<Add, Window>,
     focus_events: Populated<(Entity, &StrayFocusEvent)>,
     windows: Windows,
+    applications: Query<&Application>,
     mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
-    let Some(window_id) = windows.get(entity).map(|window| window.id()) else {
+    let Some((window, _, parent)) = windows.get_parent(entity) else {
         return;
     };
+    let Ok(app) = applications.get(parent) else {
+        return;
+    };
+    let window_id = window.id();
+    let incarnation = window.incarnation();
+    let pid = app.pid();
 
     focus_events
         .iter()
-        .filter(|(_, stray_focus)| stray_focus.0 == window_id)
-        .for_each(|(timeout_entity, _)| {
+        .filter(|(_, stray_focus)| {
+            stray_focus.0.window_id == window_id
+                && stray_focus.0.pid.is_none_or(|expected| expected == pid)
+                && stray_focus
+                    .0
+                    .incarnation
+                    .is_none_or(|expected| expected == incarnation)
+        })
+        .for_each(|(timeout_entity, stray_focus)| {
             debug!("Re-queueing lost focus event for window id {window_id}.");
-            commands.trigger(SendMessageTrigger(Event::window_focused(window_id)));
+            commands.trigger(SendMessageTrigger(Event::WindowFocused(FocusObservation {
+                incarnation: Some(incarnation),
+                ..stray_focus.0
+            })));
             if let Ok(mut entity_commands) = commands.get_entity(timeout_entity) {
                 entity_commands.try_despawn();
             }

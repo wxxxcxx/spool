@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::debug;
 
 use crate::ecs::BProcess;
+use crate::errors::{Error, Result};
 use crate::platform::{OSStatus, Pid, ProcessSerialNumber, WorkspaceObserver};
 
 unsafe extern "C" {
@@ -66,6 +67,17 @@ unsafe extern "C" {
     /// # Original signature:
     /// `OSStatus` GetProcessPID(const `ProcessSerialNumber` *psn, `pid_t` *pid);
     fn GetProcessPID(psn: *const ProcessSerialNumber, pid: *mut Pid) -> OSStatus;
+}
+
+pub(crate) fn pid_for_psn(psn: ProcessSerialNumber) -> Result<Option<Pid>> {
+    const PROCESS_NOT_FOUND: OSStatus = -600;
+
+    let mut pid = 0;
+    match unsafe { GetProcessPID(&raw const psn, &raw mut pid) } {
+        0 => Ok(Some(pid)),
+        PROCESS_NOT_FOUND => Ok(None),
+        code => Err(Error::macos("GetProcessPID", code)),
+    }
 }
 
 /// Defines the interface for interacting with a macOS process, abstracting OS-specific details.
@@ -206,8 +218,7 @@ impl Process {
     ///
     /// A `Pin<Box<Self>>` containing the new `Process` instance.
     pub fn new(psn: &ProcessSerialNumber, observer: Retained<WorkspaceObserver>) -> Pin<Box<Self>> {
-        let mut pid: Pid = 0;
-        unsafe { GetProcessPID(psn, NonNull::from(&mut pid).as_ptr()) };
+        let pid = pid_for_psn(*psn).ok().flatten().unwrap_or_default();
 
         let mut nameref: *const CFString = std::ptr::null();
         unsafe { CopyProcessName(psn, &raw mut nameref) };

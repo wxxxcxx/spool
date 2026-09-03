@@ -14,13 +14,14 @@ use super::{ActiveDisplayMarker, FocusFollowsMouse, SkipReshuffle};
 use crate::{
     config::Config,
     ecs::{
-        ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, Floating, FocusedMarker,
-        FullWidthMarker, Initializing, LayoutPosition, NativeFullscreenMarker, Position,
-        RepositionMarker, ResizeMarker, Scrolling, WidthRatio, WindowVisibility,
-        layout::LayoutStrip, reconcile::WindowUnavailable,
+        ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, FlashMessage, Floating,
+        FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, NativeFullscreenMarker,
+        ObservedWindowFrame, Position, PresentedWindowFrame, RepositionMarker, ResizeMarker,
+        Scrolling, WidthRatio, WindowFrameMotion, WindowVisibility, layout::LayoutStrip,
+        reconcile::WindowUnavailable,
     },
-    manager::{Application, Display, Origin, Size, Window},
-    platform::{ProcessSerialNumber, WinID},
+    manager::{Display, Origin, Size, Window},
+    platform::{WinID, WindowIncarnation},
 };
 
 /// A Bevy `SystemParam` that provides access to the application's configuration and related state.
@@ -198,6 +199,7 @@ impl ActiveDisplayMut<'_, '_> {
 pub struct FrameActivity<'w, 's> {
     repositioning: Query<'w, 's, (), With<RepositionMarker>>,
     resizing: Query<'w, 's, (), With<ResizeMarker>>,
+    window_motion: Query<'w, 's, (), With<WindowFrameMotion>>,
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
 }
@@ -208,6 +210,7 @@ impl FrameActivity<'_, '_> {
     pub fn mid_frame(&self) -> bool {
         !self.repositioning.is_empty()
             || !self.resizing.is_empty()
+            || !self.window_motion.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
     }
@@ -223,8 +226,8 @@ pub struct WindowCtx<'w, 's> {
     pub commands: Commands<'w, 's>,
 }
 
-/// A window's layout slot, current frame, width ratio, and any in-flight
-/// reposition/resize markers.
+/// A window's layout inputs, declarative frame projections, width ratio, and
+/// any command requests not yet consumed by the frame pipeline.
 type WindowPlacements<'w, 's> = Query<
     'w,
     's,
@@ -232,6 +235,9 @@ type WindowPlacements<'w, 's> = Query<
         &'static LayoutPosition,
         &'static Position,
         &'static Bounds,
+        Option<&'static ObservedWindowFrame>,
+        Option<&'static PresentedWindowFrame>,
+        Option<&'static DesiredWindowFrame>,
         &'static WidthRatio,
         Option<&'static RepositionMarker>,
         Option<&'static ResizeMarker>,
@@ -342,17 +348,53 @@ impl Windows<'_, '_> {
             .map(|(window, entity, _, _, _)| (window, entity))
     }
 
-    pub fn find_parent(&self, window_id: WinID) -> Option<(&Window, Entity, Entity)> {
+    pub fn find_incarnation(
+        &self,
+        window_id: WinID,
+        incarnation: WindowIncarnation,
+    ) -> Option<(&Window, Entity)> {
+        self.available
+            .iter()
+            .find(|(window, _, _, _, _)| {
+                window.id() == window_id && window.incarnation() == incarnation
+            })
+            .map(|(window, entity, _, _, _)| (window, entity))
+    }
+
+    pub fn get_parent(&self, entity: Entity) -> Option<(&Window, Entity, Entity)> {
+        self.available
+            .get(entity)
+            .ok()
+            .map(|(window, entity, childof, _, _)| (window, entity, childof.parent()))
+    }
+
+    pub fn find_parent_matching(
+        &self,
+        window_id: WinID,
+        mut eligible: impl FnMut(&Window, Entity) -> bool,
+    ) -> Option<(&Window, Entity, Entity)> {
         self.available
             .iter()
             .find_map(|(window, entity, childof, _, _)| {
-                (window.id() == window_id).then_some((window, entity, childof.parent()))
+                (window.id() == window_id && eligible(window, childof.parent())).then_some((
+                    window,
+                    entity,
+                    childof.parent(),
+                ))
             })
     }
 
-    pub fn find_parent_any(&self, window_id: WinID) -> Option<(&Window, Entity, Entity)> {
+    pub fn find_parent_incarnation_any(
+        &self,
+        window_id: WinID,
+        incarnation: WindowIncarnation,
+    ) -> Option<(&Window, Entity, Entity)> {
         self.all.iter().find_map(|(window, entity, childof, _, _)| {
-            (window.id() == window_id).then_some((window, entity, childof.parent()))
+            (window.id() == window_id && window.incarnation() == incarnation).then_some((
+                window,
+                entity,
+                childof.parent(),
+            ))
         })
     }
 
@@ -390,45 +432,45 @@ impl Windows<'_, '_> {
             .ok()
     }
 
-    pub fn psn(&self, window_id: WinID, apps: &Query<&Application>) -> Option<ProcessSerialNumber> {
-        self.find_parent(window_id)
-            .and_then(|(_, _, parent)| apps.get(parent).ok())
-            .map(|app| app.psn())
-    }
-
     pub fn origin(&self, entity: Entity) -> Option<Origin> {
         self.positions
             .get(entity)
             .ok()
-            .map(|(_, origin, _, _, _, _)| origin.0)
+            .map(|(_, origin, _, _, _, _, _, _, _)| origin.0)
     }
 
     pub fn size(&self, entity: Entity) -> Option<Size> {
         self.positions
             .get(entity)
             .ok()
-            .map(|(_, _, size, _, _, _)| size.0)
+            .map(|(_, _, size, _, _, _, _, _, _)| size.0)
     }
 
     pub fn width_ratio(&self, entity: Entity) -> Option<f64> {
         self.positions
             .get(entity)
             .ok()
-            .map(|(_, _, _, ratio, _, _)| ratio.0)
+            .map(|(_, _, _, _, _, _, ratio, _, _)| ratio.0)
     }
 
     pub fn frame(&self, entity: Entity) -> Option<IRect> {
         self.positions
             .get(entity)
             .ok()
-            .map(|(_, origin, size, _, _, _)| IRect::from_corners(origin.0, origin.0 + size.0))
+            .map(|(_, origin, size, observed, presented, _, _, _, _)| {
+                observed
+                    .map(|frame| frame.0)
+                    .or_else(|| presented.map(|frame| frame.0))
+                    .unwrap_or_else(|| IRect::from_corners(origin.0, origin.0 + size.0))
+            })
     }
 
     pub fn moving_frame(&self, entity: Entity) -> Option<IRect> {
-        self.positions
-            .get(entity)
-            .ok()
-            .map(|(_, origin, size, _, reposition, resize)| {
+        self.positions.get(entity).ok().map(
+            |(_, origin, size, _, _, desired, _, reposition, resize)| {
+                if let Some(desired) = desired {
+                    return desired.0;
+                }
                 let size = size.0;
                 let mut frame = IRect::from_corners(origin.0, origin.0 + size);
 
@@ -440,13 +482,14 @@ impl Windows<'_, '_> {
                     frame.max = frame.min + resize.0;
                 }
                 frame
-            })
+            },
+        )
     }
 
     pub fn layout_position(&self, entity: Entity) -> Option<&LayoutPosition> {
         self.positions
             .get(entity)
             .ok()
-            .map(|(layout_position, _, _, _, _, _)| layout_position)
+            .map(|(layout_position, _, _, _, _, _, _, _, _)| layout_position)
     }
 }

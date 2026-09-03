@@ -1,4 +1,5 @@
 use bevy::app::{App, Plugin, PreUpdate, Update};
+use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -9,6 +10,7 @@ use bevy::ecs::query::{Has, With};
 use bevy::ecs::system::{Commands, Local, NonSend, Query, Res};
 use bevy::math::IRect;
 use bevy::platform::collections::HashSet;
+use bevy::time::Time;
 use objc2_app_kit::NSScreen;
 use objc2_core_graphics::CGDirectDisplayID;
 use std::collections::HashMap;
@@ -19,8 +21,8 @@ use tracing::{Level, debug, error, instrument, warn};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, ReadDisplayProperties, RefreshWindowSizes,
-    SendMessageTrigger, SpawnCommandsExt, Timeout,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, ReadDisplayProperties,
+    RefreshWindowSizes, SendMessageTrigger, SpawnCommandsExt, Timeout,
 };
 use crate::events::Event;
 use crate::manager::{Display, WindowManager, irect_from};
@@ -34,9 +36,42 @@ pub struct DisplayEventsPlugin;
 impl Plugin for DisplayEventsPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PreUpdate, display_change_handler);
-        app.add_systems(Update, reconcile_displays)
-            .add_observer(read_display_properties_trigger)
-            .add_observer(cleanup_active_display_marker);
+        app.add_systems(
+            Update,
+            (reconcile_displays, refresh_display_properties_for_dock),
+        )
+        .add_observer(read_display_properties_trigger)
+        .add_observer(cleanup_active_display_marker);
+    }
+}
+
+/// Treat Dock notifications as invalidation hints and periodically reconcile
+/// `NSScreen.visibleFrame` so a dropped or early notification cannot leave the
+/// usable viewport stale. Repeated reads are cheap and only publish ECS changes
+/// when the resulting display or Dock geometry actually differs.
+fn refresh_display_properties_for_dock(
+    mut messages: MessageReader<Event>,
+    displays: Query<Entity, With<Display>>,
+    time: Res<Time>,
+    mut since_refresh: Local<Duration>,
+    mut commands: Commands,
+) {
+    const DOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+    let invalidated = messages.read().any(|event| {
+        matches!(
+            event,
+            Event::DockDidChangePref { .. } | Event::DockDidRestart { .. }
+        )
+    });
+    *since_refresh = since_refresh.saturating_add(time.delta());
+    if !invalidated && *since_refresh < DOCK_REFRESH_INTERVAL {
+        return;
+    }
+    *since_refresh = Duration::ZERO;
+
+    for entity in displays {
+        commands.trigger(ReadDisplayProperties(entity));
     }
 }
 
@@ -367,12 +402,12 @@ impl FloatingLayer {
 
 fn read_display_properties_trigger(
     trigger: On<ReadDisplayProperties>,
-    mut displays: Query<(&mut Display, Entity)>,
+    mut displays: Query<(&mut Display, Entity, Option<&DockPosition>)>,
     platform: Option<NonSend<Pin<Box<PlatformCallbacks>>>>,
     config: Option<Res<Config>>,
     mut commands: Commands,
 ) {
-    let Ok((mut display, entity)) = displays.get_mut(trigger.event().0) else {
+    let Ok((mut display, entity, current_dock)) = displays.get_mut(trigger.event().0) else {
         return;
     };
     let display_id = display.id();
@@ -388,23 +423,32 @@ fn read_display_properties_trigger(
         debug!("notch on display {display_id}: {insets:?}");
         round_px(insets.top)
     });
-    if let Some(height) = notch {
-        display.set_notch_height(height);
+
+    let menubar_height = config.as_deref().and_then(Config::menubar_height);
+    let previous_bounds = display.bounds();
+    {
+        let display = display.bypass_change_detection();
+        if let Some(height) = notch {
+            display.set_notch_height(height);
+        }
+        if config.is_some() {
+            display.set_menubar_height_override(menubar_height);
+        }
+    }
+    if display.bounds() != previous_bounds {
+        display.set_changed();
     }
 
     let dock = read_screen_property(&screens, display_id, |screen| {
         let visible_frame = irect_from(screen.visibleFrame());
         display.locate_dock(&visible_frame)
     });
-    if let Some(dock) = dock {
+    if let Some(dock) = dock
+        && current_dock.copied() != Some(dock)
+    {
         debug!("dock on display {display_id}: {:?}", dock);
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_insert(dock);
         }
-    }
-
-    if let Some(config) = config {
-        let height = config.menubar_height();
-        display.set_menubar_height_override(height);
     }
 }

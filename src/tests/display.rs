@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use bevy::ecs::observer::On;
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
 
@@ -8,12 +9,36 @@ use crate::commands::{Command, MouseMove, MoveFocus, Operation};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
-use crate::ecs::{ActiveWorkspaceMarker, DockPosition, Floating, RefreshWindowSizes, Timeout};
+use crate::ecs::{
+    ActiveWorkspaceMarker, Bounds, DockPosition, Floating, ObservedWindowFrame,
+    ReadDisplayProperties, RefreshWindowSizes, Timeout,
+};
 use crate::events::Event;
-use crate::manager::{Display, Origin, Size};
+use crate::manager::{Display, Origin, Size, Window};
 use crate::{assert_not_on_workspace, assert_on_workspace, assert_window_at, assert_window_size};
 
 use super::*;
+
+fn discover_bottom_dock(displays: Query<Entity, Added<Display>>, mut commands: Commands) {
+    for entity in &displays {
+        commands.entity(entity).insert(DockPosition::Bottom(80));
+    }
+}
+
+#[derive(Resource, Default)]
+struct SimulatedDockRefresh(bool);
+
+fn simulate_visible_dock_after_refresh(
+    trigger: On<ReadDisplayProperties>,
+    refresh: Res<SimulatedDockRefresh>,
+    mut commands: Commands,
+) {
+    if refresh.0 {
+        commands
+            .entity(trigger.event().0)
+            .insert(DockPosition::Bottom(80));
+    }
+}
 
 #[test]
 fn test_multi_display_lifecycle() {
@@ -392,7 +417,7 @@ fn test_mouse_to_next_display() {
 /// inactive displays onto the active display. `apply_window_properties`
 /// initially appends every observed window to the active strip; if the
 /// layout writers run before `finish_setup` has reassigned them, they
-/// cache active-display coordinates into `Position` and `commit_window_position`
+/// cache active-display coordinates into `Position` and `commit_window_frame`
 /// later pushes those to macOS, moving the windows.
 #[test]
 fn test_init_keeps_windows_on_their_real_displays() {
@@ -608,4 +633,167 @@ fn native_spaces_observe_switches_on_an_inactive_display() {
             },
             Event::SpaceChanged,
         ]);
+}
+
+#[test]
+fn visible_dock_reflows_the_active_strip_to_the_usable_height() {
+    const DOCK_HEIGHT: i32 = 80;
+    let expected_height = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - DOCK_HEIGHT;
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(10);
+
+    let display_entity = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &Display)>()
+            .iter(world)
+            .find_map(|(entity, display)| (display.id() == TEST_DISPLAY_ID).then_some(entity))
+            .expect("active display")
+    };
+    harness
+        .world()
+        .entity_mut(display_entity)
+        .insert(DockPosition::Bottom(DOCK_HEIGHT));
+    let viewport_height = {
+        let world = harness.world();
+        let display = world
+            .get::<Display>(display_entity)
+            .expect("active display");
+        let dock = world
+            .get::<DockPosition>(display_entity)
+            .expect("visible dock");
+        display
+            .actual_display_bounds(Some(dock), world.resource::<Config>())
+            .height()
+    };
+    assert_eq!(viewport_height, expected_height);
+    harness.pump_frames(3);
+
+    let entity = find_window_entity(0, harness.world());
+    assert_eq!(
+        harness.world().get::<Bounds>(entity).expect("bounds").0.y,
+        expected_height,
+        "ECS bounds must be recomputed from the Dock-reduced viewport"
+    );
+    assert_window_size!(harness.world(), 0, TEST_WINDOW_WIDTH, expected_height);
+}
+
+#[test]
+fn dock_preference_change_rereads_display_and_reflows_windows() {
+    const DOCK_HEIGHT: i32 = 80;
+    let expected_height = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - DOCK_HEIGHT;
+    let mut harness = TestHarness::new().with_windows(1);
+    harness
+        .app
+        .insert_resource(SimulatedDockRefresh::default())
+        .add_observer(simulate_visible_dock_after_refresh);
+    harness.pump_frames(10);
+    harness.world().resource_mut::<SimulatedDockRefresh>().0 = true;
+
+    harness.world().write_message(Event::DockDidChangePref {
+        msg: "test Dock auto-hide change".to_string(),
+    });
+    harness.pump_frames(3);
+
+    let entity = find_window_entity(0, harness.world());
+    assert_eq!(
+        harness.world().get::<Bounds>(entity).expect("bounds").0.y,
+        expected_height,
+        "a Dock visibility preference change must refresh the usable viewport"
+    );
+}
+
+#[test]
+fn dock_refresh_heartbeat_recovers_a_missed_notification() {
+    const DOCK_HEIGHT: i32 = 80;
+    let expected_height = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - DOCK_HEIGHT;
+    let mut harness = TestHarness::new().with_windows(1);
+    harness
+        .app
+        .insert_resource(SimulatedDockRefresh::default())
+        .add_observer(simulate_visible_dock_after_refresh);
+    harness.pump_frames(10);
+    harness.world().resource_mut::<SimulatedDockRefresh>().0 = true;
+
+    // No Dock event is delivered. The periodic read must still converge to the
+    // actual NSScreen.visibleFrame instead of retaining stale geometry forever.
+    harness.pump_frames(12);
+
+    let entity = find_window_entity(0, harness.world());
+    assert_eq!(
+        harness.world().get::<Bounds>(entity).expect("bounds").0.y,
+        expected_height,
+        "the Dock reconciliation heartbeat must recover a dropped notification"
+    );
+}
+
+#[test]
+fn dock_height_animation_avoids_expensive_complete_frame_writes() {
+    const DOCK_HEIGHT: i32 = 80;
+    let config: Config = (
+        crate::config::MainOptions {
+            animation_speed: Some(12.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(1);
+    harness.pump_frames(15);
+
+    let entity = find_window_entity(0, harness.world());
+    let initial_origin = harness
+        .world()
+        .get::<ObservedWindowFrame>(entity)
+        .expect("observed frame")
+        .0
+        .min;
+    let baseline_complete_writes = harness.mock_state.frame_write_attempts(0);
+    let display_entity = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &Display)>()
+            .iter(world)
+            .find_map(|(entity, display)| (display.id() == TEST_DISPLAY_ID).then_some(entity))
+            .expect("active display")
+    };
+
+    harness
+        .world()
+        .entity_mut(display_entity)
+        .insert(DockPosition::Bottom(DOCK_HEIGHT));
+    harness.pump_frames(5);
+
+    assert_eq!(
+        harness.mock_state.frame_write_attempts(0),
+        baseline_complete_writes,
+        "a height-only Dock animation must not run the costly complete-frame AX sequence every tick"
+    );
+    assert!(
+        harness.mock_state.resize_write_attempts(0) > 0,
+        "the Dock animation must use the size-only AX path"
+    );
+    assert_eq!(
+        harness
+            .world()
+            .get::<ObservedWindowFrame>(entity)
+            .expect("observed frame")
+            .0
+            .min,
+        initial_origin,
+        "the size-only fast path must preserve the confirmed origin"
+    );
+}
+
+#[test]
+fn startup_layout_uses_the_visible_dock_height_for_every_column() {
+    const DOCK_HEIGHT: i32 = 80;
+    let expected_height = TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - DOCK_HEIGHT;
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.app.add_systems(PreUpdate, discover_bottom_dock);
+
+    harness.pump_frames(10);
+
+    assert_window_size!(harness.world(), 0, TEST_WINDOW_WIDTH, expected_height);
+    assert_window_size!(harness.world(), 1, TEST_WINDOW_WIDTH, expected_height);
 }

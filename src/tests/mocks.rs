@@ -11,7 +11,7 @@ use crate::events::{DestroySource, Event};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
-    Window, origin_from, origin_to,
+    Window, WindowPadding, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 
@@ -25,12 +25,14 @@ pub(crate) struct MockAppData {
     pub(crate) focused_window_id: Option<WinID>,
     pub(crate) is_frontmost: bool,
     pub(crate) connection: Option<crate::platform::ConnID>,
+    pub(crate) running: bool,
 }
 
 /// Data for a mocked window.
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct MockWindowData {
     pub(crate) id: WinID,
+    pub(crate) incarnation: crate::platform::WindowIncarnation,
     pub(crate) pid: Pid,
     pub(crate) frame: IRect,
     pub(crate) title: String,
@@ -51,6 +53,7 @@ impl Default for MockWindowData {
     fn default() -> Self {
         Self {
             id: 0,
+            incarnation: 0,
             pid: 0,
             frame: IRect::default(),
             title: String::new(),
@@ -80,6 +83,10 @@ struct MockDisplayData {
 struct MockStateInner {
     apps: HashMap<Pid, MockAppData>,
     windows: HashMap<WinID, MockWindowData>,
+    /// Last frame observed through the mocked AX handle. `windows[*].frame`
+    /// is the `WindowServer` truth; keeping the two separate lets tests model a
+    /// lost move/resize notification and a stale optimistic cache.
+    cached_frames: HashMap<WinID, IRect>,
     displays: HashMap<u32, MockDisplayData>,
     fullscreen_spaces: HashSet<WorkspaceId>,
     active_display_id: u32,
@@ -88,6 +95,7 @@ struct MockStateInner {
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
+    stale_window_incarnations: HashMap<WinID, crate::platform::WindowIncarnation>,
     /// Windows missing from both inventories whose cached AX handles still
     /// answer attribute queries, as some applications do after closing.
     stale_ax_handles: HashSet<WinID>,
@@ -97,6 +105,35 @@ struct MockStateInner {
     native_space_control: bool,
     native_space_intents: Vec<crate::manager::NativeSpaceIntent>,
     focus_requests: Vec<WinID>,
+    window_server_inventory_available: bool,
+    workspace_membership_scripts:
+        HashMap<WorkspaceId, VecDeque<std::result::Result<Vec<WinID>, ()>>>,
+    active_space_query_scripts: HashMap<u32, VecDeque<std::result::Result<WorkspaceId, ()>>>,
+    present_display_topology_scripts: HashMap<u32, VecDeque<std::result::Result<(), ()>>>,
+    window_observer_failures: HashMap<WinID, u32>,
+    window_observer_attempts: HashMap<WinID, u32>,
+    application_inventory_failures: HashMap<Pid, u32>,
+    incomplete_application_inventories: HashSet<Pid>,
+    omitted_application_inventory_windows: HashSet<(Pid, WinID)>,
+    focused_window_query_failures: HashMap<Pid, u32>,
+    full_screen_query_failures: HashMap<WinID, u32>,
+    application_liveness_failures: HashMap<Pid, u32>,
+    constrained_frame_writes: HashSet<WinID>,
+    progressive_frame_writes: HashSet<WinID>,
+    frame_write_attempts: HashMap<WinID, u32>,
+    resize_write_attempts: HashMap<WinID, u32>,
+    frame_write_readback_failures: HashMap<WinID, u32>,
+    applied_horizontal_padding: HashMap<WinID, i32>,
+    applied_vertical_padding: HashMap<WinID, i32>,
+    notification_request_failures: u32,
+    notification_request_attempts: u32,
+    next_window_incarnation: crate::platform::WindowIncarnation,
+}
+
+fn application_inventory_omits(inner: &MockStateInner, pid: Pid, window_id: WinID) -> bool {
+    inner
+        .omitted_application_inventory_windows
+        .contains(&(pid, window_id))
 }
 
 #[derive(Clone)]
@@ -110,17 +147,41 @@ impl MockState {
             inner: Arc::new(RwLock::new(MockStateInner {
                 apps: HashMap::new(),
                 windows: HashMap::new(),
+                cached_frames: HashMap::new(),
                 displays: HashMap::new(),
                 fullscreen_spaces: HashSet::new(),
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
+                stale_window_incarnations: HashMap::new(),
                 stale_ax_handles: HashSet::new(),
                 withdrawn_surfaces: HashMap::new(),
                 native_space_control: false,
                 native_space_intents: Vec::new(),
                 focus_requests: Vec::new(),
+                window_server_inventory_available: true,
+                workspace_membership_scripts: HashMap::new(),
+                active_space_query_scripts: HashMap::new(),
+                present_display_topology_scripts: HashMap::new(),
+                window_observer_failures: HashMap::new(),
+                window_observer_attempts: HashMap::new(),
+                application_inventory_failures: HashMap::new(),
+                incomplete_application_inventories: HashSet::new(),
+                omitted_application_inventory_windows: HashSet::new(),
+                focused_window_query_failures: HashMap::new(),
+                full_screen_query_failures: HashMap::new(),
+                application_liveness_failures: HashMap::new(),
+                constrained_frame_writes: HashSet::new(),
+                progressive_frame_writes: HashSet::new(),
+                frame_write_attempts: HashMap::new(),
+                resize_write_attempts: HashMap::new(),
+                frame_write_readback_failures: HashMap::new(),
+                applied_horizontal_padding: HashMap::new(),
+                applied_vertical_padding: HashMap::new(),
+                notification_request_failures: 0,
+                notification_request_attempts: 0,
+                next_window_incarnation: 0,
             })),
         }
     }
@@ -163,8 +224,36 @@ impl MockState {
                 focused_window_id: None,
                 is_frontmost: true,
                 connection: Some(0),
+                running: true,
             },
         );
+    }
+
+    pub fn set_app_running(&self, pid: Pid, running: bool) {
+        if let Some(app) = self.inner.force_write().apps.get_mut(&pid) {
+            app.running = running;
+        }
+    }
+
+    pub fn fail_application_liveness(&self, pid: Pid, attempts: u32) {
+        self.inner
+            .force_write()
+            .application_liveness_failures
+            .insert(pid, attempts);
+    }
+
+    pub fn fail_focused_window_queries(&self, pid: Pid, attempts: u32) {
+        self.inner
+            .force_write()
+            .focused_window_query_failures
+            .insert(pid, attempts);
+    }
+
+    pub fn fail_full_screen_queries(&self, id: WinID, attempts: u32) {
+        self.inner
+            .force_write()
+            .full_screen_query_failures
+            .insert(id, attempts);
     }
 
     pub fn spawn_window(
@@ -175,10 +264,13 @@ impl MockState {
         frame: IRect,
     ) -> Window {
         let mut inner = self.inner.force_write();
+        inner.next_window_incarnation = inner.next_window_incarnation.saturating_add(1);
+        let incarnation = inner.next_window_incarnation;
         inner.windows.insert(
             id,
             MockWindowData {
                 id,
+                incarnation,
                 pid,
                 frame,
                 title: format!("Window {id}"),
@@ -186,6 +278,8 @@ impl MockState {
                 ..default()
             },
         );
+        inner.cached_frames.insert(id, frame);
+        drop(inner);
         self.create_window(id)
     }
 
@@ -263,6 +357,74 @@ impl MockState {
         }
     }
 
+    pub(crate) fn destroy_workspace(&self, display_id: u32, workspace_id: WorkspaceId) {
+        let mut inner = self.inner.force_write();
+        let display = inner
+            .displays
+            .get_mut(&display_id)
+            .expect("finding display");
+        display.workspaces.retain(|id| *id != workspace_id);
+        inner.fullscreen_spaces.remove(&workspace_id);
+    }
+
+    pub(crate) fn script_workspace_membership_queries(
+        &self,
+        workspace_id: WorkspaceId,
+        responses: impl IntoIterator<Item = std::result::Result<Vec<WinID>, ()>>,
+    ) {
+        self.inner
+            .force_write()
+            .workspace_membership_scripts
+            .insert(workspace_id, responses.into_iter().collect());
+    }
+
+    pub(crate) fn script_active_space_queries(
+        &self,
+        display_id: u32,
+        responses: impl IntoIterator<Item = std::result::Result<WorkspaceId, ()>>,
+    ) {
+        self.inner
+            .force_write()
+            .active_space_query_scripts
+            .insert(display_id, responses.into_iter().collect());
+    }
+
+    pub(crate) fn script_present_display_topology_queries(
+        &self,
+        display_id: u32,
+        responses: impl IntoIterator<Item = std::result::Result<(), ()>>,
+    ) {
+        self.inner
+            .force_write()
+            .present_display_topology_scripts
+            .insert(display_id, responses.into_iter().collect());
+    }
+
+    fn query_workspace_windows(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> crate::errors::Result<Vec<WinID>> {
+        let mut inner = self.inner.force_write();
+        if let Some(response) = inner
+            .workspace_membership_scripts
+            .get_mut(&workspace_id)
+            .and_then(VecDeque::pop_front)
+        {
+            return response.map_err(|()| {
+                Error::Generic(format!(
+                    "workspace {workspace_id} scripted membership unavailable"
+                ))
+            });
+        }
+        let mut windows = inner
+            .windows
+            .values()
+            .filter_map(|window| (window.workspace_id == workspace_id).then_some(window.id))
+            .collect::<Vec<_>>();
+        windows.sort_unstable();
+        Ok(windows)
+    }
+
     pub fn drain_events(&self) -> Vec<Event> {
         let mut inner = self.inner.force_write();
         inner.event_queue.drain(..).collect()
@@ -278,6 +440,136 @@ impl MockState {
         if let Some(w) = inner.windows.get_mut(&id) {
             f(w);
         }
+    }
+
+    /// Changes the `WindowServer` frame without sending an AX notification.
+    pub fn os_set_window_frame_silently(&self, id: WinID, frame: IRect) {
+        self.update_window(id, |window| window.frame = frame);
+    }
+
+    pub fn actual_window_frame(&self, id: WinID) -> Option<IRect> {
+        self.inner
+            .force_read()
+            .windows
+            .get(&id)
+            .map(|window| window.frame)
+    }
+
+    pub fn cached_window_frame(&self, id: WinID) -> Option<IRect> {
+        self.inner.force_read().cached_frames.get(&id).copied()
+    }
+
+    pub fn set_window_server_inventory_available(&self, available: bool) {
+        self.inner.force_write().window_server_inventory_available = available;
+    }
+
+    pub fn fail_window_observer_attempts(&self, id: WinID, attempts: u32) {
+        self.inner
+            .force_write()
+            .window_observer_failures
+            .insert(id, attempts);
+    }
+
+    pub fn fail_application_inventory_attempts(&self, pid: Pid, attempts: u32) {
+        self.inner
+            .force_write()
+            .application_inventory_failures
+            .insert(pid, attempts);
+    }
+
+    pub fn set_application_inventory_complete(&self, pid: Pid, complete: bool) {
+        let mut inner = self.inner.force_write();
+        if complete {
+            inner.incomplete_application_inventories.remove(&pid);
+        } else {
+            inner.incomplete_application_inventories.insert(pid);
+        }
+    }
+
+    pub fn omit_window_from_application_inventory(
+        &self,
+        pid: Pid,
+        window_id: WinID,
+        omitted: bool,
+    ) {
+        let mut inner = self.inner.force_write();
+        if omitted {
+            inner
+                .omitted_application_inventory_windows
+                .insert((pid, window_id));
+        } else {
+            inner
+                .omitted_application_inventory_windows
+                .remove(&(pid, window_id));
+        }
+    }
+
+    pub fn window_observer_attempts(&self, id: WinID) -> u32 {
+        self.inner
+            .force_read()
+            .window_observer_attempts
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn constrain_frame_writes(&self, id: WinID, constrained: bool) {
+        let mut inner = self.inner.force_write();
+        if constrained {
+            inner.constrained_frame_writes.insert(id);
+        } else {
+            inner.constrained_frame_writes.remove(&id);
+        }
+    }
+
+    pub fn progress_frame_writes(&self, id: WinID, progressive: bool) {
+        let mut inner = self.inner.force_write();
+        if progressive {
+            inner.progressive_frame_writes.insert(id);
+        } else {
+            inner.progressive_frame_writes.remove(&id);
+        }
+    }
+
+    pub fn fail_frame_write_readbacks(&self, id: WinID, attempts: u32) {
+        self.inner
+            .force_write()
+            .frame_write_readback_failures
+            .insert(id, attempts);
+    }
+
+    pub fn frame_write_attempts(&self, id: WinID) -> u32 {
+        self.inner
+            .force_read()
+            .frame_write_attempts
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn resize_write_attempts(&self, id: WinID) -> u32 {
+        self.inner
+            .force_read()
+            .resize_write_attempts
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn applied_horizontal_padding(&self, id: WinID) -> Option<i32> {
+        self.inner
+            .force_read()
+            .applied_horizontal_padding
+            .get(&id)
+            .copied()
+    }
+
+    pub fn fail_notification_requests(&self, attempts: u32) {
+        self.inner.force_write().notification_request_failures = attempts;
+    }
+
+    pub fn notification_request_attempts(&self) -> u32 {
+        self.inner.force_read().notification_request_attempts
     }
 
     #[allow(unused)]
@@ -297,9 +589,11 @@ impl MockState {
             let size = w.frame.size();
             w.frame.min = origin;
             w.frame.max = origin + size;
-            inner
-                .event_queue
-                .push_back(Event::WindowMoved { window_id: id });
+            let incarnation = w.incarnation;
+            inner.event_queue.push_back(Event::WindowMoved {
+                window_id: id,
+                incarnation,
+            });
         }
     }
 
@@ -308,9 +602,11 @@ impl MockState {
         let mut inner = self.inner.force_write();
         if let Some(w) = inner.windows.get_mut(&id) {
             w.frame.max = w.frame.min + size;
-            inner
-                .event_queue
-                .push_back(Event::WindowResized { window_id: id });
+            let incarnation = w.incarnation;
+            inner.event_queue.push_back(Event::WindowResized {
+                window_id: id,
+                incarnation,
+            });
         }
     }
 
@@ -319,14 +615,17 @@ impl MockState {
         let mut inner = self.inner.force_write();
         if let Some(w) = inner.windows.get_mut(&id) {
             w.minimized = minimized;
+            let incarnation = w.incarnation;
             if minimized {
-                inner
-                    .event_queue
-                    .push_back(Event::WindowMinimized { window_id: id });
+                inner.event_queue.push_back(Event::WindowMinimized {
+                    window_id: id,
+                    incarnation: Some(incarnation),
+                });
             } else {
-                inner
-                    .event_queue
-                    .push_back(Event::WindowDeminimized { window_id: id });
+                inner.event_queue.push_back(Event::WindowDeminimized {
+                    window_id: id,
+                    incarnation: Some(incarnation),
+                });
             }
         }
     }
@@ -342,14 +641,33 @@ impl MockState {
             return;
         };
         inner.stale_window_ids.insert(id, window.pid);
+        inner
+            .stale_window_incarnations
+            .insert(id, window.incarnation);
         inner.event_queue.push_back(Event::WindowDestroyed {
             window_id: id,
             source: DestroySource::SpaceNotification,
+            incarnation: None,
         });
         inner.event_queue.push_back(Event::WindowDestroyed {
             window_id: id,
             source: DestroySource::Accessibility,
+            incarnation: Some(window.incarnation),
         });
+    }
+
+    /// Leaves the retired AX identity in the application's inventory without
+    /// delivering either close notification. This models ID reuse during the
+    /// short interval before the application's AX list catches up.
+    pub fn os_stale_window_without_notifications(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        let Some(window) = inner.windows.remove(&id) else {
+            return;
+        };
+        inner.stale_window_ids.insert(id, window.pid);
+        inner
+            .stale_window_incarnations
+            .insert(id, window.incarnation);
     }
 
     /// Makes a window disappear with no notification at all, modelling a
@@ -397,7 +715,9 @@ impl MockState {
     /// Lets the app's window list catch up with reality after a close.
     #[allow(unused)]
     pub fn os_settle_window_list(&self) {
-        self.inner.force_write().stale_window_ids.clear();
+        let mut inner = self.inner.force_write();
+        inner.stale_window_ids.clear();
+        inner.stale_window_incarnations.clear();
     }
 
     // --- Interaction Helpers ---
@@ -453,17 +773,47 @@ impl MockState {
 
     #[allow(clippy::too_many_lines)]
     pub fn create_window(&self, id: WinID) -> Window {
+        let inner = self.inner.force_read();
+        let incarnation = inner
+            .windows
+            .get(&id)
+            .or_else(|| inner.withdrawn_surfaces.get(&id))
+            .map(|window| window.incarnation)
+            .unwrap_or_default();
+        drop(inner);
+        self.create_window_with_incarnation(id, incarnation)
+    }
+
+    pub fn create_stale_window(&self, id: WinID) -> Window {
+        let incarnation = self
+            .inner
+            .force_read()
+            .stale_window_incarnations
+            .get(&id)
+            .copied()
+            .expect("stale window incarnation");
+        self.create_window_with_incarnation(id, incarnation)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn create_window_with_incarnation(
+        &self,
+        id: WinID,
+        incarnation: crate::platform::WindowIncarnation,
+    ) -> Window {
         let mut mw = MockWindowApi::new();
 
         mw.expect_id().return_const(id);
+        mw.expect_incarnation().return_const(incarnation);
 
         let s = self.clone();
         mw.expect_pid().returning(move || {
-            s.inner
-                .force_read()
+            let inner = s.inner.force_read();
+            inner
                 .windows
                 .get(&id)
                 .map(|w| w.pid)
+                .or_else(|| inner.stale_window_ids.get(&id).copied())
                 .ok_or(Error::InvalidWindow)
         });
 
@@ -471,28 +821,86 @@ impl MockState {
         mw.expect_frame().returning(move || {
             s.inner
                 .force_read()
-                .windows
+                .cached_frames
                 .get(&id)
-                .map(|w| w.frame)
+                .copied()
                 .unwrap_or_default()
-        });
-
-        let s = self.clone();
-        mw.expect_resize().returning(move |size| {
-            let mut inner = s.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
-                w.frame.max = w.frame.min + size;
-            }
         });
 
         let s_move = self.clone();
         mw.expect_reposition().returning(move |origin| {
             let mut inner = s_move.inner.force_write();
-            if let Some(w) = inner.windows.get_mut(&id) {
+            let frame = if let Some(w) = inner.windows.get_mut(&id) {
                 let size = w.frame.size();
                 w.frame.min = origin;
                 w.frame.max = origin + size;
+                w.frame
+            } else {
+                return Err(Error::InvalidWindow);
+            };
+            inner.cached_frames.insert(id, frame);
+            Ok(frame)
+        });
+
+        let s_resize = self.clone();
+        mw.expect_resize_preserving_origin()
+            .returning(move |frame| {
+                let mut inner = s_resize.inner.force_write();
+                *inner.resize_write_attempts.entry(id).or_default() += 1;
+                if inner.constrained_frame_writes.contains(&id) {
+                    return inner
+                        .windows
+                        .get(&id)
+                        .map(|window| window.frame)
+                        .ok_or(Error::InvalidWindow);
+                }
+                let Some(window) = inner.windows.get_mut(&id) else {
+                    return Err(Error::InvalidWindow);
+                };
+                window.frame = frame;
+                if let Some(remaining) = inner.frame_write_readback_failures.get_mut(&id)
+                    && *remaining > 0
+                {
+                    *remaining -= 1;
+                    return Err(Error::Generic("mock AX frame readback failure".to_string()));
+                }
+                inner.cached_frames.insert(id, frame);
+                Ok(frame)
+            });
+
+        let s = self.clone();
+        mw.expect_set_frame().returning(move |frame| {
+            let mut inner = s.inner.force_write();
+            *inner.frame_write_attempts.entry(id).or_default() += 1;
+            if inner.progressive_frame_writes.contains(&id) {
+                let Some(window) = inner.windows.get_mut(&id) else {
+                    return Err(Error::InvalidWindow);
+                };
+                window.frame =
+                    IRect::from_corners(window.frame.min + IVec2::X, window.frame.max + IVec2::X);
+                let observed = window.frame;
+                inner.cached_frames.insert(id, observed);
+                return Ok(observed);
             }
+            if inner.constrained_frame_writes.contains(&id) {
+                return inner
+                    .windows
+                    .get(&id)
+                    .map(|window| window.frame)
+                    .ok_or(Error::InvalidWindow);
+            }
+            let Some(window) = inner.windows.get_mut(&id) else {
+                return Err(Error::InvalidWindow);
+            };
+            window.frame = frame;
+            if let Some(remaining) = inner.frame_write_readback_failures.get_mut(&id)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return Err(Error::Generic("mock AX frame readback failure".to_string()));
+            }
+            inner.cached_frames.insert(id, frame);
+            Ok(frame)
         });
 
         let s = self.clone();
@@ -524,12 +932,21 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_update_frame().returning(move || {
-            s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.frame)
-                .ok_or(Error::InvalidWindow)
+            let mut inner = s.inner.force_write();
+            if let Some(frame) = inner.windows.get(&id).map(|window| window.frame) {
+                inner.cached_frames.insert(id, frame);
+                Ok(frame)
+            } else if inner.stale_window_ids.contains_key(&id)
+                || inner.stale_ax_handles.contains(&id)
+            {
+                inner
+                    .cached_frames
+                    .get(&id)
+                    .copied()
+                    .ok_or(Error::InvalidWindow)
+            } else {
+                Err(Error::InvalidWindow)
+            }
         });
 
         let s = self.clone();
@@ -605,6 +1022,22 @@ impl MockState {
         });
 
         let s = self.clone();
+        mw.expect_try_is_full_screen().returning(move || {
+            let mut inner = s.inner.force_write();
+            if let Some(remaining) = inner.full_screen_query_failures.get_mut(&id)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return Err(Error::InvalidWindow);
+            }
+            inner
+                .windows
+                .get(&id)
+                .map(|window| window.is_full_screen)
+                .ok_or(Error::InvalidWindow)
+        });
+
+        let s = self.clone();
         mw.expect_border_radius().returning(move || {
             s.inner
                 .force_read()
@@ -621,12 +1054,174 @@ impl MockState {
             .returning(move |_psn, _focused_window, _focused_psn| {
                 s.request_focus(id);
             });
-        mw.expect_set_padding().return_const(());
+        let s = self.clone();
+        mw.expect_set_padding().returning(move |padding| {
+            let mut inner = s.inner.force_write();
+            match padding {
+                WindowPadding::Horizontal(value) => {
+                    inner.applied_horizontal_padding.insert(id, value);
+                }
+                WindowPadding::Vertical(value) => {
+                    inner.applied_vertical_padding.insert(id, value);
+                }
+            }
+        });
 
         Window::new(Box::new(mw))
     }
 
+    fn mock_application_windows(&self, application: &mut MockApplicationApi, pid: Pid) {
+        let s = self.clone();
+        application
+            .expect_observe_window()
+            .returning(move |window| {
+                let id = window.id();
+                let mut inner = s.inner.force_write();
+                *inner.window_observer_attempts.entry(id).or_default() += 1;
+                let Some(remaining) = inner.window_observer_failures.get_mut(&id) else {
+                    return Ok(true);
+                };
+                if *remaining == 0 {
+                    return Ok(true);
+                }
+                *remaining -= 1;
+                Ok(false)
+            });
+        application.expect_unobserve_window().return_const(());
+        self.mock_application_inventory(application, pid);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn mock_application_inventory(&self, application: &mut MockApplicationApi, pid: Pid) {
+        let s = self.clone();
+        let window_ids = move || {
+            let inner = s.inner.force_read();
+            inner
+                .windows
+                .values()
+                .filter(|w| w.pid == pid)
+                .map(|w| w.id)
+                .chain(
+                    inner
+                        .stale_window_ids
+                        .iter()
+                        .filter(|&(_, &owner)| owner == pid)
+                        .map(|(&id, _)| id),
+                )
+                .collect::<Vec<_>>()
+        };
+
+        let (s, ids) = (self.clone(), window_ids.clone());
+        application.expect_window_list().returning(move |_| {
+            ids()
+                .into_iter()
+                .filter(|id| {
+                    s.inner
+                        .force_read()
+                        .windows
+                        .get(id)
+                        .is_some_and(|window| window.role != "AXUnknown")
+                })
+                .map(|id| s.create_window(id))
+                .collect()
+        });
+        let s = self.clone();
+        application.expect_window_inventory().returning(move |_| {
+            let (identities, candidate_keys, complete) = {
+                let mut inner = s.inner.force_write();
+                if let Some(remaining) = inner.application_inventory_failures.get_mut(&pid)
+                    && *remaining > 0
+                {
+                    *remaining -= 1;
+                    return Err(Error::InvalidWindow);
+                }
+                let identities = inner
+                    .windows
+                    .values()
+                    .filter(|window| {
+                        window.pid == pid && !application_inventory_omits(&inner, pid, window.id)
+                    })
+                    .map(|window| (window.id, window.incarnation))
+                    .chain(
+                        inner
+                            .stale_window_ids
+                            .iter()
+                            .filter(|&(_, &owner)| owner == pid)
+                            .map(|(&id, _)| {
+                                (
+                                    id,
+                                    inner
+                                        .stale_window_incarnations
+                                        .get(&id)
+                                        .copied()
+                                        .unwrap_or_default(),
+                                )
+                            }),
+                    )
+                    .collect();
+                let candidate_keys = inner
+                    .windows
+                    .values()
+                    .filter(|window| {
+                        window.pid == pid
+                            && window.role != "AXUnknown"
+                            && !application_inventory_omits(&inner, pid, window.id)
+                    })
+                    .map(|window| (window.id, window.incarnation))
+                    .chain(
+                        inner
+                            .stale_window_ids
+                            .iter()
+                            .filter(|&(_, &owner)| owner == pid)
+                            .filter_map(|(&id, _)| {
+                                inner
+                                    .stale_window_incarnations
+                                    .get(&id)
+                                    .copied()
+                                    .map(|incarnation| (id, incarnation))
+                            }),
+                    )
+                    .collect::<Vec<_>>();
+                let complete = !inner.incomplete_application_inventories.contains(&pid)
+                    && !inner
+                        .omitted_application_inventory_windows
+                        .iter()
+                        .any(|(owner, _)| *owner == pid);
+                (identities, candidate_keys, complete)
+            };
+            Ok(crate::manager::app::ApplicationWindowInventory {
+                identities,
+                candidates: candidate_keys
+                    .into_iter()
+                    .map(|(id, incarnation)| s.create_window_with_incarnation(id, incarnation))
+                    .collect(),
+                complete,
+            })
+        });
+        let s = self.clone();
+        application.expect_owns_window().returning(move |window| {
+            let inner = s.inner.force_read();
+            let identity = (window.id(), window.incarnation());
+            Ok(inner.windows.values().any(|candidate| {
+                candidate.pid == pid && (candidate.id, candidate.incarnation) == identity
+            }) || inner.stale_window_ids.get(&window.id()) == Some(&pid)
+                && inner.stale_window_incarnations.get(&window.id()) == Some(&window.incarnation()))
+        });
+    }
+
     pub fn create_application(&self, pid: Pid) -> Application {
+        self.create_application_with_liveness(pid, None)
+    }
+
+    pub fn create_application_with_running(&self, pid: Pid, running: bool) -> Application {
+        self.create_application_with_liveness(pid, Some(Ok(running)))
+    }
+
+    fn create_application_with_liveness(
+        &self,
+        pid: Pid,
+        liveness: Option<crate::errors::Result<bool>>,
+    ) -> Application {
         let mut ma = MockApplicationApi::new();
         let s = self.clone();
 
@@ -636,8 +1231,14 @@ impl MockState {
 
         let s = self.clone();
         ma.expect_focused_window_id().returning(move || {
-            s.inner
-                .force_read()
+            let mut inner = s.inner.force_write();
+            if let Some(remaining) = inner.focused_window_query_failures.get_mut(&pid)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return Err(Error::macos("mock focused-window query", -1));
+            }
+            inner
                 .apps
                 .get(&pid)
                 .and_then(|a| a.focused_window_id)
@@ -680,31 +1281,24 @@ impl MockState {
                 .and_then(|a| a.connection)
         });
 
-        ma.expect_observe().returning(|| Ok(true));
-        ma.expect_observe_window().returning(|_| Ok(true));
-        ma.expect_unobserve_window().return_const(());
-        let s = self.clone();
-        let window_ids = move || {
-            let inner = s.inner.force_read();
-            inner
-                .windows
-                .values()
-                .filter(|w| w.pid == pid)
-                .map(|w| w.id)
-                .chain(
-                    inner
-                        .stale_window_ids
-                        .iter()
-                        .filter(|&(_, &owner)| owner == pid)
-                        .map(|(&id, _)| id),
-                )
-                .collect::<Vec<_>>()
-        };
+        if let Some(liveness) = liveness {
+            ma.expect_is_running().return_const(liveness);
+        } else {
+            let s = self.clone();
+            ma.expect_is_running().returning(move || {
+                let mut inner = s.inner.force_write();
+                if let Some(remaining) = inner.application_liveness_failures.get_mut(&pid)
+                    && *remaining > 0
+                {
+                    *remaining -= 1;
+                    return Err(Error::macos("mock application liveness", -1));
+                }
+                Ok(inner.apps.get(&pid).is_some_and(|app| app.running))
+            });
+        }
 
-        let (s, ids) = (self.clone(), window_ids.clone());
-        ma.expect_window_list()
-            .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
-        ma.expect_window_ids().returning(move || Ok(window_ids()));
+        ma.expect_observe().returning(|| Ok(true));
+        self.mock_application_windows(&mut ma, pid);
 
         Application::new(Box::new(ma))
     }
@@ -772,20 +1366,34 @@ impl MockState {
         });
 
         let s = self.clone();
-        wm.expect_windows_in_session().returning(move || {
+        wm.expect_window_owners_in_session().returning(move || {
             let inner = s.inner.force_read();
+            if !inner.window_server_inventory_available {
+                return None;
+            }
             Some(
                 inner
                     .windows
-                    .keys()
-                    .chain(inner.withdrawn_surfaces.keys())
-                    .copied()
+                    .iter()
+                    .chain(inner.withdrawn_surfaces.iter())
+                    .map(|(id, window)| (*id, window.pid))
                     .collect(),
             )
         });
 
+        let s = self.clone();
         wm.expect_request_window_notifications()
-            .returning(|_| Ok(()));
+            .returning(move |_| {
+                let mut inner = s.inner.force_write();
+                inner.notification_request_attempts += 1;
+                if inner.notification_request_failures == 0 {
+                    return Ok(());
+                }
+                inner.notification_request_failures -= 1;
+                Err(Error::Generic(
+                    "mock WindowServer subscription failure".to_string(),
+                ))
+            });
     }
 
     pub fn create_window_manager(&self) -> MockWindowManagerApi {
@@ -797,11 +1405,20 @@ impl MockState {
 
         let s = self.clone();
         wm.expect_active_display_space().returning(move |id| {
-            s.inner
-                .force_read()
+            let mut inner = s.inner.force_write();
+            if let Some(response) = inner
+                .active_space_query_scripts
+                .get_mut(&id)
+                .and_then(VecDeque::pop_front)
+            {
+                return response.map_err(|()| {
+                    Error::Generic(format!("display {id} scripted active Space unavailable"))
+                });
+            }
+            inner
                 .displays
                 .get(&id)
-                .map(|d| d.workspaces[0])
+                .and_then(|display| display.workspaces.first().copied())
                 .ok_or(Error::InvalidWindow)
         });
 
@@ -820,15 +1437,25 @@ impl MockState {
 
         let s = self.clone();
         wm.expect_present_displays().returning(move || {
-            s.inner
-                .force_read()
-                .displays
-                .values()
-                .map(|d| {
-                    (
-                        Display::new(d.id, d.bounds, TEST_MENUBAR_HEIGHT),
-                        d.workspaces.clone(),
-                    )
+            let mut inner = s.inner.force_write();
+            let display_ids = inner.displays.keys().copied().collect::<Vec<_>>();
+            display_ids
+                .into_iter()
+                .filter_map(|display_id| {
+                    let topology_available = inner
+                        .present_display_topology_scripts
+                        .get_mut(&display_id)
+                        .and_then(VecDeque::pop_front)
+                        .unwrap_or(Ok(()))
+                        .is_ok();
+                    if !topology_available {
+                        return None;
+                    }
+                    let display = inner.displays.get(&display_id)?;
+                    Some((
+                        Display::new(display.id, display.bounds, TEST_MENUBAR_HEIGHT),
+                        display.workspaces.clone(),
+                    ))
                 })
                 .collect()
         });
@@ -853,18 +1480,7 @@ impl MockState {
 
         let s = self.clone();
         wm.expect_windows_in_workspace()
-            .returning(move |workspace_id| {
-                let mut windows = s
-                    .inner
-                    .force_read()
-                    .windows
-                    .values()
-                    .filter_map(|w| (w.workspace_id == workspace_id).then_some(w.id))
-                    .collect::<Vec<_>>();
-                // Sort the windows to keep the tests consistent
-                windows.sort_unstable();
-                Ok(windows)
-            });
+            .returning(move |workspace_id| s.query_workspace_windows(workspace_id));
 
         self.mock_window_server_inventory(&mut wm);
 

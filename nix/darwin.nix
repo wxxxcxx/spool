@@ -22,13 +22,6 @@
           launchd.user.agents.spool = {
             serviceConfig = {
               Label = "com.wxxxcxx.spool";
-              # The Mach service clients look up. launchd creates and holds the
-              # port, so `spool send-cmd`/`query`/`subscribe` and the Lua module
-              # keep working across a daemon restart rather than racing it to
-              # register the name.
-              MachServices = {
-                "com.wxxxcxx.spool" = true;
-              };
               KeepAlive = {
                 Crashed = true;
                 SuccessfulExit = false;

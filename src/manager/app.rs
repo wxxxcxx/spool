@@ -17,13 +17,16 @@ use stdext::function_name;
 use tracing::{debug, error};
 
 use super::skylight::_SLPSGetFrontProcess;
-use super::{ProcessApi, Window, WindowOS, ax_window_id};
+use super::{
+    ProcessApi, Window, WindowOS, ax_window_id, process::pid_for_psn,
+    windows::ax_window_incarnation,
+};
 use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::events::{DestroySource, Event, EventSender, FocusSource, ReconcileScope};
 use crate::platform::{
     AXObserverAddNotification, AXObserverCreate, AXObserverRemoveNotification, CFStringRef, ConnID,
-    Pid, ProcessSerialNumber, WinID,
+    Pid, ProcessSerialNumber, WinID, WindowIncarnation,
 };
 use crate::util::{AXUIAttributes, AXUIWrapper, MacResult, add_run_loop, remove_run_loop};
 
@@ -76,10 +79,11 @@ pub trait ApplicationApi: Send + Sync {
     ///
     /// Returns an `Error` if the focused window cannot be determined.
     fn focused_window_id(&self) -> Result<WinID>;
-    /// Returns the current AX window inventory without constructing full window
-    /// wrappers. Unlike `window_list`, query failure remains distinguishable
-    /// from an application which genuinely has no windows.
-    fn window_ids(&self) -> Result<Vec<WinID>>;
+    /// Returns one AX snapshot containing both raw identities and the subset
+    /// accepted by Spool's trackability rules.
+    fn window_inventory(&self, config: &Config) -> Result<ApplicationWindowInventory>;
+    /// Whether this application owns this concrete AX window incarnation.
+    fn owns_window(&self, window: &Window) -> Result<bool>;
     /// Returns a list of all windows belonging to this application.
     ///
     /// # Arguments
@@ -118,6 +122,20 @@ pub trait ApplicationApi: Send + Sync {
     fn bundle_id(&self) -> Option<String>;
     /// Returns the display name of the application.
     fn name(&self) -> &str;
+    /// Whether the original process serial number still resolves to this PID.
+    ///
+    /// Query failures are distinct from a definitively terminated process so a
+    /// transient Process Manager error cannot retire a live application.
+    fn is_running(&self) -> Result<bool>;
+}
+
+pub struct ApplicationWindowInventory {
+    pub identities: Vec<(WinID, WindowIncarnation)>,
+    pub candidates: Vec<Window>,
+    /// False when the AX window list succeeded but at least one element could
+    /// not be identified. Known entries remain useful for discovery, while
+    /// absence from this snapshot is not yet destructive evidence.
+    pub complete: bool,
 }
 
 /// A wrapper struct for `ApplicationApi` trait objects, allowing for dynamic dispatch.
@@ -257,10 +275,44 @@ impl ApplicationApi for ApplicationOS {
         self.element.focused_window_id()
     }
 
-    fn window_ids(&self) -> Result<Vec<WinID>> {
-        self.element
-            .windows()
-            .map(|windows| collect_window_ids(windows, |element| ax_window_id(element.as_ptr())))
+    fn window_inventory(&self, config: &Config) -> Result<ApplicationWindowInventory> {
+        let bundle_id = self.bundle_id.as_deref();
+        let mut identities = Vec::new();
+        let mut candidates = Vec::new();
+        let mut complete = true;
+        for element in self.element.windows()? {
+            let Ok(window_id) = ax_window_id(element.as_ptr()).inspect_err(|error| {
+                debug!(%error, "unable to identify one AX window inventory element");
+            }) else {
+                complete = false;
+                continue;
+            };
+            identities.push((window_id, ax_window_incarnation(&element)));
+            if let Ok(window) = WindowOS::new_with_config(&element, config, bundle_id) {
+                candidates.push(Window::new(Box::new(window)));
+            }
+        }
+        Ok(ApplicationWindowInventory {
+            identities,
+            candidates,
+            complete,
+        })
+    }
+
+    fn owns_window(&self, window: &Window) -> Result<bool> {
+        let target = (window.id(), window.incarnation());
+        for element in self.element.windows()? {
+            let Ok(window_id) = ax_window_id(element.as_ptr()).inspect_err(|error| {
+                debug!(%error, "unable to identify one AX ownership element");
+            }) else {
+                continue;
+            };
+            let identity = (window_id, ax_window_incarnation(&element));
+            if identity == target {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Retrieves a list of all windows associated with the application.
@@ -310,7 +362,7 @@ impl ApplicationApi for ApplicationOS {
                 .add_observer(
                     &element,
                     &AX_WINDOW_NOTIFICATIONS,
-                    ObserverType::Window(window.id()),
+                    ObserverType::Window(window.id(), window.incarnation()),
                 )
                 .map(|retry| retry.is_empty())
         } else {
@@ -326,7 +378,7 @@ impl ApplicationApi for ApplicationOS {
     fn unobserve_window(&mut self, window: &Window) {
         if let Some(element) = window.element() {
             self.handler.remove_observer(
-                &ObserverType::Window(window.id()),
+                &ObserverType::Window(window.id(), window.incarnation()),
                 &element,
                 &AX_WINDOW_NOTIFICATIONS,
             );
@@ -358,16 +410,10 @@ impl ApplicationApi for ApplicationOS {
     fn name(&self) -> &str {
         &self.name
     }
-}
 
-fn collect_window_ids<T, E>(
-    elements: impl IntoIterator<Item = T>,
-    mut resolve: impl FnMut(T) -> std::result::Result<WinID, E>,
-) -> Vec<WinID> {
-    elements
-        .into_iter()
-        .filter_map(|element| resolve(element).ok())
-        .collect()
+    fn is_running(&self) -> Result<bool> {
+        pid_for_psn(self.psn).map(|pid| pid == Some(self.pid))
+    }
 }
 
 /// An enum representing the type of observer being used.
@@ -376,7 +422,7 @@ fn collect_window_ids<T, E>(
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ObserverType {
     Application,
-    Window(WinID),
+    Window(WinID, WindowIncarnation),
 }
 
 /// `ObserverContext` holds the `EventSender` and the `ObserverType`,
@@ -398,7 +444,9 @@ impl ObserverContext {
     fn notify(&self, notification: &str, element: AXUIElementRef) {
         match self.which {
             ObserverType::Application => self.notify_app(notification, element),
-            ObserverType::Window(id) => self.notify_window(notification, id),
+            ObserverType::Window(id, incarnation) => {
+                self.notify_window(notification, id, incarnation);
+            }
         }
     }
 
@@ -445,8 +493,28 @@ impl ObserverContext {
             return;
         };
         let event = match notification {
-            accessibility_sys::kAXWindowMovedNotification => Event::WindowMoved { window_id },
-            accessibility_sys::kAXWindowResizedNotification => Event::WindowResized { window_id },
+            accessibility_sys::kAXWindowMovedNotification => {
+                let Ok(element) = AXUIWrapper::retain(element).inspect_err(|err| {
+                    debug!(window_id, "unable to retain moved window element: {err}");
+                }) else {
+                    return;
+                };
+                Event::WindowMoved {
+                    window_id,
+                    incarnation: ax_window_incarnation(&element),
+                }
+            }
+            accessibility_sys::kAXWindowResizedNotification => {
+                let Ok(element) = AXUIWrapper::retain(element).inspect_err(|err| {
+                    debug!(window_id, "unable to retain resized window element: {err}");
+                }) else {
+                    return;
+                };
+                Event::WindowResized {
+                    window_id,
+                    incarnation: ax_window_incarnation(&element),
+                }
+            }
             accessibility_sys::kAXMenuOpenedNotification => Event::MenuOpened { window_id },
             accessibility_sys::kAXMenuClosedNotification => Event::MenuClosed { window_id },
             _ => {
@@ -470,21 +538,25 @@ impl ObserverContext {
     ///
     /// * `notification` - The name of the accessibility notification as a `&str`.
     /// * `window_id` - The ID of the window associated with the notification.
-    fn notify_window(&self, notification: &str, window_id: WinID) {
+    fn notify_window(&self, notification: &str, window_id: WinID, incarnation: WindowIncarnation) {
         let event = match notification {
-            accessibility_sys::kAXWindowMiniaturizedNotification => {
-                Event::WindowMinimized { window_id }
-            }
-            accessibility_sys::kAXWindowDeminiaturizedNotification => {
-                Event::WindowDeminimized { window_id }
-            }
+            accessibility_sys::kAXWindowMiniaturizedNotification => Event::WindowMinimized {
+                window_id,
+                incarnation: Some(incarnation),
+            },
+            accessibility_sys::kAXWindowDeminiaturizedNotification => Event::WindowDeminimized {
+                window_id,
+                incarnation: Some(incarnation),
+            },
             accessibility_sys::kAXUIElementDestroyedNotification => Event::WindowDestroyed {
                 window_id,
                 source: DestroySource::Accessibility,
+                incarnation: Some(incarnation),
             },
-            accessibility_sys::kAXTitleChangedNotification => {
-                Event::WindowTitleChanged { window_id }
-            }
+            accessibility_sys::kAXTitleChangedNotification => Event::WindowTitleChanged {
+                window_id,
+                incarnation: Some(incarnation),
+            },
 
             _ => {
                 error!("unhandled window notification: {notification:?}");
@@ -582,12 +654,12 @@ impl AxObserverHandler {
                 } {
                     accessibility_sys::kAXErrorSuccess
                     | accessibility_sys::kAXErrorNotificationAlreadyRegistered => Some(*name),
-                    accessibility_sys::kAXErrorCannotComplete => {
-                        retry.push(*name);
-                        None
-                    }
                     result => {
                         error!("error adding {name} {element:x?} {observer:?}: {result}");
+                        // AX can fail individual notification registrations for
+                        // reasons other than CannotComplete. Any non-success is
+                        // still incomplete and must remain eligible for retry.
+                        retry.push(*name);
                         None
                     }
                 }
@@ -697,7 +769,7 @@ mod tests {
     };
     use stdext::sync::rw_lock::RwLockExt as _;
 
-    use super::{ObserverType, collect_window_ids};
+    use super::ObserverType;
     use crate::{events::EventSender, manager::app::AxObserverHandler, util::AXUIWrapper};
 
     #[test]
@@ -712,17 +784,10 @@ mod tests {
             contexts: Arc::new(RwLock::new(Vec::new())),
         });
 
-        let first = handler.get_or_insert_context(ObserverType::Window(42));
-        let reused = handler.get_or_insert_context(ObserverType::Window(42));
+        let first = handler.get_or_insert_context(ObserverType::Window(42, 1));
+        let reused = handler.get_or_insert_context(ObserverType::Window(42, 1));
 
         assert_eq!(reused, first);
         assert_eq!(handler.contexts.as_ref().force_read().len(), 1);
-    }
-
-    #[test]
-    fn window_inventory_keeps_resolvable_ids_when_one_element_has_no_id() {
-        let ids = collect_window_ids([Some(11), None, Some(22)], |id| id.ok_or("no window id"));
-
-        assert_eq!(ids, vec![11, 22]);
     }
 }

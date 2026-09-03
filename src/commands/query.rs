@@ -28,7 +28,7 @@ use spool_shared_types::wire::Response;
 /// learn a subscriber is gone via a plain atomic flag instead of a lock shared
 /// with that task.
 struct Subscriber {
-    channel: Arc<spool_mach_ipc::Subscriber>,
+    channel: Arc<spool_local_ipc::Subscriber>,
     alive: Arc<AtomicBool>,
 }
 
@@ -128,7 +128,7 @@ impl StateBroadcastIntent {
                 Event::WindowMoved { .. } | Event::WindowResized { .. } => {
                     intent.on_screen_changed = true;
                 }
-                Event::WindowTitleChanged { window_id } => {
+                Event::WindowTitleChanged { window_id, .. } => {
                     intent.title_changes.insert(*window_id);
                 }
                 Event::DisplayAdded { display_id }
@@ -361,7 +361,7 @@ fn state_event_broadcast_handler(
     let signals = StateBroadcastSignals {
         space_changed: !active_workspace_changes.is_empty(),
         windows_changed: events.iter().any(|event| {
-            let Event::WindowMoved { window_id } = event else {
+            let Event::WindowMoved { window_id, .. } = event else {
                 return false;
             };
             state
@@ -419,7 +419,7 @@ fn state_event_broadcast_handler(
                 // The subscriber's process is gone; reaped on the next
                 // broadcast. This is a real signal from the kernel rather than
                 // a write error a merely slow reader would also produce.
-                Err(spool_mach_ipc::Error::PeerGone) => {
+                Err(spool_local_ipc::Error::PeerGone) => {
                     subscriber.alive.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -547,7 +547,10 @@ mod tests {
         let state =
             query_state_with_active_window(26_261, "com.cmuxterm.app", "term", 2, vec![26_261]);
         let mut cache = StateBroadcastCache::default();
-        let events = [SpoolEvent::WindowMoved { window_id: 26_261 }];
+        let events = [SpoolEvent::WindowMoved {
+            window_id: 26_261,
+            incarnation: 1,
+        }];
         let signals = StateBroadcastSignals {
             windows_changed: true,
             ..StateBroadcastSignals::default()
@@ -613,7 +616,11 @@ mod tests {
         // A bare move (no window-list or workspace change) still has to be
         // looked at.
         let intent = StateBroadcastIntent::from_events(
-            [SpoolEvent::WindowMoved { window_id: 10 }].iter(),
+            [SpoolEvent::WindowMoved {
+                window_id: 10,
+                incarnation: 1,
+            }]
+            .iter(),
             StateBroadcastSignals::default(),
         );
         assert!(intent.on_screen_changed);
@@ -628,7 +635,11 @@ mod tests {
         let state = query_state_with_active_window(1, "com.example.app", "term", 1, vec![1]);
         let mut cache = StateBroadcastCache::default();
         let first = collect_state_broadcast_events(
-            [SpoolEvent::WindowMoved { window_id: 1 }].iter(),
+            [SpoolEvent::WindowMoved {
+                window_id: 1,
+                incarnation: 1,
+            }]
+            .iter(),
             &state,
             &mut cache,
             |_| None,
@@ -638,7 +649,11 @@ mod tests {
         assert!(matches!(first[0], StateEvent::OnScreenChanged { .. }));
 
         let repeat = collect_state_broadcast_events(
-            [SpoolEvent::WindowMoved { window_id: 1 }].iter(),
+            [SpoolEvent::WindowMoved {
+                window_id: 1,
+                incarnation: 1,
+            }]
+            .iter(),
             &state,
             &mut cache,
             |_| None,
@@ -708,9 +723,15 @@ mod tests {
         let intent = StateBroadcastIntent::from_events(
             [
                 SpoolEvent::SpaceChanged,
-                SpoolEvent::WindowMinimized { window_id: 10 },
+                SpoolEvent::WindowMinimized {
+                    window_id: 10,
+                    incarnation: None,
+                },
                 SpoolEvent::window_focused(11),
-                SpoolEvent::WindowTitleChanged { window_id: 12 },
+                SpoolEvent::WindowTitleChanged {
+                    window_id: 12,
+                    incarnation: None,
+                },
                 SpoolEvent::DisplayResized { display_id: 2 },
             ]
             .iter(),

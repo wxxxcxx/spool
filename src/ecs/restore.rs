@@ -6,7 +6,7 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::observer::On;
 use bevy::ecs::query::Has;
 use bevy::ecs::resource::Resource;
-use bevy::ecs::system::{Commands, Query, Res, ResMut};
+use bevy::ecs::system::{Commands, Query, Res, ResMut, SystemParam};
 use bevy::time::{Time, Timer, TimerMode, Virtual};
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{Level, info, instrument, warn};
@@ -15,27 +15,25 @@ use crate::config::{Config, MissingWindowBehavior};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{SavedColumn, SavedSpace, SavedStackItem, SavedWindow, SpoolState};
+use crate::ecs::workspace::PendingSpaceDestruction;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Floating, RefreshWindowSizes, RestoreWindowState,
     SpawnCommandsExt,
 };
-use crate::manager::{Application, Display, Window};
+use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
 
 #[derive(Debug, Resource)]
 pub(crate) struct SessionRestore {
     state: SpoolState,
     timer: Timer,
-    saved_hard_keys: HashSet<WindowHardMatchKey>,
 }
 
 impl SessionRestore {
     fn new(state: SpoolState, grace: Duration) -> Self {
-        let saved_hard_keys = saved_hard_match_keys(&state);
         Self {
             state,
             timer: Timer::new(grace, TimerMode::Once),
-            saved_hard_keys,
         }
     }
 }
@@ -124,21 +122,43 @@ pub(crate) struct RestorePlan {
 
 pub(crate) struct RestorePlanner<'a> {
     state: &'a SpoolState,
+    present_spaces: &'a HashSet<WorkspaceId>,
     saved_hard_keys: HashSet<WindowHardMatchKey>,
 }
 
 impl<'a> RestorePlanner<'a> {
-    pub(crate) fn new(state: &'a SpoolState) -> Self {
+    pub(crate) fn for_present_spaces(
+        state: &'a SpoolState,
+        present_spaces: &'a HashSet<WorkspaceId>,
+    ) -> Self {
         Self {
             state,
-            saved_hard_keys: saved_hard_match_keys(state),
+            present_spaces,
+            saved_hard_keys: saved_hard_match_keys_for_spaces(state, present_spaces),
         }
+    }
+
+    fn saved_spaces(&self) -> impl Iterator<Item = &'a SavedSpace> {
+        self.state
+            .spaces
+            .iter()
+            .filter(|space| self.present_spaces.contains(&space.space_id))
+    }
+
+    fn saved_windows(&self) -> impl Iterator<Item = &'a SavedWindow> {
+        self.saved_spaces()
+            .flat_map(|space| &space.columns)
+            .flat_map(saved_windows_in_column)
+    }
+
+    fn has_saved_fallback_windows(&self) -> bool {
+        self.saved_windows().any(|window| !window.title.is_empty())
     }
 
     pub(crate) fn plan(&self, current: &[CurrentWindowIdentity]) -> RestorePlan {
         let mut plan = RestorePlan::default();
 
-        for space in &self.state.spaces {
+        for space in self.saved_spaces() {
             let surviving_strips = self.plan_space(space, current, &mut plan);
             if !surviving_strips.is_empty() {
                 plan.active_workspaces.insert(space.space_id);
@@ -260,14 +280,6 @@ impl<'a> RestorePlanner<'a> {
     }
 }
 
-fn saved_windows_in_state(state: &SpoolState) -> impl Iterator<Item = &SavedWindow> {
-    state
-        .spaces
-        .iter()
-        .flat_map(|space| &space.columns)
-        .flat_map(saved_windows_in_column)
-}
-
 fn saved_windows_in_column(column: &SavedColumn) -> Box<dyn Iterator<Item = &SavedWindow> + '_> {
     match column {
         SavedColumn::Single(saved) | SavedColumn::Fullscreen(saved) => {
@@ -302,14 +314,30 @@ impl SavedWindow {
     }
 }
 
-fn saved_hard_match_keys(state: &SpoolState) -> HashSet<WindowHardMatchKey> {
-    saved_windows_in_state(state)
+fn saved_hard_match_keys_for_spaces(
+    state: &SpoolState,
+    present_spaces: &HashSet<WorkspaceId>,
+) -> HashSet<WindowHardMatchKey> {
+    state
+        .spaces
+        .iter()
+        .filter(|space| present_spaces.contains(&space.space_id))
+        .flat_map(|space| &space.columns)
+        .flat_map(saved_windows_in_column)
         .map(SavedWindow::hard_key)
         .collect()
 }
 
-fn has_saved_fallback_windows(state: &SpoolState) -> bool {
-    saved_windows_in_state(state).any(|window| !window.title.is_empty())
+pub(crate) fn eligible_restore_space_ids(
+    topology: &[(Display, Vec<WorkspaceId>)],
+    pending_space_ids: impl IntoIterator<Item = WorkspaceId>,
+) -> HashSet<WorkspaceId> {
+    let pending = pending_space_ids.into_iter().collect::<HashSet<_>>();
+    topology
+        .iter()
+        .flat_map(|(_, spaces)| spaces.iter().copied())
+        .filter(|workspace_id| !pending.contains(workspace_id))
+        .collect()
 }
 
 pub(crate) fn matches_startup_restore_state(
@@ -318,6 +346,7 @@ pub(crate) fn matches_startup_restore_state(
     session: Option<&SessionRestore>,
     restoration: Option<&SpoolState>,
     config: &Config,
+    present_spaces: &HashSet<WorkspaceId>,
 ) -> bool {
     if !config.restore_enabled() {
         return false;
@@ -327,34 +356,52 @@ pub(crate) fn matches_startup_restore_state(
         return false;
     };
     let bundle_id = app.bundle_id().unwrap_or_default().clone();
-    let key = WindowHardMatchKey::new(window.id(), pid, bundle_id.clone());
-
-    if let Some(session) = session {
-        return session.saved_hard_keys.contains(&key);
-    }
-
-    let Some(state) = restoration else {
+    let state = if let Some(session) = session {
+        &session.state
+    } else if let Some(state) = restoration {
+        state
+    } else {
         return false;
     };
-    saved_windows_in_state(state).any(|saved| saved.hard_match(window.id(), pid, &bundle_id))
+    RestorePlanner::for_present_spaces(state, present_spaces)
+        .saved_windows()
+        .any(|saved| saved.hard_match(window.id(), pid, &bundle_id))
+}
+
+#[derive(SystemParam)]
+pub(super) struct RestoreWindowStateCtx<'w, 's> {
+    workspaces: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static mut LayoutStrip,
+            Option<&'static ChildOf>,
+            Has<ActiveWorkspaceMarker>,
+        ),
+    >,
+    displays: Query<'w, 's, (Entity, &'static Display, Has<ActiveDisplayMarker>)>,
+    apps: Query<'w, 's, &'static Application>,
+    pending_spaces: Query<'w, 's, &'static PendingSpaceDestruction>,
+    session: Option<Res<'w, SessionRestore>>,
+    restoration: Option<Res<'w, SpoolState>>,
+    window_manager: Res<'w, WindowManager>,
+    window: WindowCtx<'w, 's>,
 }
 
 #[allow(clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-pub(super) fn restore_window_state(
-    _: On<RestoreWindowState>,
-    mut workspaces: Query<(
-        Entity,
-        &mut LayoutStrip,
-        Option<&ChildOf>,
-        Has<ActiveWorkspaceMarker>,
-    )>,
-    displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
-    apps: Query<&Application>,
-    session: Option<Res<SessionRestore>>,
-    restoration: Option<Res<SpoolState>>,
-    mut ctx: WindowCtx,
-) {
+pub(super) fn restore_window_state(_: On<RestoreWindowState>, restore: RestoreWindowStateCtx) {
+    let RestoreWindowStateCtx {
+        mut workspaces,
+        displays,
+        apps,
+        pending_spaces,
+        session,
+        restoration,
+        window_manager,
+        window: mut ctx,
+    } = restore;
     let restoration = if let Some(session) = session.as_deref() {
         &session.state
     } else {
@@ -376,8 +423,20 @@ pub(super) fn restore_window_state(
         restoration
     };
 
-    let current = current_window_identities(&ctx.windows, &apps, restoration);
-    let plan = RestorePlanner::new(restoration).plan(&current);
+    let topology = window_manager.present_displays();
+    let mut live_space_displays = HashMap::new();
+    for (display, spaces) in &topology {
+        for workspace_id in spaces {
+            live_space_displays.insert(*workspace_id, display.id());
+        }
+    }
+    let present_spaces = eligible_restore_space_ids(
+        &topology,
+        pending_spaces.iter().map(|pending| pending.workspace_id),
+    );
+    let planner = RestorePlanner::for_present_spaces(restoration, &present_spaces);
+    let current = current_window_identities(&ctx.windows, &apps, &planner);
+    let plan = planner.plan(&current);
 
     if plan.consumed_entities.is_empty() {
         info!(
@@ -408,7 +467,12 @@ pub(super) fn restore_window_state(
             strip.remove(*entity);
         }
 
-        if had_consumed_window && strip.all_windows().is_empty() {
+        // A pending strip is a topology tombstone. Restore may empty it, but
+        // only destroyed-Space reconciliation may decide that it can die.
+        if had_consumed_window
+            && strip.all_windows().is_empty()
+            && pending_spaces.get(entity).is_err()
+        {
             emptied_existing_strips.insert(entity);
         }
     }
@@ -429,6 +493,7 @@ pub(super) fn restore_window_state(
     for planned in &plan.strips {
         let Some((display_entity, display)) = select_display(
             planned.workspace_id,
+            live_space_displays.get(&planned.workspace_id).copied(),
             planned.display_id,
             &existing_workspace_parents,
             &displays,
@@ -508,7 +573,7 @@ fn layout_strip_from_plan(planned: &PlannedStrip) -> LayoutStrip {
 fn current_window_identities(
     windows: &Windows,
     apps: &Query<&Application>,
-    restoration: &SpoolState,
+    planner: &RestorePlanner,
 ) -> Vec<CurrentWindowIdentity> {
     let mut current = windows
         .tiled_iter()
@@ -527,9 +592,8 @@ fn current_window_identities(
         })
         .collect::<Vec<_>>();
 
-    if has_saved_fallback_windows(restoration) {
-        let saved_hard_keys = saved_hard_match_keys(restoration);
-        hydrate_fallback_identities(&mut current, windows, &saved_hard_keys);
+    if planner.has_saved_fallback_windows() {
+        hydrate_fallback_identities(&mut current, windows, &planner.saved_hard_keys);
     }
 
     current
@@ -559,10 +623,19 @@ fn hydrate_fallback_identities(
 
 fn select_display<'a>(
     workspace_id: WorkspaceId,
+    live_display_id: Option<CGDirectDisplayID>,
     planned_display_id: Option<CGDirectDisplayID>,
     existing_workspace_parents: &HashMap<WorkspaceId, Entity>,
     displays: &'a Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
 ) -> Option<(Entity, &'a Display)> {
+    if let Some(display_id) = live_display_id
+        && let Some((entity, display, _)) = displays
+            .iter()
+            .find(|(_, display, _)| display.id() == display_id)
+    {
+        return Some((entity, display));
+    }
+
     if let Some(display_entity) = existing_workspace_parents.get(&workspace_id)
         && let Ok((entity, display, _)) = displays.get(*display_entity)
     {

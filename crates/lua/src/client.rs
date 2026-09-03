@@ -1,8 +1,9 @@
-//! The client half of the API: talks to a running daemon over its Mach
-//! service. [`module`] builds the table `require("spool")` returns.
+//! The client half of the API: talks to a running daemon over its Unix socket.
+//! [`module`] builds the table `require("spool")` returns.
 //!
-//! Service name defaults to `com.karinushka.spool`, overridable via the
-//! `SPOOL_MACH_SERVICE` environment variable or `spool.set_service_name`.
+//! The logical instance name defaults to `com.wxxxcxx.spool`. A loadable Lua
+//! client may override only its own destination with `spool.set_service_name`;
+//! the daemon's production singleton name is fixed.
 //!
 //! Every call here blocks: Lua's C API is synchronous, so a callback cannot
 //! yield into an executor.
@@ -11,7 +12,7 @@ use std::rc::Rc;
 use std::sync::{LazyLock, Mutex};
 
 use mlua::prelude::*;
-use spool_mach_ipc::{RecvPort, SendPort, Sender};
+use spool_local_ipc::Client;
 use spool_shared_types::commands::{Command, MoveFocus};
 use spool_shared_types::script_state::ScriptStateWrite;
 use spool_shared_types::script_value::ScriptValue;
@@ -33,9 +34,9 @@ fn service_name() -> String {
     )
 }
 
-fn connect() -> LuaResult<Sender<Request>> {
-    Sender::connect(&service_name()).map_err(|err| match err {
-        spool_mach_ipc::Error::NotRunning => {
+fn connect() -> LuaResult<Client> {
+    Client::connect(&service_name()).map_err(|err| match err {
+        spool_local_ipc::Error::NotRunning => {
             LuaError::RuntimeError("spool is not running".to_string())
         }
         other => LuaError::external(other),
@@ -46,8 +47,7 @@ fn connect() -> LuaResult<Sender<Request>> {
 /// raised as a Lua error rather than returned, so a failed call is an error,
 /// not a silent no-op.
 fn call(request: &Request) -> LuaResult<Response> {
-    let sender = connect()?;
-    let response: Response = sender.call_blocking(request).map_err(LuaError::external)?;
+    let response = connect()?.call(request).map_err(LuaError::external)?;
 
     match response {
         Response::Error(message) => Err(LuaError::RuntimeError(message)),
@@ -56,8 +56,7 @@ fn call(request: &Request) -> LuaResult<Response> {
 }
 
 fn send(request: &Request) -> LuaResult<()> {
-    let sender = connect()?;
-    sender.send_blocking(request).map_err(LuaError::external)
+    connect()?.send(request).map_err(LuaError::external)
 }
 
 fn dispatch(_: &Lua, command: Command) -> LuaResult<bool> {
@@ -297,16 +296,15 @@ fn subscribe(
         .and_then(|opts| opts.get::<Option<bool>>("decode").ok().flatten())
         .unwrap_or(true);
 
-    let sender = connect()?;
-    let stream = sender
-        .subscribe_blocking::<StateEvent>(&Request::Subscribe)
+    let mut stream = connect()?
+        .subscribe(&Request::Subscribe)
         .map_err(LuaError::external)?;
 
     loop {
         let event = match stream.recv_blocking() {
-            Ok(delivery) => delivery.value,
+            Ok(event) => event,
             // The daemon is gone; the subscription ends.
-            Err(spool_mach_ipc::Error::PeerGone) => break,
+            Err(spool_local_ipc::Error::PeerGone) => break,
             Err(err) => return Err(LuaError::external(err)),
         };
 
@@ -327,7 +325,7 @@ fn subscribe(
     Ok(true)
 }
 
-/// `spool.set_service_name(name)` — override the daemon's Mach service name.
+/// `spool.set_service_name(name)` — override the daemon's socket instance name.
 #[allow(clippy::unnecessary_wraps)]
 fn set_service_name(_: &Lua, name: String) -> LuaResult<()> {
     if let Ok(mut guard) = SERVICE.lock() {

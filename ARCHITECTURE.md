@@ -7,7 +7,7 @@ This document provides a high-level overview of Spool's architecture for contrib
 Spool manages macOS windows as a **sliding strip** (inspired by Niri and PaperWM). The core design philosophy is **Data-Driven/ECS**: instead of managing windows as complex objects with internal state, we represent the "World" as a collection of simple data components (Windows, Displays, Workspaces) that are processed by systems.
 
 The primary problem Spool solves is providing a predictable, stable, and ergonomic tiling experience on macOS. By using Bevy's ECS, we gain:
-- **Declarative Logic:** Systems react to changes in window properties (e.g., `Changed<Position>`).
+- **Declarative Logic:** layout state is rendered into a desired window frame; effects and OS observations are separate projections.
 - **High Performance:** Parallel system execution and efficient change detection.
 - **Modularity:** Functionality is divided into decoupled plugins and systems.
 
@@ -21,10 +21,14 @@ Bevy is typically used for games, so Spool implements a custom bridge to interac
 3.  **Pump System:** The `pump_events` system (in `src/ecs/systems.rs`) reads from this channel during the `PreUpdate` phase and writes Bevy `Message`s or triggers `Observer`s.
 4.  **Observers:** Bevy Observers (primarily in `src/ecs/triggers.rs`, with focused domains such as session restore in `src/ecs/restore.rs`) react to these events to update the ECS World (e.g., spawning new `Window` entities or updating `FocusedMarker`).
 
-### State Synchronization (ECS -> macOS)
-1.  **Systems:** Bevy systems (like `layout::position_layout_windows`) calculate the intended positions and sizes of windows based on the tiling logic.
-2.  **Commit Systems:** In the `PostUpdate` phase, specialized systems like `commit_window_position` and `commit_window_size` identify windows that need updating.
-3.  **FFI Calls:** These systems call methods on the `Window` trait object (implemented by `WindowOS` in `src/manager/windows.rs`), which performs the actual accessibility API calls to move or resize the physical macOS window.
+### Declarative Frame Pipeline (ECS -> macOS -> ECS)
+1.  **Render:** `layout::position_layout_windows` derives `DesiredWindowFrame` from Layout State. This is the final target and does not advance gradually.
+2.  **Present:** `window_frame::animate_presented_window_frames` derives `PresentedWindowFrame` from the desired frame. Gestures and cross-Space jumps may explicitly snap this projection.
+3.  **Commit:** `systems::commit_window_frame` is the normal-operation geometry writer. It sends only the presented frame through the `Window` abstraction.
+4.  **Observe:** synchronous AX readback and external notifications update `ObservedWindowFrame`. Borders and public queries use this confirmed projection.
+5.  **Reconcile:** `reconcile::reconcile_windows` periodically compares desired and observed frames, retries boundedly, and also repairs missed lifecycle notifications from complete AX and WindowServer inventories.
+
+The flow is intentionally one-way. An ordinary macOS readback never mutates tiled Layout State. User- or application-driven geometry is first collected as a `Geometry Gesture`; only the settled final frame becomes a single Layout State action. Floating windows are the exception because no tiling neighbours depend on their geometry.
 
 **Note:** All AppKit/Accessibility calls must happen on the **Main Thread**. Spool ensures this by using `NonSend` resources and executing critical synchronization systems on the main thread.
 
@@ -43,6 +47,10 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 | Directory / Module | Responsibility Statement |
 | :--- | :--- |
 | `src/ecs/layout.rs` | Tiling algorithms, column management, and coordinate calculations. |
+| `src/ecs/window_frame.rs` | Desired/presented frame projections and animation. |
+| `src/ecs/window_geometry.rs` | Debounced adoption of externally initiated move/resize gestures. |
+| `src/ecs/reconcile.rs` | Lifecycle audits and bounded desired/observed convergence. |
+| `src/ecs/exit_restore.rs` | Session-local restoration of eligible pre-Spool window geometry. |
 | `src/ecs/systems.rs` | Bevy systems for lifecycle management, event pumping, and state syncing. |
 | `src/ecs/params.rs` | High-level Bevy `SystemParam` abstractions for querying the World. |
 | `src/ecs/triggers.rs` | Reactive event handlers (Observers) for OS and internal events. |
@@ -56,9 +64,10 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 | `src/platform/` | Low-level macOS FFI, event loop integration, and workspace/input hooks. |
 | `src/config/` | Configuration parsing, validation, and hot-reloading logic. |
 | `src/commands.rs` | Implementation of CLI subcommands. |
-| `src/client.rs` | The CLI side of the IPC protocol, and the only place JSON is produced. |
-| `src/reader.rs` | The daemon side: owns the Mach service and turns requests into events. |
-| `crates/mach_ipc` | Typed channels over Mach ports; the transport itself. Async and blocking spellings of each operation, on `SendPort`/`RecvPort`. |
+| `src/client.rs` | The CLI query, command, and subscription adapter over the typed IPC protocol. |
+| `src/client_script.rs` | Isolated, on-demand Lua client execution; injects the socket-backed `spool` module without entering the daemon runtime. |
+| `src/reader.rs` | The daemon adapter: turns authenticated local IPC requests into events. |
+| `crates/local_ipc` | The deep IPC module: singleton lock, Unix socket lifecycle, peer authentication, bounded framing, deadlines, replies, and subscriptions. |
 | `src/overlay.rs` | Logic for drawing active window borders and inactive window dimming. |
 
 ## 4. Key Data Entities
@@ -68,15 +77,20 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 - **`Display`:** Represents a physical monitor and its bounds.
 - **`LayoutStrip`:** One per native Space; manages its ordered list of `Column`s.
 - **`NativeSpace`:** Stable session ID, per-display ordinal, and user/fullscreen kind read from macOS.
-- **`LayoutPosition` / `Position`:** The intended (layout) vs. actual (on-screen) coordinates.
-- **`Bounds` / `WidthRatio`:** The size of the window and its relative width in the tiling strip.
+- **`LayoutPosition`:** A window's logical slot inside its `LayoutStrip`.
+- **`Position` / `Bounds`:** Compatibility inputs used by the existing strip math while the layout model is progressively deepened. They are not physical truth and do not directly drive macOS writes.
+- **`DesiredWindowFrame`:** The final geometry rendered from Layout State.
+- **`PresentedWindowFrame`:** The current animation/effect output and sole normal commit input.
+- **`ObservedWindowFrame`:** The latest geometry successfully read back from macOS.
+- **`WidthRatio`:** A window's relative width in the tiling strip.
 - **`FocusedMarker`:** Identifies the currently focused window.
 - **`ActiveWorkspaceMarker`**: Identifies the currently active workspace.
 - **`VisibleNativeSpaceMarker`**: Marks the native Space currently visible on each display.
 - **`NativeFullscreenMarker`**: Marks a window that is in macOS native fullscreen mode.
 - **`Floating`:** Marks a tracked window that is outside the tiling layout but remains focusable and operable.
 - **`WindowVisibility`:** Records why a tracked window is temporarily unavailable (`Minimized` or `Hidden`) without changing whether it is tiled or floating.
-- **`RepositionMarker` / `ResizeMarker`**: Used to signal that a window needs to be moved or resized.
+- **`RepositionMarker` / `ResizeMarker`**: Command requests. For windows they are consumed into layout state; for layout strips they continue to drive strip animation.
+- **`WindowFrameMotion`**: Marks a presented frame that has not converged to its desired frame.
 
 ### Resources
 - **`WindowManager`:** A wrapper for the global window management state and OS bridge.
@@ -90,6 +104,10 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 
 - **Main Thread Only:** Any interaction with `objc2`, `AppKit`, or `Accessibility` APIs **must** occur on the main thread.
 - **Split ownership:** ECS is the source of truth for tiling inside a Space. macOS is the source of truth for Space topology, visibility, and window membership; private operations must be reconciled from OS state before ECS converges.
+- **Single-direction geometry:** Layout State writes Desired; animation writes Presented; the macOS bridge writes Observed. No projection writes backward into an earlier layer.
+- **Single normal commit input:** Normal window geometry writes consume only `PresentedWindowFrame`. Fullscreen transitions, Space reassignment, and graceful exit explicitly suspend or supersede this writer.
+- **Confirmed surfaces:** Borders, hit-testing heuristics, tab detection, and public frame queries use observed geometry when it exists.
+- **Gesture coalescing:** Intermediate external move/resize notifications update observation only. Tiled Layout State changes once after the gesture quiet period, so neighbouring windows reflow once.
 - **Pure Layout:** Layout math (in `layout.rs`) should remain as pure as possible, operating on coordinates and ratios rather than directly calling OS APIs.
 - **Bounded Restore:** Saved session state is only consulted during startup restore. After `SessionRestore` expires, normal config and window-rule placement owns newly discovered windows.
 - **Reactive Power Saving:** Systems should use Bevy's reactive scheduling to avoid CPU usage when no windows are moving or events are occurring.
@@ -128,11 +146,13 @@ graph TD
     A[macOS Window Server] -->|Native Event| B(src/platform Layer)
     B -->|mpsc Channel| C(pump_events System)
     C -->|Bevy Event| D(Observer / Trigger)
-    D -->|Update ECS| E{ECS World}
-    E -->|Changed Component| F(Layout/Animation System)
-    F -->|Set RepositionMarker| E
-    E -->|PostUpdate| G(commit_window_position)
-    G -->|FFI Call| A
+    D -->|Action / invalidation| E[Layout State]
+    E -->|Render| F[DesiredWindowFrame]
+    F -->|Animate or snap| G[PresentedWindowFrame]
+    G -->|commit_window_frame| A
+    A -->|AX readback| O[ObservedWindowFrame]
+    O -->|Border / query / drift comparison| Q[Consumers]
+    O -. settled external geometry .-> E
     H[CommandReader] -->|Unix Socket| C
     S[SpoolState file] -->|Startup load| R(session restore)
     R -->|Rebuild saved strips| E

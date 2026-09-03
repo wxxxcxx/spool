@@ -1,5 +1,5 @@
 use bevy::app::AppExit;
-use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
+use bevy::ecs::change_detection::{DetectChanges, Ref};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::RemovedComponents;
@@ -12,7 +12,7 @@ use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
-use objc2_foundation::NSPoint;
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
@@ -29,10 +29,13 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::{FocusCoordinator, FocusSignal};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
-use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
+use crate::ecs::params::{FrameActivity, Windows};
+use crate::ecs::reconcile::WindowUnavailable;
+use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, Initializing, LowPowerMode,
-    MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState, Scrolling,
+    ActiveWorkspaceMarker, Bounds, BruteforceWindows, DesiredWindowFrame, DockPosition,
+    FlashMessage, Floating, Initializing, LowPowerMode, MissionControlActive, ObservedWindowFrame,
+    Position, PresentedWindowFrame, ReadDisplayProperties, RestoreWindowState, Scrolling,
     SendMessageTrigger, SpawnCommandsExt, WidthRatio, WindowProperties, WindowVisibility,
 };
 use crate::events::{Event, FocusSource, InputEvent};
@@ -40,7 +43,7 @@ use crate::manager::{
     Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
-use crate::platform::{PlatformCallbacks, WinID};
+use crate::platform::{PlatformCallbacks, WinID, WindowIncarnation};
 
 /// Keeps `WindowServer`'s per-window close notification subscription aligned
 /// with the ECS inventory on macOS versions that require explicit requests.
@@ -49,11 +52,15 @@ pub(super) fn refresh_window_notifications(
     added: Query<(), Added<Window>>,
     mut removed: RemovedComponents<Window>,
     window_manager: Res<WindowManager>,
+    time: Res<Time>,
+    mut since_retry: Local<Duration>,
 ) {
     let inventory_changed = !added.is_empty() || removed.read().next().is_some();
-    if !inventory_changed {
+    *since_retry = since_retry.saturating_add(time.delta());
+    if !inventory_changed && *since_retry < Duration::from_secs(5) {
         return;
     }
+    *since_retry = Duration::ZERO;
 
     let window_ids = windows.iter().map(|window| window.id()).collect::<Vec<_>>();
     _ = window_manager
@@ -70,43 +77,72 @@ type TimedOutSpawns<'w, 's> = Populated<
     Or<(With<BProcess>, With<Application>)>,
 >;
 
-/// Windows as [`window_moved_update_frame`] sees them: the element to re-read,
-/// the origin to update, and the marker saying we are the ones moving it.
-type MovableWindows<'w, 's> = Query<
+type PendingWindowFrames<'w, 's> = Query<
     'w,
     's,
     (
+        Entity,
         &'static mut Window,
-        &'static mut Position,
-        &'static Bounds,
-        Option<&'static WindowVisibility>,
-        Has<RepositionMarker>,
+        Ref<'static, PresentedWindowFrame>,
+        &'static DesiredWindowFrame,
+        &'static mut WidthRatio,
+        Option<&'static mut ObservedWindowFrame>,
+        Has<Floating>,
     ),
-    Without<LayoutStrip>,
+    (
+        Changed<PresentedWindowFrame>,
+        Without<WindowUnavailable>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
 >;
 
-/// Windows as the resize handler rewrites them: the OS handle to re-read the
-/// frame from, the size to overwrite, and whether the window is ours to lay
-/// out at all.
-type ResizableWindows<'w, 's> = Query<
+type PositionVerificationWindows<'w, 's> = Populated<
     'w,
     's,
     (
-        &'static mut Window,
         Entity,
-        &'static Position,
-        &'static mut Bounds,
-        Option<&'static WindowVisibility>,
-        Has<ResizeMarker>,
+        &'static mut Window,
+        &'static DesiredWindowFrame,
+        &'static mut VerifyWindowPosition,
+        Option<&'static mut ObservedWindowFrame>,
     ),
-    Without<LayoutStrip>,
+    Without<WindowSpaceReassignmentPending>,
+>;
+
+type AnimatedPositions<'w, 's> = Populated<
+    'w,
+    's,
+    (&'static mut Position, Entity, &'static RepositionMarker),
+    (Without<WindowSpaceReassignmentPending>, Without<Window>),
+>;
+
+type AnimatedSizes<'w, 's> = Populated<
+    'w,
+    's,
+    (&'static mut Bounds, Entity, &'static ResizeMarker),
+    (Without<WindowSpaceReassignmentPending>, Without<Window>),
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
-const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 500;
 const LOOP_MAX_TIMEOUT_MS: u32 = 50;
 const LOOP_TIMEOUT_STEP: u32 = 1;
+
+fn next_pump_timeout(current: u32, drained: bool, frame_active: bool, low_power: bool) -> u32 {
+    // While a presentation is in flight, return to the ECS/AX pipeline almost
+    // immediately. Sleeping for a display frame here leaves no budget for the
+    // synchronous accessibility writes that actually present the windows.
+    if !drained || frame_active {
+        return LOOP_TIMEOUT_STEP;
+    }
+
+    let timeout_limit = if low_power {
+        LOOP_MAX_TIMEOUT_LOWPOWER_MS
+    } else {
+        LOOP_MAX_TIMEOUT_MS
+    };
+    current.min(timeout_limit) + LOOP_TIMEOUT_STEP
+}
 
 /// How long [`pump_events`] may spend draining the incoming channel before it
 /// has to hand the frame back, and how many events it may take in one go.
@@ -220,13 +256,19 @@ pub(crate) fn add_existing_application(
     for (mut app, entity) in fresh_apps {
         let mut offscreen_windows = vec![];
 
-        if app.observe().is_ok_and(|result| result)
-            && let Ok((found_windows, offscreen)) = window_manager
-                .find_existing_application_windows(&mut app, &spaces, &config)
-                .inspect_err(|err| warn!("{err}"))
+        match app.observe() {
+            Ok(true) => {}
+            Ok(false) => debug!(pid = app.pid(), "some application observers need retry"),
+            Err(error) => {
+                warn!(pid = app.pid(), %error, "unable to register application observers");
+            }
+        }
+        if let Ok((found_windows, offscreen)) = window_manager
+            .find_existing_application_windows(&mut app, &spaces, &config)
+            .inspect_err(|err| warn!("{err}"))
         {
             offscreen_windows.extend(offscreen);
-            commands.trigger(SpawnWindowTrigger(found_windows));
+            commands.trigger(SpawnWindowTrigger::for_application(entity, found_windows));
         }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<ExistingMarker>();
@@ -272,7 +314,7 @@ pub(crate) fn finish_setup(
     if !bruteforce_tasks.is_empty() {
         for (entity, mut job) in &mut bruteforce_tasks {
             if let Some(found_windows) = future::block_on(future::poll_once(&mut job.0)) {
-                commands.trigger(SpawnWindowTrigger(found_windows));
+                commands.trigger(SpawnWindowTrigger::new(found_windows));
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_despawn();
                 }
@@ -440,7 +482,7 @@ pub(super) fn add_launched_application(
                 "spawn! (polling path found {} new windows for {entity})",
                 create_windows.len(),
             );
-            commands.trigger(SpawnWindowTrigger(create_windows));
+            commands.trigger(SpawnWindowTrigger::for_application(entity, create_windows));
         } else if has_children {
             // Windows were already created via AXCreated notification path.
             // Remove FreshMarker so the Timeout gets cleaned up.
@@ -542,7 +584,11 @@ pub(super) fn retry_front_switch(
             }
             continue;
         }
-        if let Ok(focused_id) = app.focused_window_id() {
+        retry.timer.tick(clock.delta());
+        retry.probe.tick(clock.delta());
+        if retry.probe.just_finished()
+            && let Ok(focused_id) = app.focused_window_id()
+        {
             debug!("Front switch retry succeeded for window {focused_id}.");
             commands.trigger(SendMessageTrigger(Event::resolved_focus(
                 focused_id,
@@ -555,7 +601,6 @@ pub(super) fn retry_front_switch(
             }
             continue;
         }
-        retry.timer.tick(clock.delta());
         if retry.timer.is_finished() {
             warn!(
                 "Focused-window query for '{}' timed out; actual focus remains unknown.",
@@ -597,7 +642,7 @@ fn ease_out_factor(rate: f64, delta: f64) -> f32 {
 /// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
+    animate: AnimatedPositions,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
@@ -641,11 +686,10 @@ pub(super) fn animate_entities(
 /// # Arguments
 ///
 /// * `windows` - A `Populated` query for `(&mut Window, Entity, &ResizeMarker)` components.
-/// * `active_display` - An `ActiveDisplay` system parameter providing immutable access to the active display.
 /// * `commands` - Bevy commands to remove the `ResizeMarker` when resizing is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
-    animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
+    animate: AnimatedSizes,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
@@ -759,133 +803,9 @@ pub(crate) fn pump_events(
     received_events.extend(pending_mouse.take());
     messages.write_batch(received_events);
 
-    if drained {
-        let frame_active = activity.mid_frame();
-        let low_power = low_power_mode.is_some_and(|low_power| low_power.0);
-        let timeout_limit = if frame_active {
-            LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
-        } else if low_power {
-            LOOP_MAX_TIMEOUT_LOWPOWER_MS
-        } else {
-            LOOP_MAX_TIMEOUT_MS
-        };
-        *timeout = timeout.min(timeout_limit) + LOOP_TIMEOUT_STEP;
-    } else {
-        // Still backed up: come straight back rather than sleeping on it.
-        *timeout = LOOP_TIMEOUT_STEP;
-    }
-}
-
-#[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn window_resized_update_frame(
-    mut messages: MessageReader<Event>,
-    mut windows: ResizableWindows,
-    mut workspaces: Query<(&LayoutStrip, &mut Position)>,
-) {
-    for event in messages.read() {
-        let Event::WindowResized { window_id } = event else {
-            continue;
-        };
-
-        let Some((mut window, entity, position, mut bounds, visibility, resizing)) = windows
-            .iter_mut()
-            .find(|window| window.0.id() == *window_id)
-        else {
-            continue;
-        };
-        if visibility.is_some() {
-            continue;
-        }
-        // Our own resize, echoed back: `commit_window_size` requested this size
-        // and `animate_resize_entities` is still stepping toward it, so reading
-        // the echo in here would fight the animation producing that difference.
-        // Only a resize we did not initiate is new information.
-        if resizing {
-            continue;
-        }
-        let Ok(new_frame) = window.update_frame() else {
-            continue;
-        };
-        let active_strip = workspaces
-            .iter_mut()
-            .find(|(strip, _)| strip.contains(entity));
-        let tabbed = active_strip
-            .as_ref()
-            .is_some_and(|strip| strip.0.tabbed(entity));
-
-        let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
-        if old_frame.size() != new_frame.size() {
-            if tabbed {
-                bounds.bypass_change_detection().0 = new_frame.size();
-            } else {
-                bounds.0 = new_frame.size();
-            }
-        }
-
-        // If the window was resized, shift LayoutStrip slightly to avoid moving right corner.
-        let Some((strip, mut strip_position)) = active_strip else {
-            // Floating window, don't nudge the strip.
-            continue;
-        };
-        if tabbed {
-            // Native tabs share a single layout slot. Keep the strip anchored
-            // and let the tab sync/layout systems propagate the new size.
-            continue;
-        }
-
-        if old_frame.min.x != new_frame.min.x {
-            let shift = (old_frame.size() - new_frame.size()).with_y(0);
-            // Search marke: reposition_entity - Updating position directly to reduce jitter.
-            strip_position.0.x += shift.x;
-        }
-
-        // When the user drags the top edge of a stacked window, we adjust the window above to
-        // accomodate.
-        let diff = old_frame.min.y - new_frame.min.y;
-        if diff.abs() > 0
-            && let Some(above_entity) = strip.above(entity)
-            && let Ok((_, _, _, mut above_bounds, _, _)) = windows.get_mut(above_entity)
-            && above_bounds.0.y - diff > 200
-        {
-            above_bounds.0.y -= diff;
-        }
-    }
-}
-
-#[instrument(level = Level::TRACE, skip_all)]
-pub(crate) fn window_moved_update_frame(
-    mut messages: MessageReader<Event>,
-    mut windows: MovableWindows,
-) {
-    for event in messages.read() {
-        let Event::WindowMoved { window_id } = event else {
-            continue;
-        };
-
-        let Some((mut window, mut position, bounds, visibility, repositioning)) = windows
-            .iter_mut()
-            .find(|window| window.0.id() == *window_id)
-        else {
-            continue;
-        };
-        if visibility.is_some() {
-            continue;
-        }
-        // Our own move, echoed back: `animate_entities` lerps from the current
-        // `Position`, so overwriting it with the echoed frame mid-animation
-        // restarts each step from behind, and the two chase each other.
-        if repositioning {
-            continue;
-        }
-        let Ok(new_frame) = window.update_frame() else {
-            continue;
-        };
-
-        let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
-        if old_frame.min != new_frame.min {
-            position.0 = new_frame.min;
-        }
-    }
+    let frame_active = activity.mid_frame();
+    let low_power = low_power_mode.is_some_and(|low_power| low_power.0);
+    *timeout = next_pump_timeout(*timeout, drained, frame_active, low_power);
 }
 
 pub(crate) fn gather_initial_processes(
@@ -976,8 +896,16 @@ pub(crate) fn gather_initial_processes(
 #[derive(Default)]
 pub(super) struct OverlayWindowConfigCache {
     window_id: Option<WinID>,
+    application: Option<Entity>,
+    incarnation: Option<WindowIncarnation>,
     focused_border_radius: Option<f64>,
     detected_border_radius: Option<f64>,
+}
+
+impl OverlayWindowConfigCache {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1003,9 +931,48 @@ fn is_overlay_target(state: OverlayTargetState) -> bool {
         }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlayDisposition {
+    Render,
+    Hide,
+    Remove,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlayWorkspaceState {
+    Missing,
+    Suppressed,
+    Active,
+}
+
+fn overlay_disposition(
+    enabled: bool,
+    workspace: OverlayWorkspaceState,
+    has_target: bool,
+) -> OverlayDisposition {
+    if !enabled || matches!(workspace, OverlayWorkspaceState::Missing) {
+        OverlayDisposition::Remove
+    } else if matches!(workspace, OverlayWorkspaceState::Suppressed) {
+        OverlayDisposition::Hide
+    } else if !has_target {
+        OverlayDisposition::Remove
+    } else {
+        OverlayDisposition::Render
+    }
+}
+
+fn confirmed_overlay_frame(observed: Option<&ObservedWindowFrame>) -> Option<IRect> {
+    observed.map(|frame| frame.0)
+}
+
 #[cfg(test)]
 mod overlay_target_tests {
-    use super::{OverlayLayoutMode, OverlayTargetState, is_overlay_target};
+    use super::{
+        OverlayDisposition, OverlayLayoutMode, OverlayTargetState, OverlayWorkspaceState,
+        confirmed_overlay_frame, is_overlay_target, overlay_disposition,
+    };
+    use crate::ecs::ObservedWindowFrame;
+    use bevy::math::{IRect, IVec2};
 
     #[test]
     fn accepts_visible_tiled_or_floating_focus_in_active_space() {
@@ -1041,6 +1008,65 @@ mod overlay_target_tests {
         state.in_active_space = true;
         assert!(!is_overlay_target(state));
     }
+
+    #[test]
+    fn overlay_lifecycle_removes_when_configuration_is_disabled() {
+        assert_eq!(
+            overlay_disposition(false, OverlayWorkspaceState::Active, true),
+            OverlayDisposition::Remove
+        );
+    }
+
+    #[test]
+    fn overlay_lifecycle_removes_without_an_active_workspace() {
+        assert_eq!(
+            overlay_disposition(true, OverlayWorkspaceState::Missing, true),
+            OverlayDisposition::Remove
+        );
+    }
+
+    #[test]
+    fn overlay_lifecycle_removes_when_the_target_disappears() {
+        assert_eq!(
+            overlay_disposition(true, OverlayWorkspaceState::Active, false),
+            OverlayDisposition::Remove
+        );
+    }
+
+    #[test]
+    fn overlay_lifecycle_hides_only_for_temporary_suppression() {
+        assert_eq!(
+            overlay_disposition(true, OverlayWorkspaceState::Suppressed, true),
+            OverlayDisposition::Hide
+        );
+        assert_eq!(
+            overlay_disposition(true, OverlayWorkspaceState::Active, true),
+            OverlayDisposition::Render
+        );
+    }
+
+    #[test]
+    fn overlay_geometry_requires_a_confirmed_observed_frame() {
+        let frame = IRect::from_corners(IVec2::new(10, 20), IVec2::new(310, 220));
+        let observed = ObservedWindowFrame(frame);
+
+        assert_eq!(confirmed_overlay_frame(Some(&observed)), Some(frame));
+        assert_eq!(confirmed_overlay_frame(None), None);
+    }
+}
+
+#[cfg(test)]
+mod event_pump_timing_tests {
+    use super::next_pump_timeout;
+
+    #[test]
+    fn active_window_animation_does_not_sleep_away_its_frame_budget() {
+        assert_eq!(
+            next_pump_timeout(16, true, true, false),
+            1,
+            "window animation must return to layout and AX presentation without first waiting a full frame"
+        );
+    }
 }
 
 #[derive(SystemParam)]
@@ -1048,120 +1074,193 @@ pub(super) struct OverlayInputs<'w, 's> {
     windows: Windows<'w, 's>,
     focus: Res<'w, FocusCoordinator>,
     applications: Query<'w, 's, &'static Application>,
+    observed_frames: Query<'w, 's, &'static ObservedWindowFrame>,
     window_manager: Res<'w, WindowManager>,
     mission_control_active: Res<'w, MissionControlActive>,
     config: Res<'w, Config>,
 }
 
+fn resolve_overlay_target(
+    inputs: &OverlayInputs,
+    active_strip: &LayoutStrip,
+) -> crate::errors::Result<Option<(NSRect, Entity)>> {
+    let Some(entity) = inputs.focus.snapshot().confirmed_entity() else {
+        return Ok(None);
+    };
+    let Some((window, _, state)) = inputs.windows.get_tracked(entity) else {
+        return Ok(None);
+    };
+    let Some(frame) = confirmed_overlay_frame(inputs.observed_frames.get(entity).ok()) else {
+        return Ok(None);
+    };
+    let floating = state.is_floating();
+    let in_active_space = if floating {
+        inputs
+            .window_manager
+            .windows_in_workspace(active_strip.id())?
+            .contains(&window.id())
+    } else {
+        true
+    };
+    let target = OverlayTargetState {
+        mode: if floating {
+            OverlayLayoutMode::Floating
+        } else {
+            OverlayLayoutMode::Tiled
+        },
+        eligible: state.is_visible() && !window.is_full_screen(),
+        in_active_strip: active_strip.contains(entity),
+        in_active_space,
+    };
+    if !is_overlay_target(target) {
+        return Ok(None);
+    }
+
+    let h_pad = window.horizontal_padding();
+    let v_pad = window.vertical_padding();
+    let frame = NSRect::new(
+        NSPoint::new(
+            f64::from(frame.min.x + h_pad),
+            f64::from(frame.min.y + v_pad),
+        ),
+        NSSize::new(
+            f64::from(frame.width() - 2 * h_pad),
+            f64::from(frame.height() - 2 * v_pad),
+        ),
+    );
+    Ok(Some((frame, entity)))
+}
+
+fn overlay_border_params(
+    inputs: &OverlayInputs,
+    window: &Window,
+    application: Entity,
+    cache: &mut OverlayWindowConfigCache,
+) -> Option<crate::overlay::BorderParams> {
+    use crate::overlay::BorderParams;
+
+    if cache.window_id != Some(window.id())
+        || cache.application != Some(application)
+        || cache.incarnation != Some(window.incarnation())
+        || inputs.config.is_changed()
+    {
+        let app = inputs.applications.get(application).ok()?;
+        let properties = WindowProperties::new(app, window, &inputs.config);
+        cache.window_id = Some(window.id());
+        cache.application = Some(application);
+        cache.incarnation = Some(window.incarnation());
+        cache.focused_border_radius = properties.border_radius();
+        cache.detected_border_radius = window.border_radius();
+    }
+
+    let calculated_radius = match inputs.config.border_radius() {
+        BorderRadiusOption::Auto => cache.detected_border_radius.unwrap_or(10.0),
+        BorderRadiusOption::Value(value) => value.max(0.0),
+    };
+    Some(BorderParams {
+        color: inputs.config.border_color(),
+        opacity: inputs.config.border_opacity(),
+        width: inputs.config.border_width(),
+        radius: cache.focused_border_radius.unwrap_or(calculated_radius),
+    })
+}
+
 pub(super) fn update_overlays(
-    // Gating lives in the `overlay_dirty` run condition (strip change *or*
-    // focus change); this query just resolves the current active workspace.
-    active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
+    // Gating lives in the `overlay_dirty` run condition; this query just
+    // resolves the current active workspace.
+    active_workspace: Query<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
     inputs: OverlayInputs,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mut window_config_cache: Local<OverlayWindowConfigCache>,
 ) {
-    use crate::overlay::BorderParams;
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
-
     let Some(mut overlay_mgr) = overlay_mgr else {
         return;
     };
 
     let dim_opacity = inputs.config.dim_inactive_opacity();
     let border_enabled = inputs.config.border_active_window();
+    let enabled = dim_opacity != 0.0 || border_enabled;
 
     // Hide overlays during swipe, mission control, native fullscreen spaces,
     // or briefly after a space change (macOS space-switch animation).
-    let Some((swiping, active_strip)) = active_workspace.iter().next() else {
-        return;
+    let active_workspace = active_workspace.iter().next();
+    let workspace_state = match active_workspace {
+        None => OverlayWorkspaceState::Missing,
+        Some((swiping, strip))
+            if swiping || inputs.mission_control_active.0 || strip.is_fullscreen() =>
+        {
+            OverlayWorkspaceState::Suppressed
+        }
+        Some(_) => OverlayWorkspaceState::Active,
+    };
+    match overlay_disposition(enabled, workspace_state, true) {
+        OverlayDisposition::Remove => {
+            overlay_mgr.remove_all();
+            window_config_cache.clear();
+            return;
+        }
+        OverlayDisposition::Hide => {
+            overlay_mgr.hide_all();
+            window_config_cache.clear();
+            return;
+        }
+        OverlayDisposition::Render => {}
+    }
+    let Some((_, active_strip)) = active_workspace else {
+        unreachable!("overlay disposition rejects a missing active workspace")
     };
 
-    if swiping || inputs.mission_control_active.0 || active_strip.is_fullscreen() {
-        overlay_mgr.hide_all();
-        return;
-    }
-
-    if dim_opacity == 0.0 && !border_enabled {
+    // Tiled membership belongs to ECS; floating Space membership belongs to
+    // macOS. Both require a confirmed observed frame.
+    let overlay_target = match resolve_overlay_target(&inputs, active_strip) {
+        Ok(target) => target,
+        Err(error) => {
+            // Space membership is a transient private-API read. Preserve the
+            // overlay allocation and retry on the periodic refresh instead of
+            // turning one failed query into a persistent missing border.
+            warn!(%error, "unable to resolve overlay target in active Space");
+            overlay_mgr.hide_all();
+            window_config_cache.clear();
+            return;
+        }
+    };
+    if overlay_disposition(
+        enabled,
+        OverlayWorkspaceState::Active,
+        overlay_target.is_some(),
+    ) == OverlayDisposition::Remove
+    {
+        // The target is no longer part of the authoritative inventory. Destroy
+        // the surfaces so a missed close notification cannot leave a ghost border.
         overlay_mgr.remove_all();
+        window_config_cache.clear();
         return;
     }
-
-    let active_space_windows = inputs
-        .window_manager
-        .windows_in_workspace(active_strip.id())
-        .unwrap_or_default();
-
-    // Resolve the focused tracked window. Tiled membership belongs to ECS;
-    // floating Space membership belongs to macOS.
-    let visual_focus = inputs
-        .focus
-        .snapshot()
-        .confirmed_window_id()
-        .and_then(|window_id| inputs.windows.find(window_id));
-    let (focused_abs_cg, focused_window_id) = if let Some((window, entity, state)) =
-        visual_focus.and_then(|(_, entity)| inputs.windows.get_tracked(entity))
-        && is_overlay_target(OverlayTargetState {
-            mode: if state.is_floating() {
-                OverlayLayoutMode::Floating
-            } else {
-                OverlayLayoutMode::Tiled
-            },
-            eligible: state.is_visible() && !window.is_full_screen(),
-            in_active_strip: active_strip.contains(entity),
-            in_active_space: active_space_windows.contains(&window.id()),
-        }) {
-        let frame = window.frame();
-        let h_pad = window.horizontal_padding();
-        let v_pad = window.vertical_padding();
-        let focused_abs_cg = Some(NSRect::new(
-            NSPoint::new(
-                f64::from(frame.min.x + h_pad),
-                f64::from(frame.min.y + v_pad),
-            ),
-            NSSize::new(
-                f64::from(frame.width() - 2 * h_pad),
-                f64::from(frame.height() - 2 * v_pad),
-            ),
-        ));
-
-        (focused_abs_cg, window.id())
-    } else {
-        // No tracked window on the active Space has focus: hide the overlay rather than
-        // dimming everything or drawing a ghost border around an off-screen window.
-        overlay_mgr.hide_all();
+    let Some((focused_abs_cg, focused_entity)) = overlay_target else {
+        unreachable!("overlay disposition rejects a missing target")
+    };
+    let Some((focused_window, _, focused_application)) = inputs.windows.get_parent(focused_entity)
+    else {
+        overlay_mgr.remove_all();
+        window_config_cache.clear();
         return;
     };
+    let focused_window_id = focused_window.id();
 
     let border_params = if border_enabled {
-        if window_config_cache.window_id != Some(focused_window_id) || inputs.config.is_changed() {
-            let Some((window, _, parent)) = inputs.windows.find_parent(focused_window_id) else {
-                return;
-            };
-            let Ok(app) = inputs.applications.get(parent) else {
-                return;
-            };
-            let properties = WindowProperties::new(app, window, &inputs.config);
-            window_config_cache.window_id = Some(focused_window_id);
-            window_config_cache.focused_border_radius = properties.border_radius();
-            window_config_cache.detected_border_radius = window.border_radius();
-        }
-
-        let calculated_radius = match inputs.config.border_radius() {
-            BorderRadiusOption::Auto => window_config_cache.detected_border_radius.unwrap_or(10.0),
-            BorderRadiusOption::Value(value) => value.max(0.0),
+        let Some(params) = overlay_border_params(
+            &inputs,
+            focused_window,
+            focused_application,
+            &mut window_config_cache,
+        ) else {
+            overlay_mgr.remove_all();
+            window_config_cache.clear();
+            return;
         };
-
-        Some(BorderParams {
-            color: inputs.config.border_color(),
-            opacity: inputs.config.border_opacity(),
-            width: inputs.config.border_width(),
-            radius: window_config_cache
-                .focused_border_radius
-                .unwrap_or(calculated_radius),
-        })
+        Some(params)
     } else {
-        window_config_cache.window_id = None;
+        window_config_cache.clear();
         None
     };
 
@@ -1169,39 +1268,121 @@ pub(super) fn update_overlays(
     overlay_mgr.update(
         dim_opacity,
         dim_color,
-        focused_abs_cg,
+        Some(focused_abs_cg),
         Some(focused_window_id),
         border_params.as_ref(),
     );
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn commit_window_position(
-    mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
+pub(super) fn commit_window_frame(
+    mut windows: PendingWindowFrames,
+    layout_strips: Query<(&LayoutStrip, &ChildOf), Without<PendingSpaceDestruction>>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
+    config: Res<Config>,
+    settling: Res<super::window_geometry::WindowGeometrySettling>,
+    mut commands: Commands,
 ) {
-    moved_windows
-        .par_iter_mut()
-        .for_each(|(mut window, position)| window.reposition(position.0));
+    for (entity, mut window, presented, desired, mut width_ratio, observed, floating) in
+        &mut windows
+    {
+        let native_fullscreen = layout_strips
+            .iter()
+            .any(|(strip, _)| strip.is_fullscreen() && strip.contains(entity));
+        if native_fullscreen || window.try_is_full_screen().unwrap_or(true) {
+            continue;
+        }
+        if settling.contains(entity) {
+            continue;
+        }
+        let target = presented.0;
+        if !floating
+            && let Some(display_width) = layout_strips
+                .iter()
+                .find_map(|(strip, child)| strip.contains(entity).then_some(child.parent()))
+                .and_then(|display_entity| displays.get(display_entity).ok())
+                .map(|(display, dock)| display.actual_display_bounds(dock, &config).width())
+                .filter(|width| *width > 0)
+        {
+            let desired_ratio = f64::from(desired.0.width()) / f64::from(display_width);
+            if (width_ratio.0 - desired_ratio).abs() > f64::EPSILON {
+                width_ratio.0 = desired_ratio;
+            }
+        }
+        let observed_frame = observed.as_ref().map(|observed| observed.0);
+        let needs_size_write =
+            observed_frame.is_none_or(|observed| observed.size() != target.size());
+        let height_only_resize = observed_frame.is_some_and(|observed| {
+            observed.min == target.min
+                && observed.width() == target.width()
+                && observed.height() != target.height()
+        });
+        let result = if height_only_resize {
+            // Dock/menu-bar changes commonly alter only the usable height.
+            // Avoid the complete frame sequence (size/read/position/size/read)
+            // unless AX unexpectedly moves the origin or the width also changes.
+            window.resize_preserving_origin(target)
+        } else if needs_size_write {
+            // A size write may move the window. Supply the complete presented
+            // frame so position and size remain one atomic projection.
+            window.set_frame(target)
+        } else {
+            window.reposition(target.min)
+        };
+
+        match result {
+            Ok(frame) => {
+                if let Some(mut observed) = observed {
+                    if observed.0 != frame {
+                        observed.0 = frame;
+                    }
+                } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(ObservedWindowFrame(frame));
+                }
+            }
+            Err(error) => {
+                warn!(window_id = window.id(), %error, "unable to commit window frame");
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<ObservedWindowFrame>();
+                }
+            }
+        }
+    }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn verify_window_position(
-    mut windows: Populated<(Entity, &mut Window, &Position, &mut VerifyWindowPosition)>,
+    mut windows: PositionVerificationWindows,
     mut commands: Commands,
 ) {
-    for (entity, mut window, position, mut verification) in &mut windows {
-        if window
-            .update_frame()
-            .is_ok_and(|frame| frame.min == position.0)
-        {
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<VerifyWindowPosition>();
+    for (entity, mut window, desired, mut verification, mut observed) in &mut windows {
+        let mut confirmed_frame = window.update_frame().ok();
+        let already_positioned = confirmed_frame.is_some_and(|frame| frame.min == desired.0.min);
+
+        if !already_positioned {
+            match window.reposition(desired.0.min) {
+                Ok(frame) => confirmed_frame = Some(frame),
+                Err(error) => {
+                    warn!(window_id = window.id(), %error, "unable to retry window position");
+                    confirmed_frame = None;
+                }
             }
-            continue;
         }
 
-        window.reposition(position.0);
-        if verification.tick()
+        if let Some(frame) = confirmed_frame {
+            if let Some(observed) = observed.as_deref_mut() {
+                if observed.0 != frame {
+                    observed.0 = frame;
+                }
+            } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert(ObservedWindowFrame(frame));
+            }
+        } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<ObservedWindowFrame>();
+        }
+
+        let positioned = confirmed_frame.is_some_and(|frame| frame.min == desired.0.min);
+        if (positioned || verification.tick())
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
             entity_commands.try_remove::<VerifyWindowPosition>();
@@ -1209,27 +1390,12 @@ pub(super) fn verify_window_position(
     }
 }
 
-#[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn commit_window_size(
-    active_display: ActiveDisplay,
-    mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
-) {
-    let display_bounds = active_display.bounds();
-    resized_windows
-        .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
-            window.resize(size.0);
-        });
-}
-
-/// Restores user-visible window state before Spool shuts down: clears any
-/// brightness dim, removes the dim/border overlay window, and centers every
-/// tracked window on the display its frame center falls in.
+/// Clears visual effects owned by Spool before shutdown. Launch-frame
+/// restoration is handled separately in the final schedule so no layout or
+/// animation system can overwrite it.
 pub(super) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<&mut Window>,
-    displays: Query<&Display>,
+    all_windows: Query<&Window>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
 ) {
@@ -1240,48 +1406,6 @@ pub(super) fn cleanup_on_exit(
 
         if let Some(ref mut overlay_mgr) = overlay_mgr {
             overlay_mgr.remove_all();
-        }
-
-        let display_bounds = displays.iter().map(Display::bounds).collect::<Vec<_>>();
-        if display_bounds.is_empty() {
-            return;
-        }
-
-        for mut window in &mut all_windows {
-            let frame = window.frame();
-            let center = frame.center();
-            let bounds = display_bounds
-                .iter()
-                .find(|b| {
-                    center.x >= b.min.x
-                        && center.x <= b.max.x
-                        && center.y >= b.min.y
-                        && center.y <= b.max.y
-                })
-                .copied()
-                .unwrap_or(display_bounds[0]);
-
-            let mut size = frame.size();
-            if size.x > bounds.width() || size.y > bounds.height() {
-                let new_size = bevy::math::IVec2::new(
-                    size.x.min(bounds.width() * 9 / 10),
-                    size.y.min(bounds.height() * 9 / 10),
-                );
-                window.resize(new_size);
-                size = new_size;
-            }
-
-            let origin = bevy::math::IVec2::new(
-                bounds.min.x + (bounds.width() - size.x) / 2,
-                bounds.min.y + (bounds.height() - size.y) / 2,
-            );
-            info!(
-                "exit cleanup: window {} -> origin {:?}, size {:?}",
-                window.id(),
-                origin,
-                size
-            );
-            window.reposition(origin);
         }
     }
 }
@@ -1368,14 +1492,14 @@ pub(crate) fn window_creation_event(mut messages: MessageReader<Event>, mut comm
             })
             .map(|window| Window::new(Box::new(window)))
         {
-            commands.trigger(SpawnWindowTrigger(vec![window]));
+            commands.trigger(SpawnWindowTrigger::new(vec![window]));
         }
     }
 }
 
 pub(crate) fn detect_tabbed_windows(
-    created: Populated<(Entity, &Position, &Bounds, &ChildOf), Added<Window>>,
-    windows: Query<(Entity, &Window, &Position, &Bounds, &ChildOf), With<Window>>,
+    created: Populated<(Entity, &ObservedWindowFrame, &ChildOf), Added<Window>>,
+    windows: Query<(Entity, &Window, &ObservedWindowFrame, &ChildOf), With<Window>>,
     apps: Query<Entity, With<Application>>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
@@ -1390,7 +1514,7 @@ pub(crate) fn detect_tabbed_windows(
         return;
     };
 
-    for (entity, Position(position), Bounds(bounds), child) in created {
+    for (entity, ObservedWindowFrame(frame), child) in created {
         let Ok(app_entity) = apps.get(child.parent()) else {
             continue;
         };
@@ -1400,35 +1524,35 @@ pub(crate) fn detect_tabbed_windows(
         let mut same_size = workspace_entities
             .iter()
             .filter_map(|e| windows.get(*e).ok())
-            .filter(|(leader, _, _, Bounds(leader_bounds), child)| {
+            .filter(|(leader, _, leader_frame, child)| {
                 *leader != entity
                     && child.parent() == app_entity
-                    && leader_bounds.chebyshev_distance(*bounds) <= 1
+                    && leader_frame.0.size().chebyshev_distance(frame.size()) <= 1
             })
             .collect::<Vec<_>>();
 
         // Now check whether any of these found windows have the same position?
         let tabbed = same_size
             .iter()
-            .find_map(|(leader, window, Position(leader_position), _, _)| {
+            .find_map(|(leader, window, leader_frame, _)| {
                 // If the window has a positional match, it's tabbed!
-                (leader_position.chebyshev_distance(*position) <= 1)
+                (leader_frame.0.min.chebyshev_distance(frame.min) <= 1)
                     .then_some((*leader, window.id()))
             })
             .or_else(|| {
                 // Otherwise if no windows were found by position, sort all the windows by distance
                 // and then pick the one which is currently offscreen.
                 // This heuristic relaxes the position matching, because the window is bumped into view.
-                same_size.sort_by_key(|(_, _, Position(candidate_position), _, _)| {
-                    position.x.abs_diff(candidate_position.x)
+                same_size.sort_by_key(|(_, _, candidate_frame, _)| {
+                    frame.min.x.abs_diff(candidate_frame.0.min.x)
                 });
-                same_size.into_iter().find_map(
-                    |(leader, window, Position(leader_position), Bounds(leader_bounds), _)| {
-                        let offscreen = !display_bounds.contains(*leader_position)
-                            || !display_bounds.contains(*leader_position + leader_bounds);
+                same_size
+                    .into_iter()
+                    .find_map(|(leader, window, leader_frame, _)| {
+                        let offscreen = !display_bounds.contains(leader_frame.0.min)
+                            || !display_bounds.contains(leader_frame.0.max);
                         offscreen.then_some((leader, window.id()))
-                    },
-                )
+                    })
             });
 
         if let Some((leader, leader_id)) = tabbed

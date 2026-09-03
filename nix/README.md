@@ -37,8 +37,7 @@ expose the same following options:
 | `services.spool.config` | `null`, lines, or path | `null` | Spool's `init.lua` (Lua source or a file). Written to `$XDG_CONFIG_HOME/spool/init.lua` (or `~/.spool.lua`). Mirrors Home Manager's `services.sketchybar.config`. A `spool.setup{...}` here takes precedence over `settings`. Requires `luaConfig.enable`. |
 | `services.spool.settings` | `null` or `attribute set` | `null` | Spool TOML configuration (See [`CONFIGURATION.md`](/CONFIGURATION.md)) |
 | `services.spool.extraPackages` | `list of package` | `[ ]` | Extra packages on spool's `PATH` at runtime (e.g. `sketchybar`). |
-| `services.spool.luaConfig.enable` | `boolean` | `true` | Whether `package` is built with the embedded Lua scripting runtime (`init.lua`) compiled in. Only takes effect when `package` is left at its default. |
-| `services.spool.lua` | `package` | `package.luaModule.lua` | The Lua interpreter `extraLuaPackages` are resolved against. |
+| `services.spool.luaConfig.enable` | `boolean` | `true` | Whether `package` is built with the complete Lua capability, including the embedded vendored LuaJIT and `init.lua`. Only takes effect when `package` is left at its default. |
 | `services.spool.extraLuaPackages` | `function` | `luaPs: [ ]` | Extra Lua packages available to `init.lua` via `require(...)` (e.g. [sbarlua](https://github.com/FelixKratz/SbarLua)). Same shape as Home Manager's `programs.sketchybar.extraLuaPackages` — a function from a Lua package set to a list of derivations. |
 
 #### Example

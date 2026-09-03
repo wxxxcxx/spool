@@ -1,9 +1,10 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::With;
+use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Query, Res, ResMut, Single, SystemParam};
+use bevy::ecs::system::{Commands, Local, Query, Res, ResMut, SystemParam};
+use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
@@ -13,14 +14,18 @@ use crate::config::Config;
 use crate::ecs::focus::{FocusCoordinator, FocusSignal};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
+use crate::ecs::reconcile::WindowUnavailable;
+use crate::ecs::window_geometry::WindowGeometrySettling;
+use crate::ecs::workspace::WindowSpaceReassignmentPending;
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling,
-    SpawnCommandsExt,
+    ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, MissionControlActive,
+    ObservedWindowFrame, Position, PresentedWindowFrame, Scrolling, SpawnCommandsExt,
+    WindowFrameMotion,
 };
 use bevy::ecs::schedule::common_conditions::on_message;
 
 use crate::events::{Event, InputEvent};
-use crate::manager::{Display, Origin, WindowManager, origin_from};
+use crate::manager::{Display, Origin, Window, WindowManager, origin_from};
 use crate::platform::WinID;
 use crate::util::round_px;
 
@@ -51,7 +56,7 @@ impl Plugin for MouseEventsPlugin {
                     mouse_down_trigger,
                 )
                     .run_if(mission_control_inactive),
-                mouse_up_trigger,
+                mouse_up_trigger.after(super::window_geometry::observe_external_window_geometry),
                 horizontal_warp_mouse_trigger,
             )
                 .run_if(on_message::<InputEvent>),
@@ -273,6 +278,7 @@ fn mouse_down_trigger(mut messages: MessageReader<InputEvent>, mut ctx: MouseDow
 fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
     mouse_held: Query<(Entity, &MouseHeldMarker)>,
+    mut settling: ResMut<WindowGeometrySettling>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -281,7 +287,9 @@ fn mouse_up_trigger(
         }
 
         for (held_entity, marker) in &mouse_held {
-            commands.reshuffle_around(marker.0);
+            if !settling.defer_reshuffle(marker.0) {
+                commands.reshuffle_around(marker.0);
+            }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
             }
@@ -295,15 +303,49 @@ pub(super) struct MouseResizeState {
     window_id: Option<WinID>,
 }
 
+type MouseResizeWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        Entity,
+        &'static mut Position,
+        &'static mut Bounds,
+        &'static mut DesiredWindowFrame,
+        &'static mut PresentedWindowFrame,
+        Option<&'static mut ObservedWindowFrame>,
+        Has<crate::ecs::Floating>,
+    ),
+    (
+        Without<LayoutStrip>,
+        Without<WindowUnavailable>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
+>;
+
+#[derive(SystemParam)]
+struct MouseResizeCtx<'w, 's> {
+    windows: MouseResizeWindows<'w, 's>,
+    window_manager: Res<'w, WindowManager>,
+    config: Res<'w, Config>,
+    time: Res<'w, Time>,
+    settling: ResMut<'w, WindowGeometrySettling>,
+    commands: Commands<'w, 's>,
+}
+
 fn mouse_resize_trigger(
     mut messages: MessageReader<InputEvent>,
-    windows: Windows,
-    active_workspace: Single<(Entity, &LayoutStrip, &Position), With<ActiveWorkspaceMarker>>,
-    window_manager: Res<WindowManager>,
-    config: Res<Config>,
+    ctx: MouseResizeCtx,
     mut state: Local<MouseResizeState>,
-    mut commands: Commands,
 ) {
+    let MouseResizeCtx {
+        mut windows,
+        window_manager,
+        config,
+        time,
+        mut settling,
+        mut commands,
+    } = ctx;
     for InputEvent(event) in messages.read() {
         let Event::MouseMoved { point, modifiers } = event else {
             continue;
@@ -340,33 +382,64 @@ fn mouse_resize_trigger(
             window_id
         };
 
-        let Some((window, entity)) = windows.find(window_id) else {
+        let Some((
+            mut window,
+            entity,
+            mut position,
+            mut bounds,
+            mut desired,
+            mut presented,
+            observed,
+            floating,
+        )) = windows
+            .iter_mut()
+            .find(|(window, ..)| window.id() == window_id)
+        else {
             continue;
         };
-        let (strip_entity, strip, strip_position) = *active_workspace;
-        let floating = !strip.contains(entity);
 
         let mut frame = window.frame();
+        let start = IRect::from_corners(position.0, position.0 + bounds.0);
         let center = frame.center();
 
         if pointer.x < center.x {
-            if floating && let Some(mut origin) = windows.origin(entity) {
-                // For floating windows, move the window itself.
-                origin.x += dx;
-                commands.reposition_entity(entity, origin);
-            } else {
-                // Resize Left Edge: increase/decrease width AND shift the strip so the right edge stays
-                // anchored.
-                let mut origin = strip_position.0;
-                origin.x += dx;
-                commands.reposition_entity(strip_entity, origin);
-            }
-
             frame.min.x += dx;
         } else {
             frame.max.x += dx;
         }
-        commands.resize_entity(entity, frame.size());
+        if frame.width() <= 0 {
+            continue;
+        }
+
+        match window.set_frame(frame) {
+            Ok(confirmed) => {
+                if let Some(mut observed) = observed
+                    && observed.0 != confirmed
+                {
+                    observed.0 = confirmed;
+                }
+                if presented.0 != confirmed {
+                    presented.0 = confirmed;
+                }
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<WindowFrameMotion>();
+                }
+                if floating {
+                    if position.0 != confirmed.min {
+                        position.0 = confirmed.min;
+                    }
+                    if bounds.0 != confirmed.size() {
+                        bounds.0 = confirmed.size();
+                    }
+                    if desired.0 != confirmed {
+                        desired.0 = confirmed;
+                    }
+                } else {
+                    settling.record(entity, &window, start, confirmed, time.elapsed());
+                }
+            }
+            Err(error) => warn!(window_id, %error, "unable to apply mouse resize"),
+        }
     }
 }
 

@@ -403,11 +403,13 @@ fn test_window_server_close_of_live_app_closes_the_gap() {
         Event::WindowDestroyed {
             window_id: 1,
             source: DestroySource::WindowServer,
+            incarnation: None,
         },
     ];
 
     TestHarness::new()
         .with_windows(3)
+        .on_iteration(0, |_world, state| state.os_vanish_window(1))
         .on_iteration(1, |world, _state| {
             assert!(
                 !window_exists(world, 1),

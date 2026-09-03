@@ -148,19 +148,19 @@ impl TryFrom<&Event> for LuaEvent {
             Event::WindowFocused(observation) => LuaEvent::WindowFocused {
                 window_id: observation.window_id,
             },
-            Event::WindowMoved { window_id } => LuaEvent::WindowMoved {
+            Event::WindowMoved { window_id, .. } => LuaEvent::WindowMoved {
                 window_id: *window_id,
             },
-            Event::WindowResized { window_id } => LuaEvent::WindowResized {
+            Event::WindowResized { window_id, .. } => LuaEvent::WindowResized {
                 window_id: *window_id,
             },
-            Event::WindowMinimized { window_id } => LuaEvent::WindowMinimized {
+            Event::WindowMinimized { window_id, .. } => LuaEvent::WindowMinimized {
                 window_id: *window_id,
             },
-            Event::WindowDeminimized { window_id } => LuaEvent::WindowDeminimized {
+            Event::WindowDeminimized { window_id, .. } => LuaEvent::WindowDeminimized {
                 window_id: *window_id,
             },
-            Event::WindowTitleChanged { window_id } => LuaEvent::WindowTitleChanged {
+            Event::WindowTitleChanged { window_id, .. } => LuaEvent::WindowTitleChanged {
                 window_id: *window_id,
             },
 

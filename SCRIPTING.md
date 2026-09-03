@@ -2,6 +2,29 @@
 
 Spool embeds a Lua runtime, letting a script declare the entire configuration via `spool.setup{...}`, hook into window-manager events (`spool.on`), bind keys to Lua callbacks or command strings (`spool.bind`), query state, persist data across reloads, and programmatically manipulate window sets.
 
+This guide distinguishes two kinds of script:
+
+- A **configuration script** is the long-lived `init.lua` described below. It
+  declares configuration and registers callbacks inside the daemon's Lua
+  worker.
+- A **client script** is an on-demand program run with `spool script`. It gets
+  the socket-backed query, state, command, window-set, and subscription
+  interfaces, but not `setup`, `bind`, or `on`. Each invocation uses a fresh
+  Lua runtime in the CLI process, so it cannot block or mutate the
+  configuration runtime. The command is available in Lua-enabled builds,
+  including the default build.
+
+```shell
+spool script task.lua -- first-argument second-argument
+spool script -e 'print(spool.query_active().focused_window_title)'
+printf 'print(spool.state.get("mode"))' | spool script -
+```
+
+Arguments after `--` are available as `arg[1]`, `arg[2]`, and so on; `arg[0]`
+is the file name, `-e`, or `-`. Scripts control stdout themselves with
+`print`. The global `spool` and `require("spool")` return the same client
+module.
+
 ---
 
 ## 1. Getting Started
@@ -190,7 +213,12 @@ spool.state.mutate("count", function(n) return (n or 0) + 1 end)
 
 Reach for `mutate` whenever the new value depends on the old one. It reads, runs your function, and stores the result only if the value is still what it read; if something else modified it first, `mutate` re-runs your function against the new value.
 
-Keys are plain strings; values can be strings, numbers, booleans, or JSON-shaped tables. The store is saved in `$XDG_STATE_HOME/spool/script-state.json`.
+Keys are plain strings; values can be strings, numbers, booleans, or JSON-shaped tables. The store is saved in `$XDG_STATE_HOME/spool/script-state.json`. A client script reads and writes the same store:
+
+```shell
+spool script -e 'print(spool.state.get("pads.term"))'
+spool script -e 'spool.state.set("mode", "compact")'
+```
 
 ---
 

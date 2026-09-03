@@ -16,7 +16,7 @@ let
   cfg = config.services.spool;
   tomlFormat = pkgs.formats.toml { };
 
-  luaPackages = cfg.lua.pkgs;
+  luaPackages = cfg.package.luaModule.lua.pkgs;
   resolvedExtraLuaPackages = if cfg.luaConfig.enable then cfg.extraLuaPackages luaPackages else [ ];
   luaPaths = lib.optional (resolvedExtraLuaPackages != [ ]) (
     lib.concatMapStringsSep ";" luaPackages.getLuaPath resolvedExtraLuaPackages
@@ -103,31 +103,15 @@ in
           wrapSpool (
             cfg.package.override {
               enableLua = true;
-              lua = cfg.lua;
             }
           )
         else
           cfg.package.override { enableLua = false; };
       description = ''
         The final spool package that will be installed and run. This is
-        the result of `package.override { enableLua = ...; lua = ...; }`
-        (see `luaConfig.enable` and `lua`), so it may differ from
-        `package` if those options are set.
-      '';
-    };
-
-    lua = lib.mkOption {
-      type = lib.types.package;
-      default = cfg.package.luaModule.lua;
-      defaultText = lib.literalExpression "config.services.spool.package.luaModule.lua";
-      description = ''
-        The Lua interpreter `extraLuaPackages` are resolved against.
-        Defaults to whichever interpreter `services.spool.package`'s
-        loadable Lua module was built for (see `spool.luaModule.override`
-        in `nix/package.nix`), so overriding `package` alone keeps this in
-        sync; override this directly if you need `extraLuaPackages` to
-        resolve against a different interpreter than `package` was built
-        with.
+        the result of `package.override { enableLua = ...; }` (see
+        `luaConfig.enable`), so it may differ from `package` when that option
+        is set.
       '';
     };
 
@@ -138,8 +122,8 @@ in
         description = ''
           Whether `services.spool.package` is built with the embedded Lua
           scripting runtime (`init.lua`, `spool.on`/`spool.bind`,
-          `spool.setup`) compiled in — the `lua` Cargo feature. Disable for
-          a build with no Lua dependency at all. Only takes effect when
+          `spool.setup`) and its vendored LuaJIT compiled in — the complete
+          `lua` Cargo feature. Disable for a build with no Lua dependency. Only takes effect when
           `package` is left at its default (an overrideable `spool.override
           { enableLua = ...; }` derivation); implies `extraLuaPackages` and
           `config` are ignored when `false`.

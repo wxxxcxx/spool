@@ -3,31 +3,6 @@ use std::path::Path;
 
 const DEFAULT_SDK: &str = "MacOSX.sdk";
 
-use cfg_if::cfg_if;
-
-macro_rules! lua_version_cfg_if {
-    ( $( $feat:literal => $ver:literal ),+ $(,)? ) => {
-        cfg_if! {
-            $(
-                if #[cfg(feature = $feat)] {
-                    pub(crate) const LUA_VERSION: &'static str = $ver;
-                } else
-            )+
-            {
-                pub(crate) const LUA_VERSION: &'static str = "unknown";
-            }
-        }
-    };
-}
-
-lua_version_cfg_if!(
-    "lua54" => "Lua 5.4",
-    "lua53" => "Lua 5.3",
-    "lua55" => "Lua 5.5",
-    "lua52" => "Lua 5.2",
-    "luajit" => "LuaJIT",
-);
-
 fn main() {
     let sdk_dir = std::env::var("DEVELOPER_DIR").map_or_else(
         |_| "/Library/Developer/CommandLineTools/SDKs".to_string(),
@@ -67,6 +42,6 @@ fn main() {
     }
 
     if cfg!(feature = "lua") {
-        println!("cargo:rustc-env=SPOOL_LUA_VERSION={LUA_VERSION}");
+        println!("cargo:rustc-env=SPOOL_LUA_VERSION=LuaJIT");
     }
 }

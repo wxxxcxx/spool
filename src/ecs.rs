@@ -10,7 +10,7 @@ use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
+use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor, SystemCondition as _};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
@@ -29,7 +29,7 @@ use crate::config::{CONFIGURATION_FILE, Config, WindowParams};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::state::SpoolState;
 use crate::errors::Result;
-use crate::events::{Event, EventSender, InputEvent};
+use crate::events::{Event, EventSender, FocusObservation, InputEvent};
 #[cfg(feature = "lua")]
 use crate::lua;
 use crate::manager::{
@@ -40,6 +40,7 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
+pub(crate) mod exit_restore;
 pub mod focus;
 pub mod layout;
 #[cfg(feature = "lua")]
@@ -54,7 +55,11 @@ pub mod scroll;
 pub mod state;
 pub(crate) mod systems;
 mod triggers;
+pub mod window_frame;
+pub(crate) mod window_geometry;
 pub mod workspace;
+
+pub use window_frame::{DesiredWindowFrame, PresentedWindowFrame, WindowFrameMotion};
 
 // Shared by the Lua reload system so a `spool.setup{...}` reload applies the
 // same menubar/passthrough side effects as a TOML reload.
@@ -72,15 +77,14 @@ pub(crate) use triggers::apply_config_side_effects;
 pub fn register_systems(app: &mut bevy::app::App) {
     const LOW_POWER_MODE_CHECK_SEC: u64 = 60;
 
+    app.init_resource::<reconcile::WindowStateSync>();
+    app.init_resource::<window_geometry::WindowGeometrySettling>();
+
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
             .iter()
             .next()
             .is_none_or(|marker| !marker.is_user_swiping)
-    };
-    let dimming_enabled = |config: Option<Res<Config>>| {
-        config
-            .is_some_and(|config| config.has_dim_inactive_color() || config.border_active_window())
     };
     // The overlay must refresh not just when the active strip's layout changes,
     // but also whenever focus moves, including focus loss, which otherwise
@@ -93,15 +97,27 @@ pub fn register_systems(app: &mut bevy::app::App) {
          workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
          focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>,
          focused_resized: Query<(), (With<FocusedMarker>, Changed<Bounds>)>,
+         observed_moved: Query<(), (With<FocusedMarker>, Changed<ObservedWindowFrame>)>,
+         config: Option<Res<Config>>,
          focus: Option<Res<focus::FocusCoordinator>>,
-         mut focus_lost: RemovedComponents<FocusedMarker>| {
+         mission_control: Option<Res<MissionControlActive>>,
+         mut focus_lost: RemovedComponents<FocusedMarker>,
+         mut workspace_lost: RemovedComponents<ActiveWorkspaceMarker>,
+         mut observed_lost: RemovedComponents<ObservedWindowFrame>,
+         mut window_removed: RemovedComponents<Window>| {
             !strip_changed.is_empty()
                 || !focus_gained.is_empty()
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
                 || !focused_resized.is_empty()
+                || !observed_moved.is_empty()
+                || config.is_some_and(|config| config.is_changed())
                 || focus.is_some_and(|focus| focus.is_changed())
+                || mission_control.is_some_and(|state| state.is_changed())
                 || focus_lost.read().next().is_some()
+                || workspace_lost.read().next().is_some()
+                || observed_lost.read().next().is_some()
+                || window_removed.read().next().is_some()
         };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
@@ -119,6 +135,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::window_creation_event,
             systems::pump_events,
             systems::demux_input_events.after(systems::pump_events),
+            exit_restore::begin_exit.after(systems::pump_events),
         ),
     );
     app.add_systems(
@@ -129,7 +146,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::detect_tabbed_windows.run_if(native_tabs_enabled),
                 triggers::apply_window_positions,
             )
-                .chain(),
+                .chain()
+                .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             (
                 systems::add_existing_process,
                 systems::add_existing_application,
@@ -146,13 +164,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(resource_exists::<LowPowerMode>)
                 .run_if(on_timer(Duration::from_secs(LOW_POWER_MODE_CHECK_SEC))),
             (
-                systems::window_resized_update_frame,
-                systems::window_moved_update_frame,
+                window_geometry::observe_external_window_geometry,
+                window_geometry::settle_external_window_geometry.run_if(not_swiping),
             )
-                .chain()
-                .run_if(not_swiping),
+                .chain(),
             systems::cleanup_on_exit,
-            reconcile::reconcile_windows,
+            reconcile::reconcile_windows
+                .after(window_geometry::settle_external_window_geometry)
+                .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             reconcile::confirm_unavailable_windows,
             systems::refresh_window_notifications,
             restore::tick_restore_grace,
@@ -165,29 +184,32 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_systems(
         PostUpdate,
         (
-            (
-                systems::animate_entities,
-                systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
-                systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
-            )
-                .chain(),
-            (
-                systems::animate_resize_entities,
-                systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
-            )
-                .chain(),
+            systems::animate_entities.run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
+            systems::animate_resize_entities
+                .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
+            window_frame::animate_presented_window_frames
+                .after(systems::animate_entities)
+                .after(systems::animate_resize_entities)
+                .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
+            systems::commit_window_frame
+                .after(window_frame::animate_presented_window_frames)
+                .run_if(not(resource_exists::<Initializing>))
+                .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
+            systems::verify_window_position
+                .after(systems::commit_window_frame)
+                .run_if(not(resource_exists::<Initializing>))
+                .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             (
                 systems::update_overlays
-                    .after(systems::animate_entities)
-                    .after(systems::animate_resize_entities)
-                    .run_if(dimming_enabled)
-                    .run_if(overlay_dirty),
+                    .after(systems::commit_window_frame)
+                    .run_if(overlay_dirty.or_eager(on_timer(Duration::from_secs(1)))),
                 systems::update_flash_messages,
             )
                 .chain(),
             crate::menubar::update_menu_bar.run_if(overlay_dirty),
         ),
     );
+    app.add_systems(Last, exit_restore::restore_launch_windows);
 }
 
 /// Registers all the event triggers for the window manager.
@@ -238,6 +260,30 @@ pub struct ActiveDisplayMarker;
 #[derive(Component)]
 pub struct FreshMarker;
 
+/// A concrete AX window moved to a different Application entity. Systems that
+/// derive rules and layout from the owning bundle treat this like a fresh
+/// window without changing its stable ECS identity.
+#[derive(Component)]
+pub(crate) struct WindowOwnershipChanged;
+
+/// Keeps default window rules pending until their AX geometry readback and the
+/// corresponding layout insertion both succeed. Transient AX failures leave
+/// this marker in place so the next update retries the complete operation.
+#[derive(Component)]
+pub(crate) struct WindowDefaultsPending;
+
+/// The window-rule/default phase completed successfully and the window may
+/// now be inserted into its layout strip. Kept separate from
+/// [`WindowDefaultsPending`] so a later successful probe cannot bypass a
+/// transient AX failure from the defaults phase in the same update.
+#[derive(Component)]
+pub(crate) struct WindowDefaultsApplied;
+
+/// A startup window is still owned by a native fullscreen Space, so its
+/// physical fullscreen frame must not be captured as tiled layout state.
+#[derive(Component)]
+pub(crate) struct FullscreenDefaultsDeferred;
+
 /// Marker component used to gather existing processes and windows during initialization.
 #[derive(Component)]
 pub struct ExistingMarker;
@@ -281,11 +327,24 @@ pub struct Scrolling {
 #[derive(Component, Clone, Debug, Default, Deref, DerefMut)]
 pub struct LayoutPosition(pub Origin);
 
+/// Compatibility origin used by the current `LayoutStrip` math.
+/// [`DesiredWindowFrame`] is the canonical rendered target.
 #[derive(Component, Clone, Debug, Deref, DerefMut)]
 pub struct Position(pub Origin);
 
+/// Logical size input used by the current `LayoutStrip` math.
+/// It is neither animation progress nor confirmed macOS geometry.
 #[derive(Component, Clone, Debug, Deref, DerefMut)]
 pub struct Bounds(pub Size);
+
+/// The most recent window frame successfully read back from macOS.
+///
+/// During animation or when an application constrains a write this may differ
+/// from both the desired and presented projections. Consumers that must follow
+/// the real surface, such as the focus border, use this projection instead of
+/// optimistic layout state or `WindowOS`'s write-through cache.
+#[derive(Component, Clone, Copy, Debug, Deref, DerefMut, PartialEq, Eq)]
+pub struct ObservedWindowFrame(pub bevy::math::IRect);
 
 #[derive(Component, Clone, Debug, Deref, DerefMut)]
 pub struct WidthRatio(pub f64);
@@ -382,7 +441,7 @@ impl Timeout {
 
 /// Component used as a retry mechanism for stray focus events that arrive before the target window is fully created.
 #[derive(Component)]
-pub struct StrayFocusEvent(pub WinID);
+pub struct StrayFocusEvent(pub FocusObservation);
 
 /// Component used as a retry mechanism when `focused_window_id()` fails during
 /// an `ApplicationFrontSwitched` event (e.g. transient `kAXErrorCannotComplete`).
@@ -391,6 +450,7 @@ pub struct RetryFrontSwitch {
     pub app_entity: Entity,
     pub generation: u64,
     pub timer: Timer,
+    pub probe: Timer,
 }
 
 impl RetryFrontSwitch {
@@ -399,6 +459,7 @@ impl RetryFrontSwitch {
             app_entity,
             generation,
             timer: Timer::from_seconds(duration.as_secs_f32(), bevy::time::TimerMode::Once),
+            probe: Timer::new(Duration::from_millis(100), bevy::time::TimerMode::Repeating),
         }
     }
 }
@@ -406,7 +467,7 @@ impl RetryFrontSwitch {
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);
 
-#[derive(Component, Debug)]
+#[derive(Clone, Component, Copy, Debug, Eq, PartialEq)]
 pub enum DockPosition {
     Bottom(i32),
     Left(i32),
@@ -478,7 +539,26 @@ pub struct Initializing;
 
 /// Bevy event trigger for spawning new windows.
 #[derive(BevyEvent)]
-pub struct SpawnWindowTrigger(pub Vec<Window>);
+pub struct SpawnWindowTrigger {
+    windows: Vec<Window>,
+    application: Option<Entity>,
+}
+
+impl SpawnWindowTrigger {
+    pub fn new(windows: Vec<Window>) -> Self {
+        Self {
+            windows,
+            application: None,
+        }
+    }
+
+    pub(crate) fn for_application(application: Entity, windows: Vec<Window>) -> Self {
+        Self {
+            windows,
+            application: Some(application),
+        }
+    }
+}
 
 #[derive(BevyEvent)]
 pub struct ReadDisplayProperties(pub Entity);

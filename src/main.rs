@@ -6,12 +6,16 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+#[cfg(feature = "lua")]
+use clap::Args;
 use clap::{Parser, Subcommand};
 use tracing::{error, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod accessibility_prompt;
 mod client;
+#[cfg(feature = "lua")]
+mod client_script;
 mod commands;
 mod config;
 mod ecs;
@@ -33,20 +37,16 @@ embed_plist::embed_info_plist!("../assets/Info.plist");
 
 use events::{Event, EventSender};
 
-use client::ClientCommand;
-use ecs::state::StateQueryKind;
-use errors::Result;
-use platform::service;
-use reader::CommandReader;
-use spool_shared_types::script_state::ScriptStateWrite;
-use spool_shared_types::script_value::ScriptValue;
-use spool_shared_types::wire::ScriptStateRequest;
-
 use crate::ecs::setup_bevy_app;
 use crate::manager::{check_ax_privilege, request_ax_privilege};
 use crate::menubar::MenuBarManager;
 use crate::platform::PlatformCallbacks;
 use accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
+use client::ClientCommand;
+use ecs::state::StateQueryKind;
+use errors::Result;
+use platform::service;
+use reader::CommandReader;
 
 #[cfg(feature = "lua")]
 pub const VERSION_STRING: &str = concat!(
@@ -120,16 +120,14 @@ pub enum SubCmd {
 
     /// Subscribes to structured state events from the running daemon.
     Subscribe {
+        /// Emits complete line-delimited JSON instead of the default TSV summary.
         #[arg(long)]
         json: bool,
     },
 
-    /// Reads and writes the script state store, the same one `spool.state`
-    /// gives a Lua script.
-    State {
-        #[clap(subcommand)]
-        state: StateCmd,
-    },
+    /// Runs an isolated Lua client script against the running daemon.
+    #[cfg(feature = "lua")]
+    Script(ScriptCmd),
 
     /// Inspects or applies the one-time v2-to-v3 Space state migration.
     MigrateState {
@@ -142,43 +140,45 @@ pub enum SubCmd {
     },
 }
 
-#[derive(Clone, Debug, Subcommand)]
-pub enum StateCmd {
-    /// Prints the value stored under a key, or `null`.
-    Get { key: String },
-    /// Stores a value, given as JSON.
-    Set { key: String, value: String },
-    /// Removes a key.
-    Remove { key: String },
-    /// Stores a value only if the key still holds what it was read as. Both
-    /// values are JSON, or `-` for "no value": absent in `expected`, a removal
-    /// in `value`.
-    Cas {
-        key: String,
-        expected: String,
-        value: String,
-    },
+#[cfg(feature = "lua")]
+#[derive(Clone, Debug, Args)]
+pub struct ScriptCmd {
+    /// Executes the supplied Lua source instead of reading a file.
+    #[arg(short = 'e', long, value_name = "CODE", conflicts_with = "file")]
+    eval: Option<String>,
+
+    /// Lua file to execute; use `-` to read the script from standard input.
+    #[arg(value_name = "FILE", required_unless_present = "eval")]
+    file: Option<PathBuf>,
+
+    /// Values exposed to Lua as `arg[1]`, `arg[2]`, and so on.
+    #[arg(last = true, value_name = "ARG")]
+    args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum QueryCmd {
     /// Prints the complete state document.
     State {
+        /// Emits complete JSON instead of the default TSV summary.
         #[arg(long)]
         json: bool,
     },
     /// Prints native macOS Spaces and their tracked windows.
     Spaces {
+        /// Emits complete JSON instead of the default TSV summary.
         #[arg(long)]
         json: bool,
     },
     /// Prints the active focus/workspace state.
     Active {
+        /// Emits complete JSON instead of the default TSV summary.
         #[arg(long)]
         json: bool,
     },
     /// Prints the windows currently visible on screen, slivers excluded.
     OnScreen {
+        /// Emits complete JSON instead of the default TSV summary.
         #[arg(long)]
         json: bool,
     },
@@ -244,9 +244,18 @@ fn main() -> Result<()> {
         SubCmd::Stop => service()?.stop()?,
         SubCmd::Restart => service()?.restart()?,
         SubCmd::SendCmd { cmd } => client::run(ClientCommand::Send(cmd))?,
-        SubCmd::Query { query } => client::run(ClientCommand::Query(query.kind()))?,
-        SubCmd::Subscribe { json: _ } => client::run(ClientCommand::Subscribe)?,
-        SubCmd::State { state } => client::run(ClientCommand::ScriptState(state.request()?))?,
+        SubCmd::Query { query } => {
+            let (kind, format) = query.request();
+            client::run(ClientCommand::Query { kind, format })?;
+        }
+        SubCmd::Subscribe { json } => client::run(ClientCommand::Subscribe(
+            client::OutputFormat::from_json(json),
+        ))?,
+        #[cfg(feature = "lua")]
+        SubCmd::Script(script) => {
+            let (source, args) = script.request();
+            client_script::run(source, args)?;
+        }
         SubCmd::MigrateState { path, apply } => {
             let path = path.unwrap_or_else(ecs::state::SpoolState::default_state_file_path);
             let report = ecs::state::SpoolState::migrate_file(&path, apply)?;
@@ -296,57 +305,39 @@ fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bo
 }
 
 impl QueryCmd {
-    fn kind(&self) -> StateQueryKind {
+    fn request(&self) -> (StateQueryKind, client::OutputFormat) {
         match self {
-            QueryCmd::State { json: _ } => StateQueryKind::State,
-            QueryCmd::Spaces { json: _ } => StateQueryKind::Spaces,
-            QueryCmd::Active { json: _ } => StateQueryKind::Active,
-            QueryCmd::OnScreen { json: _ } => StateQueryKind::OnScreen,
+            QueryCmd::State { json } => (
+                StateQueryKind::State,
+                client::OutputFormat::from_json(*json),
+            ),
+            QueryCmd::Spaces { json } => (
+                StateQueryKind::Spaces,
+                client::OutputFormat::from_json(*json),
+            ),
+            QueryCmd::Active { json } => (
+                StateQueryKind::Active,
+                client::OutputFormat::from_json(*json),
+            ),
+            QueryCmd::OnScreen { json } => (
+                StateQueryKind::OnScreen,
+                client::OutputFormat::from_json(*json),
+            ),
         }
     }
 }
 
-impl StateCmd {
-    /// The request this asks the daemon for. Values arrive from the shell as
-    /// JSON text and are parsed here, so nothing past this point deals in
-    /// strings.
-    fn request(&self) -> errors::Result<ScriptStateRequest> {
-        /// The `-` that a shell caller writes for "there is no value here":
-        /// absent in `expected`, a removal in `value`. It cannot collide with
-        /// JSON, where a string is quoted.
-        const ABSENT: &str = "-";
-
-        let parse = |raw: &str| -> errors::Result<ScriptValue> {
-            serde_json::from_str::<serde_json::Value>(raw)
-                .map(ScriptValue::from)
-                .map_err(|err| errors::Error::InvalidInput(format!("{raw:?} is not JSON: {err}")))
+#[cfg(feature = "lua")]
+impl ScriptCmd {
+    fn request(self) -> (client_script::ScriptSource, Vec<String>) {
+        let source = match (self.eval, self.file) {
+            (Some(source), None) => client_script::ScriptSource::Inline(source),
+            (None, Some(path)) if path.as_os_str() == "-" => client_script::ScriptSource::Stdin,
+            (None, Some(path)) => client_script::ScriptSource::File(path),
+            // Clap enforces exactly one source before this point.
+            _ => unreachable!("script source must be validated by clap"),
         };
-        let maybe = |raw: &str| -> errors::Result<Option<ScriptValue>> {
-            if raw == ABSENT {
-                Ok(None)
-            } else {
-                parse(raw).map(Some)
-            }
-        };
-
-        Ok(match self {
-            StateCmd::Get { key } => ScriptStateRequest::Get { key: key.clone() },
-            StateCmd::Set { key, value } => {
-                ScriptStateRequest::Write(ScriptStateWrite::set(key.clone(), parse(value)?))
-            }
-            StateCmd::Remove { key } => {
-                ScriptStateRequest::Write(ScriptStateWrite::remove(key.clone()))
-            }
-            StateCmd::Cas {
-                key,
-                expected,
-                value,
-            } => ScriptStateRequest::Write(ScriptStateWrite::compare_and_set(
-                key.clone(),
-                maybe(expected)?,
-                maybe(value)?,
-            )),
-        })
+        (source, self.args)
     }
 }
 
@@ -389,5 +380,43 @@ fn maybe_warn_deprecated_options_for_service(subcmd: &SubCmd) {
                 path.display()
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "lua"))]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn script_accepts_inline_source_and_arguments_after_separator() {
+        let cli = Spool::try_parse_from(["spool", "script", "-e", "print(arg[1])", "--", "hello"])
+            .unwrap();
+        let Some(SubCmd::Script(script)) = cli.subcmd else {
+            panic!("expected script command");
+        };
+        assert_eq!(
+            script.request(),
+            (
+                client_script::ScriptSource::Inline("print(arg[1])".into()),
+                vec!["hello".into()]
+            )
+        );
+    }
+
+    #[test]
+    fn script_dash_means_standard_input() {
+        let cli = Spool::try_parse_from(["spool", "script", "-"]).unwrap();
+        let Some(SubCmd::Script(script)) = cli.subcmd else {
+            panic!("expected script command");
+        };
+        assert_eq!(
+            script.request(),
+            (client_script::ScriptSource::Stdin, Vec::new())
+        );
+    }
+
+    #[test]
+    fn removed_state_command_is_not_accepted() {
+        assert!(Spool::try_parse_from(["spool", "state", "get", "key"]).is_err());
     }
 }

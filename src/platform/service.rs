@@ -294,4 +294,9 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn launch_agent_does_not_publish_a_mach_service() {
+        assert!(!include_str!("../../assets/launchd.plist").contains("MachServices"));
+    }
 }

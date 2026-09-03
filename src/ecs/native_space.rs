@@ -7,14 +7,19 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::Has;
 use bevy::ecs::resource::Resource;
-use bevy::ecs::system::{Commands, Local, Query, Res};
+use bevy::ecs::system::{Commands, Local, Query, Res, SystemParam};
+use bevy::time::Time;
 use tracing::{Level, debug, error, instrument, warn};
 
 use crate::commands::{Command, MoveFocus};
 use crate::config::Config;
-use crate::ecs::SpawnCommandsExt;
+use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::Windows;
+use crate::ecs::workspace::PendingSpaceDestruction;
+use crate::ecs::{
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Position, RefreshWindowSizes, SpawnCommandsExt,
+};
 use crate::events::Event;
 use crate::manager::{Display, NativeSpaceIntent, WindowManager};
 use crate::platform::WorkspaceId;
@@ -285,24 +290,151 @@ type ObservedNativeSpaces<'w, 's> = Query<
     (
         Entity,
         &'static LayoutStrip,
-        &'static ChildOf,
+        Option<&'static ChildOf>,
         Option<&'static mut NativeSpace>,
         Has<VisibleNativeSpaceMarker>,
+        Has<ActiveWorkspaceMarker>,
+        Has<PendingSpaceDestruction>,
     ),
 >;
+
+type ObservedFloatingLayers<'w, 's> =
+    Query<'w, 's, (Entity, &'static FloatingLayer, Option<&'static ChildOf>)>;
+
+#[derive(SystemParam)]
+pub(crate) struct NativeSpaceObservationCtx<'w, 's> {
+    displays: Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
+    spaces: ObservedNativeSpaces<'w, 's>,
+    floating_layers: ObservedFloatingLayers<'w, 's>,
+    window_manager: Res<'w, WindowManager>,
+    time: Res<'w, Time>,
+    generation: Local<'s, u64>,
+    since_audit: Local<'s, Duration>,
+    commands: Commands<'w, 's>,
+}
+
+struct DisplaySpaceProjection<'a> {
+    display: &'a Display,
+    display_entity: Entity,
+    display_active: bool,
+    topology: &'a [WorkspaceId],
+    visible_id: WorkspaceId,
+}
+
+fn reconcile_display_space_projections(
+    projection: DisplaySpaceProjection<'_>,
+    spaces: &mut ObservedNativeSpaces,
+    floating_layers: &ObservedFloatingLayers,
+    window_manager: &WindowManager,
+    commands: &mut Commands,
+) {
+    let DisplaySpaceProjection {
+        display,
+        display_entity,
+        display_active,
+        topology,
+        visible_id,
+    } = projection;
+    for (ordinal, space_id) in topology.iter().copied().enumerate() {
+        let observed = NativeSpace::new(
+            space_id,
+            ordinal,
+            window_manager.workspace_is_fullscreen(space_id),
+        );
+        let should_be_visible = space_id == visible_id;
+        let should_be_active = display_active && should_be_visible;
+        let mut found = false;
+        let mut tombstoned = false;
+
+        for (entity, strip, child, native, visible, active, pending) in spaces.iter_mut() {
+            if strip.id() != space_id {
+                continue;
+            }
+            if pending {
+                tombstoned = true;
+                continue;
+            }
+            if found {
+                continue;
+            }
+            found = true;
+
+            if let Some(mut native) = native {
+                *native = observed;
+            } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert(observed);
+            }
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                if child.is_none_or(|child| child.parent() != display_entity) {
+                    entity_commands.try_insert((
+                        ChildOf(display_entity),
+                        Position(display.bounds().min),
+                        RefreshWindowSizes::default(),
+                    ));
+                }
+                if should_be_visible && !visible {
+                    entity_commands.try_insert(VisibleNativeSpaceMarker);
+                } else if !should_be_visible && visible {
+                    entity_commands.try_remove::<VisibleNativeSpaceMarker>();
+                }
+                if should_be_active && !active {
+                    entity_commands.try_insert(ActiveWorkspaceMarker);
+                } else if !should_be_active && active {
+                    entity_commands.try_remove::<ActiveWorkspaceMarker>();
+                }
+            }
+        }
+
+        if !found && !tombstoned {
+            let display_id = display.id();
+            debug!(space_id, display_id, "projecting new Space");
+            let mut spawned = commands.spawn_layout_strip(
+                LayoutStrip::new(space_id),
+                display.bounds().min,
+                display_entity,
+                should_be_active,
+            );
+            spawned.try_insert(observed);
+            if should_be_visible {
+                spawned.try_insert(VisibleNativeSpaceMarker);
+            }
+        }
+
+        let layer = floating_layers
+            .iter()
+            .find(|(_, layer, _)| layer.workspace_id == space_id);
+        if let Some((entity, _, child)) = layer {
+            if child.is_none_or(|child| child.parent() != display_entity)
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_insert(ChildOf(display_entity));
+            }
+        } else {
+            commands.spawn((FloatingLayer::new(space_id), ChildOf(display_entity)));
+        }
+    }
+}
 
 /// Reconciles read-only Space topology and per-display visibility from
 /// macOS. This system never changes Spaces or moves windows between them.
 #[instrument(level = tracing::Level::DEBUG, skip_all)]
 pub(crate) fn reconcile_native_spaces(
     mut messages: MessageReader<Event>,
-    displays: Query<(&Display, Entity)>,
-    mut spaces: ObservedNativeSpaces,
-    window_manager: Res<WindowManager>,
-    mut generation: Local<u64>,
-    mut commands: Commands,
+    ctx: NativeSpaceObservationCtx,
 ) {
-    let triggers = messages
+    const TOPOLOGY_HEARTBEAT: Duration = Duration::from_secs(1);
+
+    let NativeSpaceObservationCtx {
+        displays,
+        mut spaces,
+        floating_layers,
+        window_manager,
+        time,
+        mut generation,
+        mut since_audit,
+        mut commands,
+    } = ctx;
+    let mut triggers = messages
         .read()
         .filter_map(|event| match event {
             Event::SpaceChanged => Some("space-changed"),
@@ -317,9 +449,15 @@ pub(crate) fn reconcile_native_spaces(
             _ => None,
         })
         .collect::<Vec<_>>();
-    if triggers.is_empty() {
+    *since_audit = since_audit.saturating_add(time.delta());
+    let heartbeat = *since_audit >= TOPOLOGY_HEARTBEAT;
+    if triggers.is_empty() && !heartbeat {
         return;
     }
+    if heartbeat {
+        triggers.push("heartbeat");
+    }
+    *since_audit = Duration::ZERO;
     *generation = generation.wrapping_add(1);
 
     let topology_by_display = window_manager
@@ -328,7 +466,7 @@ pub(crate) fn reconcile_native_spaces(
         .map(|(display, spaces)| (display.id(), spaces))
         .collect::<HashMap<_, _>>();
 
-    for (display, display_entity) in &displays {
+    for (display, display_entity, display_active) in &displays {
         let display_id = display.id();
         let Ok(visible_id) = window_manager.active_display_space(display_id) else {
             error!(display_id, "unable to read visible Space");
@@ -338,33 +476,19 @@ pub(crate) fn reconcile_native_spaces(
             warn!(display_id, "Space topology unavailable");
             continue;
         };
-
-        for (entity, strip, child, native, visible) in &mut spaces {
-            if child.parent() != display_entity {
-                continue;
-            }
-            let Some(ordinal) = topology.iter().position(|id| *id == strip.id()) else {
-                continue;
-            };
-            let observed = NativeSpace::new(
-                strip.id(),
-                ordinal,
-                window_manager.workspace_is_fullscreen(strip.id()),
-            );
-            if let Some(mut native) = native {
-                *native = observed;
-            } else {
-                commands.entity(entity).try_insert(observed);
-            }
-            let should_be_visible = strip.id() == visible_id;
-            if should_be_visible && !visible {
-                commands.entity(entity).try_insert(VisibleNativeSpaceMarker);
-            } else if !should_be_visible && visible {
-                commands
-                    .entity(entity)
-                    .try_remove::<VisibleNativeSpaceMarker>();
-            }
-        }
+        reconcile_display_space_projections(
+            DisplaySpaceProjection {
+                display,
+                display_entity,
+                display_active,
+                topology,
+                visible_id,
+            },
+            &mut spaces,
+            &floating_layers,
+            &window_manager,
+            &mut commands,
+        );
 
         debug!(
             generation = *generation,

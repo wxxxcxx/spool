@@ -21,7 +21,7 @@ fn spawn_matching_native_tab(world: &mut World, state: &MockState, window_id: Wi
     // The previous window should now not be visible on screen.
     state.window_visible(window_id, false);
 
-    world.trigger(SpawnWindowTrigger(vec![window]));
+    world.trigger(SpawnWindowTrigger::new(vec![window]));
 }
 
 #[test]
@@ -108,9 +108,11 @@ fn test_native_tab_removal_keeps_remaining_window_column() {
         .on_iteration(0, move |world, state| {
             spawn_matching_native_tab(world, &state, 0);
         })
-        .on_iteration(1, move |world, _state| {
-            let tab_one = find_window_entity(1, world);
-            world.entity_mut(tab_one).despawn();
+        .on_iteration(1, move |_world, state| {
+            // Model a real native-tab close. Removing only the ECS entity while
+            // leaving the mock WindowServer surface alive now correctly causes
+            // the window-state heartbeat to discover and restore it.
+            state.os_close_window(1);
         })
         .on_iteration(2, move |world, _state| {
             let tab_zero = find_window_entity(0, world);
@@ -159,7 +161,7 @@ fn test_offscreen_same_app_same_width_different_frame_not_tabbed() {
             // Pretend the existing window is off-screen so the only thing preventing
             // a false positive is the frame check.
             state.window_visible(0, false);
-            world.trigger(SpawnWindowTrigger(vec![window]));
+            world.trigger(SpawnWindowTrigger::new(vec![window]));
         })
         .on_iteration(1, move |world, _state| {
             let leader = find_window_entity(0, world);

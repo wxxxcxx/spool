@@ -183,8 +183,7 @@ impl SavedWindow {
         windows: &Windows,
         apps: &Query<&Application>,
     ) -> Option<Self> {
-        let window = windows.get(entity)?;
-        let (_, _, app_entity) = windows.find_parent(window.id())?;
+        let (window, _, app_entity) = windows.get_parent(entity)?;
         let app = apps.get(app_entity).ok()?;
 
         Some(Self {
@@ -682,7 +681,7 @@ impl QueryStateParams<'_, '_> {
         sliver_width: i32,
     ) -> Option<spool_shared_types::windowset::WindowRec> {
         let (window, _, state) = self.windows.get_tracked(entity)?;
-        let (_, _, app_entity) = self.windows.find_parent(window.id())?;
+        let (_, _, app_entity) = self.windows.get_parent(entity)?;
         let app = self.apps.get(app_entity).ok()?;
         let frame = self.windows.frame(entity);
         // Minimized and hidden windows are never on screen, whatever their last
@@ -792,7 +791,7 @@ impl QueryState for SpoolQueryState {
                 .chain(floating)
                 .filter_map(|entity| {
                     let (window, _, state) = windows.get_tracked(entity)?;
-                    let (_, _, app_entity) = windows.find_parent(window.id())?;
+                    let (_, _, app_entity) = windows.get_parent(entity)?;
                     let app = apps.get(app_entity).ok()?;
                     let bundle_id = app.bundle_id().unwrap_or_default().clone();
                     let app_name = app.name().to_string();

@@ -57,4 +57,4 @@ fi
 source "$tmp"
 
 echo "Sourced env from $EXEC_PATH (minus trailing exec line if present)"echo "Done: sourced env from final-arg file (minus trailing exec if present)."
-cargo flamegraph -f lua,luajit --profile fast-release
+cargo flamegraph -f lua --profile fast-release

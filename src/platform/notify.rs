@@ -123,6 +123,7 @@ impl NotifyHandler {
                     _ = self.events.send(Event::WindowDestroyed {
                         window_id,
                         source: DestroySource::SpaceNotification,
+                        incarnation: None,
                     });
                 }
             }
@@ -133,6 +134,7 @@ impl NotifyHandler {
                     _ = self.events.send(Event::WindowDestroyed {
                         window_id,
                         source: DestroySource::WindowServer,
+                        incarnation: None,
                     });
                 }
             }
@@ -307,6 +309,7 @@ mod tests {
             Ok(Event::WindowDestroyed {
                 window_id: 42,
                 source: DestroySource::WindowServer,
+                incarnation: None,
             })
         ));
     }

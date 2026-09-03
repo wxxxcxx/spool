@@ -1,11 +1,15 @@
 mod display;
+mod exit_restore;
 mod harness;
 mod interaction;
 mod mocks;
+mod native_space_projection;
 mod session_restore;
 mod state;
 mod tabs;
 mod tiling;
+mod window_frame_architecture;
+mod window_state_sync;
 
 pub(crate) use harness::*;
 pub(crate) use mocks::*;

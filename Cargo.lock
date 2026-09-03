@@ -2215,12 +2215,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mach2"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
-
-[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3250,7 +3244,6 @@ dependencies = [
  "async-lock",
  "bevy",
  "bitflags",
- "cfg-if",
  "chrono",
  "clap",
  "crossbeam-channel",
@@ -3274,8 +3267,8 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_json",
+ "spool-local-ipc",
  "spool-lua",
- "spool-mach-ipc",
  "spool-shared-types",
  "stdext",
  "toml",
@@ -3285,28 +3278,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "spool-lua"
+name = "spool-local-ipc"
 version = "0.4.4"
 dependencies = [
- "cfg-if",
- "futures-lite",
- "mlua",
- "regex",
+ "libc",
+ "postcard",
  "serde",
- "serde_json",
- "spool-mach-ipc",
  "spool-shared-types",
 ]
 
 [[package]]
-name = "spool-mach-ipc"
+name = "spool-lua"
 version = "0.4.4"
 dependencies = [
- "futures-lite",
- "libc",
- "mach2",
- "postcard",
+ "mlua",
+ "regex",
  "serde",
+ "serde_json",
+ "spool-local-ipc",
+ "spool-shared-types",
 ]
 
 [[package]]

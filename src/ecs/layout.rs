@@ -13,10 +13,13 @@ use stdext::function_name;
 use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
+use crate::ecs::native_space::VisibleNativeSpaceMarker;
 use crate::ecs::params::Windows;
+use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    Position, RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
+    ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, EnsureVisibleMarker,
+    Initializing, LayoutPosition, Position, PresentedWindowFrame, ReshuffleAroundMarker, Scrolling,
+    SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -37,22 +40,36 @@ type StripPlacements<'w, 's> = Query<
         &'static ChildOf,
         Option<Ref<'static, ActiveWorkspaceMarker>>,
     ),
+    Without<PendingSpaceDestruction>,
 >;
 
 /// Displays paired with the Dock's current edge, which is what turns a display's
 /// raw bounds into the usable viewport.
 type DisplayViewports<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
 
-/// Windows whose size or origin changed this tick — either one means the strip
-/// holding them has to re-run its layout.
+type ChangedDisplayViewports<'w, 's> =
+    Query<'w, 's, Entity, Or<(Changed<Display>, Changed<DockPosition>)>>;
+
+type VisibleLayoutStrips<'w, 's> = Query<
+    'w,
+    's,
+    (&'static ChildOf, &'static mut LayoutStrip),
+    (
+        With<VisibleNativeSpaceMarker>,
+        Without<PendingSpaceDestruction>,
+    ),
+>;
+
+/// Windows whose logical size changed this tick. Presentation and observed
+/// geometry are projections and must never invalidate the layout by themselves.
 type ResizedWindows<'w, 's> = Populated<
     'w,
     's,
     Entity,
-    Or<(
+    (
         (Changed<Bounds>, With<Window>),
-        (Changed<Position>, With<Window>),
-    )>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
 >;
 
 /// Window frames as the layout writes them: the current origin, and the size and
@@ -65,7 +82,11 @@ type WindowFrames<'w, 's> = Query<
         &'static mut Bounds,
         &'static mut LayoutPosition,
     ),
-    (Without<LayoutStrip>, With<Window>),
+    (
+        Without<LayoutStrip>,
+        With<Window>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
 >;
 
 /// Windows the layout just assigned a new slot to, with the frame fields that
@@ -78,9 +99,66 @@ type RepositionedWindows<'w, 's> = Populated<
         &'static Window,
         &'static LayoutPosition,
         &'static mut Position,
-        &'static mut Bounds,
+        &'static Bounds,
+        Option<&'static mut DesiredWindowFrame>,
+        Option<&'static mut PresentedWindowFrame>,
     ),
-    (Changed<LayoutPosition>, With<Window>, Without<LayoutStrip>),
+    (
+        Or<(Changed<LayoutPosition>, Changed<Bounds>)>,
+        With<Window>,
+        Without<LayoutStrip>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
+>;
+
+type ChangedLayoutStrips<'w, 's> = Populated<
+    'w,
+    's,
+    (&'static LayoutStrip, &'static ChildOf),
+    (Changed<LayoutStrip>, Without<PendingSpaceDestruction>),
+>;
+
+type ReshuffleMarkers<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, &'static LayoutPosition),
+    (
+        With<ReshuffleAroundMarker>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
+>;
+
+type EnsureVisibleMarkers<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, &'static LayoutPosition),
+    (
+        With<EnsureVisibleMarker>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
+>;
+
+type StableLayoutPositions<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut LayoutPosition,
+    (
+        With<Window>,
+        Without<LayoutStrip>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
+>;
+
+type StableWorkspacePlacements<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static LayoutStrip,
+        &'static Position,
+        Has<Scrolling>,
+        &'static ChildOf,
+    ),
+    (With<LayoutStrip>, Without<PendingSpaceDestruction>),
 >;
 
 /// Clamp a window origin to the range where it still touches both viewport
@@ -101,6 +179,8 @@ impl Plugin for LayoutEventsPlugin {
                 // Wait for finish_setup before tiling: until then every window
                 // sits in the active strip regardless of its real display.
                 (
+                    super::window_frame::apply_window_frame_requests,
+                    display_viewport_changed,
                     layout_sizes_changed,
                     layout_strip_changed,
                     reshuffle_layout_strip,
@@ -113,6 +193,22 @@ impl Plugin for LayoutEventsPlugin {
                     .run_if(not(resource_exists::<Initializing>)),
             ),
         );
+    }
+}
+
+/// Invalidates the currently visible strip when its display's usable viewport
+/// changes. Display properties are discovered through deferred startup
+/// commands, so the strip may not exist yet when `DockPosition` is inserted;
+/// change detection carries that observation into the first layout pass.
+fn display_viewport_changed(
+    changed_displays: ChangedDisplayViewports,
+    mut strips: VisibleLayoutStrips,
+) {
+    let changed_displays = changed_displays.iter().collect::<EntityHashSet>();
+    for (child, mut strip) in &mut strips {
+        if changed_displays.contains(&child.parent()) && !strip.is_fullscreen() {
+            strip.set_changed();
+        }
     }
 }
 
@@ -375,6 +471,33 @@ impl LayoutStrip {
 
     pub(crate) fn append_strip(&mut self, other: &mut Self) {
         self.columns.append(&mut other.columns);
+    }
+
+    /// Removes `selected` windows and returns the same columns with stacks and
+    /// tab groups preserved. A fullscreen column becomes a normal single
+    /// column when it leaves the native fullscreen Space.
+    pub(crate) fn take_windows_preserving_layout(
+        &mut self,
+        selected: &std::collections::HashSet<Entity>,
+    ) -> Self {
+        let mut extracted = Self {
+            id: self.id,
+            columns: self.columns.clone(),
+        };
+        for entity in extracted.all_windows() {
+            if !selected.contains(&entity) {
+                extracted.remove(entity);
+            }
+        }
+        for entity in selected {
+            self.remove(*entity);
+        }
+        for column in &mut extracted.columns {
+            if let Column::Fullscren(entity) = column {
+                *column = Column::Single(*entity);
+            }
+        }
+        extracted
     }
 
     pub fn append_tab_group(&mut self, entities: &[Entity]) {
@@ -925,7 +1048,10 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
 
 /// Watches for size changes to windows and if they are changed, signals to the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
-fn layout_sizes_changed(changed_sizes: ResizedWindows, workspaces: Query<&mut LayoutStrip>) {
+fn layout_sizes_changed(
+    changed_sizes: ResizedWindows,
+    workspaces: Query<&mut LayoutStrip, Without<PendingSpaceDestruction>>,
+) {
     let changed_entities = changed_sizes.iter().collect::<EntityHashSet>();
     workspaces.into_iter().for_each(|mut strip| {
         if strip_has_changed_window(&strip, &changed_entities) {
@@ -966,7 +1092,7 @@ fn stack_item_has_changed_window(item: &StackItem, changed_entities: &EntityHash
 /// re-calculates the logical positions of all the windows in the layout strip.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn layout_strip_changed(
-    changed_strips: Populated<(&LayoutStrip, &ChildOf), Changed<LayoutStrip>>,
+    changed_strips: ChangedLayoutStrips,
     mut windows: WindowFrames,
     displays: DisplayViewports,
     config: Res<Config>,
@@ -1006,7 +1132,7 @@ fn layout_strip_changed(
 
 #[instrument(level = Level::DEBUG, skip_all)]
 fn reshuffle_layout_strip(
-    markers: Query<(Entity, &LayoutPosition), With<ReshuffleAroundMarker>>,
+    markers: ReshuffleMarkers,
     strips: StripPlacements,
     displays: DisplayViewports,
     windows: Windows,
@@ -1102,7 +1228,7 @@ fn reshuffle_layout_strip(
 /// shortfall — never to anchor the entity to a particular position.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn ensure_visible_in_strip(
-    markers: Query<(Entity, &LayoutPosition), With<EnsureVisibleMarker>>,
+    markers: EnsureVisibleMarkers,
     strips: StripPlacements,
     displays: DisplayViewports,
     windows: Windows,
@@ -1149,8 +1275,8 @@ fn ensure_visible_in_strip(
 /// marks all the windows in the strip as requiring re-positioning.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn position_layout_strips(
-    moved_strips: Populated<&LayoutStrip, Changed<Position>>,
-    mut windows: Query<&mut LayoutPosition, (With<Window>, Without<LayoutStrip>)>,
+    moved_strips: Populated<&LayoutStrip, (Changed<Position>, Without<PendingSpaceDestruction>)>,
+    mut windows: StableLayoutPositions,
 ) {
     for strip in moved_strips {
         for entity in strip.all_windows() {
@@ -1277,7 +1403,7 @@ fn insert_stack_item_window_contexts(
 #[instrument(level = Level::DEBUG, skip_all)]
 fn position_layout_windows(
     positioned_windows: RepositionedWindows,
-    workspaces: Query<(&LayoutStrip, &Position, Has<Scrolling>, &ChildOf), With<LayoutStrip>>,
+    workspaces: StableWorkspacePlacements,
     displays: DisplayViewports,
     config: Res<Config>,
     mut commands: Commands,
@@ -1295,12 +1421,14 @@ fn position_layout_windows(
         );
     }
 
-    for (entity, window, layout_position, mut position, mut bounds) in positioned_windows {
+    for (entity, window, layout_position, mut position, bounds, mut desired, mut presented) in
+        positioned_windows
+    {
         let Some(context) = strip_contexts.get(&entity) else {
-            return;
+            continue;
         };
         let Ok((display, dock)) = displays.get(context.display_entity) else {
-            return;
+            continue;
         };
         let viewport = display.actual_display_bounds(dock, &config);
         // Gets 80% of the display height as threshold.
@@ -1351,31 +1479,20 @@ fn position_layout_windows(
             }
         }
 
-        if bounds.0 != frame.size() {
-            bounds.0 = frame.size();
-        }
-
+        // Position remains a compatibility projection for the existing strip
+        // math. It is the final target, never the animated/presented origin.
+        let offscreen_move = position.0.y.abs_diff(frame.min.y) > vertical_move_threshold;
         if position.0 != frame.min {
-            // Direct-assign (snap) when:
-            //   - The user is actively swiping: windows must track the finger in lockstep.
-            //   - A workspace switch just moved the strip vertically: jumping the full off-screen
-            //   distance should be instantaneous.
-            // Otherwise (programmatic strip animation, or pure layout change), animate toward the
-            // new position so layout changes (swap/add/remove) slide instead of teleport. When the
-            // strip is also being animated, the per-window target is recomputed each tick from the
-            // strip's current position, so the two motions compose: e.g., on swap, the focused
-            // window's target converges back to its old visual position as the strip settles, while
-            // the other window slides past.
-            let offscreen_move = position.0.y.abs_diff(frame.min.y) > vertical_move_threshold;
-            if context.swiping || offscreen_move {
-                position.0 = frame.min;
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_remove::<RepositionMarker>();
-                }
-            } else {
-                commands.reposition_entity(entity, frame.min);
-            }
+            position.0 = frame.min;
         }
+        super::window_frame::set_desired_frame(
+            entity,
+            frame,
+            context.swiping || offscreen_move,
+            desired.as_deref_mut(),
+            presented.as_deref_mut(),
+            &mut commands,
+        );
     }
 }
 

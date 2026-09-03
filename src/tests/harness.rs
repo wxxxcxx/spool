@@ -82,7 +82,9 @@ impl TestHarness {
                     .spawn_window(pid, TEST_WORKSPACE_ID, win_id, frame)
             })
             .collect::<Vec<_>>();
-        self.app.world_mut().trigger(SpawnWindowTrigger(windows));
+        self.app
+            .world_mut()
+            .trigger(SpawnWindowTrigger::new(windows));
         if count > 0 {
             self.mock_state.update_app(pid, |app| {
                 app.focused_window_id.get_or_insert(0);
@@ -111,7 +113,7 @@ impl TestHarness {
         self.mock_state.update_window(id, f);
         self.app
             .world_mut()
-            .trigger(SpawnWindowTrigger(vec![window]));
+            .trigger(SpawnWindowTrigger::new(vec![window]));
         self
     }
 
@@ -126,7 +128,7 @@ impl TestHarness {
         self.mock_state.update_window(id, f);
         self.app
             .world_mut()
-            .trigger(SpawnWindowTrigger(vec![window]));
+            .trigger(SpawnWindowTrigger::new(vec![window]));
         self
     }
 
@@ -145,7 +147,7 @@ impl TestHarness {
         self.mock_state.update_window(id, f);
         self.app
             .world_mut()
-            .trigger(SpawnWindowTrigger(vec![window]));
+            .trigger(SpawnWindowTrigger::new(vec![window]));
         self
     }
 
@@ -204,18 +206,21 @@ impl TestHarness {
     pub(crate) fn run(&mut self, commands: Vec<Event>) {
         for (iteration, command) in commands.into_iter().enumerate() {
             self.app.world_mut().write_message::<Event>(command);
-
-            for _ in 0..5 {
-                self.app.update();
-
-                // Drain and process events from our virtual OS
-                for event in self.mock_state.drain_events() {
-                    self.app.world_mut().write_message::<Event>(event);
-                }
-            }
+            self.pump_frames(5);
 
             if let Some(verifier) = self.verifiers.get_mut(&iteration) {
                 verifier(self.app.world_mut(), self.mock_state.clone());
+            }
+        }
+    }
+
+    pub(crate) fn pump_frames(&mut self, frames: usize) {
+        for _ in 0..frames {
+            self.app.update();
+
+            // Drain and process events from our virtual OS.
+            for event in self.mock_state.drain_events() {
+                self.app.world_mut().write_message::<Event>(event);
             }
         }
     }

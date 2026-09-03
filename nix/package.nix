@@ -35,28 +35,6 @@
         ];
       };
 
-      # The Cargo ABI feature naming an interpreter (`luajit`, `lua54`, ...).
-      # Pure, so it is the one Lua-related thing that can live out here.
-      #
-      # `lua51` is rejected here rather than passed through: the workspace no
-      # longer offers that feature (the async world-access calls need an
-      # interpreter that can yield out of a Rust callback, which reference 5.1
-      # cannot), and an unknown `--features` reaches the user as a cargo error
-      # naming a feature they never asked for. LuaJIT reports luaversion "5.1"
-      # but is matched by name before this, and can yield.
-      luaFeature =
-        lua:
-        if lib.hasInfix "luajit" (lua.pname or lua.name or "") then
-          "luajit"
-        else
-          let
-            feature = "lua" + lib.replaceStrings [ "." ] [ "" ] lua.luaversion;
-          in
-          if feature == "lua51" then
-            throw "spool: Lua 5.1 is not supported (its C API cannot yield out of a Rust callback); use luajit or Lua 5.2+."
-          else
-            feature;
-
       # Arguments common to everything built from this workspace.
       commonArgs = {
         inherit version;
@@ -66,87 +44,40 @@
         doCheck = false;
       };
 
-      # The interpreter the dependency artifacts are built against. Also the
-      # default for `mkSpool`'s `lua` knob: LuaJIT's tracing JIT keeps handler
-      # dispatch cheap enough to run on the hot event path.
-      defaultLua = pkgs.luajit;
+      # Spool has one Lua implementation. The daemon embeds its own vendored
+      # LuaJIT; this package supplies headers for the independently loadable C
+      # module and the package set used by `extraLuaPackages`.
+      lua = pkgs.luajit;
 
       # Third-party dependencies, compiled once and reused by every derivation
       # here instead of being rebuilt per source change.
       #
-      # Deliberately NOT a function of `mkSpool`'s knobs. Parameterising it
-      # gives one `spool-deps` per (enableLua, lua) combination — same name,
-      # different store path — so a config that touches both a Lua and a non-Lua
-      # variant (this flake's own `spool` and `spool-lua`, say) builds the
-      # whole dependency graph twice over. Building the widest feature set once
-      # keeps a single `spool-deps` in the closure: a non-Lua build simply
-      # ignores the `mlua`/`mlua-sys` artifacts, and a build against a different
-      # interpreter recompiles only those two crates inside its own derivation
-      # rather than the graph beneath them.
+      # Built with the widest feature set once. A non-Lua build simply ignores
+      # the Lua artifacts in this shared dependency derivation.
       sharedDeps = craneLib.buildDepsOnly (
         commonArgs
         // {
           inherit pname;
-          cargoExtraArgs = "--no-default-features --features lua,${luaFeature defaultLua}";
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [
-            pkgs.apple-sdk.privateFrameworksHook
-            #            ##            (pkgs.darwinMinVersionHook "12.5")
-            defaultLua
-          ];
+          cargoExtraArgs = "--no-default-features --features lua";
+          buildInputs = [ pkgs.apple-sdk.privateFrameworksHook ];
         }
       );
 
-      # Everything else is a function of the two knobs.
-      #
       # Overrideable like a nixpkgs package (`spool.override { enableLua =
-      # false; }` or `spool.override { lua = pkgs.lua5_4; }`). `enableLua`
-      # toggles the `lua` Cargo
-      # feature, which builds in the `init.lua` scripting runtime
-      # (`spool.on`/`spool.bind`); it is on by default at the Cargo level
-      # (see `Cargo.toml`) and here. `lua` resolves the whole Lua dependency
-      # graph: the daemon's `mlua` ABI feature (`luajit`/`lua54`/..., via
-      # `luaFeature`), the interpreter it links against, and the one the
-      # loadable module (`spool.luaModule`) is built for. It defaults to
-      # `defaultLua`, the interpreter `sharedDeps` is built against, and the
-      # module stays independently overrideable afterwards via
-      # `spool.luaModule.override { lua = ...; }`.
+      # false; }`). `enableLua` is the only Lua build choice: enabled means the
+      # complete vendored LuaJIT capability, disabled means no Lua dependency.
       mkSpool =
         {
           enableLua ? true,
-          lua ? defaultLua,
         }:
         let
-          # What building against an interpreter takes: pkg-config to find it,
-          # the interpreter itself for its headers and library. Deliberately
-          # *not* mlua's `vendored` feature, which builds an interpreter from
-          # source and fails here — `luajit-src` copies its sources out of the
-          # read-only store and then cannot write to the copy.
-          luaBuildInputs = {
-            nativeBuildInputs = lib.optional enableLua pkgs.pkg-config;
-            buildInputs = lib.optional enableLua lua;
-          };
+          cargoExtraArgs = "--no-default-features" + lib.optionalString enableLua " --features lua";
 
-          # Nix supplies the selected interpreter, so never inherit Cargo's
-          # vendored LuaJIT default. This also keeps `enableLua = false` a
-          # genuinely Lua-free build.
-          cargoExtraArgs =
-            "--no-default-features" + lib.optionalString enableLua " --features lua,${luaFeature lua}";
-
-          # --- Loadable Lua C module, as a function of the interpreter -------
+          # --- Loadable LuaJIT C module ---------------------------------------
           #
-          # Mirrors a nixpkgs Lua package: takes `lua`, defaults to the one the
-          # daemon was built for, and is overrideable
-          # (`spool.luaModule.override { lua = pkgs.lua5_4; }`). Unlike the
-          # daemon it links no Lua at all, resolving `lua_*` from the host
-          # interpreter at load time (see the crate's build.rs); the
-          # interpreter only supplies headers. Not exposed as its own top-level
-          # flake package — it only makes sense in the context of a `spool`
-          # build, so it is reached through `spool.luaModule`.
-          mkLuaModule =
-            {
-              lua ? pkgs.luajit,
-            }:
+          # Unlike the daemon it embeds no Lua, resolving `lua_*` from its
+          # LuaJIT host at load time. The package only supplies headers here.
+          luaModule =
             let
               ver = lua.luaversion;
               drv = craneLib.buildPackage (
@@ -160,8 +91,7 @@
                   cargoArtifacts = sharedDeps;
                   nativeBuildInputs = [ pkgs.pkg-config ];
                   buildInputs = [ lua ];
-                  # Select the Lua ABI feature matching the interpreter.
-                  cargoExtraArgs = "-p spool-lua --no-default-features --features module,${luaFeature lua}";
+                  cargoExtraArgs = "-p spool-lua --no-default-features --features module";
                   # Install the cdylib as `spool.so` under the interpreter's
                   # C-module path, so a `${moduleDir}/?.so` cpath entry finds it.
                   installPhaseCommand = ''
@@ -189,18 +119,16 @@
         in
         craneLib.buildPackage (
           commonArgs
-          // luaBuildInputs
           // {
             inherit cargoExtraArgs;
             pname = "spool${if enableLua then "-with-lua" else ""}";
             cargoArtifacts = sharedDeps;
 
             # Expose the loadable Lua module so downstream configs can
-            # reference it as `spool.luaModule` (the derivation, built for
-            # the same interpreter as `lua` above), `spool.luaModule.moduleDir`
+            # reference it as `spool.luaModule`, `spool.luaModule.moduleDir`
             # (the dir for a `package.cpath` `?.so` entry), or
             # `spool.luaModule.modulePath` (the `spool.so` file).
-            passthru.luaModule = lib.makeOverridable mkLuaModule { inherit lua; };
+            passthru.luaModule = luaModule;
 
             meta = {
               # Tells `lib.getExe` which package name to get.

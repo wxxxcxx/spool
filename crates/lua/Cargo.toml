@@ -16,32 +16,20 @@ crate-type = ["rlib", "cdylib"]
 [lints.clippy]
 pedantic = "warn"
 
-# `module` makes this a loadable Lua module resolving the Lua C API from the
-# host interpreter (no Lua embedded); the `lua5x` features pick the ABI, and
-# exactly one must be enabled alongside it. 5.1 and Luau are not among them —
-# see the daemon's Cargo.toml for why the workspace does not carry them. Build
-# the module with:
-#   cargo build -p spool-lua --no-default-features --features module,lua54
-# The daemon takes the default (no features) and supplies its own vendored
-# interpreter through its own mlua dependency.
+# `module` makes this a loadable LuaJIT module resolving the Lua C API from the
+# host interpreter (no interpreter is embedded in the module). The daemon takes
+# the default (no features) and supplies its vendored LuaJIT through its own
+# `mlua` dependency.
 [features]
 default = []
-vendored = ["mlua/vendored"]
-module = ["mlua/module"]
-lua52 = ["mlua/lua52"]
-lua53 = ["mlua/lua53"]
-lua54 = ["mlua/lua54"]
-lua55 = ["mlua/lua55"]
-luajit = ["mlua/luajit"]
+module = ["mlua/module", "mlua/luajit"]
 
 [dependencies]
 mlua = { workspace = true }
-cfg-if = { workspace = true }
 spool-shared-types = { workspace = true, features = ["lua"] }
 serde = { workspace = true }
 # Decoding daemon query responses into Lua values.
 serde_json = { workspace = true }
 # `spool.match` compiles app/bundle/title patterns.
 regex = { workspace = true }
-futures-lite = "2.6"
-spool-mach-ipc.workspace = true
+spool-local-ipc.workspace = true

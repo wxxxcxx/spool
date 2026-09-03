@@ -43,6 +43,9 @@ mod workspace;
 pub type OSStatus = i32;
 /// Type alias for `WinID`, a 32-bit integer representing a window identifier in `SkyLight`.
 pub type WinID = i32;
+/// Stable identity of one AX window object during its lifetime. Unlike
+/// [`WinID`], this changes when `WindowServer` reuses an integer ID.
+pub type WindowIncarnation = u64;
 /// Type alias for `ConnID`, a 64-bit integer representing a connection identifier in `SkyLight`.
 pub type ConnID = i64;
 

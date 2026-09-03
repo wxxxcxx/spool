@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bevy::app::{App, Plugin, PostUpdate, PreUpdate, Update};
+use bevy::ecs::change_detection::DetectChangesMut as _;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
@@ -212,7 +213,7 @@ fn extract_once<T>(
 /// into the shared handle.
 pub fn drain_lua_outbox(
     worker: Option<Res<LuaWorker>>,
-    config: Option<Res<Config>>,
+    mut config: Option<ResMut<Config>>,
     mut displays: Query<&mut Display>,
     windows: Windows,
     applications: Query<&Application>,
@@ -230,8 +231,9 @@ pub fn drain_lua_outbox(
             FromLua::ConfigChanged => {
                 // Swap into the shared handle, then re-apply the same side
                 // effects a TOML reload does.
-                if let (Some(config), Some(built)) = (config.as_ref(), worker.built_config()) {
+                if let (Some(config), Some(built)) = (config.as_mut(), worker.built_config()) {
                     config.replace_inner_from(&built);
+                    config.set_changed();
                     apply_config_side_effects(config, &mut displays, &windows, &applications);
                 }
             }

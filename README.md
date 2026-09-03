@@ -238,8 +238,7 @@ $ spool
 ### Sending Commands
 
 Spool exposes a `send-cmd` subcommand that lets you control the running
-instance from the command line over a Mach service
-(`com.wxxxcxx.spool`). Any
+instance from the command line over its authenticated Unix socket. Any
 command that can be bound to a hotkey can also be sent programmatically:
 
 ```shell
@@ -316,21 +315,62 @@ $ spool send-cmd space focus 42
 
 ### Querying and Subscribing to State
 
-Spool also exposes structured JSON state for scripts and status bars:
+Spool exposes a compact tab-separated summary by default, which is convenient
+to read in a terminal or process with `awk`:
+
+```shell
+$ spool query state
+$ spool query spaces
+$ spool query active
+$ spool query on-screen
+$ spool subscribe
+```
+
+Pass `--json` when a script or status bar needs the complete structured state:
 
 ```shell
 $ spool query state --json
 $ spool query spaces --json
 $ spool query active --json
+$ spool query on-screen --json
 $ spool subscribe --json
 ```
 
-`query` prints a JSON snapshot and exits. `subscribe --json` keeps the channel
-open and emits line-delimited JSON events for changes that integrations usually
-care about, including focus changes, Space changes, window-list
-changes, title changes, and display changes. See
+`query` prints one snapshot and exits. `subscribe` keeps the channel open and
+prints a header followed by one TSV summary row per event; `subscribe --json`
+instead emits one complete JSON object per line. Events cover focus changes,
+Space changes, window-list changes, title changes, and display changes. See
 [`QUERY_AND_SUBSCRIBE_FORMAT.md`](./QUERY_AND_SUBSCRIBE_FORMAT.md) for the
 full payload contract.
+
+### Running Client Scripts
+
+For logic that is more involved than one `send-cmd`, run an isolated Lua
+client (available in the default Lua-enabled build). The script runs in the
+invoking CLI process, while its `spool.*` calls talk to the running daemon over
+the Unix socket:
+
+```shell
+# Execute a file. Arguments after `--` become arg[1], arg[2], ... in Lua.
+$ spool script arrange.lua -- terminal work
+
+# Execute an inline expression.
+$ spool script -e 'print(spool.query_active().focused_window_title)'
+
+# Read from standard input.
+$ printf 'print(spool.state.get("mode"))' | spool script -
+```
+
+Both the global `spool` value and `require("spool")` refer to the client API.
+It can query state, persist script-owned values, send window commands,
+transform window sets, and subscribe to changes. It deliberately cannot call
+configuration-only functions such as `spool.setup`, `spool.bind`, or
+`spool.on`.
+
+Each invocation receives a fresh Lua runtime. A script that blocks, loops, or
+mutates Lua globals affects only that CLI process, never the daemon's
+configuration runtime. Output is controlled by the script with `print`; a Lua
+error is written to stderr with a traceback and produces a non-zero exit.
 
 #### Scripting ideas
 

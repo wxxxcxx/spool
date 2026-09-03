@@ -10,12 +10,11 @@ use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
+    CFArray, CFBoolean, CFHash, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
     kCFBooleanFalse, kCFBooleanTrue,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -31,24 +30,93 @@ use super::skylight::{
 use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::manager::{Origin, Size, irect_from};
-use crate::platform::{Pid, ProcessSerialNumber, WinID, macos_major_version};
+use crate::platform::{Pid, ProcessSerialNumber, WinID, WindowIncarnation, macos_major_version};
 use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
 
-/// Per-PID ref-count for the `AXEnhancedUserInterface` workaround. Tracks how many
-/// concurrent window operations are in-flight for each app so the attribute is only
-/// re-enabled after the last one completes (safe under `par_iter_mut`).
-static ENHANCED_UI_REFCOUNT: LazyLock<Mutex<HashMap<Pid, usize>>> =
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct EnhancedUiKey {
+    pid: Pid,
+    application_incarnation: WindowIncarnation,
+}
+
+impl EnhancedUiKey {
+    fn new(pid: Pid, application_incarnation: WindowIncarnation) -> Self {
+        Self {
+            pid,
+            application_incarnation,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EnhancedUiState {
+    depth: usize,
+    restore: bool,
+}
+
+impl EnhancedUiState {
+    fn new(restore: bool) -> Self {
+        Self { depth: 1, restore }
+    }
+
+    fn acquire(&mut self) {
+        self.depth += 1;
+    }
+
+    /// Returns whether the attribute must be restored when this was the final lease.
+    fn release(&mut self) -> Option<bool> {
+        self.depth = self.depth.saturating_sub(1);
+        (self.depth == 0).then_some(self.restore)
+    }
+}
+
+/// Active `AXEnhancedUserInterface` leases, keyed by the exact AX application
+/// identity. The mutex deliberately covers the first AX read/write and the last
+/// restore so two concurrent first users cannot both toggle the same app, and a
+/// reused PID cannot inherit state from an earlier application object.
+static ENHANCED_UI_STATES: LazyLock<Mutex<HashMap<EnhancedUiKey, EnhancedUiState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Apps observed not to have `AXEnhancedUserInterface` set, so the workaround
-/// above can skip them without asking again.
-///
-/// An `RwLock` rather than a `Mutex`: entries are written once and read by
-/// many concurrent `par_iter_mut` workers afterwards, so readers must not
-/// exclude each other. Entries die with the process, so a relaunch (new pid)
-/// is asked afresh.
-static ENHANCED_UI_ABSENT: LazyLock<RwLock<HashSet<Pid>>> =
-    LazyLock::new(|| RwLock::new(HashSet::new()));
+fn acquire_enhanced_ui_state(
+    states: &Mutex<HashMap<EnhancedUiKey, EnhancedUiState>>,
+    key: EnhancedUiKey,
+    first_acquire: impl FnOnce() -> bool,
+) {
+    let mut states = states
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match states.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().acquire(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(EnhancedUiState::new(first_acquire()));
+        }
+    }
+}
+
+fn release_enhanced_ui_state(
+    states: &Mutex<HashMap<EnhancedUiKey, EnhancedUiState>>,
+    key: EnhancedUiKey,
+    restore: impl FnOnce(),
+) {
+    let mut states = states
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(state) = states.get_mut(&key) else {
+        return;
+    };
+    let Some(should_restore) = state.release() else {
+        return;
+    };
+    if should_restore {
+        restore();
+    }
+    states.remove(&key);
+}
+
+struct EnhancedUiLease {
+    key: EnhancedUiKey,
+    application: CFRetained<AXUIWrapper>,
+}
 
 /// macOS may partially apply an AX width increase when the requested right edge
 /// would be far outside the display. Moving the partial result left by the
@@ -69,6 +137,25 @@ fn resize_staging_origin(
     })
 }
 
+fn observe_geometry_write_result(
+    operation: &'static str,
+    write_result: Result<()>,
+    observe: impl FnOnce() -> Result<IRect>,
+) -> Result<IRect> {
+    let observed_result = observe();
+    match (write_result, observed_result) {
+        (Ok(()), observed) => observed,
+        (Err(write_error), Ok(observed)) => {
+            warn!(%write_error, operation, ?observed, "AX geometry request only partially succeeded");
+            Err(write_error)
+        }
+        (Err(write_error), Err(observe_error)) => {
+            warn!(%observe_error, operation, "unable to read back failed AX geometry request");
+            Err(write_error)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum WindowPadding {
     Vertical(i32),
@@ -78,6 +165,7 @@ pub enum WindowPadding {
 #[automock]
 pub trait WindowApi: Send + Sync {
     fn id(&self) -> WinID;
+    fn incarnation(&self) -> WindowIncarnation;
     fn frame(&self) -> IRect;
     fn element(&self) -> Option<CFRetained<AXUIWrapper>>;
     fn title(&self) -> Result<String>;
@@ -89,9 +177,18 @@ pub trait WindowApi: Send + Sync {
     fn role(&self) -> Result<String>;
     fn subrole(&self) -> Result<String>;
     fn is_minimized(&self) -> bool;
+    /// Reads the native fullscreen attribute without collapsing an AX failure
+    /// into `false`.
+    fn try_is_full_screen(&self) -> Result<bool>;
     fn is_full_screen(&self) -> bool;
-    fn reposition(&mut self, origin: Origin);
-    fn resize(&mut self, size: Size);
+    /// Requests a new origin and returns the frame read back from AX.
+    fn reposition(&mut self, origin: Origin) -> Result<IRect>;
+    /// Resizes a frame whose origin is intended to stay fixed. The common
+    /// path performs one size write; if AX moves the window as a side effect,
+    /// the origin is restored before the final confirmed frame is returned.
+    fn resize_preserving_origin(&mut self, frame: IRect) -> Result<IRect>;
+    /// Applies a complete target frame and returns the frame confirmed by AX.
+    fn set_frame(&mut self, frame: IRect) -> Result<IRect>;
     fn update_frame(&mut self) -> Result<IRect>;
     fn focus_without_raise(
         &self,
@@ -152,6 +249,11 @@ pub fn try_ax_window_id(element_ref: AXUIElementRef) -> Option<WinID> {
     Some(window_id)
 }
 
+pub(crate) fn ax_window_incarnation(element: &AXUIWrapper) -> WindowIncarnation {
+    let element: &CFType = element.as_ref();
+    CFHash(Some(element)) as WindowIncarnation
+}
+
 // const CPS_ALL_WINDOWS: u32 = 0x100;
 const CPS_USER_GENERATED: u32 = 0x200;
 // const CPS_NO_WINDOWS: u32 = 0x400;
@@ -166,11 +268,6 @@ pub struct WindowOS {
     border_radius: OnceLock<Option<f64>>,
     pid: OnceLock<Result<Pid>>,
     app_reference: OnceLock<Option<CFRetained<AXUIWrapper>>>,
-    /// Set once this window's app is known not to use
-    /// `AXEnhancedUserInterface` (the common case), so the steady-state check
-    /// in [`Self::disable_enhanced_ui`] is a relaxed atomic load instead of
-    /// contending for the global mutex from every `par_iter_mut` worker.
-    enhanced_ui_absent: AtomicBool,
 
     /// The last title read off the element, cached because reading one is a
     /// synchronous cross-process call and many callers want it for every
@@ -226,7 +323,6 @@ impl WindowOS {
             border_radius: OnceLock::new(),
             pid: OnceLock::new(),
             app_reference: OnceLock::new(),
-            enhanced_ui_absent: AtomicBool::new(false),
             title: RwLock::new(None),
         };
 
@@ -311,108 +407,62 @@ impl WindowOS {
 
     /// Disables `AXEnhancedUserInterface` on this window's app if it is currently enabled.
     ///
-    /// Uses a per-PID ref-count so that concurrent operations on windows of the same app
-    /// (via `par_iter_mut`) keep the attribute disabled until the last caller re-enables it.
-    ///
-    /// This avoids animated move/resize that breaks window management for apps like Chrome,
-    /// Firefox, and Zen Browser when accessibility clients (e.g. Kindavim) enable enhanced UI.
-    fn disable_enhanced_ui(&self) {
-        // Nothing to disable, and nothing to lock or ask: this window's app has
-        // already been found not to use the attribute.
-        if self.enhanced_ui_absent.load(Ordering::Relaxed) {
-            return;
-        }
-        let Ok(pid) = self.pid() else { return };
-        // Another window of the same app may have answered the question already.
-        // Taken before the ref-count mutex, since the answer is usually "absent"
-        // and that path should not touch the ref-count at all.
-        if ENHANCED_UI_ABSENT
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&pid)
-        {
-            self.enhanced_ui_absent.store(true, Ordering::Relaxed);
-            return;
-        }
-        // Scoped so the lock isn't held across the accessibility calls below:
-        // each is a synchronous round-trip into another process, and holding a
-        // global mutex across them would serialize every `par_iter_mut` worker
-        // behind the slowest app.
-        {
-            let mut counts = ENHANCED_UI_REFCOUNT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(count) = counts.get_mut(&pid) {
-                *count += 1;
-                return;
-            }
-        }
-        let Some(app_element) = self.app_reference() else {
-            return;
-        };
+    /// The returned lease must be passed to [`Self::reenable_enhanced_ui`]. The
+    /// first AX probe/write and ref-count acquisition happen under one lock, so
+    /// concurrent windows cannot race through two independent first-acquire paths.
+    fn disable_enhanced_ui(&self) -> Option<EnhancedUiLease> {
+        let pid = self.pid().ok()?;
+        let application = self.app_reference()?;
+        let key = EnhancedUiKey::new(pid, ax_window_incarnation(&application));
         let attr = CFString::from_static_str("AXEnhancedUserInterface");
-        let enabled = app_element
-            .get_attribute::<CFBoolean>(&attr)
-            .is_ok_and(|v| CFBoolean::value(&v));
-        if enabled {
-            unsafe {
+
+        acquire_enhanced_ui_state(&ENHANCED_UI_STATES, key, || {
+            let enabled = application
+                .get_attribute::<CFBoolean>(&attr)
+                .is_ok_and(|value| CFBoolean::value(&value));
+            if !enabled {
+                return false;
+            }
+
+            let result = unsafe {
                 AXUIElementSetAttributeValue(
-                    app_element.as_ptr(),
+                    application.as_ptr(),
                     attr.as_ref(),
                     kCFBooleanFalse.unwrap(),
-                );
+                )
             }
-            // Incremented rather than set: two windows of the same app can race
-            // here and both owe a matching `reenable_enhanced_ui`; setting 1
-            // would let the second one decrement past zero.
-            *ENHANCED_UI_REFCOUNT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(pid)
-                .or_insert(0) += 1;
-        } else {
-            ENHANCED_UI_ABSENT
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(pid);
-            self.enhanced_ui_absent.store(true, Ordering::Relaxed);
-        }
+            .to_result("disable AXEnhancedUserInterface");
+            if let Err(error) = result {
+                warn!(%error, "unable to disable AXEnhancedUserInterface");
+                return false;
+            }
+            true
+        });
+
+        Some(EnhancedUiLease { key, application })
     }
 
-    /// Re-enables `AXEnhancedUserInterface` on this window's app once the last concurrent
-    /// caller has finished. Pairs with [`disable_enhanced_ui`].
-    fn reenable_enhanced_ui(&self) {
-        // Nothing was disabled, so there is no ref-count entry to find and no
-        // reason to take the lock looking for one.
-        if self.enhanced_ui_absent.load(Ordering::Relaxed) {
-            return;
-        }
-        let Ok(pid) = self.pid() else { return };
-        let mut counts = ENHANCED_UI_REFCOUNT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(count) = counts.get_mut(&pid) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        if *count > 0 {
-            return;
-        }
-        counts.remove(&pid);
-        drop(counts);
-        if let Some(app_element) = self.app_reference() {
+    /// Releases an `AXEnhancedUserInterface` lease and restores the attribute
+    /// after the final concurrent operation on this exact application object.
+    fn reenable_enhanced_ui(lease: Option<EnhancedUiLease>) {
+        let Some(lease) = lease else { return };
+        release_enhanced_ui_state(&ENHANCED_UI_STATES, lease.key, || {
             let attr = CFString::from_static_str("AXEnhancedUserInterface");
-            unsafe {
+            let result = unsafe {
                 AXUIElementSetAttributeValue(
-                    app_element.as_ptr(),
+                    lease.application.as_ptr(),
                     attr.as_ref(),
                     kCFBooleanTrue.unwrap(),
-                );
+                )
             }
-        }
+            .to_result("reenable AXEnhancedUserInterface");
+            if let Err(error) = result {
+                warn!(%error, "unable to reenable AXEnhancedUserInterface");
+            }
+        });
     }
 
-    fn set_ax_position(&mut self, origin: Origin) {
+    fn set_ax_position(&mut self, origin: Origin) -> Result<()> {
         let mut point = CGPoint::new(
             f64::from(origin.x + self.horizontal_padding),
             f64::from(origin.y + self.vertical_padding),
@@ -423,21 +473,23 @@ impl WindowOS {
                 NonNull::from(&mut point).as_ptr().cast(),
             )
         };
-        if let Ok(position) = AXUIWrapper::retain(position_ref) {
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    self.ax_element.as_ptr(),
-                    CFString::from_static_str(kAXPositionAttribute).as_ref(),
-                    position.as_ref(),
-                )
-            };
-            let size = self.frame.size();
-            self.frame.min = origin;
-            self.frame.max = origin + size;
+        let position = AXUIWrapper::retain(position_ref)?;
+        unsafe {
+            AXUIElementSetAttributeValue(
+                self.ax_element.as_ptr(),
+                CFString::from_static_str(kAXPositionAttribute).as_ref(),
+                position.as_ref(),
+            )
         }
+        .to_result(function_name!())?;
+
+        let size = self.frame.size();
+        self.frame.min = origin;
+        self.frame.max = origin + size;
+        Ok(())
     }
 
-    fn set_ax_size(&mut self, size: Size) {
+    fn set_ax_size(&mut self, size: Size) -> Result<()> {
         let width_padding = 2 * self.horizontal_padding;
         let height_padding = 2 * self.vertical_padding;
         let mut cgsize = CGSize::new(
@@ -450,16 +502,75 @@ impl WindowOS {
                 NonNull::from(&mut cgsize).as_ptr().cast(),
             )
         };
-        if let Ok(size_value) = AXUIWrapper::retain(size_ref) {
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    self.ax_element.as_ptr(),
-                    CFString::from_static_str(kAXSizeAttribute).as_ref(),
-                    size_value.as_ref(),
-                )
-            };
-            self.frame.max = self.frame.min + size;
+        let size_value = AXUIWrapper::retain(size_ref)?;
+        unsafe {
+            AXUIElementSetAttributeValue(
+                self.ax_element.as_ptr(),
+                CFString::from_static_str(kAXSizeAttribute).as_ref(),
+                size_value.as_ref(),
+            )
         }
+        .to_result(function_name!())?;
+
+        self.frame.max = self.frame.min + size;
+        Ok(())
+    }
+
+    /// Writes a complete target frame without trusting the cached frame to
+    /// decide whether any AX call can be skipped.
+    fn write_ax_frame(&mut self, target_frame: IRect, previous_frame: IRect) -> Result<()> {
+        let size = target_frame.size();
+        self.set_ax_size(size)?;
+
+        let mut previous_observed_frame = previous_frame;
+        let mut staged = false;
+        for attempt in 1..=3 {
+            let Ok(actual_frame) = self.update_frame() else {
+                break;
+            };
+            let Some(staging_origin) =
+                resize_staging_origin(previous_observed_frame, actual_frame, size.x)
+            else {
+                break;
+            };
+            debug!(
+                attempt,
+                requested_width = size.x,
+                actual_width = actual_frame.width(),
+                staging_x = staging_origin.x,
+                "retrying partially constrained AX resize from an offscreen origin"
+            );
+            staged = true;
+            previous_observed_frame = actual_frame;
+            self.set_ax_position(staging_origin)?;
+            self.set_ax_size(size)?;
+        }
+
+        if staged && let Ok(final_frame) = self.update_frame() {
+            debug!(
+                requested_width = size.x,
+                actual_width = final_frame.width(),
+                "completed staged AX resize"
+            );
+        }
+
+        // AX commonly moves a window while changing its size. Reassert the
+        // intended origin between two size writes, matching the sequence used
+        // by mature macOS window managers.
+        self.set_ax_position(target_frame.min)?;
+        self.set_ax_size(size)
+    }
+
+    /// Always refreshes the frame cache after a geometry request. AX setters
+    /// are not transactional, so a failed sequence may still have moved or
+    /// resized the window. The original write error still reaches the caller,
+    /// while the readback keeps subsequent geometry decisions synchronized.
+    fn observe_geometry_write(
+        &mut self,
+        operation: &'static str,
+        write_result: Result<()>,
+    ) -> Result<IRect> {
+        observe_geometry_write_result(operation, write_result, || self.update_frame())
     }
 
     /// Makes the window the key window for its application by sending synthesized events.
@@ -498,6 +609,10 @@ impl WindowApi for WindowOS {
     /// The window ID as `WinID`.
     fn id(&self) -> WinID {
         self.id
+    }
+
+    fn incarnation(&self) -> WindowIncarnation {
+        ax_window_incarnation(&self.ax_element)
     }
 
     /// Returns the current frame (`CGRect`) of the window.
@@ -572,66 +687,48 @@ impl WindowApi for WindowOS {
     }
 
     fn is_full_screen(&self) -> bool {
-        self.ax_element.full_screen().unwrap_or(false)
+        self.try_is_full_screen().unwrap_or(false)
+    }
+
+    fn try_is_full_screen(&self) -> Result<bool> {
+        self.ax_element.full_screen()
     }
 
     #[instrument(level = Level::TRACE)]
-    fn reposition(&mut self, origin: Origin) {
-        if self.frame.min == origin {
-            trace!("already in position.");
-            return;
-        }
-        self.disable_enhanced_ui();
-        self.set_ax_position(origin);
-        self.reenable_enhanced_ui();
+    fn reposition(&mut self, origin: Origin) -> Result<IRect> {
+        let enhanced_ui_lease = self.disable_enhanced_ui();
+        let write_result = self.set_ax_position(origin);
+        let result = self.observe_geometry_write("reposition", write_result);
+        Self::reenable_enhanced_ui(enhanced_ui_lease);
+        result
     }
 
     #[instrument(level = Level::TRACE)]
-    fn resize(&mut self, size: Size) {
-        if self.frame.size() == size {
-            trace!("already correct size.");
-            return;
+    fn resize_preserving_origin(&mut self, target: IRect) -> Result<IRect> {
+        let enhanced_ui_lease = self.disable_enhanced_ui();
+        let write_result = self.set_ax_size(target.size());
+        let mut result = self.observe_geometry_write("resize_preserving_origin", write_result);
+
+        if result
+            .as_ref()
+            .is_ok_and(|observed| observed.min != target.min)
+        {
+            let write_result = self.set_ax_position(target.min);
+            result = self.observe_geometry_write("restore_resize_origin", write_result);
         }
+
+        Self::reenable_enhanced_ui(enhanced_ui_lease);
+        result
+    }
+
+    #[instrument(level = Level::TRACE)]
+    fn set_frame(&mut self, frame: IRect) -> Result<IRect> {
         let previous_frame = self.frame;
-        let target_origin = previous_frame.min;
-        self.disable_enhanced_ui();
-        self.set_ax_size(size);
-
-        let mut previous_observed_frame = previous_frame;
-        let mut staged = false;
-        for attempt in 1..=3 {
-            let Ok(actual_frame) = self.update_frame() else {
-                break;
-            };
-            let Some(staging_origin) =
-                resize_staging_origin(previous_observed_frame, actual_frame, size.x)
-            else {
-                break;
-            };
-            debug!(
-                attempt,
-                requested_width = size.x,
-                actual_width = actual_frame.width(),
-                staging_x = staging_origin.x,
-                "retrying partially constrained AX resize from an offscreen origin"
-            );
-            staged = true;
-            previous_observed_frame = actual_frame;
-            self.set_ax_position(staging_origin);
-            self.set_ax_size(size);
-        }
-
-        if staged {
-            if let Ok(final_frame) = self.update_frame() {
-                debug!(
-                    requested_width = size.x,
-                    actual_width = final_frame.width(),
-                    "completed staged AX resize"
-                );
-            }
-            self.set_ax_position(target_origin);
-        }
-        self.reenable_enhanced_ui();
+        let enhanced_ui_lease = self.disable_enhanced_ui();
+        let write_result = self.write_ax_frame(frame, previous_frame);
+        let result = self.observe_geometry_write("set_frame", write_result);
+        Self::reenable_enhanced_ui(enhanced_ui_lease);
+        result
     }
 
     /// Updates the internal `frame` of the window by querying its current position and size from the Accessibility API.
@@ -669,17 +766,24 @@ impl WindowApi for WindowOS {
         };
 
         let mut frame = CGRect::default();
-        unsafe {
-            AXValueGetValue(
+        let (position_ok, size_ok) = unsafe {
+            let position_ok = AXValueGetValue(
                 position.as_ptr(),
                 kAXValueTypeCGPoint,
                 NonNull::from(&mut frame.origin).as_ptr().cast(),
             );
-            AXValueGetValue(
+            let size_ok = AXValueGetValue(
                 size.as_ptr(),
                 kAXValueTypeCGSize,
                 NonNull::from(&mut frame.size).as_ptr().cast(),
             );
+            (position_ok, size_ok)
+        };
+        if !position_ok || !size_ok {
+            return Err(Error::invalid_window(&format!(
+                "unable to decode AX frame for window {} (position: {position_ok}, size: {size_ok})",
+                self.id
+            )));
         }
         // if (CGRectEqualToRect(new_frame, window->frame)) {
         //     debug("%s:DEBOUNCED %s %d\n", __FUNCTION__, window->application->name, window->id);
@@ -823,6 +927,100 @@ impl WindowApi for WindowOS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn enhanced_ui_first_acquire_and_final_restore_are_atomic() {
+        let states = Arc::new(Mutex::new(HashMap::new()));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let restores = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(2));
+        let acquired = Arc::new(Barrier::new(2));
+        let key = EnhancedUiKey::new(42, 7);
+
+        let handles = (0..2)
+            .map(|_| {
+                let states = Arc::clone(&states);
+                let probes = Arc::clone(&probes);
+                let restores = Arc::clone(&restores);
+                let start = Arc::clone(&start);
+                let acquired = Arc::clone(&acquired);
+                std::thread::spawn(move || {
+                    start.wait();
+                    acquire_enhanced_ui_state(&states, key, || {
+                        probes.fetch_add(1, Ordering::SeqCst);
+                        true
+                    });
+                    acquired.wait();
+                    release_enhanced_ui_state(&states, key, || {
+                        restores.fetch_add(1, Ordering::SeqCst);
+                    });
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert_eq!(restores.load(Ordering::SeqCst), 1);
+        assert!(states.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn enhanced_ui_state_distinguishes_pid_reuse_by_ax_incarnation() {
+        let states = Mutex::new(HashMap::new());
+        let probes = AtomicUsize::new(0);
+        let restores = AtomicUsize::new(0);
+        let old_application = EnhancedUiKey::new(42, 7);
+        let new_application = EnhancedUiKey::new(42, 8);
+
+        acquire_enhanced_ui_state(&states, old_application, || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        acquire_enhanced_ui_state(&states, new_application, || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+
+        assert_ne!(old_application, new_application);
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert_eq!(states.lock().unwrap().len(), 2);
+
+        for key in [old_application, new_application] {
+            release_enhanced_ui_state(&states, key, || {
+                restores.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert_eq!(restores.load(Ordering::SeqCst), 2);
+        assert!(states.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn geometry_readback_refreshes_observation_but_preserves_write_error() {
+        let observed = Cell::new(false);
+        let actual_frame = IRect::new(10, 20, 310, 220);
+
+        let result = observe_geometry_write_result(
+            "test",
+            Err(Error::Generic("setter failed".to_string())),
+            || {
+                observed.set(true);
+                Ok(actual_frame)
+            },
+        );
+
+        assert!(observed.get());
+        assert!(matches!(
+            result,
+            Err(Error::Generic(ref message)) if message == "setter failed"
+        ));
+    }
 
     #[test]
     fn stages_partially_applied_width_growth() {

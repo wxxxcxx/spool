@@ -16,15 +16,13 @@ members = ["crates/*"]
 default-members = ["."]
 
 # Versions shared by the daemon, the loadable Lua module and the command crate,
-# so the three can never drift apart. Members add only the features they need
-# (the Lua ABI in particular differs: vendored here, `module` in crates/lua).
+# so the three can never drift apart. Spool supports one Lua implementation:
+# LuaJIT, embedded by the daemon and resolved from the host by the C module.
 [workspace.dependencies]
-cfg-if = "1.0.4"
 futures-lite = "2.6"
-mach2 = "0.6"
 mlua = { version = "0.12", default-features = false, features = ["serialize"] }
 spool-lua = { path = "crates/lua" }
-spool-mach-ipc = { path = "crates/mach_ipc" }
+spool-local-ipc = { path = "crates/local_ipc" }
 spool-shared-types = { path = "crates/shared_types" }
 regex = "1.12"
 serde = { version = "1.0", features = ["derive", "rc"] }
@@ -33,44 +31,23 @@ serde_json = "1.0"
 [lints.clippy]
 pedantic = "warn"
 
-# `lua` builds in the `init.lua` scripting runtime (`spool.on`/
-# `spool.bind`). Plain Cargo builds include a vendored LuaJIT by default; use
-# `--no-default-features` for a build without Lua. Exactly one ABI feature must
-# be picked alongside `lua` (same convention as `crates/lua`) — `luajit` is
-# the one to pick unless you have a reason not to: handlers run on the event
-# path, and its tracing JIT is worth roughly an order of magnitude there over
-# the reference interpreter. The `lua5x` features remain for scripts needing
-# 5.2+ semantics LuaJIT lacks.
-#
-# Lua 5.1 and Luau are deliberately not offered. The world-access calls
-# (`spool.query*`, the window set, `spool.state`) are async, which means the
-# interpreter has to be able to yield out of a Rust callback. LuaJIT can —
-# it is resumable across pcall, metamethods and C boundaries — but reference
-# 5.1 cannot yield across a C-call boundary at all, and Luau is missing the
-# same machinery (mlua gates several of its async APIs off both).
-#
-# `vendored` builds the interpreter from source rather than linking one the
-# system already has, and is what a plain `cargo build` wants. Leave it off
-# where the build already supplies an interpreter and its headers (the Nix
-# package does, via pkg-config): building it from source there fails anyway,
-# because `luajit-src` copies its sources out of the read-only Nix store and
-# then cannot write to the copy.
+# `lua` is the complete scripting capability: the `init.lua` worker,
+# `spool script`, Lua value conversion, and a vendored LuaJIT. There are no
+# independent interpreter/source-selection features, so every Lua-enabled
+# Spool binary has the same semantics. Use `--no-default-features` for a build
+# without Lua.
 [features]
-default = ["lua", "vendored", "luajit"]
-vendored = ["mlua/vendored"]
+default = ["lua"]
 lua = [
   "dep:mlua",
   "dep:spool-lua",
   "dep:async-executor",
+  "mlua/luajit",
+  "mlua/vendored",
   # Brings in the `FromLua`/`IntoLua` impls the embedded runtime needs to hand
   # a script the values it stored.
   "spool-shared-types/lua",
 ]
-luajit = ["mlua/luajit"]
-lua55 = ["mlua/lua55"]
-lua52 = ["mlua/lua52"]
-lua53 = ["mlua/lua53"]
-lua54 = ["mlua/lua54"]
 
 [profile.fast-release]
 inherits = "release"
@@ -110,9 +87,6 @@ derive_more = { version = "2.1", features = ["deref", "deref_mut"] }
 embed_plist = "1.2"
 launchctl = "0.3"
 libc = "0.2"
-# Vendoring is left to the `vendored` feature rather than forced on here, so a
-# build that already has an interpreter to link against can say so.
-#
 # `async` is added only for the daemon: it is the embedded runtime that awaits
 # the main thread for world access. The loadable module in `crates/lua` talks to
 # the daemon over a socket and has nothing to await, so it stays on the plain
@@ -139,7 +113,7 @@ objc2-app-kit = { version = "0.3", features = [
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 objc2-core-graphics = "0.3"
-spool-mach-ipc = { workspace = true }
+spool-local-ipc = { workspace = true }
 spool-shared-types = { workspace = true }
 spool-lua = { workspace = true, optional = true }
 objc2-quartz-core = { version = "0.3", features = [
@@ -165,6 +139,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ctrlc = { version = "3.5", features = ["termination"] }
 xdg = "3.0"
 mockall = "0.15"
-[build-dependencies]
-cfg-if = { workspace = true}
-

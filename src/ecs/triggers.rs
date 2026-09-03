@@ -5,12 +5,13 @@ use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Has, With, Without};
+use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::system::{Commands, NonSendMut, Populated, Query, Res, ResMut, Single, SystemParam};
 use bevy::math::IRect;
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
@@ -23,23 +24,90 @@ use crate::config::Config;
 use crate::ecs::focus::{FocusCoordinator, FocusSignal};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
+use crate::ecs::reconcile::{WindowStateSync, WindowUnavailable};
 use crate::ecs::state::SpoolState;
+use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, InitialWindowMarker, Initializing, LayoutPosition,
-    Position, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    VerifyWindowPosition, WidthRatio, WindowProperties,
+    ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, FullscreenDefaultsDeferred,
+    InitialWindowMarker, Initializing, LayoutPosition, ObservedWindowFrame, Position,
+    PresentedWindowFrame, RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling,
+    SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio, WindowDefaultsApplied,
+    WindowDefaultsPending, WindowFrameMotion, WindowOwnershipChanged, WindowProperties,
 };
 use crate::events::{DestroySource, Event, FocusObservation, FocusSource};
 use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
 };
-use crate::platform::WinID;
+use crate::platform::{WinID, WindowIncarnation, WorkspaceId};
 use crate::util::{round_px, symlink_target};
 
 /// The display currently in front, paired with the Dock's edge — together they
 /// give the usable viewport a window has to be fitted into.
 type ActiveDisplayViewport<'w, 's> =
     Single<'w, 's, (&'static Display, Option<&'static DockPosition>), With<ActiveDisplayMarker>>;
+
+type ResizeVerificationWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        &'static mut Position,
+        &'static mut Bounds,
+        &'static mut DesiredWindowFrame,
+        &'static mut PresentedWindowFrame,
+        Option<&'static mut ObservedWindowFrame>,
+        Has<Floating>,
+    ),
+    Without<WindowSpaceReassignmentPending>,
+>;
+
+type DefaultableWindows<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut Window,
+        &'static mut Position,
+        &'static mut Bounds,
+        &'static mut DesiredWindowFrame,
+        &'static mut PresentedWindowFrame,
+        Option<&'static mut ObservedWindowFrame>,
+        &'static ChildOf,
+    ),
+    (
+        With<WindowDefaultsPending>,
+        Without<WindowDefaultsApplied>,
+        Without<FullscreenDefaultsDeferred>,
+        Without<WindowUnavailable>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
+>;
+
+type PositionedWindows<'w, 's> = Populated<
+    'w,
+    's,
+    (Entity, Has<InitialWindowMarker>),
+    (
+        With<WindowDefaultsPending>,
+        With<WindowDefaultsApplied>,
+        With<ObservedWindowFrame>,
+        Without<FullscreenDefaultsDeferred>,
+        Without<WindowUnavailable>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
+>;
+
+#[derive(SystemParam)]
+pub(super) struct SpawnWindowCtx<'w, 's> {
+    windows: Query<'w, 's, (Entity, &'static Window, &'static ChildOf)>,
+    apps: Query<'w, 's, (Entity, &'static mut Application)>,
+    active_display: ActiveDisplay<'w, 's>,
+    launch_capture: crate::ecs::exit_restore::LaunchCapture<'w, 's>,
+    initializing: Option<Res<'w, Initializing>>,
+    restore: Option<Res<'w, crate::ecs::restore::SessionRestore>>,
+    sync: ResMut<'w, WindowStateSync>,
+    commands: Commands<'w, 's>,
+}
 
 /// Computes the passthrough keybinding set for the given window/app and
 /// publishes it to the input thread. Called on focus change and config reload.
@@ -80,9 +148,8 @@ pub(crate) fn apply_config_side_effects(
     }
 
     // Recompute passthrough keys for the currently focused window.
-    if let Some((window, _, parent)) = windows
-        .focused()
-        .and_then(|(w, e)| windows.find_parent(w.id()).map(|(w, _, p)| (w, e, p)))
+    if let Some((_, entity)) = windows.focused()
+        && let Some((window, _, parent)) = windows.get_parent(entity)
         && let Ok(app) = applications.get(parent)
     {
         update_passthrough(window, app, config);
@@ -139,9 +206,23 @@ pub(super) fn front_switched_trigger(
                 )
             }
             Event::FocusRevalidationRequested { pid, source } => {
-                let Some((app_entity, app)) =
-                    applications.iter().find(|(_, app)| app.pid() == *pid)
-                else {
+                let mut uncertain = None;
+                let mut current = None;
+                for candidate @ (_, app) in applications.iter().filter(|(_, app)| app.pid() == *pid)
+                {
+                    match app.is_running() {
+                        Ok(true) => {
+                            current = Some(candidate);
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            debug!(pid, %error, "focus revalidation liveness check failed open");
+                            uncertain.get_or_insert(candidate);
+                        }
+                    }
+                }
+                let Some((app_entity, app)) = current.or(uncertain) else {
                     debug!("Unable to revalidate focus for pid {pid} from {source:?}");
                     continue;
                 };
@@ -249,11 +330,19 @@ fn confirm_tracked_focus_observation(
     app: &Application,
     focus: &mut FocusCoordinator,
 ) -> bool {
-    if !app.is_frontmost()
-        || app
-            .focused_window_id()
-            .is_ok_and(|id| id != observation.window_id)
-    {
+    if !app.is_frontmost() {
+        return false;
+    }
+    let Ok(focused_window_id) = app.focused_window_id().inspect_err(|error| {
+        debug!(
+            window_id = observation.window_id,
+            %error,
+            "focus observation deferred because AX focus is unavailable"
+        );
+    }) else {
+        return false;
+    };
+    if focused_window_id != observation.window_id {
         return false;
     }
     let Some(generation) = focus
@@ -297,7 +386,13 @@ fn queue_untracked_focus_observation(
         window_id: Some(observation.window_id),
     });
     let timeout = Timeout::new(Duration::from_secs(RETRY_SEC), None, commands);
-    commands.spawn((timeout, StrayFocusEvent(observation.window_id)));
+    commands.spawn((
+        timeout,
+        StrayFocusEvent(FocusObservation {
+            generation: Some(generation),
+            ..observation
+        }),
+    ));
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -325,7 +420,19 @@ pub(super) fn window_focused_trigger(
             continue;
         }
 
-        let Some((window, entity, parent)) = ctx.windows.find_parent(window_id) else {
+        let Some((window, entity, parent)) =
+            ctx.windows
+                .find_parent_matching(window_id, |window, parent| {
+                    applications.get(parent).is_ok_and(|app| {
+                        observation.pid.is_none_or(|pid| app.pid() == pid)
+                            && observation
+                                .incarnation
+                                .is_none_or(|incarnation| window.incarnation() == incarnation)
+                            && app.is_frontmost()
+                            && app.owns_window(window).is_ok_and(|owned| owned)
+                    })
+                })
+        else {
             queue_untracked_focus_observation(observation, &mut focus, &mut ctx.commands);
             continue;
         };
@@ -338,7 +445,7 @@ pub(super) fn window_focused_trigger(
         let already_focused = ctx
             .windows
             .focused()
-            .is_some_and(|(focused, _)| focused.id() == window_id);
+            .is_some_and(|(_, focused_entity)| focused_entity == entity);
         let confirms_request = focus.snapshot().requested_entity() == Some(entity);
 
         // Delayed cross-app and same-app events must not overwrite a newer
@@ -556,20 +663,29 @@ pub(super) fn dispatch_application_messages(
     visibility_query: Query<&WindowVisibility>,
     mut commands: Commands,
 ) {
-    let find_window = |window_id| windows.find(window_id);
+    let find_window = |window_id, incarnation| match incarnation {
+        Some(incarnation) => windows.find_incarnation(window_id, incarnation),
+        None => windows.find(window_id),
+    };
 
     for event in messages.read() {
         match event {
-            Event::WindowMinimized { window_id } => {
-                if let Some((_, entity)) = find_window(*window_id)
+            Event::WindowMinimized {
+                window_id,
+                incarnation,
+            } => {
+                if let Some((_, entity)) = find_window(*window_id, *incarnation)
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
                     entity_commands.try_insert(WindowVisibility::Minimized);
                 }
             }
 
-            Event::WindowDeminimized { window_id } => {
-                if let Some((_, entity)) = find_window(*window_id)
+            Event::WindowDeminimized {
+                window_id,
+                incarnation,
+            } => {
+                if let Some((_, entity)) = find_window(*window_id, *incarnation)
                     && matches!(
                         visibility_query.get(entity),
                         Ok(WindowVisibility::Minimized)
@@ -581,35 +697,53 @@ pub(super) fn dispatch_application_messages(
             }
 
             Event::ApplicationHidden { pid } => {
-                let Some((_, children)) = applications.iter().find(|(app, _)| app.pid() == *pid)
-                else {
-                    warn!("Unable to find with pid {pid}");
-                    continue;
-                };
-                for entity in children {
-                    // Preserve a minimized state; layout mode is independent.
-                    if visibility_query.get(*entity).is_err()
-                        && let Ok(mut entity_commands) = commands.get_entity(*entity)
-                    {
-                        entity_commands.try_insert(WindowVisibility::Hidden);
+                let mut found = false;
+                for (app, children) in applications.iter().filter(|(app, _)| app.pid() == *pid) {
+                    match app.is_running() {
+                        Ok(false) => continue,
+                        Ok(true) => {}
+                        Err(error) => {
+                            debug!(pid, %error, "application hide liveness check failed open");
+                        }
                     }
+                    found = true;
+                    for entity in children {
+                        // Preserve a minimized state; layout mode is independent.
+                        if visibility_query.get(*entity).is_err()
+                            && let Ok(mut entity_commands) = commands.get_entity(*entity)
+                        {
+                            entity_commands.try_insert(WindowVisibility::Hidden);
+                        }
+                    }
+                }
+                if !found {
+                    warn!("Unable to find with pid {pid}");
                 }
             }
 
             Event::ApplicationVisible { pid } => {
-                let Some((_, children)) = applications.iter().find(|(app, _)| app.pid() == *pid)
-                else {
-                    warn!("Unable to find application with pid {pid}");
-                    continue;
-                };
-                for entity in children {
-                    // Only restore windows that were hidden by the app hide/show cycle.
-                    // Preserve layout mode and minimized state.
-                    if matches!(visibility_query.get(*entity), Ok(WindowVisibility::Hidden))
-                        && let Ok(mut entity_commands) = commands.get_entity(*entity)
-                    {
-                        entity_commands.try_remove::<WindowVisibility>();
+                let mut found = false;
+                for (app, children) in applications.iter().filter(|(app, _)| app.pid() == *pid) {
+                    match app.is_running() {
+                        Ok(false) => continue,
+                        Ok(true) => {}
+                        Err(error) => {
+                            debug!(pid, %error, "application show liveness check failed open");
+                        }
                     }
+                    found = true;
+                    for entity in children {
+                        // Only restore windows that were hidden by the app hide/show cycle.
+                        // Preserve layout mode and minimized state.
+                        if matches!(visibility_query.get(*entity), Ok(WindowVisibility::Hidden))
+                            && let Ok(mut entity_commands) = commands.get_entity(*entity)
+                        {
+                            entity_commands.try_remove::<WindowVisibility>();
+                        }
+                    }
+                }
+                if !found {
+                    warn!("Unable to find application with pid {pid}");
                 }
             }
             _ => (),
@@ -698,14 +832,13 @@ pub(super) fn window_floating_trigger(
     };
     let display_bounds = display.actual_display_bounds(dock, &ctx.config);
 
-    let Some((window, frame)) = ctx.windows.get(entity).zip(ctx.windows.frame(entity)) else {
+    let Some((window, _, parent)) = ctx.windows.get_parent(entity) else {
         return;
     };
-    let Some((_, app)) = ctx
-        .windows
-        .find_parent(window.id())
-        .and_then(|(_, _, parent)| apps.get(parent).ok())
-    else {
+    let Some(frame) = ctx.windows.frame(entity) else {
+        return;
+    };
+    let Ok((_, app)) = apps.get(parent) else {
         return;
     };
 
@@ -800,6 +933,12 @@ pub(super) fn window_visibility_removed_trigger(
     }
 }
 
+#[derive(SystemParam)]
+pub(super) struct RetileState<'w, 's> {
+    previous_strips: Query<'w, 's, &'static PreviousTiledStrip>,
+    pending_reassignments: Query<'w, 's, (), With<WindowSpaceReassignmentPending>>,
+}
+
 pub(super) fn retile_window_trigger(
     trigger: On<RetileWindow>,
     active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
@@ -813,15 +952,26 @@ pub(super) fn retile_window_trigger(
         ),
         Without<Window>,
     >,
-    previous_strips: Query<&PreviousTiledStrip>,
+    state: RetileState,
     initializing: Option<Res<Initializing>>,
     mut ctx: WindowCtx,
 ) {
+    let RetileState {
+        previous_strips,
+        pending_reassignments,
+    } = state;
     // finish_setup handles the initial strip assignment during init.
     if initializing.is_some() {
         return;
     }
     let entity = trigger.event().0;
+    if pending_reassignments.get(entity).is_ok() {
+        debug!(
+            ?entity,
+            "deferring retile until native Space reassignment settles"
+        );
+        return;
+    }
 
     if ctx
         .windows
@@ -840,11 +990,8 @@ pub(super) fn retile_window_trigger(
         .ok()
         .map(|previous| previous.index);
 
-    if let Some(window) = ctx.windows.get(entity)
-        && let Some((_, app)) = ctx
-            .windows
-            .find_parent(window.id())
-            .and_then(|(_, _, parent)| apps.get(parent).ok())
+    if let Some((window, _, parent)) = ctx.windows.get_parent(entity)
+        && let Ok((_, app)) = apps.get(parent)
     {
         let properties = WindowProperties::new(app, window, &ctx.config);
 
@@ -942,15 +1089,30 @@ pub(super) fn window_destroyed_trigger(
     mut messages: MessageReader<Event>,
     mut apps: Query<&mut Application>,
     mut focus: ResMut<FocusCoordinator>,
+    mut sync: ResMut<WindowStateSync>,
     windows: Windows,
     mut commands: Commands,
 ) {
     for event in messages.read() {
-        let Event::WindowDestroyed { window_id, source } = event else {
+        let Event::WindowDestroyed {
+            window_id,
+            source,
+            incarnation,
+        } = event
+        else {
             continue;
         };
 
-        let Some((window, entity, parent)) = windows.find_parent_any(*window_id) else {
+        let Some(incarnation) = incarnation else {
+            // SLS and WindowServer notifications only carry a recyclable
+            // integer ID. The inventory reconciler resolves those against AX
+            // and process ownership instead of risking deletion of a new use
+            // of the same ID.
+            continue;
+        };
+        let Some((window, entity, parent)) =
+            windows.find_parent_incarnation_any(*window_id, *incarnation)
+        else {
             debug!("Duplicate event: window {window_id} already destroyed.");
             continue;
         };
@@ -977,6 +1139,8 @@ pub(super) fn window_destroyed_trigger(
         };
 
         app.unobserve_window(window);
+        sync.retire_window(parent, window);
+        sync.forget_window(entity);
 
         focus.observe(FocusSignal::Invalidated { entity });
         focus.forget(entity);
@@ -995,13 +1159,156 @@ pub(super) fn window_destroyed_trigger(
 /// subscriber sees the new title in the same frame it changed.
 pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, windows: Windows) {
     for event in messages.read() {
-        let Event::WindowTitleChanged { window_id } = event else {
+        let Event::WindowTitleChanged {
+            window_id,
+            incarnation,
+        } = event
+        else {
             continue;
         };
-        if let Some((window, _)) = windows.find(*window_id) {
+        let window = match incarnation {
+            Some(incarnation) => windows.find_incarnation(*window_id, *incarnation),
+            None => windows.find(*window_id),
+        };
+        if let Some((window, _)) = window {
             window.invalidate_title();
         }
     }
+}
+
+fn transfer_window_ownership(
+    entity: Entity,
+    application: Entity,
+    window: Window,
+    frame: IRect,
+    ctx: &mut SpawnWindowCtx,
+) {
+    let window_id = window.id();
+    let Ok((_, mut app)) = ctx.apps.get_mut(application) else {
+        return;
+    };
+    match app.observe_window(&window) {
+        Ok(true) => {}
+        Ok(false) => debug!(window_id, "some window observers need retry"),
+        Err(error) => warn!(window_id, %error, "unable to register window observers"),
+    }
+    ctx.sync.forget_window(entity);
+    if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
+        let width_ratio =
+            WidthRatio(f64::from(frame.width()) / f64::from(ctx.active_display.bounds().width()));
+        entity_commands.try_insert((
+            window,
+            ChildOf(application),
+            Position(frame.min),
+            Bounds(frame.size()),
+            DesiredWindowFrame(frame),
+            PresentedWindowFrame(frame),
+            ObservedWindowFrame(frame),
+            width_ratio,
+            WindowOwnershipChanged,
+            WindowDefaultsPending,
+        ));
+        entity_commands.remove::<(
+            PreviousTiledStrip,
+            WindowUnavailable,
+            RepositionMarker,
+            ResizeMarker,
+            WindowFrameMotion,
+            FullscreenDefaultsDeferred,
+            WindowDefaultsApplied,
+        )>();
+    }
+}
+
+fn reconcile_existing_window(
+    mut window: Window,
+    application: Entity,
+    ctx: &mut SpawnWindowCtx,
+) -> Option<Window> {
+    let window_id = window.id();
+    let incarnation = window.incarnation();
+    let Some((entity, existing, parent)) = ctx.windows.iter().find(|(_, existing, _)| {
+        existing.id() == window_id && existing.incarnation() == incarnation
+    }) else {
+        return Some(window);
+    };
+    if parent.parent() != application {
+        let Ok(frame) = window
+            .update_frame()
+            .inspect_err(|error| warn!(window_id, %error, "unable to transfer window ownership"))
+        else {
+            return None;
+        };
+        if let Ok((_, mut old_app)) = ctx.apps.get_mut(parent.parent()) {
+            old_app.unobserve_window(existing);
+        }
+        transfer_window_ownership(entity, application, window, frame, ctx);
+    }
+    None
+}
+
+type SpawnCandidateBuckets = HashMap<(Entity, WinID), HashSet<WindowIncarnation>>;
+
+fn collect_spawn_candidates(
+    target_application: Option<Entity>,
+    new_windows: Vec<Window>,
+    ctx: &mut SpawnWindowCtx,
+) -> (Vec<(Entity, Window)>, SpawnCandidateBuckets) {
+    let mut candidates = Vec::new();
+    let mut buckets = SpawnCandidateBuckets::new();
+
+    for window in new_windows {
+        let window_id = window.id();
+        let Ok(pid) = window.pid() else {
+            trace!("Unable to get window pid for {window_id}");
+            continue;
+        };
+        let Some(app_entity) = ctx
+            .apps
+            .iter_mut()
+            .find(|(entity, app)| {
+                app.pid() == pid
+                    && target_application.is_none_or(|target| *entity == target)
+                    && (target_application.is_some()
+                        || app.owns_window(&window).is_ok_and(|owned| owned))
+            })
+            .map(|(entity, _)| entity)
+        else {
+            trace!("unable to find application with pid {pid}.");
+            continue;
+        };
+        if ctx.sync.is_window_retired(app_entity, &window) {
+            debug!(
+                window_id,
+                incarnation = window.incarnation(),
+                ?app_entity,
+                "ignoring retired AX window incarnation"
+            );
+            continue;
+        }
+        buckets
+            .entry((app_entity, window_id))
+            .or_default()
+            .insert(window.incarnation());
+        candidates.push((app_entity, window));
+    }
+
+    (candidates, buckets)
+}
+
+fn log_spawned_window(window: &Window) {
+    if !tracing::enabled!(Level::DEBUG) {
+        return;
+    }
+    let window_id = window.id();
+    let title = window.title().unwrap_or_default();
+    let role = window.role().unwrap_or_default();
+    let subrole = window.subrole().unwrap_or_default();
+    let element = window
+        .element()
+        .map(|element| format!("{element}"))
+        .unwrap_or_default();
+    debug!("created {window_id} title: {title} role: {role} subrole: {subrole} element: {element}",);
 }
 
 /// Handles the event when a new window is created. It adds the window to the manager and sets focus.
@@ -1015,59 +1322,64 @@ pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, window
 /// * `main_cid` - The main connection ID resource.
 /// * `commands` - Bevy commands to manage components and trigger events.
 #[instrument(level = Level::DEBUG, skip_all)]
-pub(super) fn spawn_window_trigger(
-    mut trigger: On<SpawnWindowTrigger>,
-    windows: Query<&Window>,
-    mut apps: Query<(Entity, &mut Application)>,
-    active_display: ActiveDisplay,
-    initializing: Option<Res<Initializing>>,
-    restore: Option<Res<crate::ecs::restore::SessionRestore>>,
-    mut commands: Commands,
-) {
-    let new_windows = &mut trigger.event_mut().0;
+pub(super) fn spawn_window_trigger(mut trigger: On<SpawnWindowTrigger>, mut ctx: SpawnWindowCtx) {
+    let target_application = trigger.event().application;
+    let new_windows = std::mem::take(&mut trigger.event_mut().windows);
+    let (candidates, candidate_buckets) =
+        collect_spawn_candidates(target_application, new_windows, &mut ctx);
 
-    while let Some(mut window) = new_windows.pop() {
+    let mut processed_buckets = HashSet::new();
+    for (app_entity, window) in candidates {
         let window_id = window.id();
-
-        if windows.iter().any(|window| window.id() == window_id) {
+        let bucket = (app_entity, window_id);
+        let incarnation_count = candidate_buckets.get(&bucket).map_or(0, HashSet::len);
+        if incarnation_count > 1 {
+            if processed_buckets.insert(bucket) {
+                debug!(
+                    window_id,
+                    ?app_entity,
+                    count = incarnation_count,
+                    "deferring ambiguous AX window candidates to inventory reconciliation"
+                );
+            }
             continue;
         }
-
+        if !processed_buckets.insert(bucket) {
+            continue;
+        }
         let Ok(pid) = window.pid() else {
             trace!("Unable to get window pid for {window_id}");
             continue;
         };
-        let Some((app_entity, mut app)) = apps.iter_mut().find(|(_, app)| app.pid() == pid) else {
-            trace!("unable to find application with pid {pid}.");
+        let Some(mut window) = reconcile_existing_window(window, app_entity, &mut ctx) else {
             continue;
         };
 
-        if tracing::enabled!(Level::DEBUG) {
-            let title = window.title().unwrap_or_default();
-            let role = window.role().unwrap_or_default();
-            let subrole = window.subrole().unwrap_or_default();
-            let element = window
-                .element()
-                .map(|element| format!("{element}"))
-                .unwrap_or_default();
-            debug!(
-                "created {window_id} title: {title} role: {role} subrole: {subrole} element: {element}",
-            );
+        let Ok((_, mut app)) = ctx.apps.get_mut(app_entity) else {
+            continue;
+        };
+
+        log_spawned_window(&window);
+
+        match app.observe_window(&window) {
+            Ok(true) => {}
+            Ok(false) => debug!(window_id, "some window observers need retry"),
+            Err(error) => warn!(window_id, %error, "unable to register window observers"),
         }
 
-        if app.observe_window(&window).is_err() {
-            warn!("Error observing window {window_id}.");
-        }
-
-        // update_frame expands the OS rect by the per-window padding, so calling it *after*
-        // set_padding produces the correct logical frame for the ECS components below.
+        // Seed the observed projection immediately. `apply_window_defaults`
+        // refreshes it again after applying padding or frame rules.
         let Ok(frame) = window.update_frame().inspect_err(|err| error!("{err}")) else {
             continue;
         };
         let position = Position(frame.min);
         let bounds = Bounds(frame.size());
+        let launch_snapshot = ctx
+            .initializing
+            .as_ref()
+            .and_then(|_| ctx.launch_capture.capture(&window, &app, frame));
         let width_ratio =
-            WidthRatio(f64::from(frame.width()) / f64::from(active_display.bounds().width()));
+            WidthRatio(f64::from(frame.width()) / f64::from(ctx.active_display.bounds().width()));
         let layout_position = LayoutPosition::default();
 
         let title = window.title().unwrap_or_default();
@@ -1082,45 +1394,120 @@ pub(super) fn spawn_window_trigger(
 
         // Insert the window into the internal Bevy state.
         // This insertion triggers window attributes observer.
-        let mut entity_commands = commands.spawn((
+        let mut entity_commands = ctx.commands.spawn((
             position,
             bounds,
+            DesiredWindowFrame(frame),
+            PresentedWindowFrame(frame),
+            ObservedWindowFrame(frame),
             width_ratio,
             window,
             layout_position,
             ChildOf(app_entity),
+            WindowDefaultsPending,
         ));
-        if initializing.is_some() {
+        if ctx.initializing.is_some() {
             entity_commands.insert(InitialWindowMarker);
         }
+        if let Some(snapshot) = launch_snapshot {
+            entity_commands.insert(snapshot);
+        }
 
-        commands.trigger(SendMessageTrigger(Event::WindowSpawned {
-            window_id,
-            pid,
-            app_name,
-            bundle_id,
-            title,
-            frame: window_frame,
-            floating: false,
-        }));
+        ctx.commands
+            .trigger(SendMessageTrigger(Event::WindowSpawned {
+                window_id,
+                pid,
+                app_name,
+                bundle_id,
+                title,
+                frame: window_frame,
+                floating: false,
+            }));
     }
 
-    if initializing.is_none() && restore.is_some() {
-        commands.trigger(RestoreWindowState);
+    if ctx.initializing.is_none() && ctx.restore.is_some() {
+        ctx.commands.trigger(RestoreWindowState);
     }
 }
 
+type DefaultFrameState<'a> = (
+    &'a mut Position,
+    &'a mut Bounds,
+    &'a mut DesiredWindowFrame,
+    &'a mut PresentedWindowFrame,
+    Option<&'a mut ObservedWindowFrame>,
+);
+
+fn commit_default_frame(
+    entity: Entity,
+    frame: IRect,
+    state: DefaultFrameState<'_>,
+    commands: &mut Commands,
+) {
+    let (position, bounds, desired, presented, observed) = state;
+    position.0 = frame.min;
+    bounds.0 = frame.size();
+    desired.0 = frame;
+    presented.0 = frame;
+    if let Some(observed) = observed {
+        observed.0 = frame;
+    } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_insert(ObservedWindowFrame(frame));
+    }
+}
+
+fn invalidate_default_frame(entity: Entity, commands: &mut Commands) {
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<ObservedWindowFrame>();
+    }
+}
+
+fn mark_window_defaults_applied(entity: Entity, commands: &mut Commands) {
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_insert(WindowDefaultsApplied);
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "default application is one retryable transaction across floating and tiled rules"
+)]
 pub(super) fn apply_window_defaults(
-    added: Populated<(&mut Window, &mut Position, &mut Bounds, &ChildOf), Added<Window>>,
+    added: DefaultableWindows,
     apps: Query<(Entity, &Application)>,
     active_display: ActiveDisplay,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
+    mut commands: Commands,
 ) {
-    for (ref mut window, mut position, mut bounds, child) in added {
+    for (
+        entity,
+        ref mut window,
+        mut position,
+        mut bounds,
+        mut desired,
+        mut presented,
+        mut observed,
+        child,
+    ) in added
+    {
         let Ok((_, app)) = apps.get(child.parent()) else {
             continue;
         };
+
+        // A startup fullscreen frame is physical state owned by macOS, not a
+        // sensible tiling size. Keep the defaults transaction pending until
+        // AX positively confirms that the window is windowed again.
+        match window.try_is_full_screen() {
+            Ok(true) => {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(FullscreenDefaultsDeferred);
+                }
+                continue;
+            }
+            Err(_) => continue,
+            Ok(false) => {}
+        }
 
         let properties = WindowProperties::new(app, window, &config);
         debug!("Applying window defaults for '{}'", window.id());
@@ -1130,14 +1517,64 @@ pub(super) fn apply_window_defaults(
         // Do not add padding to floating windows.
         if properties.floating() {
             // Skip grid_ratios during init: we don't know this window's display.
-            if !initializing && let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
-                let bounds = active_display.actual_bounds(&config);
-                let x = bounds.min.x + round_px(f64::from(bounds.width()) * rx);
-                let y = bounds.min.y + round_px(f64::from(bounds.height()) * ry);
-                let w = round_px(f64::from(bounds.width()) * rw);
-                let h = round_px(f64::from(bounds.height()) * rh);
-                window.reposition(Origin::new(x, y));
-                window.resize(Size::new(w, h));
+            let applied = if !initializing && let Some((rx, ry, rw, rh)) = properties.grid_ratios()
+            {
+                let viewport = active_display.actual_bounds(&config);
+                let x = viewport.min.x + round_px(f64::from(viewport.width()) * rx);
+                let y = viewport.min.y + round_px(f64::from(viewport.height()) * ry);
+                let w = round_px(f64::from(viewport.width()) * rw);
+                let h = round_px(f64::from(viewport.height()) * rh);
+                let target = IRect::new(x, y, w, h);
+                match window.set_frame(target) {
+                    Ok(frame) => {
+                        commit_default_frame(
+                            entity,
+                            frame,
+                            (
+                                &mut position,
+                                &mut bounds,
+                                &mut desired,
+                                &mut presented,
+                                observed.as_deref_mut(),
+                            ),
+                            &mut commands,
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        warn!(window_id = window.id(), %error, "unable to apply window grid defaults");
+                        invalidate_default_frame(entity, &mut commands);
+                        false
+                    }
+                }
+            } else if observed.is_none() {
+                match window.update_frame() {
+                    Ok(frame) => {
+                        commit_default_frame(
+                            entity,
+                            frame,
+                            (
+                                &mut position,
+                                &mut bounds,
+                                &mut desired,
+                                &mut presented,
+                                None,
+                            ),
+                            &mut commands,
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        warn!(window_id = window.id(), %error, "unable to refresh floating window defaults");
+                        invalidate_default_frame(entity, &mut commands);
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if applied {
+                mark_window_defaults_applied(entity, &mut commands);
             }
             continue;
         }
@@ -1145,77 +1582,157 @@ pub(super) fn apply_window_defaults(
         let hpadding = properties.horizontal_padding();
         window.set_padding(WindowPadding::Vertical(vpadding.clamp(0, 50)));
         window.set_padding(WindowPadding::Horizontal(hpadding.clamp(0, 50)));
-        if let Ok(frame) = window.update_frame() {
-            position.0 = frame.min;
-            bounds.0 = frame.size();
-        }
+        let Ok(frame) = window.update_frame() else {
+            invalidate_default_frame(entity, &mut commands);
+            continue;
+        };
+        commit_default_frame(
+            entity,
+            frame,
+            (
+                &mut position,
+                &mut bounds,
+                &mut desired,
+                &mut presented,
+                observed.as_deref_mut(),
+            ),
+            &mut commands,
+        );
 
         // Apply configured width AFTER update_frame so it isn't overwritten.
         // Use padded display width (matching window_resize command behavior).
         // Safe during init: this only resizes, it doesn't reposition, so a
         // window on an inactive display stays put.
         if let Some(width) = properties.width_ratio() {
-            _ = window.update_frame().inspect_err(|err| error!("{err}"));
-            let bounds = active_display.actual_bounds(&config);
+            let viewport = active_display.actual_bounds(&config);
             let (_, pad_right, _, pad_left) = config.edge_padding();
-            let padded_width = bounds.width() - pad_left - pad_right;
+            let padded_width = viewport.width() - pad_left - pad_right;
             let new_width = round_px(f64::from(padded_width) * width);
             let height = window.frame().height();
-            window.resize(Size::new(new_width, height));
-            // Re-read the actual OS size: the app may enforce a minimum width
-            // that differs from our request.
-            _ = window.update_frame().inspect_err(|err| error!("{err}"));
+            let target = IRect::from_corners(
+                window.frame().min,
+                window.frame().min + Size::new(new_width, height),
+            );
+            match window.set_frame(target) {
+                Ok(frame) => commit_default_frame(
+                    entity,
+                    frame,
+                    (
+                        &mut position,
+                        &mut bounds,
+                        &mut desired,
+                        &mut presented,
+                        observed.as_deref_mut(),
+                    ),
+                    &mut commands,
+                ),
+                Err(error) => {
+                    warn!(window_id = window.id(), %error, "unable to apply configured window width");
+                    invalidate_default_frame(entity, &mut commands);
+                    continue;
+                }
+            }
         }
+        mark_window_defaults_applied(entity, &mut commands);
     }
 }
 
 #[derive(SystemParam)]
 pub(super) struct ApplyWindowPositionsCtx<'w, 's> {
     focus: Res<'w, FocusCoordinator>,
+    window_manager: Res<'w, WindowManager>,
+    pending_spaces: Query<'w, 's, &'static PendingSpaceDestruction>,
     window: WindowCtx<'w, 's>,
 }
 
+impl ApplyWindowPositionsCtx<'_, '_> {
+    fn eligible_restore_spaces(&self) -> HashSet<WorkspaceId> {
+        let topology = self.window_manager.present_displays();
+        crate::ecs::restore::eligible_restore_space_ids(
+            &topology,
+            self.pending_spaces
+                .iter()
+                .map(|pending| pending.workspace_id),
+        )
+    }
+}
+
+fn finish_pending_window_defaults(entity: Entity, commands: &mut Commands) {
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<(
+            WindowDefaultsPending,
+            WindowDefaultsApplied,
+            FullscreenDefaultsDeferred,
+            InitialWindowMarker,
+            WindowOwnershipChanged,
+        )>();
+    }
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "placement is one ordered transaction covering restore, rules, insertion, and focus"
+)]
 pub(super) fn apply_window_positions(
-    added: Populated<(Entity, Has<InitialWindowMarker>), Added<Window>>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    added: PositionedWindows,
+    mut workspaces: Query<
+        (&mut LayoutStrip, Has<ActiveWorkspaceMarker>),
+        Without<PendingSpaceDestruction>,
+    >,
     apps: Query<&Application>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<SpoolState>>,
     ctx: ApplyWindowPositionsCtx,
 ) {
+    let present_spaces = if restore.is_some() && restoration.is_some() {
+        ctx.eligible_restore_spaces()
+    } else {
+        HashSet::new()
+    };
     let ApplyWindowPositionsCtx {
         focus,
+        window_manager: _,
+        pending_spaces: _,
         window: mut ctx,
     } = ctx;
     for (entity, initial_window) in added {
-        if initial_window && let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-            entity_commands.try_remove::<InitialWindowMarker>();
-        }
         if workspaces.iter().any(|(strip, _)| strip.tabbed(entity)) {
             debug!("Ignoring tabbed {entity} attributes.");
+            finish_pending_window_defaults(entity, &mut ctx.commands);
             continue;
         }
 
-        let Some((window, _, parent)) = ctx
-            .windows
-            .get(entity)
-            .and_then(|window| ctx.windows.find_parent(window.id()))
-        else {
+        let Some((window, _, parent)) = ctx.windows.get_parent(entity) else {
             continue;
         };
         let Ok(app) = apps.get(parent) else {
             continue;
         };
 
-        if crate::ecs::restore::matches_startup_restore_state(
-            window,
-            app,
-            restore.as_deref(),
-            restoration.as_deref(),
-            &ctx.config,
-        ) {
+        let in_fullscreen_strip = workspaces
+            .iter()
+            .any(|(strip, _)| strip.is_fullscreen() && strip.contains(entity));
+        if in_fullscreen_strip || window.try_is_full_screen().unwrap_or(true) {
+            continue;
+        }
+
+        // A saved-state match only describes intent. The restore pass may have
+        // rejected that state against a different topology snapshot, so only
+        // skip defaults after ECS confirms that the window was actually placed.
+        let already_inserted = workspaces.iter().any(|(strip, _)| strip.contains(entity));
+        if already_inserted
+            && crate::ecs::restore::matches_startup_restore_state(
+                window,
+                app,
+                restore.as_deref(),
+                restoration.as_deref(),
+                &ctx.config,
+                &present_spaces,
+            )
+        {
+            finish_pending_window_defaults(entity, &mut ctx.commands);
             continue;
         }
 
@@ -1232,18 +1749,21 @@ pub(super) fn apply_window_positions(
                 // Avoid managing window if it's floating.
                 entity_commands.try_insert(Floating);
             }
+            finish_pending_window_defaults(entity, &mut ctx.commands);
             continue;
         }
 
-        // During startup, the window is already inserted into some strip.
-        let allready_inserted = workspaces
-            .iter_mut()
-            .find_map(|(strip, _)| strip.contains(entity).then_some(strip));
-        if allready_inserted.is_none()
-            && let Some(mut strip) = workspaces
+        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
+            entity_commands.try_remove::<Floating>();
+        }
+
+        if !already_inserted {
+            let Some(mut strip) = workspaces
                 .iter_mut()
                 .find_map(|(strip, active)| active.then_some(strip))
-        {
+            else {
+                continue;
+            };
             // Attempt inserting the window at a pre-defined position.
             let insert_at = properties.insertion().map_or_else(
                 || {
@@ -1292,6 +1812,7 @@ pub(super) fn apply_window_positions(
                     .trigger(SendMessageTrigger(Event::window_focused(window.id())));
             }
         }
+        finish_pending_window_defaults(entity, &mut ctx.commands);
     }
 }
 
@@ -1320,13 +1841,21 @@ pub(super) fn refresh_configuration_trigger(
                 ModifyKind::Metadata(MetadataKind::WriteTime)
                 | ModifyKind::Data(DataChange::Content),
             ) => (),
-            EventKind::Remove(_) => {
-                for path in &event.paths {
-                    _ = watcher.unwatch(path).inspect_err(|err| {
-                        error!("unwatching the config '{}': {err}", path.display());
-                    });
+            EventKind::Remove(_)
+            | EventKind::Create(_)
+            | EventKind::Modify(ModifyKind::Name(_)) => {
+                // Atomic saves replace the inode and invalidate a file-level
+                // watch. Rebuild the shared TOML/Lua watcher while the new path
+                // is present instead of permanently unwatching it.
+                for path in event.paths.iter().rev() {
+                    let Some(new_watcher) =
+                        crate::ecs::rewatch_configs(&window_manager, path.as_path())
+                    else {
+                        continue;
+                    };
+                    **watcher = new_watcher;
+                    break;
                 }
-                continue;
             }
             _ => continue,
         }
@@ -1371,10 +1900,13 @@ pub(super) fn refresh_configuration_trigger(
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
     mut workspaces: Query<&mut LayoutStrip>,
+    mut focus: ResMut<FocusCoordinator>,
 ) {
     let entity = trigger.event().entity;
 
-    if let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) {
+    focus.observe(FocusSignal::Invalidated { entity });
+    focus.forget(entity);
+    for mut strip in workspaces.iter_mut().filter(|strip| strip.contains(entity)) {
         debug!(
             "Removing despawned entity {entity} from strip {}",
             strip.id()
@@ -1405,22 +1937,50 @@ pub(super) fn cleanup_timeout_trigger(
 }
 
 pub(super) fn window_resize_verifier(
-    mut removed: RemovedComponents<ResizeMarker>,
-    mut windows: Query<(&mut Window, &Position, &mut Bounds)>,
+    mut removed: RemovedComponents<WindowFrameMotion>,
+    mut windows: ResizeVerificationWindows,
     layout_strips: Query<&LayoutStrip>,
     mut commands: Commands,
 ) {
     use std::cmp::Ordering;
     for entity in removed.read() {
-        let Ok((mut window, _, mut bounds)) = windows.get_mut(entity) else {
+        let Ok((
+            mut window,
+            mut position,
+            mut bounds,
+            mut desired,
+            mut presented,
+            observed,
+            floating,
+        )) = windows.get_mut(entity)
+        else {
             continue;
         };
+        if window.try_is_full_screen().unwrap_or(true) {
+            continue;
+        }
         let Ok(frame) = window.update_frame() else {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<ObservedWindowFrame>();
+            }
             continue;
         };
+        if let Some(mut observed) = observed
+            && observed.0 != frame
+        {
+            observed.0 = frame;
+        }
+
+        if floating {
+            position.0 = frame.min;
+            bounds.0 = frame.size();
+            desired.0 = frame;
+            presented.0 = frame;
+            continue;
+        }
 
         let actual_size = frame.size();
-        let expected_size = bounds.0;
+        let expected_size = desired.0.size();
 
         // note: macOS loves to make window sizes to even numbers, so we treat actual+1 as equal.
         let width_ord = fuzzy_equal(actual_size.x, expected_size.x);
@@ -1436,7 +1996,12 @@ pub(super) fn window_resize_verifier(
             expected_size,
             actual_size,
         );
-        bounds.0 = actual_size;
+        // Bounds is the tiled layout's desired size. Keep that intent intact
+        // and ask the central reconciler to retry from the observed frame.
+        commands.trigger(SendMessageTrigger(Event::WindowResized {
+            window_id: window.id(),
+            incarnation: window.incarnation(),
+        }));
 
         // we may hitting minimum width constraint on this window or this window isn't resizable.
         // if this window is a part of a column, other windows in the column might have resized(shrunk) successfully,
@@ -1458,9 +2023,7 @@ pub(super) fn window_resize_verifier(
             let get_window_frame = |entity| {
                 windows
                     .get(entity)
-                    .map(|(_, position, bounds)| {
-                        IRect::from_corners(position.0, position.0 + bounds.0)
-                    })
+                    .map(|(_, _, _, desired, _, _, _)| desired.0)
                     .ok()
             };
 
