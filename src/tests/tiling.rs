@@ -1,5 +1,6 @@
-use crate::commands::{Command, Direction, Operation, ResizeDirection};
+use crate::commands::{Action, Direction, Operation, ResizeAxis, ResizeDirection};
 use crate::config::{Config, MainOptions, WindowParams};
+use crate::ecs::Floating;
 use crate::ecs::layout::LayoutStrip;
 use crate::events::Event;
 use crate::{assert_window_at, assert_window_size};
@@ -18,35 +19,35 @@ fn test_window_shuffle() {
 
     let commands = vec![
         Event::MenuOpened { window_id: 0 }, // 0
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::Last)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::Last)),
         }, // 2
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::First)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::First)),
         }, // 3
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
         }, // 4
-        Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToggleStack),
         }, // 5
-        Event::Command {
-            command: Command::Window(Operation::Center),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Center),
         }, // 6
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
         }, // 7
-        Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToggleStack),
         }, // 8
-        Event::Command {
-            command: Command::Window(Operation::Center),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Center),
         }, // 9
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         }, // 10
     ];
 
@@ -113,11 +114,14 @@ fn test_window_shuffle() {
 fn test_window_balance() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Resize {
+                axis: ResizeAxis::Width,
+                direction: ResizeDirection::Grow,
+            }),
         },
-        Event::Command {
-            command: Command::Window(Operation::Balance),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Balance),
         },
     ];
 
@@ -140,17 +144,17 @@ fn test_window_balance() {
 fn test_startup_windows() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
         },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
         },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::First)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::First)),
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -168,17 +172,29 @@ fn test_startup_windows() {
 fn test_window_resize_grow_and_shrink_cycle() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Resize {
+                axis: ResizeAxis::Width,
+                direction: ResizeDirection::Grow,
+            }),
         },
-        Event::Command {
-            command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Resize {
+                axis: ResizeAxis::Width,
+                direction: ResizeDirection::Grow,
+            }),
         },
-        Event::Command {
-            command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Resize {
+                axis: ResizeAxis::Width,
+                direction: ResizeDirection::Grow,
+            }),
         },
-        Event::Command {
-            command: Command::Window(Operation::Resize(ResizeDirection::Shrink)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Resize {
+                axis: ResizeAxis::Width,
+                direction: ResizeDirection::Shrink,
+            }),
         },
     ];
 
@@ -213,15 +229,15 @@ fn test_window_resize_grow_and_shrink_cycle() {
 fn test_window_can_resize_to_two_display_widths_and_scroll() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::SetWidth(2.0)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::SetWidth(2.0)),
         },
         Event::Swipe {
             delta: 0.3,
             fingers: 3,
         },
-        Event::Command {
-            command: Command::Window(Operation::Snap),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Snap),
         },
     ];
 
@@ -272,14 +288,14 @@ fn assert_oversized_window_is_pannable(world: &mut World, id: i32) {
 #[test]
 fn test_floating_window_does_not_hold_a_slot_in_the_strip() {
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         }, // 0
-        Event::Command {
-            command: Command::Window(Operation::ToggleFloating),
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToggleFloating),
         }, // 1 — float the focused window
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         }, // 2
     ];
 
@@ -310,17 +326,113 @@ fn test_floating_window_does_not_hold_a_slot_in_the_strip() {
         .run(commands);
 }
 
+#[test]
+fn shared_move_resize_and_maximize_actions_dispatch_for_floating_windows() {
+    let commands = vec![
+        Event::ActionRequested {
+            action: Action::PrintState,
+        },
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToggleFloating),
+        },
+        Event::ActionRequested {
+            action: Action::Window(Operation::Move(Direction::East)),
+        },
+        Event::ActionRequested {
+            action: Action::Window(Operation::Resize {
+                axis: ResizeAxis::Width,
+                direction: ResizeDirection::Grow,
+            }),
+        },
+        Event::ActionRequested {
+            action: Action::Window(Operation::Resize {
+                axis: ResizeAxis::Height,
+                direction: ResizeDirection::Shrink,
+            }),
+        },
+        Event::ActionRequested {
+            action: Action::Window(Operation::Maximize),
+        },
+        Event::ActionRequested {
+            action: Action::Window(Operation::Maximize),
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(1_000_000.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .on_iteration(2, |world, _state| {
+            assert_window_at!(world, 0, 52, 52);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_window_size!(world, 0, 440, 598);
+        })
+        .on_iteration(4, |world, _state| {
+            assert_window_size!(world, 0, 440, 558);
+        })
+        .on_iteration(5, |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_size!(world, 0, TEST_DISPLAY_WIDTH, 748);
+        })
+        .on_iteration(6, |world, _state| {
+            assert_window_at!(world, 0, 32, 72);
+            assert_window_size!(world, 0, 440, 558);
+        })
+        .run(commands);
+}
+
+#[test]
+fn toggle_stack_uses_the_current_layout_state() {
+    let commands = vec![
+        Event::ActionRequested {
+            action: Action::PrintState,
+        },
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
+        },
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToggleStack),
+        },
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToggleStack),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(2, |world, _state| {
+            let mut strips = world.query::<&LayoutStrip>();
+            let strip = strips.single(world).expect("one layout strip");
+            assert_eq!(strip.len(), 1, "the focused column should stack left");
+        })
+        .on_iteration(3, |world, _state| {
+            let mut strips = world.query::<&LayoutStrip>();
+            let strip = strips.single(world).expect("one layout strip");
+            assert_eq!(strip.len(), 2, "the focused item should unstack again");
+        })
+        .run(commands);
+}
+
 /// The same invariant for a window floated by a config rule rather than by the
 /// toggle. This is the path that runs while the window is being spawned, so it
 /// races the strip insertion the tiling path is doing at the same time.
 #[test]
 fn test_rule_floated_window_does_not_hold_a_slot_in_the_strip() {
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -348,6 +460,41 @@ fn test_rule_floated_window_does_not_hold_a_slot_in_the_strip() {
         .run(commands);
 }
 
+#[test]
+fn fixed_size_window_floats_instead_of_disturbing_the_tiled_strip() {
+    let harness = TestHarness::new().with_windows(2);
+    harness
+        .mock_state
+        .update_window(0, |window| window.resizable = false);
+
+    harness
+        .on_iteration(1, |world, state| {
+            let fixed = find_window_entity(0, world);
+            assert!(
+                world.get::<Floating>(fixed).is_some(),
+                "a window whose AXSize attribute is not settable cannot be a tiled layout target"
+            );
+            let mut strips = world.query::<&LayoutStrip>();
+            assert!(
+                strips.iter(world).all(|strip| !strip.contains(fixed)),
+                "a fixed-size floating window must not reserve a layout column"
+            );
+            assert_eq!(
+                state.frame_write_attempts(0),
+                0,
+                "Spool must not issue impossible frame writes to a fixed-size window"
+            );
+        })
+        .run(vec![
+            Event::ActionRequested {
+                action: Action::PrintState,
+            },
+            Event::ActionRequested {
+                action: Action::PrintState,
+            },
+        ]);
+}
+
 /// Closing a window while its application stays alive must free its slot in
 /// the strip. The AX element of such a window often keeps answering queries
 /// after the window is gone, which used to make `window_destroyed_trigger`
@@ -356,14 +503,14 @@ fn test_rule_floated_window_does_not_hold_a_slot_in_the_strip() {
 #[test]
 fn test_closing_window_of_live_app_closes_the_gap() {
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         }, // 0
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         }, // 1
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         }, // 2
     ];
 
@@ -397,8 +544,8 @@ fn test_window_server_close_of_live_app_closes_the_gap() {
     use crate::events::DestroySource;
 
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         Event::WindowDestroyed {
             window_id: 1,
@@ -431,8 +578,8 @@ fn test_reconcile_removes_a_vanished_window_and_closes_the_gap() {
     use crate::events::ReconcileScope;
 
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         Event::ReconcileWindows {
             scope: ReconcileScope::Application(TEST_PROCESS_ID),
@@ -470,8 +617,8 @@ fn test_reconcile_removes_vanished_window_with_responsive_stale_ax_handle() {
     use crate::events::ReconcileScope;
 
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         Event::ReconcileWindows {
             scope: ReconcileScope::Application(TEST_PROCESS_ID),
@@ -502,12 +649,12 @@ fn test_reconcile_removes_vanished_window_with_responsive_stale_ax_handle() {
 }
 
 #[test]
-fn test_reconcile_filters_ax_withdrawn_window_before_cg_surface_disappears() {
+fn test_reconcile_suspends_ax_withdrawn_window_without_reflowing_live_surface() {
     use crate::events::ReconcileScope;
 
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         Event::ReconcileWindows {
             scope: ReconcileScope::Application(TEST_PROCESS_ID),
@@ -524,8 +671,8 @@ fn test_reconcile_filters_ax_withdrawn_window_before_cg_surface_disappears() {
             );
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                TEST_WINDOW_WIDTH,
-                "AX-withdrawn window must leave layout immediately"
+                2 * TEST_WINDOW_WIDTH,
+                "a live WindowServer surface must retain its declarative layout slot"
             );
         })
         .run(commands);
@@ -554,8 +701,8 @@ fn reconciling_a_withdrawn_focused_window_invalidates_confirmed_focus() {
             assert!(state.take_focus_requests().is_empty());
         })
         .run(vec![
-            Event::Command {
-                command: Command::PrintState,
+            Event::ActionRequested {
+                action: Action::PrintState,
             },
             Event::ReconcileWindows {
                 scope: ReconcileScope::Application(TEST_PROCESS_ID),
@@ -571,8 +718,8 @@ fn test_reconcile_restores_a_temporarily_withdrawn_window() {
         scope: ReconcileScope::Application(TEST_PROCESS_ID),
     };
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         reconcile(),
         reconcile(),
@@ -582,7 +729,10 @@ fn test_reconcile_restores_a_temporarily_withdrawn_window() {
         .with_windows(3)
         .on_iteration(0, |_world, state| state.os_withdraw_window(1))
         .on_iteration(1, |world, state| {
-            assert_eq!(window_x(world, 2) - window_x(world, 0), TEST_WINDOW_WIDTH);
+            assert_eq!(
+                window_x(world, 2) - window_x(world, 0),
+                2 * TEST_WINDOW_WIDTH
+            );
             state.os_restore_withdrawn_window(1);
         })
         .on_iteration(2, |world, _state| {
@@ -600,14 +750,14 @@ fn test_reconcile_destroys_withdrawn_window_after_cg_confirmation() {
     use crate::events::ReconcileScope;
 
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         Event::ReconcileWindows {
             scope: ReconcileScope::Application(TEST_PROCESS_ID),
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -630,11 +780,11 @@ fn test_reconcile_destroys_withdrawn_window_after_cg_confirmation() {
 #[test]
 fn test_reconcile_discovers_window_missing_from_ecs() {
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::ReconcileWindows,
+        Event::ActionRequested {
+            action: Action::ReconcileWindows,
         },
     ];
 

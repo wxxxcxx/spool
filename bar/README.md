@@ -79,9 +79,9 @@ The initial state comes from `spool query state --json`. Every line from
 full query. UI actions use only the targeted CLI commands:
 
 ```sh
-spool send-cmd window focusid WINDOW_ID
-spool send-cmd space focus SPACE_ID
-spool send-cmd window move-to-space WINDOW_ID SPACE_ID stay
+spool action window focusid WINDOW_ID
+spool action space focus SPACE_ID
+spool action window move-to-space WINDOW_ID SPACE_ID stay
 ```
 
 SpoolBar addresses Spaces by stable `space_id`, not by their display order. It

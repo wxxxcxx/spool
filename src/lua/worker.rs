@@ -8,7 +8,7 @@
 //! ([`StoreRequest`]) go through their own reply channels, so a handler
 //! awaiting an answer never blocks the others. Nothing crossing either
 //! channel is a Lua value — only plain data ([`LuaEvent`], [`WindowSet`],
-//! [`Command`], [`SpoolQueryState`]); see [`super::convert`] for the
+//! [`Action`], [`SpoolQueryState`]); see [`super::convert`] for the
 //! marshalling.
 
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ use tracing::{error, info, warn};
 use super::convert::{self, LuaEvent};
 use super::runtime::LuaRuntime;
 use super::world::{DispatchWorld, WorldAccess};
-use crate::commands::Command;
+use crate::commands::Action;
 use crate::config::Config;
 use crate::ecs::state::SpoolQueryState;
 use crate::platform::input::set_lua_keybinds;
@@ -64,9 +64,9 @@ enum ToLua {
     Shutdown,
 }
 
-/// A side effect a callback produced, on its way back to the command bus.
+/// A side effect a callback produced, on its way back to the action bus.
 pub(super) enum FromLua {
-    Command(Command),
+    Action(Action),
     Flash {
         message: String,
         duration: f32,
@@ -106,7 +106,7 @@ pub(super) enum StoreRequest {
     },
     /// One write against the store.
     ///
-    /// Unlike a command, a write waits for its answer: the store has a
+    /// Unlike an action, a write waits for its answer: the store has a
     /// second writer (a socket client), and `spool.state.mutate` needs to
     /// know whether it was overtaken while the handler can still retry.
     Write {
@@ -461,16 +461,16 @@ struct Task<'a> {
 }
 
 impl Task<'_> {
-    /// Puts what this dispatch queued on its way to the command bus.
+    /// Puts what this dispatch queued on its way to the action bus.
     ///
     /// The outbox is shared, so a dispatch that finishes while another is
-    /// suspended may carry that one's commands out with its own — every
-    /// command still reaches the bus exactly once, in order, just not
+    /// suspended may carry that one's actions out with its own — every
+    /// action still reaches the bus exactly once, in order, just not
     /// necessarily via the dispatch that queued it.
     fn finish(&self) {
-        let (commands, flashes) = self.runtime.drain_outbox();
-        for command in commands {
-            let _ = self.to_main.try_send(FromLua::Command(command));
+        let (actions, flashes) = self.runtime.drain_outbox();
+        for action in actions {
+            let _ = self.to_main.try_send(FromLua::Action(action));
         }
         for (message, duration) in flashes {
             flash(&self.to_main, message, duration);
@@ -648,24 +648,21 @@ mod tests {
     fn next_flash(worker: &LuaWorker, what: &str) -> String {
         match next_effect(worker, what) {
             FromLua::Flash { message, .. } => message,
-            FromLua::Command(command) => panic!("expected a flash, got {command:?}"),
+            FromLua::Action(action) => panic!("expected a flash, got {action:?}"),
             FromLua::ConfigChanged => panic!("expected a flash, got a config change"),
         }
     }
 
     #[test]
     fn bind_dispatch_reaches_the_outbox() {
-        let worker = worker(r#"spool.bind("alt - b", "window balance")"#);
+        let worker = worker(r#"spool.bind("alt+b", spool.action.window.balance)"#);
         worker.send_binds(vec![1]);
-        let FromLua::Command(command) = next_effect(&worker, "the bound command") else {
-            panic!("expected a command");
+        let FromLua::Action(action) = next_effect(&worker, "the bound action") else {
+            panic!("expected an action");
         };
         assert!(
-            matches!(
-                command,
-                Command::Window(crate::commands::Operation::Balance)
-            ),
-            "expected a balance command, got {command:?}"
+            matches!(action, Action::Window(crate::commands::Operation::Balance)),
+            "expected a balance action, got {action:?}"
         );
     }
 
@@ -681,7 +678,7 @@ mod tests {
     fn query_round_trip_is_served_by_the_host() {
         let worker = worker(
             r#"
-            spool.bind("alt - q", function()
+            spool.bind("alt+q", function()
               spool.flash(spool.query_active().focused_app_name)
             end)
             "#,
@@ -701,7 +698,7 @@ mod tests {
     fn two_queries_in_one_dispatch_cost_one_round_trip() {
         let worker = worker(
             r#"
-            spool.bind("alt - q", function()
+            spool.bind("alt+q", function()
               spool.query_active()
               spool.query_on_screen()
               spool.flash("done")
@@ -723,8 +720,8 @@ mod tests {
     fn a_dropped_reply_channel_errors_the_handler_not_the_worker() {
         let worker = worker(
             r#"
-            spool.bind("alt - q", function() spool.query_active() end)
-            spool.bind("alt - b", "window balance")
+            spool.bind("alt+q", function() spool.query_active() end)
+            spool.bind("alt+b", spool.action.window.balance)
             "#,
         );
         worker.send_binds(vec![1]);
@@ -733,12 +730,12 @@ mod tests {
 
         // The handler's error is not the worker's: it is still dispatching.
         worker.send_binds(vec![2]);
-        let FromLua::Command(command) = next_effect(&worker, "the next bind") else {
-            panic!("expected a command");
+        let FromLua::Action(action) = next_effect(&worker, "the next bind") else {
+            panic!("expected an action");
         };
         assert!(matches!(
-            command,
-            Command::Window(crate::commands::Operation::Balance)
+            action,
+            Action::Window(crate::commands::Operation::Balance)
         ));
     }
 
@@ -747,7 +744,11 @@ mod tests {
         let directory = std::env::temp_dir().join("spool-lua-worker-reload-failure");
         std::fs::create_dir_all(&directory).unwrap();
         let script = directory.join("init.lua");
-        std::fs::write(&script, r#"spool.bind("alt - b", "window balance")"#).unwrap();
+        std::fs::write(
+            &script,
+            r#"spool.bind("alt+b", spool.action.window.balance)"#,
+        )
+        .unwrap();
 
         let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision());
         std::fs::write(&script, "this is not lua ===").unwrap();
@@ -761,7 +762,7 @@ mod tests {
         worker.send_binds(vec![1]);
         assert!(matches!(
             next_effect(&worker, "the surviving bind"),
-            FromLua::Command(Command::Window(crate::commands::Operation::Balance))
+            FromLua::Action(Action::Window(crate::commands::Operation::Balance))
         ));
 
         std::fs::remove_dir_all(&directory).ok();
@@ -772,7 +773,11 @@ mod tests {
         let directory = std::env::temp_dir().join("spool-lua-worker-reload-success");
         std::fs::create_dir_all(&directory).unwrap();
         let script = directory.join("init.lua");
-        std::fs::write(&script, r#"spool.bind("alt - b", "window balance")"#).unwrap();
+        std::fs::write(
+            &script,
+            r#"spool.bind("alt+b", spool.action.window.balance)"#,
+        )
+        .unwrap();
 
         let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision());
         assert!(!worker.has_event_handlers(), "no spool.on handlers yet");
@@ -851,7 +856,7 @@ mod tests {
         // second reads. A Lua global could not carry a value across this.
         std::fs::write(
             &script,
-            r#"spool.bind("alt - a", function() spool.state.set("counter", 41) end)"#,
+            r#"spool.bind("alt+a", function() spool.state.set("counter", 41) end)"#,
         )
         .unwrap();
 
@@ -862,7 +867,7 @@ mod tests {
         // handler got that far.
         std::fs::write(
             &script,
-            r#"spool.bind("alt - b", function()
+            r#"spool.bind("alt+b", function()
                  spool.flash("counter=" .. tostring(spool.state.get("counter")))
                end)"#,
         )
@@ -893,15 +898,15 @@ mod tests {
     #[test]
     fn a_returned_window_set_commits_its_operations() {
         let worker =
-            worker(r#"spool.bind("alt - f", function(ws) return ws:focus(ws:focused()) end)"#);
+            worker(r#"spool.bind("alt+f", function(ws) return ws:focus(ws:focused()) end)"#);
         worker.send_binds(vec![1]);
         serve_window_set(&worker);
 
-        let FromLua::Command(command) = next_effect(&worker, "the layout command") else {
-            panic!("expected a command");
+        let FromLua::Action(action) = next_effect(&worker, "the layout action") else {
+            panic!("expected an action");
         };
-        let Command::Layout(ops) = command else {
-            panic!("expected a layout command, got {command:?}");
+        let Action::Layout(ops) = action else {
+            panic!("expected a layout action, got {action:?}");
         };
         assert_eq!(ops, vec![LayoutOp::Focus(7)]);
     }
@@ -910,7 +915,7 @@ mod tests {
     fn a_window_set_computed_but_not_returned_commits_nothing() {
         let worker = worker(
             r#"
-            spool.bind("alt - f", function(ws)
+            spool.bind("alt+f", function(ws)
               local unused = ws:focus(ws:focused()):view(2)
               spool.flash("discarded")
             end)
@@ -930,11 +935,11 @@ mod tests {
     fn a_handler_that_raises_after_transforming_commits_nothing() {
         let worker = worker(
             r#"
-            spool.bind("alt - f", function(ws)
+            spool.bind("alt+f", function(ws)
               local pending = ws:focus(ws:focused())
               error("nope")
             end)
-            spool.bind("alt - b", "window balance")
+            spool.bind("alt+b", spool.action.window.balance)
             "#,
         );
         worker.send_binds(vec![1]);
@@ -944,7 +949,7 @@ mod tests {
         worker.send_binds(vec![2]);
         assert!(matches!(
             next_effect(&worker, "the next bind"),
-            FromLua::Command(Command::Window(crate::commands::Operation::Balance))
+            FromLua::Action(Action::Window(crate::commands::Operation::Balance))
         ));
     }
 
@@ -952,7 +957,7 @@ mod tests {
     fn chained_transforms_commit_in_order() {
         let worker = worker(
             r#"
-            spool.bind("alt - x", function(ws)
+            spool.bind("alt+x", function(ws)
               return ws:focus(7):width(7, 0.75):shift(7, 2)
             end)
             "#,
@@ -960,9 +965,8 @@ mod tests {
         worker.send_binds(vec![1]);
         serve_window_set(&worker);
 
-        let FromLua::Command(Command::Layout(ops)) = next_effect(&worker, "the layout command")
-        else {
-            panic!("expected a layout command");
+        let FromLua::Action(Action::Layout(ops)) = next_effect(&worker, "the layout action") else {
+            panic!("expected a layout action");
         };
         assert_eq!(
             ops,
@@ -985,12 +989,12 @@ mod tests {
     fn a_handler_that_ignores_the_window_set_never_fetches_one() {
         // Laziness is what keeps the window set affordable on hot events: it
         // costs a round-trip and reads every window title over the AX API.
-        let worker = worker(r#"spool.bind("alt - b", "window balance")"#);
+        let worker = worker(r#"spool.bind("alt+b", spool.action.window.balance)"#);
         worker.send_binds(vec![1]);
 
         assert!(matches!(
-            next_effect(&worker, "the bound command"),
-            FromLua::Command(Command::Window(crate::commands::Operation::Balance))
+            next_effect(&worker, "the bound action"),
+            FromLua::Action(Action::Window(crate::commands::Operation::Balance))
         ));
         assert!(
             worker.world_queries.try_recv().is_err(),
@@ -1002,8 +1006,8 @@ mod tests {
     fn two_handlers_in_one_batch_share_one_window_set() {
         let worker = worker(
             r#"
-            spool.bind("alt - a", function(ws) spool.flash(tostring(ws:focused())) end)
-            spool.bind("alt - b", function(ws) spool.flash(tostring(ws:focused())) end)
+            spool.bind("alt+a", function(ws) spool.flash(tostring(ws:focused())) end)
+            spool.bind("alt+b", function(ws) spool.flash(tostring(ws:focused())) end)
             "#,
         );
         worker.send_binds(vec![1, 2]);
@@ -1023,10 +1027,10 @@ mod tests {
     fn a_handler_waiting_on_the_world_does_not_hold_up_the_next_one() {
         let worker = worker(
             r#"
-            spool.bind("alt - a", function()
+            spool.bind("alt+a", function()
               spool.flash(spool.query_active().focused_app_name)
             end)
-            spool.bind("alt - b", function() spool.flash("second") end)
+            spool.bind("alt+b", function() spool.flash("second") end)
             "#,
         );
         worker.send_binds(vec![1, 2]);
@@ -1066,11 +1070,11 @@ mod tests {
         let worker = worker(
             r#"
             escaped = nil
-            spool.bind("alt - a", function(ws)
+            spool.bind("alt+a", function(ws)
               escaped = ws
               spool.flash(tostring(ws:focused()))
             end)
-            spool.bind("alt - b", function() spool.flash(tostring(escaped:focused())) end)
+            spool.bind("alt+b", function() spool.flash(tostring(escaped:focused())) end)
             "#,
         );
         worker.send_binds(vec![1]);

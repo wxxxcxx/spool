@@ -82,11 +82,11 @@
                 mouse_follows_focus = true;
               };
               bindings = {
-                window_focus_west = "cmd - h";
-                window_focus_east = "cmd - l";
-                window_resize = "alt - r";
-                window_center = "alt - c";
-                quit = "ctrl + alt - q";
+                window_focus_west = "cmd+h";
+                window_focus_east = "cmd+l";
+                window_grow_width = "alt+equal";
+                window_center = "alt+c";
+                quit = "ctrl+alt+q";
               };
             };
             config = ''
@@ -124,11 +124,11 @@
               conf=`<"$confPath" toml2json`
               echo $conf | jq -e ".options.focus_follows_mouse == true"
               echo $conf | jq -e ".options.mouse_follows_focus == true"
-              echo $conf | jq -e ".bindings.window_focus_west == \"cmd - h\""
-              echo $conf | jq -e ".bindings.window_focus_east == \"cmd - l\""
-              echo $conf | jq -e ".bindings.window_resize == \"alt - r\""
-              echo $conf | jq -e ".bindings.window_center == \"alt - c\""
-              echo $conf | jq -e ".bindings.quit == \"ctrl + alt - q\""
+              echo $conf | jq -e ".bindings.window_focus_west == \"cmd+h\""
+              echo $conf | jq -e ".bindings.window_focus_east == \"cmd+l\""
+              echo $conf | jq -e ".bindings.window_grow_width == \"alt+equal\""
+              echo $conf | jq -e ".bindings.window_center == \"alt+c\""
+              echo $conf | jq -e ".bindings.quit == \"ctrl+alt+q\""
 
               luaPath=`<service.json jq -r ".EnvironmentVariables.SPOOL_LUA"`
               echo >&2 "checking init.lua in $luaPath"

@@ -145,11 +145,11 @@ in
           mouse_follows_focus = true;
         };
         bindings = {
-          window_focus_west = "cmd - h";
-          window_focus_east = "cmd - l";
-          window_resize = "alt - r";
-          window_center = "alt - c";
-          quit = "ctrl + alt - q";
+          window_focus_west = "cmd+h";
+          window_focus_east = "cmd+l";
+          window_grow_width = "alt+equal";
+          window_center = "alt+c";
+          quit = "ctrl+alt+q";
         };
       };
     };
@@ -160,8 +160,8 @@ in
       example = ''
         spool.setup {
           options = { focus_follows_mouse = true },
-          bindings = { ["window focus east"] = "alt - l" },
         }
+        spool.bind("alt+l", spool.action.window.focus_east)
       '';
       description = ''
         Contents of spool's `init.lua` — either a block of Lua source or a

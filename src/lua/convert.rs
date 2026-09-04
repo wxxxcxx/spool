@@ -242,7 +242,7 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::ApplicationFrontSwitched { .. }
             | Event::WindowCreated { .. }
             | Event::ReconcileWindows { .. }
-            | Event::Command { .. }
+            | Event::ActionRequested { .. }
             | Event::StateQuery { .. }
             | Event::WindowSetQuery { .. }
             | Event::StateSubscribe { .. }
@@ -488,8 +488,8 @@ mod tests {
         assert!(
             event_to_lua(
                 &lua,
-                &Event::Command {
-                    command: crate::commands::Command::Lua(0),
+                &Event::ActionRequested {
+                    action: crate::commands::Action::Lua(0),
                 }
             )
             .is_none()

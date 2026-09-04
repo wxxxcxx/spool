@@ -64,12 +64,12 @@ expose the same following options:
         preset_column_widths = [0.25 0.33 0.5 0.66 0.75];
       };
       bindings = {
-        window_focus_west = "cmd - h";
-        window_focus_east = "cmd - l";
-        window_resize = "alt - r";
-        window_center = "alt - c";
-        window_balance = "alt - b";
-        quit = "ctrl + alt - q";
+        window_focus_west = "cmd+h";
+        window_focus_east = "cmd+l";
+        window_grow_width = "alt+equal";
+        window_center = "alt+c";
+        window_balance = "alt+b";
+        quit = "ctrl+alt+q";
       };
     };
   };
@@ -87,14 +87,12 @@ services.spool = {
   config = ''
     spool.setup {
       options = { focus_follows_mouse = true, mouse_follows_focus = true },
-      bindings = {
-        ["window focus west"] = "cmd - h",
-        ["window focus east"] = "cmd - l",
-        ["quit"] = "ctrl + alt - q",
-      },
     }
 
-    spool.bind("alt - j", function(state) spool.run("window focus south") end)
+    spool.bind("cmd+h", spool.action.window.focus_west)
+    spool.bind("cmd+l", spool.action.window.focus_east)
+    spool.bind("ctrl+alt+q", spool.action.quit)
+    spool.bind("alt+j", spool.action.window.focus_south)
   '';
 };
 ```

@@ -116,6 +116,10 @@ fn update_passthrough(window: &Window, app: &Application, config: &Config) {
     crate::platform::input::set_focused_passthrough(properties.passthrough_keys());
 }
 
+fn window_is_fixed_size(window: &Window) -> bool {
+    window.is_resizable().is_ok_and(|resizable| !resizable)
+}
+
 fn focus_query_failure_level(error: &crate::errors::Error) -> Level {
     if error.macos_code() == Some(kAXErrorNoValue) {
         Level::DEBUG
@@ -982,6 +986,14 @@ pub(super) fn retile_window_trigger(
         return;
     }
 
+    if ctx.windows.get(entity).is_some_and(window_is_fixed_size) {
+        debug!(?entity, "refusing to retile fixed-size window");
+        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
+            entity_commands.try_insert(Floating);
+        }
+        return;
+    }
+
     debug!("Entity {entity} is tiled again.");
     let (display, dock) = *active_display;
     let display_bounds = display.actual_display_bounds(dock, &ctx.config);
@@ -1359,6 +1371,12 @@ pub(super) fn spawn_window_trigger(mut trigger: On<SpawnWindowTrigger>, mut ctx:
             continue;
         };
 
+        // Fixed-size capability is physical and known before layout starts,
+        // so classify it immediately. Configured floating/grid defaults stay
+        // transactional in `apply_window_defaults`: a failed grid write must
+        // retry before the Floating marker becomes final.
+        let starts_floating = window_is_fixed_size(&window);
+
         log_spawned_window(&window);
 
         match app.observe_window(&window) {
@@ -1406,6 +1424,9 @@ pub(super) fn spawn_window_trigger(mut trigger: On<SpawnWindowTrigger>, mut ctx:
             ChildOf(app_entity),
             WindowDefaultsPending,
         ));
+        if starts_floating {
+            entity_commands.insert(Floating);
+        }
         if ctx.initializing.is_some() {
             entity_commands.insert(InitialWindowMarker);
         }
@@ -1513,9 +1534,20 @@ pub(super) fn apply_window_defaults(
         debug!("Applying window defaults for '{}'", window.id());
 
         let initializing = initializing.is_some();
+        let fixed_size = match window.is_resizable() {
+            Ok(resizable) => !resizable,
+            Err(error) => {
+                debug!(window_id = window.id(), %error, "unable to query whether AXSize is settable; keeping configured layout policy");
+                false
+            }
+        };
 
         // Do not add padding to floating windows.
-        if properties.floating() {
+        if properties.floating() || fixed_size {
+            if fixed_size && let Ok(mut entity_commands) = commands.get_entity(entity) {
+                debug!(window_id = window.id(), "floating fixed-size window");
+                entity_commands.try_insert(Floating);
+            }
             // Skip grid_ratios during init: we don't know this window's display.
             let applied = if !initializing && let Some((rx, ry, rw, rh)) = properties.grid_ratios()
             {
@@ -1738,7 +1770,8 @@ pub(super) fn apply_window_positions(
 
         let properties = WindowProperties::new(app, window, &ctx.config);
 
-        if properties.floating() {
+        let fixed_size = window_is_fixed_size(window);
+        if properties.floating() || fixed_size {
             if let Some(mut strip) = workspaces
                 .iter_mut()
                 .find_map(|(strip, _)| strip.contains(entity).then_some(strip))

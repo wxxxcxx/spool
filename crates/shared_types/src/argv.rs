@@ -1,12 +1,14 @@
-//! The argv encoding of a [`Command`]: `["window", "focus", "east"]`.
+//! The argv encoding of an [`Action`]: `["window", "focus", "east"]`.
 //!
-//! This is the wire format of the `send-cmd` socket protocol and the shape the
+//! This is the argument shape of the `spool action` interface and the shape the
 //! TOML `[bindings]` keys are split into, so parsing and formatting live
 //! together here and are checked against each other by round-trip tests.
 
-use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection};
+use crate::commands::{
+    Action, Direction, FocusStep, MouseMove, MoveFocus, Operation, ResizeAxis, ResizeDirection,
+};
 
-/// Why an argv vector is not a command. Consumers wrap this in their own error
+/// Why an argv vector is not an action. Consumers wrap this in their own error
 /// type; the message is already user-facing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError(String);
@@ -17,7 +19,7 @@ impl ParseError {
     }
 
     fn invalid(argv: &[&str]) -> Self {
-        Self(format!("invalid command '{argv:?}'"))
+        Self(format!("invalid action '{argv:?}'"))
     }
 }
 
@@ -31,23 +33,23 @@ impl std::error::Error for ParseError {}
 
 type Result<T> = std::result::Result<T, ParseError>;
 
-/// Parses a command argument vector into a [`Command`] (e.g. `["window",
+/// Parses an action argument vector into an [`Action`] (e.g. `["window",
 /// "focus", "east"]`).
 ///
 /// # Errors
 ///
-/// Returns [`ParseError`] if `argv` is not a recognized command encoding.
-pub fn parse_command(argv: &[&str]) -> Result<Command> {
-    let command = *argv.first().unwrap_or(&"");
-    Ok(match command {
-        "printstate" => Command::PrintState,
-        "reconcile-windows" => Command::ReconcileWindows,
-        "window" => parse_window_command(&argv[1..])?,
-        "space" => parse_space_command(&argv[1..])?,
-        "mouse" => Command::Mouse(parse_mouse_move(&argv[1..])?),
-        "quit" => Command::Quit,
-        "restart" => Command::Restart,
-        _ => return Err(ParseError::new(format!("unhandled command '{argv:?}'"))),
+/// Returns [`ParseError`] if `argv` is not a recognized action encoding.
+pub fn parse_action(argv: &[&str]) -> Result<Action> {
+    let action = *argv.first().unwrap_or(&"");
+    Ok(match action {
+        "printstate" => Action::PrintState,
+        "reconcile-windows" => Action::ReconcileWindows,
+        "window" => parse_window_action(&argv[1..])?,
+        "space" => parse_space_action(&argv[1..])?,
+        "mouse" => Action::Mouse(parse_mouse_move(&argv[1..])?),
+        "quit" => Action::Quit,
+        "restart" => Action::Restart,
+        _ => return Err(ParseError::new(format!("unhandled action '{argv:?}'"))),
     })
 }
 
@@ -69,9 +71,9 @@ fn parse_u64(input: &str, what: &str) -> Result<u64> {
         .map_err(|_| ParseError::new(format!("invalid {what} '{input}'")))
 }
 
-fn parse_window_command(argv: &[&str]) -> Result<Command> {
+fn parse_window_action(argv: &[&str]) -> Result<Action> {
     match *argv.first().unwrap_or(&"") {
-        "focusid" if argv.len() == 2 => Ok(Command::FocusWindow {
+        "focusid" if argv.len() == 2 => Ok(Action::FocusWindow {
             window_id: parse_i32(argv[1], "window id")?,
         }),
         "move-to-space" if argv.len() == 4 => {
@@ -84,25 +86,25 @@ fn parse_window_command(argv: &[&str]) -> Result<Command> {
                     )));
                 }
             };
-            Ok(Command::MoveWindowToSpace {
+            Ok(Action::MoveWindowToSpace {
                 window_id: parse_i32(argv[1], "window id")?,
                 space_id: parse_u64(argv[2], "space id")?,
                 move_focus,
             })
         }
-        _ => Ok(Command::Window(parse_operation(argv)?)),
+        _ => Ok(Action::Window(parse_operation(argv)?)),
     }
 }
 
-fn parse_space_command(argv: &[&str]) -> Result<Command> {
+fn parse_space_action(argv: &[&str]) -> Result<Action> {
     match argv {
-        ["focus", space_id] => Ok(Command::FocusSpace {
+        ["focus", space_id] => Ok(Action::FocusSpace {
             space_id: parse_u64(space_id, "space id")?,
         }),
-        ["create", display_id] => Ok(Command::CreateSpace {
+        ["create", display_id] => Ok(Action::CreateSpace {
             display_id: parse_u32(display_id, "display id")?,
         }),
-        ["delete", space_id] => Ok(Command::DeleteSpace {
+        ["delete", space_id] => Ok(Action::DeleteSpace {
             space_id: parse_u64(space_id, "space id")?,
         }),
         _ => Err(ParseError::invalid(argv)),
@@ -111,35 +113,42 @@ fn parse_space_command(argv: &[&str]) -> Result<Command> {
 
 /// Parses a window operation (e.g. `["focus", "east"]`).
 fn parse_operation(argv: &[&str]) -> Result<Operation> {
-    let command = *argv.first().unwrap_or(&"");
+    if argv == ["focus", "other", "layer"] {
+        return Ok(Operation::FocusOtherLayer);
+    }
+
+    let action = *argv.first().unwrap_or(&"");
     let err = || ParseError::invalid(argv);
     let argument = || argv.get(1).ok_or_else(err).copied();
 
-    Ok(match command {
+    Ok(match action {
         "focus" => match argument()? {
             "floating" => Operation::FocusFloating,
             "tiled" => Operation::FocusTiled,
+            "other-layer" => Operation::FocusOtherLayer,
+            "next" => Operation::FocusStep(FocusStep::Next),
+            "previous" => Operation::FocusStep(FocusStep::Previous),
             direction => Operation::Focus(Direction::parse_positional(direction)?),
         },
-        "raise" => match argument()? {
-            "floating" => Operation::RaiseFloating,
+        "move" => Operation::Move(Direction::parse(argument()?)?),
+        "center" => Operation::Center,
+        "grow" | "shrink" => {
+            if argv.len() != 2 {
+                return Err(err());
+            }
+            Operation::Resize {
+                axis: ResizeAxis::parse(argument()?)?,
+                direction: ResizeDirection::parse(action)?,
+            }
+        }
+        "maximize" => Operation::Maximize,
+        "toggle" => match argument()? {
+            "floating" => Operation::ToggleFloating,
+            "stack" => Operation::ToggleStack,
             _ => return Err(err()),
         },
-        "togglefloatlayer" => Operation::ToggleFloatingLayer,
-        "swap" => Operation::Swap(Direction::parse(argument()?)?),
-        "center" => Operation::Center,
-        "resize" => Operation::Resize(
-            argv.get(1)
-                .map_or(Ok(ResizeDirection::Grow), |arg| ResizeDirection::parse(arg))?,
-        ),
-        "grow" => Operation::Resize(ResizeDirection::Grow),
-        "shrink" => Operation::Resize(ResizeDirection::Shrink),
-        "fullwidth" => Operation::FullWidth,
-        "togglefloating" => Operation::ToggleFloating,
         "equalize" => Operation::Equalize,
         "balance" => Operation::Balance,
-        "stack" => Operation::Stack(true),
-        "unstack" => Operation::Stack(false),
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
         "snap" => Operation::Snap,
@@ -147,43 +156,43 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
     })
 }
 
-/// Parses a mouse command (e.g. `["nextdisplay"]`).
+/// Parses a mouse action (e.g. `["nextdisplay"]`).
 fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
     match *argv.first().unwrap_or(&"") {
         "nextdisplay" => Ok(MouseMove::ToNextDisplay),
-        _ => Err(ParseError::new(format!("invalid mouse command '{argv:?}'"))),
+        _ => Err(ParseError::new(format!("invalid mouse action '{argv:?}'"))),
     }
 }
 
-impl Command {
-    /// The argv encoding of this command, as understood by [`parse_command`].
+impl Action {
+    /// The argv encoding of this action, as understood by [`parse_action`].
     ///
-    /// [`Command::Lua`] and [`Command::Layout`] have no encoding — they are
+    /// [`Action::Lua`] and [`Action::Layout`] have no encoding — they are
     /// only ever issued in-process — and yield `None`.
     #[must_use]
     pub fn to_argv(&self) -> Option<Vec<String>> {
         let argv = match self {
-            Command::Window(operation) => {
+            Action::Window(operation) => {
                 let mut argv = vec!["window".to_string()];
                 argv.extend(operation.to_argv());
                 argv
             }
-            Command::Mouse(MouseMove::ToNextDisplay) => {
+            Action::Mouse(MouseMove::ToNextDisplay) => {
                 vec!["mouse".to_string(), "nextdisplay".to_string()]
             }
-            Command::FocusWindow { window_id } => {
+            Action::FocusWindow { window_id } => {
                 vec![
                     "window".to_string(),
                     "focusid".to_string(),
                     window_id.to_string(),
                 ]
             }
-            Command::FocusSpace { space_id } => vec![
+            Action::FocusSpace { space_id } => vec![
                 "space".to_string(),
                 "focus".to_string(),
                 space_id.to_string(),
             ],
-            Command::MoveWindowToSpace {
+            Action::MoveWindowToSpace {
                 window_id,
                 space_id,
                 move_focus,
@@ -198,21 +207,21 @@ impl Command {
                 }
                 .to_string(),
             ],
-            Command::CreateSpace { display_id } => vec![
+            Action::CreateSpace { display_id } => vec![
                 "space".to_string(),
                 "create".to_string(),
                 display_id.to_string(),
             ],
-            Command::DeleteSpace { space_id } => vec![
+            Action::DeleteSpace { space_id } => vec![
                 "space".to_string(),
                 "delete".to_string(),
                 space_id.to_string(),
             ],
-            Command::Quit => vec!["quit".to_string()],
-            Command::Restart => vec!["restart".to_string()],
-            Command::PrintState => vec!["printstate".to_string()],
-            Command::ReconcileWindows => vec!["reconcile-windows".to_string()],
-            Command::Lua(_) | Command::Layout(_) => return None,
+            Action::Quit => vec!["quit".to_string()],
+            Action::Restart => vec!["restart".to_string()],
+            Action::PrintState => vec!["printstate".to_string()],
+            Action::ReconcileWindows => vec!["reconcile-windows".to_string()],
+            Action::Lua(_) | Action::Layout(_) => return None,
         };
         Some(argv)
     }
@@ -224,24 +233,23 @@ impl Operation {
         let owned = |args: &[&str]| args.iter().map(|arg| (*arg).to_string()).collect();
         match self {
             Operation::Focus(direction) => vec!["focus".to_string(), direction.token()],
-            Operation::Swap(direction) => vec!["swap".to_string(), direction.token()],
+            Operation::FocusStep(step) => owned(&["focus", step.token()]),
+            Operation::FocusOtherLayer => owned(&["focus", "other-layer"]),
+            Operation::Move(direction) => vec!["move".to_string(), direction.token()],
             Operation::Center => owned(&["center"]),
-            Operation::Resize(direction) => owned(&["resize", direction.token()]),
-            // `SetWidth` comes from window rules, not from a command line; it has
+            Operation::Resize { axis, direction } => owned(&[direction.token(), axis.token()]),
+            // `SetWidth` comes from window rules, not from the CLI action syntax; it has
             // no argv verb, so encode it as the equivalent full-width toggle.
-            Operation::SetWidth(_) | Operation::FullWidth => owned(&["fullwidth"]),
+            Operation::SetWidth(_) | Operation::Maximize => owned(&["maximize"]),
             Operation::ToNextDisplay(MoveFocus::Follow) => owned(&["nextdisplay"]),
             Operation::ToNextDisplay(MoveFocus::Stay) => owned(&["nextdisplaysend"]),
             Operation::Equalize => owned(&["equalize"]),
             Operation::Balance => owned(&["balance"]),
-            Operation::ToggleFloating => owned(&["togglefloating"]),
-            Operation::Stack(true) => owned(&["stack"]),
-            Operation::Stack(false) => owned(&["unstack"]),
+            Operation::ToggleFloating => owned(&["toggle", "floating"]),
+            Operation::ToggleStack => owned(&["toggle", "stack"]),
             Operation::Snap => owned(&["snap"]),
             Operation::FocusFloating => owned(&["focus", "floating"]),
             Operation::FocusTiled => owned(&["focus", "tiled"]),
-            Operation::RaiseFloating => owned(&["raise", "floating"]),
-            Operation::ToggleFloatingLayer => owned(&["togglefloatlayer"]),
         }
     }
 }
@@ -250,10 +258,10 @@ impl Operation {
 mod tests {
     use super::*;
 
-    fn round_trip(command: &Command) -> Command {
-        let argv = command.to_argv().expect("command should encode to argv");
+    fn round_trip(action: &Action) -> Action {
+        let argv = action.to_argv().expect("action should encode to argv");
         let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
-        parse_command(&borrowed).unwrap_or_else(|err| panic!("re-parsing {argv:?}: {err}"))
+        parse_action(&borrowed).unwrap_or_else(|err| panic!("re-parsing {argv:?}: {err}"))
     }
 
     #[test]
@@ -261,63 +269,67 @@ mod tests {
         let operations = [
             Operation::Focus(Direction::East),
             Operation::Focus(Direction::Nth(2)),
-            Operation::Swap(Direction::West),
+            Operation::FocusStep(FocusStep::Next),
+            Operation::FocusStep(FocusStep::Previous),
+            Operation::Move(Direction::West),
             Operation::Center,
-            Operation::Resize(ResizeDirection::Shrink),
-            Operation::FullWidth,
+            Operation::Resize {
+                axis: ResizeAxis::Width,
+                direction: ResizeDirection::Shrink,
+            },
+            Operation::Resize {
+                axis: ResizeAxis::Height,
+                direction: ResizeDirection::Grow,
+            },
+            Operation::Maximize,
             Operation::ToNextDisplay(MoveFocus::Follow),
             Operation::ToNextDisplay(MoveFocus::Stay),
             Operation::Equalize,
             Operation::Balance,
             Operation::ToggleFloating,
-            Operation::Stack(true),
-            Operation::Stack(false),
+            Operation::ToggleStack,
             Operation::Snap,
             Operation::FocusFloating,
             Operation::FocusTiled,
-            Operation::RaiseFloating,
-            Operation::ToggleFloatingLayer,
+            Operation::FocusOtherLayer,
         ];
 
         for operation in operations {
-            let command = Command::Window(operation.clone());
-            let reparsed = round_trip(&command);
+            let action = Action::Window(operation.clone());
+            let reparsed = round_trip(&action);
             assert_eq!(
                 format!("{reparsed:?}"),
-                format!("{command:?}"),
+                format!("{action:?}"),
                 "argv round-trip changed {operation:?}"
             );
         }
     }
 
     #[test]
-    fn global_commands_round_trip() {
-        for command in [
-            Command::Quit,
-            Command::Restart,
-            Command::PrintState,
-            Command::ReconcileWindows,
-            Command::Mouse(MouseMove::ToNextDisplay),
-            Command::FocusWindow { window_id: 42 },
-            Command::FocusSpace { space_id: 99 },
-            Command::MoveWindowToSpace {
+    fn global_actions_round_trip() {
+        for action in [
+            Action::Quit,
+            Action::Restart,
+            Action::PrintState,
+            Action::ReconcileWindows,
+            Action::Mouse(MouseMove::ToNextDisplay),
+            Action::FocusWindow { window_id: 42 },
+            Action::FocusSpace { space_id: 99 },
+            Action::MoveWindowToSpace {
                 window_id: 42,
                 space_id: 99,
                 move_focus: MoveFocus::Follow,
             },
-            Command::CreateSpace { display_id: 7 },
-            Command::DeleteSpace { space_id: 99 },
+            Action::CreateSpace { display_id: 7 },
+            Action::DeleteSpace { space_id: 99 },
         ] {
-            assert_eq!(
-                format!("{:?}", round_trip(&command)),
-                format!("{command:?}")
-            );
+            assert_eq!(format!("{:?}", round_trip(&action)), format!("{action:?}"));
         }
     }
 
     #[test]
-    fn lua_commands_have_no_argv_encoding() {
-        assert!(Command::Lua(1).to_argv().is_none());
+    fn lua_actions_have_no_argv_encoding() {
+        assert!(Action::Lua(1).to_argv().is_none());
     }
 
     #[test]
@@ -331,16 +343,50 @@ mod tests {
     }
 
     #[test]
-    fn legacy_managed_command_names_are_rejected() {
-        assert!(parse_command(&["window", "manage"]).is_err());
-        assert!(parse_command(&["window", "focus", "unmanaged"]).is_err());
-        assert!(parse_command(&["window", "focus", "managed"]).is_err());
+    fn focus_accepts_full_next_and_previous_names() {
+        let next = parse_action(&["window", "focus", "next"])
+            .expect("next should be a valid focus target");
+        let previous = parse_action(&["window", "focus", "previous"])
+            .expect("previous should be a valid focus target");
+
+        assert_eq!(format!("{next:?}"), "Window(FocusStep(Next))");
+        assert_eq!(format!("{previous:?}"), "Window(FocusStep(Previous))");
+        assert!(parse_action(&["window", "focus", "prev"]).is_err());
+        assert!(parse_action(&["window", "focus", "preview"]).is_err());
     }
 
     #[test]
-    fn invalid_commands_are_rejected() {
-        assert!(parse_command(&["definitely", "not", "a", "command"]).is_err());
-        assert!(parse_command(&["window", "focus"]).is_err());
-        assert!(parse_command(&["window", "swap", "3"]).is_err());
+    fn legacy_managed_action_names_are_rejected() {
+        assert!(parse_action(&["window", "manage"]).is_err());
+        assert!(parse_action(&["window", "focus", "unmanaged"]).is_err());
+        assert!(parse_action(&["window", "focus", "managed"]).is_err());
+    }
+
+    #[test]
+    fn removed_window_action_names_are_rejected() {
+        for action in [
+            &["window", "swap", "west"][..],
+            &["window", "resize"][..],
+            &["window", "grow"][..],
+            &["window", "shrink"][..],
+            &["window", "fullwidth"][..],
+            &["window", "togglefloating"][..],
+            &["window", "stack"][..],
+            &["window", "unstack"][..],
+            &["window", "raise", "floating"][..],
+            &["window", "togglefloatlayer"][..],
+        ] {
+            assert!(
+                parse_action(action).is_err(),
+                "legacy action survived: {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_actions_are_rejected() {
+        assert!(parse_action(&["definitely", "not", "a", "action"]).is_err());
+        assert!(parse_action(&["window", "focus"]).is_err());
+        assert!(parse_action(&["window", "move", "3"]).is_err());
     }
 }

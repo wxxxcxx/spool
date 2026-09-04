@@ -42,7 +42,8 @@ pub struct GestureOptions {
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct ScrollOptions {
     /// Modifier key(s) required for scroll wheel swiping.
-    /// Accepts the same format as keybindings: "alt", "cmd", "alt + cmd", "alt + rcmd" etc.
+    /// Accepts the same plus-separated format as keybindings: "alt", "cmd",
+    /// "alt+cmd", "alt+rcmd", etc.
     #[serde(default, deserialize_with = "deserialize_modifier")]
     pub modifier: Option<Modifiers>,
 }

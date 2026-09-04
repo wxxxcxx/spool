@@ -1,6 +1,6 @@
 # Lua Scripting Guide
 
-Spool embeds a Lua runtime, letting a script declare the entire configuration via `spool.setup{...}`, hook into window-manager events (`spool.on`), bind keys to Lua callbacks or command strings (`spool.bind`), query state, persist data across reloads, and programmatically manipulate window sets.
+Spool embeds a Lua runtime, letting a script declare the entire configuration via `spool.setup{...}`, hook into window-manager events (`spool.on`), bind keys directly to action functions or Lua callbacks (`spool.bind`), query state, persist data across reloads, and programmatically manipulate window sets.
 
 This guide distinguishes two kinds of script:
 
@@ -48,7 +48,7 @@ spool.on("window_focused", function(event, ws)
   spool.run("window balance")
 end)
 
-spool.bind("alt - j", "window focus east")
+spool.bind("alt+j", spool.action.window.focus_east)
 ```
 
 ---
@@ -72,26 +72,26 @@ spool.setup {
   restore = { enabled = true, startup_grace_ms = 2000 },
   windows = {
     -- keys are just rule names; `title` is a required regex
-    term = { title = "kitty", floating = true, bindings_passthrough = { "ctrl+alt-h" } },
+    term = { title = "kitty", floating = true, bindings_passthrough = { "ctrl+alt+h" } },
   },
 }
 ```
 
 ### Keybindings
 
-Two equivalent ways to bind keys, both accepting the exact chord syntax of the TOML `[bindings]` table:
-
-- `spool.bind(chord, handler)` — the handler is a command string **or a Lua function** (function handlers receive a state snapshot; only `spool.bind` supports them).
-- a `bindings` sub-table inside `setup`, keyed by command with the chord as the value — a shorthand that desugars onto the same path as `spool.bind`:
+`spool.bind(chord, handler)` accepts the same plus-separated chord syntax as the TOML `[bindings]` table. Put the chord first and pass either a function from `spool.action` or a custom Lua callback. A chord array binds every listed chord to the same handler:
 
 ```lua
-spool.setup {
-  bindings = {
-    ["window focus east"] = "alt - l",
-    ["quit"] = "ctrl + alt - q",
-  },
-}
+spool.bind("alt+h", spool.action.window.focus_west)
+spool.bind({ "alt+k", "alt+pageup" }, spool.action.window.focus_north)
+spool.bind("alt+shift+minus", spool.action.window.shrink_height)
+
+spool.bind("alt+3", function(ws)
+  return ws:view(spool.query_spaces()[3].space_id)
+end)
 ```
+
+Action functions live under the singular `spool.action` namespace. The main groups are `spool.action.window`, `spool.action.space`, and `spool.action.mouse`; lifecycle actions such as `spool.action.quit` and `spool.action.restart` live directly on it. Command strings remain available through the explicit `spool.run(...)` escape hatch, not as bind handlers. `spool.setup.bindings` is intentionally unsupported.
 
 ### Precedence & Reloading
 
@@ -227,9 +227,9 @@ spool script -e 'spool.state.set("mode", "compact")'
 Handlers are given a **window set** (`ws`): the whole layout — displays, native Spaces, columns, and the windows in them — as a value you can transform. It is modeled on xmonad's `StackSet`, and it is *pure*: every operation returns a **new** window set rather than changing the one you were given, and nothing touches a real window until you **return** it.
 
 ```lua
-spool.bind("alt - h",       function(ws) return ws:focus(ws:west(ws:focused())) end)
-spool.bind("alt - shift-h", function(ws) return ws:swap(ws:focused(), ws:west(ws:focused())) end)
-spool.bind("alt - 3", function(ws)
+spool.bind("alt+h",       function(ws) return ws:focus(ws:west(ws:focused())) end)
+spool.bind("alt+shift+h", function(ws) return ws:swap(ws:focused(), ws:west(ws:focused())) end)
+spool.bind("alt+3", function(ws)
   return ws:view(spool.query_spaces()[3].space_id)
 end)
 ```
@@ -237,7 +237,7 @@ end)
 Because the window set is pure:
 
 ```lua
-spool.bind("alt - b", function(ws)
+spool.bind("alt+b", function(ws)
   local tidied = ws:width(ws:focused(), 0.6)   -- computed, not applied
   if #ws:columns() < 3 then
     return                                     -- returning nothing changes nothing

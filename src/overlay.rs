@@ -1,19 +1,25 @@
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSColor, NSCompositingOperation, NSFloatingWindowLevel,
-    NSFont, NSGraphicsContext, NSNormalWindowLevel, NSParagraphStyle, NSScreen, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask,
+    NSFont, NSGraphicsContext, NSModalPanelWindowLevel, NSParagraphStyle, NSScreen, NSView,
+    NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGFloat;
+use objc2_core_graphics::CGDirectDisplayID;
 use objc2_foundation::{
-    NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
+    NSAttributedString, NSDictionary, NSMutableCopying, NSNumber, NSPoint, NSRect, NSSize,
+    NSString, ns_string,
 };
 
-use crate::platform::WinID;
+use crate::manager::move_owned_window_to_space;
+use crate::platform::{WinID, WorkspaceId};
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BorderParams {
     pub color: (f64, f64, f64),
     pub opacity: f64,
@@ -21,62 +27,100 @@ pub struct BorderParams {
     pub radius: f64,
 }
 
-/// Parameters for the fullscreen dim + cutout overlay.
-#[derive(Clone, PartialEq)]
-pub struct DimParams {
-    pub opacity: f32,
-    pub color: (f64, f64, f64),
-    /// The focused window rect to cut out (in Cocoa screen coordinates).
-    /// `None` means dim everything (no focused window).
-    pub cutout: Option<NSRect>,
-    pub cutout_radius: f64,
+/// Declarative decorations for one ordinary native Space.
+///
+/// The Space owns one transparent surface on its physical display. A missing
+/// focused target intentionally renders a fully dimmed Space with no border;
+/// this lets newly discovered inactive Spaces have a prepared surface before
+/// their first transition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpaceOverlayTarget {
+    pub space_id: WorkspaceId,
+    pub display_id: CGDirectDisplayID,
+    pub focused_abs_cg: Option<NSRect>,
+    pub focused_window_id: Option<WinID>,
+    pub border: Option<BorderParams>,
 }
 
-// ── DimView: fullscreen dark overlay with a transparent cutout ──
+#[derive(Clone, Debug, PartialEq)]
+struct DecorationStyle {
+    dim_opacity: f32,
+    dim_color: (f64, f64, f64),
+    cutout_radius: f64,
+    border: Option<BorderParams>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DecorationDrawState {
+    style: DecorationStyle,
+    cutout: Option<NSRect>,
+    border_rect: Option<NSRect>,
+}
+
+// ── DecorationView: dim cutout and border on one persistent surface ──
 
 #[derive(Debug, Clone)]
-struct DimViewIvars {
-    opacity: f32,
-    dim_r: f64,
-    dim_g: f64,
-    dim_b: f64,
-    // Cutout rect in the view's local coordinates.
-    cutout_x: f64,
-    cutout_y: f64,
-    cutout_w: f64,
-    cutout_h: f64,
-    has_cutout: bool,
-    cutout_radius: f64,
+struct DecorationViewIvars {
+    dim_opacity: Cell<f32>,
+    dim_r: Cell<f64>,
+    dim_g: Cell<f64>,
+    dim_b: Cell<f64>,
+    cutout_x: Cell<f64>,
+    cutout_y: Cell<f64>,
+    cutout_w: Cell<f64>,
+    cutout_h: Cell<f64>,
+    has_cutout: Cell<bool>,
+    cutout_radius: Cell<f64>,
+    border_x: Cell<f64>,
+    border_y: Cell<f64>,
+    border_w: Cell<f64>,
+    border_h: Cell<f64>,
+    has_border: Cell<bool>,
+    border_r: Cell<f64>,
+    border_g: Cell<f64>,
+    border_b: Cell<f64>,
+    border_opacity: Cell<f64>,
+    border_width: Cell<f64>,
+    border_radius: Cell<f64>,
 }
 
 define_class!(
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
-    #[name = "SpoolDimView"]
-    #[ivars = DimViewIvars]
+    #[name = "SpoolDecorationView"]
+    #[ivars = DecorationViewIvars]
     #[derive(Debug)]
-    struct DimView;
+    struct DecorationView;
 
-    impl DimView {
+    impl DecorationView {
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty_rect: NSRect) {
             let ivars = self.ivars();
             let bounds = self.bounds();
 
-            // Fill the entire view with the dim color.
-            let dim_color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                ivars.dim_r as CGFloat,
-                ivars.dim_g as CGFloat,
-                ivars.dim_b as CGFloat,
-                CGFloat::from(ivars.opacity),
-            );
-            dim_color.setFill();
-            NSBezierPath::fillRect(bounds);
+            // Every animation frame must erase the previous cutout and border
+            // from the buffered transparent window before drawing the next one.
+            if let Some(ctx) = NSGraphicsContext::currentContext() {
+                ctx.setCompositingOperation(NSCompositingOperation::Clear);
+                NSBezierPath::fillRect(bounds);
+                ctx.setCompositingOperation(NSCompositingOperation::SourceOver);
+            }
 
-            if ivars.has_cutout {
+            if ivars.dim_opacity.get() != 0.0 {
+                let dim_color = NSColor::colorWithSRGBRed_green_blue_alpha(
+                    ivars.dim_r.get() as CGFloat,
+                    ivars.dim_g.get() as CGFloat,
+                    ivars.dim_b.get() as CGFloat,
+                    CGFloat::from(ivars.dim_opacity.get()),
+                );
+                dim_color.setFill();
+                NSBezierPath::fillRect(bounds);
+            }
+
+            if ivars.dim_opacity.get() != 0.0 && ivars.has_cutout.get() {
                 let cutout = NSRect::new(
-                    NSPoint::new(ivars.cutout_x, ivars.cutout_y),
-                    NSSize::new(ivars.cutout_w, ivars.cutout_h),
+                    NSPoint::new(ivars.cutout_x.get(), ivars.cutout_y.get()),
+                    NSSize::new(ivars.cutout_w.get(), ivars.cutout_h.get()),
                 );
 
                 // Punch a rounded transparent hole using Clear compositing.
@@ -84,12 +128,33 @@ define_class!(
                     ctx.setCompositingOperation(NSCompositingOperation::Clear);
                     let hole = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
                         cutout,
-                        ivars.cutout_radius as CGFloat,
-                        ivars.cutout_radius as CGFloat,
+                        ivars.cutout_radius.get() as CGFloat,
+                        ivars.cutout_radius.get() as CGFloat,
                     );
                     hole.fill();
                     ctx.setCompositingOperation(NSCompositingOperation::SourceOver);
                 }
+            }
+
+            if ivars.has_border.get() {
+                let rect = NSRect::new(
+                    NSPoint::new(ivars.border_x.get(), ivars.border_y.get()),
+                    NSSize::new(ivars.border_w.get(), ivars.border_h.get()),
+                );
+                let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                    rect,
+                    ivars.border_radius.get() as CGFloat,
+                    ivars.border_radius.get() as CGFloat,
+                );
+                path.setLineWidth(ivars.border_width.get() as CGFloat);
+                let color = NSColor::colorWithSRGBRed_green_blue_alpha(
+                    ivars.border_r.get() as CGFloat,
+                    ivars.border_g.get() as CGFloat,
+                    ivars.border_b.get() as CGFloat,
+                    ivars.border_opacity.get() as CGFloat,
+                );
+                color.setStroke();
+                path.stroke();
             }
         }
 
@@ -100,95 +165,84 @@ define_class!(
     }
 );
 
-impl DimView {
-    fn new(mtm: MainThreadMarker, frame: NSRect, params: &DimParams) -> Retained<Self> {
-        let (has_cutout, cx, cy, cw, ch) = params.cutout.map_or((false, 0.0, 0.0, 0.0, 0.0), |r| {
-            (true, r.origin.x, r.origin.y, r.size.width, r.size.height)
+impl DecorationView {
+    fn new(mtm: MainThreadMarker, frame: NSRect, state: &DecorationDrawState) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(DecorationViewIvars {
+            dim_opacity: Cell::new(0.0),
+            dim_r: Cell::new(0.0),
+            dim_g: Cell::new(0.0),
+            dim_b: Cell::new(0.0),
+            cutout_x: Cell::new(0.0),
+            cutout_y: Cell::new(0.0),
+            cutout_w: Cell::new(0.0),
+            cutout_h: Cell::new(0.0),
+            has_cutout: Cell::new(false),
+            cutout_radius: Cell::new(0.0),
+            border_x: Cell::new(0.0),
+            border_y: Cell::new(0.0),
+            border_w: Cell::new(0.0),
+            border_h: Cell::new(0.0),
+            has_border: Cell::new(false),
+            border_r: Cell::new(0.0),
+            border_g: Cell::new(0.0),
+            border_b: Cell::new(0.0),
+            border_opacity: Cell::new(0.0),
+            border_width: Cell::new(0.0),
+            border_radius: Cell::new(0.0),
         });
-        let this = Self::alloc(mtm).set_ivars(DimViewIvars {
-            opacity: params.opacity,
-            dim_r: params.color.0,
-            dim_g: params.color.1,
-            dim_b: params.color.2,
-            cutout_x: cx,
-            cutout_y: cy,
-            cutout_w: cw,
-            cutout_h: ch,
-            has_cutout,
-            cutout_radius: params.cutout_radius,
-        });
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        this.update(state);
+        this
     }
-}
 
-#[derive(Debug, Clone)]
-struct BorderViewIvars {
-    border_x: f64,
-    border_y: f64,
-    border_w: f64,
-    border_h: f64,
-    color_r: f64,
-    color_g: f64,
-    color_b: f64,
-    opacity: f64,
-    width: f64,
-    radius: f64,
-}
-
-define_class!(
-    #[unsafe(super(NSView))]
-    #[thread_kind = MainThreadOnly]
-    #[name = "SpoolBorderView"]
-    #[ivars = BorderViewIvars]
-    #[derive(Debug)]
-    struct BorderView;
-
-    impl BorderView {
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty_rect: NSRect) {
-            let ivars = self.ivars();
-            let rect = NSRect::new(
-                NSPoint::new(ivars.border_x, ivars.border_y),
-                NSSize::new(ivars.border_w, ivars.border_h),
-            );
-            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                rect,
-                ivars.radius as CGFloat,
-                ivars.radius as CGFloat,
-            );
-            path.setLineWidth(ivars.width as CGFloat);
-            let color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                ivars.color_r as CGFloat,
-                ivars.color_g as CGFloat,
-                ivars.color_b as CGFloat,
-                ivars.opacity as CGFloat,
-            );
-            color.setStroke();
-            path.stroke();
+    fn update(&self, state: &DecorationDrawState) {
+        let (has_cutout, cx, cy, cw, ch) =
+            state.cutout.map_or((false, 0.0, 0.0, 0.0, 0.0), |rect| {
+                (
+                    true,
+                    rect.origin.x,
+                    rect.origin.y,
+                    rect.size.width,
+                    rect.size.height,
+                )
+            });
+        let (has_border, bx, by, bw, bh) =
+            state
+                .border_rect
+                .map_or((false, 0.0, 0.0, 0.0, 0.0), |rect| {
+                    (
+                        true,
+                        rect.origin.x,
+                        rect.origin.y,
+                        rect.size.width,
+                        rect.size.height,
+                    )
+                });
+        let ivars = self.ivars();
+        ivars.dim_opacity.set(state.style.dim_opacity);
+        ivars.dim_r.set(state.style.dim_color.0);
+        ivars.dim_g.set(state.style.dim_color.1);
+        ivars.dim_b.set(state.style.dim_color.2);
+        ivars.cutout_x.set(cx);
+        ivars.cutout_y.set(cy);
+        ivars.cutout_w.set(cw);
+        ivars.cutout_h.set(ch);
+        ivars.has_cutout.set(has_cutout);
+        ivars.cutout_radius.set(state.style.cutout_radius);
+        ivars.border_x.set(bx);
+        ivars.border_y.set(by);
+        ivars.border_w.set(bw);
+        ivars.border_h.set(bh);
+        ivars.has_border.set(has_border);
+        if let Some(border) = &state.style.border {
+            ivars.border_r.set(border.color.0);
+            ivars.border_g.set(border.color.1);
+            ivars.border_b.set(border.color.2);
+            ivars.border_opacity.set(border.opacity);
+            ivars.border_width.set(border.width);
+            ivars.border_radius.set(border.radius);
         }
-    }
-);
-
-impl BorderView {
-    fn new(
-        mtm: MainThreadMarker,
-        frame: NSRect,
-        border_rect: NSRect,
-        params: &BorderParams,
-    ) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(BorderViewIvars {
-            border_x: border_rect.origin.x,
-            border_y: border_rect.origin.y,
-            border_w: border_rect.size.width,
-            border_h: border_rect.size.height,
-            color_r: params.color.0,
-            color_g: params.color.1,
-            color_b: params.color.2,
-            opacity: params.opacity,
-            width: params.width,
-            radius: params.radius,
-        });
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+        self.setNeedsDisplay(true);
     }
 }
 
@@ -233,18 +287,12 @@ fn rects_intersect(a: NSRect, b: NSRect) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct BorderSurface {
-    /// The compact overlay window frame in global Cocoa coordinates.
-    window_frame: NSRect,
-    /// The target window border rect in the compact overlay's local coordinates.
-    border_rect: NSRect,
+struct ScreenFrame {
+    id: CGDirectDisplayID,
+    frame: NSRect,
 }
 
-fn plan_border_surfaces(
-    target: NSRect,
-    screens: &[NSRect],
-    border_width: f64,
-) -> Vec<BorderSurface> {
+fn border_touches_screen(target: NSRect, screen: NSRect, border_width: f64) -> bool {
     let half_width = border_width.max(0.0) / 2.0;
     let outer = NSRect::new(
         NSPoint::new(target.origin.x - half_width, target.origin.y - half_width),
@@ -253,31 +301,137 @@ fn plan_border_surfaces(
             target.size.height + border_width.max(0.0),
         ),
     );
+    rects_intersect(outer, screen)
+}
 
-    screens
-        .iter()
+fn screen_local_decoration(target: NSRect, screen: NSRect) -> NSRect {
+    NSRect::new(
+        NSPoint::new(
+            target.origin.x - screen.origin.x,
+            (screen.origin.y + screen.size.height) - (target.origin.y + target.size.height),
+        ),
+        target.size,
+    )
+}
+
+fn project_decoration(
+    presented: NSRect,
+    screen: NSRect,
+    style: &DecorationStyle,
+) -> DecorationDrawState {
+    let local = screen_local_decoration(presented, screen);
+    DecorationDrawState {
+        style: style.clone(),
+        cutout: (style.dim_opacity != 0.0 && rects_intersect(presented, screen)).then_some(local),
+        border_rect: style
+            .border
+            .as_ref()
+            .is_some_and(|border| border_touches_screen(presented, screen, border.width))
+            .then_some(local),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DecorationPresentation {
+    presented: NSRect,
+    target: NSRect,
+    target_id: WinID,
+    animating: bool,
+}
+
+fn retarget_decoration(
+    current: Option<DecorationPresentation>,
+    target: NSRect,
+    target_id: WinID,
+    allow_animation: bool,
+) -> DecorationPresentation {
+    let Some(current) = current else {
+        return DecorationPresentation {
+            presented: target,
+            target,
+            target_id,
+            animating: false,
+        };
+    };
+
+    // One observed focus transition dirties the overlay twice: first when the
+    // coordinator confirms the new target, then when `FocusedMarker` catches
+    // up. The second projection is the same declarative state and must be
+    // idempotent; snapping it to `target` would visibly collapse the shared
+    // dim cutout/border animation midway through the focus change.
+    if allow_animation
+        && current.animating
+        && current.target_id == target_id
+        && current.target == target
+    {
+        return current;
+    }
+
+    let focus_changed = current.target_id != target_id;
+    let animate = allow_animation && focus_changed && current.presented != target;
+    DecorationPresentation {
+        presented: if animate { current.presented } else { target },
+        target,
+        target_id,
+        animating: animate,
+    }
+}
+
+fn interpolate_rect(current: NSRect, target: NSRect, factor: f64) -> NSRect {
+    let lerp = |from: f64, to: f64| from + (to - from) * factor;
+    NSRect::new(
+        NSPoint::new(
+            lerp(current.origin.x, target.origin.x),
+            lerp(current.origin.y, target.origin.y),
+        ),
+        NSSize::new(
+            lerp(current.size.width, target.size.width),
+            lerp(current.size.height, target.size.height),
+        ),
+    )
+}
+
+fn rect_is_close(left: NSRect, right: NSRect) -> bool {
+    const SNAP_THRESHOLD: f64 = 0.5;
+    (left.origin.x - right.origin.x).abs() <= SNAP_THRESHOLD
+        && (left.origin.y - right.origin.y).abs() <= SNAP_THRESHOLD
+        && (left.size.width - right.size.width).abs() <= SNAP_THRESHOLD
+        && (left.size.height - right.size.height).abs() <= SNAP_THRESHOLD
+}
+
+fn advance_decoration(presentation: &mut DecorationPresentation, rate: f64, delta: f64) -> bool {
+    if !presentation.animating {
+        return false;
+    }
+
+    if rate <= 0.0 || !rate.is_finite() || !delta.is_finite() {
+        presentation.presented = presentation.target;
+        presentation.animating = false;
+        return true;
+    }
+
+    let factor = (1.0 - (-rate * delta.max(0.0)).exp()).clamp(0.0, 1.0);
+    let next = interpolate_rect(presentation.presented, presentation.target, factor);
+    if rect_is_close(next, presentation.target) {
+        presentation.presented = presentation.target;
+        presentation.animating = false;
+    } else {
+        presentation.presented = next;
+    }
+    true
+}
+
+fn screen_frames(mtm: MainThreadMarker) -> Vec<ScreenFrame> {
+    let screens = NSScreen::screens(mtm);
+    (&screens)
+        .into_iter()
         .filter_map(|screen| {
-            let min_x = outer.origin.x.max(screen.origin.x);
-            let min_y = outer.origin.y.max(screen.origin.y);
-            let max_x =
-                (outer.origin.x + outer.size.width).min(screen.origin.x + screen.size.width);
-            let max_y =
-                (outer.origin.y + outer.size.height).min(screen.origin.y + screen.size.height);
-            (max_x > min_x && max_y > min_y).then(|| {
-                let window_frame = NSRect::new(
-                    NSPoint::new(min_x, min_y),
-                    NSSize::new(max_x - min_x, max_y - min_y),
-                );
-                BorderSurface {
-                    window_frame,
-                    border_rect: NSRect::new(
-                        NSPoint::new(
-                            target.origin.x - window_frame.origin.x,
-                            target.origin.y - window_frame.origin.y,
-                        ),
-                        target.size,
-                    ),
-                }
+            let description = screen.deviceDescription();
+            let numbers = unsafe { description.cast_unchecked::<NSString, NSNumber>() };
+            let id = numbers.objectForKey(ns_string!("NSScreenNumber"))?.as_u32();
+            Some(ScreenFrame {
+                id,
+                frame: screen.frame(),
             })
         })
         .collect()
@@ -292,35 +446,157 @@ mod tests {
     }
 
     #[test]
-    fn border_surface_is_compact_and_accounts_for_stroke_width() {
-        let surfaces = plan_border_surfaces(
-            rect(100.0, 100.0, 200.0, 120.0),
-            &[rect(0.0, 0.0, 500.0, 500.0)],
-            4.0,
+    fn decoration_projection_uses_the_flipped_display_local_rect() {
+        assert_eq!(
+            screen_local_decoration(
+                rect(550.0, 120.0, 240.0, 180.0),
+                rect(500.0, 0.0, 500.0, 500.0),
+            ),
+            rect(50.0, 200.0, 240.0, 180.0)
         );
-
-        assert_eq!(surfaces.len(), 1);
-        assert_eq!(surfaces[0].window_frame, rect(98.0, 98.0, 204.0, 124.0));
-        assert_eq!(surfaces[0].border_rect, rect(2.0, 2.0, 200.0, 120.0));
     }
 
     #[test]
-    fn border_surface_splits_at_a_display_boundary_without_moving_the_path() {
-        let surfaces = plan_border_surfaces(
-            rect(450.0, 100.0, 100.0, 120.0),
-            &[rect(0.0, 0.0, 500.0, 500.0), rect(500.0, 0.0, 500.0, 500.0)],
-            4.0,
+    fn decoration_overlay_stays_above_cross_application_focus_reordering() {
+        assert_eq!(
+            decoration_overlay_level(),
+            objc2_app_kit::NSModalPanelWindowLevel
         );
+        assert!(decoration_overlay_level() > NSFloatingWindowLevel);
+        assert!(decoration_overlay_level() < objc2_app_kit::NSMainMenuWindowLevel);
+    }
 
-        assert_eq!(surfaces.len(), 2);
-        assert_eq!(surfaces[0].window_frame, rect(448.0, 98.0, 52.0, 124.0));
-        assert_eq!(surfaces[0].border_rect, rect(2.0, 2.0, 100.0, 120.0));
-        assert_eq!(surfaces[1].window_frame, rect(500.0, 98.0, 52.0, 124.0));
-        assert_eq!(surfaces[1].border_rect, rect(-50.0, 2.0, 100.0, 120.0));
+    #[test]
+    fn decoration_overlay_belongs_to_exactly_one_non_fullscreen_space() {
+        let behavior = decoration_collection_behavior();
+        assert!(behavior.contains(NSWindowCollectionBehavior::CanJoinAllApplications));
+        assert!(!behavior.contains(NSWindowCollectionBehavior::Stationary));
+        assert!(!behavior.contains(NSWindowCollectionBehavior::Transient));
+        assert!(!behavior.contains(NSWindowCollectionBehavior::CanJoinAllSpaces));
+        assert!(!behavior.contains(NSWindowCollectionBehavior::FullScreenAuxiliary));
+        assert!(behavior.contains(NSWindowCollectionBehavior::FullScreenNone));
+    }
+
+    #[test]
+    fn dim_cutout_and_border_share_the_same_presented_frame() {
+        let presented = rect(550.0, 120.0, 240.0, 180.0);
+        let style = DecorationStyle {
+            dim_opacity: 0.2,
+            dim_color: (0.0, 0.0, 0.0),
+            cutout_radius: 10.0,
+            border: Some(border_params()),
+        };
+
+        let projected = project_decoration(presented, rect(500.0, 0.0, 500.0, 500.0), &style);
+
+        assert_eq!(projected.cutout, projected.border_rect);
+        assert_eq!(projected.cutout, Some(rect(50.0, 200.0, 240.0, 180.0)));
+    }
+
+    #[test]
+    fn border_stroke_is_visible_on_both_sides_of_a_display_boundary() {
+        let target = rect(500.0, 100.0, 100.0, 120.0);
+
+        assert!(border_touches_screen(
+            target,
+            rect(0.0, 0.0, 500.0, 500.0),
+            4.0
+        ));
+        assert!(border_touches_screen(
+            target,
+            rect(500.0, 0.0, 500.0, 500.0),
+            4.0
+        ));
+    }
+
+    fn border_params() -> BorderParams {
+        BorderParams {
+            color: (1.0, 0.5, 0.0),
+            opacity: 0.9,
+            width: 4.0,
+            radius: 10.0,
+        }
+    }
+
+    #[test]
+    fn focus_change_animates_from_the_current_presented_border() {
+        let original = rect(20.0, 20.0, 300.0, 500.0);
+        let next = rect(340.0, 20.0, 300.0, 500.0);
+        let current = retarget_decoration(None, original, 1, true);
+
+        let retargeted = retarget_decoration(Some(current), next, 2, true);
+
+        assert_eq!(retargeted.presented, original);
+        assert_eq!(retargeted.target, next);
+        assert!(retargeted.animating);
+    }
+
+    #[test]
+    fn repeated_projection_of_the_same_focus_preserves_the_running_animation() {
+        let original = rect(20.0, 20.0, 300.0, 500.0);
+        let next = rect(340.0, 20.0, 300.0, 500.0);
+        let current = retarget_decoration(None, original, 1, true);
+        let moving = retarget_decoration(Some(current), next, 2, true);
+
+        let repeated = retarget_decoration(Some(moving), next, 2, true);
+
+        assert_eq!(repeated.presented, original);
+        assert_eq!(repeated.target, next);
+        assert!(repeated.animating);
+    }
+
+    #[test]
+    fn changing_the_same_focused_window_geometry_does_not_add_border_lag() {
+        let original = rect(20.0, 20.0, 300.0, 500.0);
+        let next = rect(40.0, 20.0, 280.0, 500.0);
+        let current = retarget_decoration(None, original, 1, true);
+
+        let retargeted = retarget_decoration(Some(current), next, 1, true);
+
+        assert_eq!(retargeted.presented, next);
+        assert!(!retargeted.animating);
+    }
+
+    #[test]
+    fn focus_change_after_overlay_suppression_snaps_instead_of_crossing_spaces() {
+        let original = rect(20.0, 20.0, 300.0, 500.0);
+        let next = rect(340.0, 20.0, 300.0, 500.0);
+        let current = retarget_decoration(None, original, 1, true);
+
+        let retargeted = retarget_decoration(Some(current), next, 2, false);
+
+        assert_eq!(retargeted.presented, next);
+        assert!(!retargeted.animating);
+    }
+
+    #[test]
+    fn border_animation_advances_position_and_size_together() {
+        let original = rect(0.0, 20.0, 300.0, 500.0);
+        let next = rect(100.0, 40.0, 500.0, 300.0);
+        let current = retarget_decoration(None, original, 1, true);
+        let mut retargeted = retarget_decoration(Some(current), next, 2, true);
+
+        assert!(advance_decoration(
+            &mut retargeted,
+            1.0,
+            std::f64::consts::LN_2
+        ));
+        assert_eq!(retargeted.presented, rect(50.0, 30.0, 400.0, 400.0));
+        assert!(retargeted.animating);
     }
 }
 
 // ── Overlay window factory ──────────────────────────────────────────────
+
+fn decoration_overlay_level() -> isize {
+    NSModalPanelWindowLevel
+}
+
+fn decoration_collection_behavior() -> NSWindowCollectionBehavior {
+    NSWindowCollectionBehavior::IgnoresCycle
+        | NSWindowCollectionBehavior::CanJoinAllApplications
+        | NSWindowCollectionBehavior::FullScreenNone
+}
 
 fn make_overlay_window(
     mtm: MainThreadMarker,
@@ -341,13 +617,14 @@ fn make_overlay_window(
     window.setIgnoresMouseEvents(true);
     window.setHasShadow(false);
     window.setLevel(level);
-    window.setCollectionBehavior(
-        NSWindowCollectionBehavior::Transient
-            | NSWindowCollectionBehavior::IgnoresCycle
-            | NSWindowCollectionBehavior::CanJoinAllSpaces
-            | NSWindowCollectionBehavior::Stationary
-            | NSWindowCollectionBehavior::FullScreenNone,
-    );
+    window.setCollectionBehavior(decoration_collection_behavior());
+    // OverlayManager owns the only strong Rust reference. Releasing the
+    // WindowServer object on `close()` prevents obsolete Space surfaces from
+    // surviving as permanently off-screen windows after topology/config
+    // reconciliation.
+    unsafe {
+        window.setReleasedWhenClosed(true);
+    }
 
     window
 }
@@ -355,195 +632,193 @@ fn make_overlay_window(
 
 pub struct OverlayManager {
     mtm: MainThreadMarker,
-    /// One dim window per display. macOS will not reliably let a single
-    /// window span multiple displays (with "Displays have separate Spaces" it
-    /// renders on only one), so each screen gets its own overlay drawn in that
-    /// screen's local coordinates. Indexed in lockstep with `NSScreen::screens`.
-    dim_overlays: Vec<(Retained<NSWindow>, DimParams)>,
-    /// Compact border windows clipped to the displays touched by the target.
-    border_overlays: Vec<(Retained<NSWindow>, BorderSurface, BorderParams, WinID)>,
+    /// One persistent transparent decoration surface per ordinary native
+    /// Space. Each surface is moved to that exact Space once, then left for
+    /// `WindowServer` to compose as part of the Space transition.
+    decoration_overlays: HashMap<WorkspaceId, DecorationOverlay>,
     hidden: bool,
+}
+
+struct DecorationOverlay {
+    display_id: CGDirectDisplayID,
+    screen_frame: NSRect,
+    window: Retained<NSWindow>,
+    view: Retained<DecorationView>,
+    presentation: Option<DecorationPresentation>,
+    style: DecorationStyle,
 }
 
 impl OverlayManager {
     pub fn new(mtm: MainThreadMarker) -> Self {
         Self {
             mtm,
-            dim_overlays: Vec::new(),
-            border_overlays: Vec::new(),
+            decoration_overlays: HashMap::new(),
             hidden: false,
         }
     }
 
-    /// Update the per-display overlays.
-    /// `focused_abs_cg` is the focused window rect in absolute CG coords,
-    /// or `None` if no window is focused.
+    /// Reconcile all ordinary native Space overlays from declarative state.
+    ///
+    /// Fullscreen Spaces must not be present in `targets`. A target without a
+    /// focused window remains a fully dimmed prepared surface, so switching to
+    /// a Space never has to create or move an overlay during the transition.
     pub fn update(
         &mut self,
         dim_opacity: f32,
         dim_color: (f64, f64, f64),
-        focused_abs_cg: Option<NSRect>,
-        focused_window_id: Option<WinID>,
-        border: Option<&BorderParams>,
+        targets: &[SpaceOverlayTarget],
     ) {
         let screen_h = primary_screen_height(self.mtm);
-        let screens = NSScreen::screens(self.mtm);
-        let screen_frames: Vec<NSRect> = (&screens)
-            .into_iter()
-            .map(|screen| screen.frame())
-            .collect();
-
-        // The focused window in Cocoa global coords (shared across all screens).
-        let focused_cocoa = focused_abs_cg.map(|cg| cg_abs_to_cocoa(cg, screen_h));
-        self.update_dim_overlays(
-            dim_opacity,
-            dim_color,
-            focused_cocoa,
-            focused_window_id,
-            border,
-            &screen_frames,
-        );
-        self.update_border_overlays(focused_cocoa, focused_window_id, border, &screen_frames);
+        let screens = screen_frames(self.mtm);
+        self.sync_decoration_overlays(&screens, screen_h, targets, dim_opacity, dim_color);
         self.hidden = false;
+        self.render_decorations();
     }
 
-    fn update_dim_overlays(
+    fn sync_decoration_overlays(
         &mut self,
+        screens: &[ScreenFrame],
+        primary_screen_height: f64,
+        targets: &[SpaceOverlayTarget],
         dim_opacity: f32,
         dim_color: (f64, f64, f64),
-        focused_cocoa: Option<NSRect>,
-        focused_window_id: Option<WinID>,
-        border: Option<&BorderParams>,
-        screen_frames: &[NSRect],
     ) {
-        let target_window_number = focused_window_id.and_then(|id| isize::try_from(id).ok());
+        let desired_spaces = targets
+            .iter()
+            .map(|target| target.space_id)
+            .collect::<HashSet<_>>();
+        self.decoration_overlays.retain(|space_id, overlay| {
+            // Native Space identity survives display sleep/wake and temporary
+            // display-ID churn. Reuse the same NSWindow and update its display
+            // and frame below instead of allocating a second surface.
+            let keep = desired_spaces.contains(space_id);
+            if !keep {
+                overlay.window.close();
+            }
+            keep
+        });
 
-        if let Some(target_window_number) = target_window_number.filter(|_| dim_opacity != 0.0) {
-            // A display was added/removed — tear down and rebuild from scratch.
-            if self.dim_overlays.len() != screen_frames.len() {
-                for (window, _) in self.dim_overlays.drain(..) {
-                    window.orderOut(None::<&AnyObject>);
+        for target in targets {
+            let Some(screen) = screens.iter().find(|screen| screen.id == target.display_id) else {
+                continue;
+            };
+            let style = DecorationStyle {
+                dim_opacity,
+                dim_color,
+                cutout_radius: target.border.as_ref().map_or(0.0, |params| params.radius),
+                border: target.border.clone(),
+            };
+            let focused_cocoa = target
+                .focused_abs_cg
+                .map(|frame| cg_abs_to_cocoa(frame, primary_screen_height));
+            let focused = focused_cocoa.zip(target.focused_window_id);
+
+            if let Some(overlay) = self.decoration_overlays.get_mut(&target.space_id) {
+                if overlay.display_id != screen.id || overlay.screen_frame != screen.frame {
+                    overlay.window.setFrame_display(screen.frame, false);
+                    overlay
+                        .view
+                        .setFrame(NSRect::new(NSPoint::new(0.0, 0.0), screen.frame.size));
+                    overlay.display_id = screen.id;
+                    overlay.screen_frame = screen.frame;
                 }
+                overlay.presentation = focused.map(|(frame, window_id)| {
+                    retarget_decoration(overlay.presentation.take(), frame, window_id, !self.hidden)
+                });
+                overlay.style = style;
+                continue;
             }
 
-            for (i, frame) in screen_frames.iter().copied().enumerate() {
-                // Cut out the focused window on every display it touches, each
-                // in that display's local (flipped, top-left origin) coords.
-                let cutout_local =
-                    focused_cocoa
-                        .filter(|wc| rects_intersect(*wc, frame))
-                        .map(|wc| {
-                            NSRect::new(
-                                NSPoint::new(
-                                    wc.origin.x - frame.origin.x,
-                                    (frame.origin.y + frame.size.height)
-                                        - (wc.origin.y + wc.size.height),
-                                ),
-                                wc.size,
-                            )
-                        });
-
-                let params = DimParams {
-                    opacity: dim_opacity,
-                    color: dim_color,
-                    cutout: cutout_local,
-                    cutout_radius: border.map_or(0.0, |params| params.radius),
-                };
-
-                if let Some((window, stored)) = self.dim_overlays.get_mut(i) {
-                    if *stored == params {
-                        window.setFrame_display(frame, false);
-                    } else {
-                        let view = DimView::new(self.mtm, frame, &params);
-                        window.setContentView(Some(&view));
-                        window.setFrame_display(frame, true);
-                        *stored = params;
-                    }
-                    window
-                        .orderWindow_relativeTo(NSWindowOrderingMode::Below, target_window_number);
-                } else {
-                    let window = make_overlay_window(self.mtm, frame, NSNormalWindowLevel);
-                    let view = DimView::new(self.mtm, frame, &params);
-                    window.setContentView(Some(&view));
-                    window
-                        .orderWindow_relativeTo(NSWindowOrderingMode::Below, target_window_number);
-                    self.dim_overlays.push((window, params));
-                }
+            let window = make_overlay_window(self.mtm, screen.frame, decoration_overlay_level());
+            let view_frame = NSRect::new(NSPoint::new(0.0, 0.0), screen.frame.size);
+            let empty_state = DecorationDrawState {
+                style: style.clone(),
+                cutout: None,
+                border_rect: None,
+            };
+            let view = DecorationView::new(self.mtm, view_frame, &empty_state);
+            window.setContentView(Some(&view));
+            let Ok(window_id) = WinID::try_from(window.windowNumber()) else {
+                window.close();
+                continue;
+            };
+            if let Err(error) = move_owned_window_to_space(window_id, target.space_id) {
+                tracing::warn!(
+                    space_id = target.space_id,
+                    %error,
+                    "unable to bind decoration overlay to native Space"
+                );
+                window.close();
+                continue;
             }
-        } else {
-            for (window, _) in self.dim_overlays.drain(..) {
-                window.orderOut(None::<&AnyObject>);
+            let presentation = focused
+                .map(|(frame, target_id)| retarget_decoration(None, frame, target_id, false));
+            self.decoration_overlays.insert(
+                target.space_id,
+                DecorationOverlay {
+                    display_id: screen.id,
+                    screen_frame: screen.frame,
+                    window,
+                    view,
+                    presentation,
+                    style,
+                },
+            );
+        }
+    }
+
+    fn render_decorations(&self) {
+        for overlay in self.decoration_overlays.values() {
+            let draw_state = overlay.presentation.as_ref().map_or_else(
+                || DecorationDrawState {
+                    style: overlay.style.clone(),
+                    cutout: None,
+                    border_rect: None,
+                },
+                |presentation| {
+                    project_decoration(presentation.presented, overlay.screen_frame, &overlay.style)
+                },
+            );
+            if overlay.style.dim_opacity != 0.0 || draw_state.border_rect.is_some() {
+                overlay.view.update(&draw_state);
+                // Commit the replacement backing contents before ordering the
+                // window. Cross-application activation must never expose the
+                // transparent buffer between the old and new decorations.
+                overlay.view.displayIfNeeded();
+                overlay.window.orderFrontRegardless();
+            } else {
+                overlay.window.orderOut(None::<&AnyObject>);
             }
         }
     }
 
-    fn update_border_overlays(
-        &mut self,
-        focused_cocoa: Option<NSRect>,
-        focused_window_id: Option<WinID>,
-        border: Option<&BorderParams>,
-        screen_frames: &[NSRect],
-    ) {
-        let target_window_number = focused_window_id.and_then(|id| isize::try_from(id).ok());
-        let border_surfaces = focused_cocoa
-            .zip(border)
-            .zip(focused_window_id)
-            .map_or_else(Vec::new, |((target, params), _)| {
-                plan_border_surfaces(target, screen_frames, params.width)
-            });
-
-        while self.border_overlays.len() > border_surfaces.len() {
-            if let Some((window, ..)) = self.border_overlays.pop() {
-                window.orderOut(None::<&AnyObject>);
-            }
+    pub fn animate_decorations(&mut self, delta: f64, rate: f64) {
+        if self.hidden {
+            return;
         }
-
-        if let (Some(params), Some(target_id), Some(target_number)) =
-            (border, focused_window_id, target_window_number)
-        {
-            for (i, surface) in border_surfaces.into_iter().enumerate() {
-                if let Some((window, stored_surface, stored_params, stored_target)) =
-                    self.border_overlays.get_mut(i)
-                {
-                    if *stored_surface != surface
-                        || *stored_params != *params
-                        || *stored_target != target_id
-                    {
-                        let view_frame =
-                            NSRect::new(NSPoint::new(0.0, 0.0), surface.window_frame.size);
-                        let view =
-                            BorderView::new(self.mtm, view_frame, surface.border_rect, params);
-                        window.setContentView(Some(&view));
-                        window.setFrame_display(surface.window_frame, true);
-                        *stored_surface = surface;
-                        *stored_params = params.clone();
-                        *stored_target = target_id;
-                    }
-                    window.orderWindow_relativeTo(NSWindowOrderingMode::Above, target_number);
-                } else {
-                    let window =
-                        make_overlay_window(self.mtm, surface.window_frame, NSNormalWindowLevel);
-                    let view_frame = NSRect::new(NSPoint::new(0.0, 0.0), surface.window_frame.size);
-                    let view = BorderView::new(self.mtm, view_frame, surface.border_rect, params);
-                    window.setContentView(Some(&view));
-                    window.orderWindow_relativeTo(NSWindowOrderingMode::Above, target_number);
-                    self.border_overlays
-                        .push((window, surface, params.clone(), target_id));
-                }
-            }
-        } else {
-            for (window, ..) in self.border_overlays.drain(..) {
-                window.orderOut(None::<&AnyObject>);
-            }
+        let advanced = self.decoration_overlays.values_mut().any(|overlay| {
+            overlay
+                .presentation
+                .as_mut()
+                .is_some_and(|presentation| advance_decoration(presentation, rate, delta))
+        });
+        if advanced {
+            self.render_decorations();
         }
+    }
+
+    pub fn decorations_are_animating(&self) -> bool {
+        !self.hidden
+            && self
+                .decoration_overlays
+                .values()
+                .filter_map(|overlay| overlay.presentation.as_ref())
+                .any(|presentation| presentation.animating)
     }
 
     pub fn remove_all(&mut self) {
-        for (window, _) in self.dim_overlays.drain(..) {
-            window.orderOut(None::<&AnyObject>);
-        }
-        for (window, ..) in self.border_overlays.drain(..) {
-            window.orderOut(None::<&AnyObject>);
+        for (_, overlay) in self.decoration_overlays.drain() {
+            overlay.window.close();
         }
         self.hidden = false;
     }
@@ -552,11 +827,8 @@ impl OverlayManager {
         if self.hidden {
             return;
         }
-        for (window, _) in &self.dim_overlays {
-            window.orderOut(None::<&AnyObject>);
-        }
-        for (window, ..) in &self.border_overlays {
-            window.orderOut(None::<&AnyObject>);
+        for overlay in self.decoration_overlays.values() {
+            overlay.window.orderOut(None::<&AnyObject>);
         }
         self.hidden = true;
     }

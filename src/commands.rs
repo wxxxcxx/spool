@@ -28,10 +28,10 @@ use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, 
 use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
-// The command vocabulary itself lives in the `spool-command` crate, shared with
-// the Lua API in `crates/lua-api` so every host speaks the same types.
+// The action vocabulary itself lives in `spool-shared-types`, shared with the
+// Lua module so every host dispatches the same types.
 pub use spool_shared_types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
+    Action, Direction, FocusStep, MouseMove, MoveFocus, Operation, ResizeAxis, ResizeDirection,
 };
 
 /// The visible Space on every display except the focused one.
@@ -58,6 +58,8 @@ type StripsWithVisibility<'w, 's> = Query<
     ),
 >;
 
+const MIN_RESIZABLE_WINDOW_SIZE: i32 = 100;
+
 pub fn register_commands(app: &mut bevy::app::App) {
     // Registered here (not with the Lua systems) so it's exercised by the mock
     // harness without a running interpreter.
@@ -79,18 +81,17 @@ pub fn register_commands(app: &mut bevy::app::App) {
             mouse_to_next_display,
             resize_window,
             command_center_window,
-            full_width_window,
+            maximize_window,
             to_next_display,
             equalize_column,
             balance_strip,
             toggle_floating_window,
-            stack_windows_handler,
+            toggle_stack_handler,
             command_move_focus,
             command_focus_floating,
             command_focus_tiled,
-            command_raise_floating,
-            command_toggle_floating_layer,
-            command_swap_focus,
+            command_focus_other_layer,
+            command_move_window,
             snap_window,
         ),
     );
@@ -100,8 +101,8 @@ fn reconcile_windows_handler(mut messages: MessageReader<Event>, mut commands: C
     if messages.read().any(|event| {
         matches!(
             event,
-            Event::Command {
-                command: Command::ReconcileWindows,
+            Event::ActionRequested {
+                action: Action::ReconcileWindows,
             }
         )
     }) {
@@ -116,8 +117,8 @@ pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
     filter: F,
 ) -> impl Iterator<Item = &'a Operation> {
     messages.read().filter_map(move |event| {
-        if let Event::Command {
-            command: Command::Window(op),
+        if let Event::ActionRequested {
+            action: Action::Window(op),
         } = event
             && filter(op)
         {
@@ -220,7 +221,7 @@ fn visible_floating_entities(
         .map(|ids| ids.into_iter().collect())
         .unwrap_or_default();
 
-    windows
+    let mut visible = windows
         .iter()
         .filter_map(|(_, entity)| {
             let (window, _, state) = windows.get_tracked(entity)?;
@@ -231,9 +232,11 @@ fn visible_floating_entities(
                 return None;
             }
             let frame = windows.frame(entity)?;
-            (!display_bounds.intersect(frame).is_empty()).then_some(entity)
+            (!display_bounds.intersect(frame).is_empty()).then_some((window.id(), entity))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    visible.sort_unstable_by_key(|(window_id, _)| *window_id);
+    visible.into_iter().map(|(_, entity)| entity).collect()
 }
 
 fn nearest_float_in_direction(
@@ -253,6 +256,115 @@ fn nearest_float_in_direction(
             .filter_map(|entity| windows.frame(entity).map(|frame| (entity, frame.center())));
 
     pick_nearest_in_direction(direction, focused_center, candidates)
+}
+
+fn floating_focus_target(
+    direction: &Direction,
+    focused_entity: Entity,
+    windows: &Windows,
+    window_manager: &WindowManager,
+    active_display: &ActiveDisplay,
+) -> Option<Entity> {
+    let visible = visible_floating_entities(
+        windows,
+        window_manager,
+        active_display.active_strip().id(),
+        active_display.bounds(),
+    );
+    match direction {
+        Direction::First => visible.first().copied(),
+        Direction::Last => visible.last().copied(),
+        Direction::Nth(_) => None,
+        Direction::West | Direction::East | Direction::North | Direction::South => {
+            nearest_float_in_direction(
+                direction,
+                focused_entity,
+                windows,
+                window_manager,
+                active_display.active_strip().id(),
+                active_display.bounds(),
+            )
+        }
+    }
+}
+
+fn focus_step_target(step: FocusStep, current: Entity, ordered: &[Entity]) -> Option<Entity> {
+    if ordered.len() < 2 {
+        return None;
+    }
+
+    let index = ordered.iter().position(|candidate| *candidate == current);
+    let target = match (step, index) {
+        (FocusStep::Next, Some(index)) => (index + 1) % ordered.len(),
+        (FocusStep::Previous, Some(0) | None) => ordered.len() - 1,
+        (FocusStep::Previous, Some(index)) => index - 1,
+        (FocusStep::Next, None) => 0,
+    };
+    Some(ordered[target])
+}
+
+fn focus_by_step(
+    step: FocusStep,
+    focused_entity: Entity,
+    windows: &Windows,
+    window_manager: &WindowManager,
+    active_display: &ActiveDisplay,
+    commands: &mut Commands,
+) {
+    let active_strip = active_display.active_strip();
+    let floating = windows
+        .get_tracked(focused_entity)
+        .is_some_and(|(_, _, state)| state.is_floating() && state.is_visible());
+    let ordered = if floating {
+        visible_floating_entities(
+            windows,
+            window_manager,
+            active_strip.id(),
+            active_display.bounds(),
+        )
+    } else {
+        active_strip.all_windows()
+    };
+
+    if let Some(entity) = focus_step_target(step, focused_entity, &ordered) {
+        commands.focus_entity(entity, true);
+        if !floating {
+            commands.ensure_visible(entity);
+        }
+    }
+}
+
+fn focus_from_native_fullscreen(
+    direction: Option<&Direction>,
+    active_display: &ActiveDisplay,
+    workspaces: &Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+    commands: &mut Commands,
+) -> bool {
+    let Some(NativeFullscreenMarker {
+        layout_strip,
+        workspace_id,
+        index: _,
+    }) = active_display.fullscreen()
+    else {
+        return false;
+    };
+    if !matches!(direction, Some(Direction::West)) {
+        return false;
+    }
+
+    let strip = workspaces
+        .iter()
+        .find_map(|(strip, entity, _)| (entity == *layout_strip).then_some(strip))
+        .or_else(|| {
+            workspaces
+                .iter()
+                .find_map(|(strip, _, _)| (strip.id() == *workspace_id).then_some(strip))
+        });
+    if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
+        debug!("fullscreen: swap raising {entity}");
+        commands.focus_entity(entity, true);
+    }
+    true
 }
 
 /// Handles the "focus" command, moving focus to a window in a specified direction.
@@ -276,35 +388,23 @@ fn command_move_focus(
     focus: Res<FocusCoordinator>,
     mut commands: Commands,
 ) {
-    let Some(Operation::Focus(direction)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::Focus(_))).next()
-    else {
+    let Some(operation) = filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::Focus(_) | Operation::FocusStep(_))
+    })
+    .next() else {
         return;
+    };
+
+    let direction = match operation {
+        Operation::Focus(direction) => Some(direction),
+        Operation::FocusStep(_) => None,
+        _ => unreachable!("focus filter only accepts focus operations"),
     };
 
     let active_strip = active_display.active_strip();
 
-    // On a fullscreen space, swap to the last column in the workspace.
-    if let Some(NativeFullscreenMarker {
-        layout_strip,
-        workspace_id,
-        index: _,
-    }) = active_display.fullscreen()
-        && matches!(direction, Direction::West)
-    {
-        let mut strip = workspaces
-            .into_iter()
-            .find_map(|(strip, entity, _)| (entity == *layout_strip).then_some(strip));
-        if strip.is_none() {
-            strip = workspaces
-                .into_iter()
-                .find_map(|(strip, _, _)| (strip.id() == *workspace_id).then_some(strip));
-        }
-
-        if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
-            debug!("fullscreen: swap raising {entity}");
-            commands.focus_entity(entity, true);
-        }
+    // On a fullscreen space, west returns to the last column in the workspace.
+    if focus_from_native_fullscreen(direction, &active_display, &workspaces, &mut commands) {
         return;
     }
 
@@ -315,18 +415,36 @@ fn command_move_focus(
         return;
     };
 
+    if let Operation::FocusStep(step) = operation {
+        focus_by_step(
+            *step,
+            focused_entity,
+            &windows,
+            &window_manager,
+            &active_display,
+            &mut commands,
+        );
+        return;
+    }
+
+    let Some(direction) = direction else {
+        return;
+    };
+
     if windows
         .get_tracked(focused_entity)
         .is_some_and(|(_, _, state)| state.is_floating() && state.is_visible())
+        // Numeric focus is an absolute tiled-column address, even when focus
+        // currently sits in the floating layer. This preserves the public
+        // 1-based column contract and provides a direct way back into tiling.
         && !matches!(direction, Direction::Nth(_))
     {
-        if let Some(entity) = nearest_float_in_direction(
+        if let Some(entity) = floating_focus_target(
             direction,
             focused_entity,
             &windows,
             &window_manager,
-            active_strip.id(),
-            active_display.bounds(),
+            &active_display,
         ) {
             commands.focus_entity(entity, true);
         }
@@ -370,10 +488,13 @@ fn command_move_focus(
 
     if let Some(entity) = candidate {
         commands.focus_entity(entity, true);
-        // Explicitly reshuffle so the target window is brought into view.
-        // This avoids a race where focus-follows-mouse leaves skip_reshuffle
-        // set, causing the WindowFocused handler to skip the reshuffle.
-        commands.reshuffle_around(entity);
+        // Requested focus is already authoritative navigation state. Project
+        // its target into the layout immediately so a delayed or dropped AX
+        // focus confirmation cannot leave the requested window off-screen.
+        // `ensure_visible` is idempotent and only moves the strip by the
+        // missing amount; the confirmed-focus path remains responsible for
+        // border/dim state and any configured auto-centering.
+        commands.ensure_visible(entity);
         return;
     }
 
@@ -388,9 +509,9 @@ fn command_move_focus(
     };
     debug!("moving focus to another display: {change_display}");
     if change_display {
-        commands.trigger(SendMessageTrigger(Event::Command {
-            command: Command::Mouse(MouseMove::ToNextDisplay),
-        }));
+        commands.trigger(SendMessageTrigger(Event::action_requested(Action::Mouse(
+            MouseMove::ToNextDisplay,
+        ))));
     }
 }
 
@@ -452,51 +573,11 @@ fn command_focus_tiled(
     }
 }
 
-fn command_raise_floating(
-    mut messages: MessageReader<Event>,
-    windows: Windows,
-    active_display: ActiveDisplay,
-    window_manager: Res<WindowManager>,
-    focus: Res<FocusCoordinator>,
-    mut commands: Commands,
-) {
-    if filter_window_operations(&mut messages, |op| matches!(op, Operation::RaiseFloating))
-        .next()
-        .is_none()
-    {
-        return;
-    }
-
-    let display_bounds = active_display.bounds();
-    let workspace_id = active_display.active_strip().id();
-    let visible_floats =
-        visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
-    let is_visible_float = |entity: Entity| -> bool { visible_floats.contains(&entity) };
-
-    let target = focus
-        .last_floating(workspace_id)
-        .filter(|entity| is_visible_float(*entity))
-        .or_else(|| visible_floats.first().copied());
-
-    for (_, entity) in windows.iter() {
-        if is_visible_float(entity) && Some(entity) != target {
-            commands.trigger(RaiseWindow {
-                entity,
-                with_strip: false,
-            });
-        }
-    }
-
-    if let Some(entity) = target {
-        commands.focus_entity(entity, true);
-    }
-}
-
 /// Focus-and-raise are deliberately coupled here: macOS AX raise can't lift a
 /// window above another app's frontmost window, so the target's app must be
 /// made frontmost. Other windows in the new top tier are raised within their
 /// own apps' stacks as a best-effort.
-fn command_toggle_floating_layer(
+fn command_focus_other_layer(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
     mut floating_layers: Query<&mut FloatingLayer>,
@@ -505,11 +586,9 @@ fn command_toggle_floating_layer(
     windows: Windows,
     mut commands: Commands,
 ) {
-    if filter_window_operations(&mut messages, |op| {
-        matches!(op, Operation::ToggleFloatingLayer)
-    })
-    .next()
-    .is_none()
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusOtherLayer))
+        .next()
+        .is_none()
     {
         return;
     }
@@ -518,29 +597,17 @@ fn command_toggle_floating_layer(
     let active_strip = active_display.active_strip();
     let workspace_id = active_strip.id();
 
-    let floating_front = floating_layers
-        .iter_mut()
-        .find_map(|mut layer| {
-            if layer.workspace_id == workspace_id {
-                layer.flip();
-                Some(layer.front)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            let layer = FloatingLayer::new(workspace_id);
-            commands.spawn((layer, ChildOf(active_display.entity())));
-            false
-        });
-
     let visible_floats =
         visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
     let visible_float = |entity: Entity| -> bool {
         visible_floats.contains(&entity) && !active_strip.contains(entity)
     };
 
-    let target = if floating_front {
+    let focus_floating = !windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_tracked(entity))
+        .is_some_and(|(_, _, state)| state.is_floating());
+    let target = if focus_floating {
         focus
             .last_floating(workspace_id)
             .filter(|entity| visible_float(*entity))
@@ -551,8 +618,22 @@ fn command_toggle_floating_layer(
             .filter(|entity| active_strip.contains(*entity))
             .or_else(|| active_strip.all_columns().into_iter().next())
     };
+    let Some(target) = target else {
+        return;
+    };
 
-    if floating_front {
+    if let Some(mut layer) = floating_layers
+        .iter_mut()
+        .find(|layer| layer.workspace_id == workspace_id)
+    {
+        layer.front = focus_floating;
+    } else {
+        let mut layer = FloatingLayer::new(workspace_id);
+        layer.front = focus_floating;
+        commands.spawn((layer, ChildOf(active_display.entity())));
+    }
+
+    if focus_floating {
         windows
             .iter()
             .filter_map(|(_, e)| visible_float(e).then_some(e))
@@ -562,50 +643,66 @@ fn command_toggle_floating_layer(
                     with_strip: false,
                 });
             });
-    } else if let Some(entity) = target {
+    } else {
         commands.trigger(RaiseWindow {
-            entity,
+            entity: target,
             with_strip: true,
         });
+        commands.ensure_visible(target);
     }
 
-    debug!("floating layer -> front: {floating_front}");
+    commands.focus_entity(target, true);
+    debug!("focused other layer: floating={focus_floating}");
 }
 
-/// Handles the "swap" command, swapping the positions of the current window with another window in a specified direction.
-///
-/// # Arguments
-///
-/// * `direction` - The `Direction` to swap the window (e.g., `Direction::West`).
-/// * `current` - The `Entity` of the currently focused `Window`.
-/// * `active_display` - A mutable reference to the `ActiveDisplayMut` representing the active display.
-/// * `windows` - A mutable query for all `Window` components.
-/// * `commands` - Bevy commands to trigger events.
-///
-/// # Returns
-///
-/// `Some(Entity)` with the entity that was swapped with, otherwise `None`.
+/// Moves the focused window. Tiled windows are reordered in the strip;
+/// floating windows move geometrically by the configured pixel step.
 #[instrument(level = Level::DEBUG, skip_all)]
-fn command_swap_focus(
+fn command_move_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(Operation::Swap(direction)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::Swap(_))).next()
+    let Some(Operation::Move(direction)) =
+        filter_window_operations(&mut messages, |op| matches!(op, Operation::Move(_))).next()
     else {
         return;
     };
 
+    let Some((_, current, state)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_tracked(entity))
+    else {
+        return;
+    };
+
+    if state.is_floating() {
+        let Some(frame) = windows.frame(current) else {
+            return;
+        };
+        let step = config.floating_window_move_step();
+        let delta = match direction {
+            Direction::West => bevy::math::IVec2::new(-step, 0),
+            Direction::East => bevy::math::IVec2::new(step, 0),
+            Direction::North => bevy::math::IVec2::new(0, -step),
+            Direction::South => bevy::math::IVec2::new(0, step),
+            Direction::First | Direction::Last | Direction::Nth(_) => return,
+        };
+        let viewport = active_display.actual_bounds(&config);
+        let origin = clamp_origin_to_viewport(frame.min + delta, frame.size(), viewport);
+        commands.reposition_entity(current, origin);
+        return;
+    }
+
     let active_strip = active_display.active_strip();
     let mut handler = || {
-        let (_, current) = windows.focused()?;
         let index = active_strip.index_of(current).ok()?;
         let other_window = get_window_in_direction(direction, current, active_strip)?;
         let new_index = active_strip.index_of(other_window).ok()?;
         debug!(
-            "swap {direction:?}: current={current} idx={index}, other={other_window} idx={new_index}, strip_len={}",
+            "move {direction:?}: current={current} idx={index}, other={other_window} idx={new_index}, strip_len={}",
             active_strip.len()
         );
 
@@ -634,7 +731,7 @@ fn command_swap_focus(
         commands.ensure_visible(window);
     } else {
         debug!(
-            "swap {direction:?}: handler returned None (focused={:?}, strip_len={})",
+            "move {direction:?}: handler returned None (focused={:?}, strip_len={})",
             windows.focused().map(|(_, e)| e),
             active_strip.len()
         );
@@ -645,7 +742,7 @@ fn command_swap_focus(
         .and_then(|(_, current)| get_window_in_direction(direction, current, active_strip))
         .is_none()
     {
-        // Check if the movement can swap to another display.
+        // Check if the tiled movement can continue on another display.
         let bounds = active_display.bounds();
         let Some(other_display) = active_display.other().next() else {
             return;
@@ -655,11 +752,11 @@ fn command_swap_focus(
             Direction::South => bounds.min.y < other_display.bounds().min.y,
             _ => false,
         };
-        debug!("swapping window to another display: {change_display}");
+        debug!("moving window to another display: {change_display}");
         if change_display {
-            commands.trigger(SendMessageTrigger(Event::Command {
-                command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
-            }));
+            commands.trigger(SendMessageTrigger(Event::action_requested(Action::Window(
+                Operation::ToNextDisplay(MoveFocus::Follow),
+            ))));
         }
     }
 }
@@ -669,6 +766,7 @@ fn command_center_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
     active_display: ActiveDisplay,
+    config: Res<Config>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
@@ -679,36 +777,143 @@ fn command_center_window(
         return;
     }
 
-    if let Some((_, entity)) = windows.focused()
+    if let Some((_, entity, state)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_tracked(entity))
         && let Some(size) = windows.size(entity)
         && let Some(mut origin) = windows.origin(entity)
     {
-        let center = active_display.bounds().center().x;
-        origin.x = center - size.x / 2;
+        let viewport = active_display.actual_bounds(&config);
 
-        if active_display.active_strip().contains(entity)
+        if state.is_tiled()
+            && active_display.active_strip().contains(entity)
             && let Some(layout_position) = windows.layout_position(entity)
         {
+            origin.x = active_display.bounds().center().x - size.x / 2;
             // Directly reposition the strip (bypasses hidden_ratio check).
             let strip_position = origin - layout_position.0;
             commands.reposition_entity(active_display.active_strip_entity(), strip_position);
         } else {
+            origin.x = viewport.center().x - size.x / 2;
+            origin.y = viewport.center().y - size.y / 2;
+            origin = clamp_origin_to_viewport(origin, size, viewport);
             commands.reposition_entity(entity, origin);
         }
 
-        window_manager.warp_mouse(active_display.bounds().center());
+        window_manager.warp_mouse(viewport.center());
     }
 }
 
-/// Resizes the focused window based on preset column widths.
-///
-/// # Arguments
-///
-/// * `active_display` - A mutable reference to the `Display` resource.
-/// * `focused_entity` - The `Entity` of the currently focused window.
-/// * `windows` - A mutable query for all `Window` components.
-/// * `commands` - Bevy commands to trigger events.
-/// * `config` - The `Config` resource.
+fn resize_floating_window(
+    operation: &Operation,
+    entity: Entity,
+    frame: IRect,
+    viewport: IRect,
+    config: &Config,
+    commands: &mut Commands,
+) {
+    let (axis, direction) = match operation {
+        Operation::Resize { axis, direction } => (*axis, *direction),
+        Operation::SetWidth(_) => (ResizeAxis::Width, ResizeDirection::Grow),
+        _ => return,
+    };
+    let delta = match direction {
+        ResizeDirection::Grow => config.floating_window_resize_step(),
+        ResizeDirection::Shrink => -config.floating_window_resize_step(),
+    };
+    let mut size = frame.size();
+    match (operation, axis) {
+        (Operation::SetWidth(ratio), ResizeAxis::Width) if ratio.is_finite() && *ratio > 0.0 => {
+            size.x = round_px(*ratio * f64::from(viewport.width()));
+        }
+        (_, ResizeAxis::Width) => {
+            size.x = (size.x + delta).clamp(MIN_RESIZABLE_WINDOW_SIZE, viewport.width());
+        }
+        (_, ResizeAxis::Height) => {
+            size.y = (size.y + delta).clamp(MIN_RESIZABLE_WINDOW_SIZE, viewport.height());
+        }
+    }
+    let origin = clamp_origin_to_viewport(
+        IRect::from_center_size(frame.center(), size).min,
+        size,
+        viewport,
+    );
+    commands.reposition_entity(entity, origin);
+    commands.resize_entity(entity, size);
+}
+
+fn resize_tiled_height(
+    entity: Entity,
+    frame: IRect,
+    viewport: IRect,
+    direction: ResizeDirection,
+    strip: &LayoutStrip,
+    config: &Config,
+    commands: &mut Commands,
+) -> bool {
+    let in_stack = strip
+        .index_of(entity)
+        .ok()
+        .and_then(|index| strip.get(index).ok())
+        .is_some_and(|column| matches!(column, Column::Stack(_)));
+    if !in_stack {
+        return false;
+    }
+
+    let delta = match direction {
+        ResizeDirection::Grow => config.floating_window_resize_step(),
+        ResizeDirection::Shrink => -config.floating_window_resize_step(),
+    };
+    let height = (frame.height() + delta).clamp(MIN_RESIZABLE_WINDOW_SIZE, viewport.height());
+    commands.resize_entity(entity, Size::new(frame.width(), height));
+    commands.reshuffle_around(entity);
+    true
+}
+
+fn tiled_width_ratio(operation: &Operation, current: f64, config: &Config) -> Option<f64> {
+    let widths = config.preset_column_widths();
+    let fallback = *widths.first().unwrap_or(&0.5);
+    let cycle = config.window_resize_cycle();
+    match operation {
+        Operation::SetWidth(ratio) if ratio.is_finite() && *ratio > 0.0 => Some(*ratio),
+        Operation::Resize {
+            direction: ResizeDirection::Grow,
+            ..
+        } => Some(
+            widths
+                .iter()
+                .copied()
+                .find(|&ratio| ratio > current + 0.05)
+                .unwrap_or_else(|| {
+                    if cycle {
+                        fallback
+                    } else {
+                        *widths.last().unwrap_or(&fallback)
+                    }
+                }),
+        ),
+        Operation::Resize {
+            direction: ResizeDirection::Shrink,
+            ..
+        } => Some(
+            widths
+                .iter()
+                .rev()
+                .copied()
+                .find(|&ratio| ratio < current - 0.05)
+                .unwrap_or_else(|| {
+                    if cycle {
+                        *widths.last().unwrap_or(&fallback)
+                    } else {
+                        fallback
+                    }
+                }),
+        ),
+        _ => None,
+    }
+}
+
+/// Resizes the focused window using behavior selected by its tiled/floating state.
 fn resize_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -717,16 +922,19 @@ fn resize_window(
     mut commands: Commands,
 ) {
     let Some(operation) = filter_window_operations(&mut messages, |op| {
-        matches!(op, Operation::Resize(_) | Operation::SetWidth(_))
+        matches!(op, Operation::Resize { .. } | Operation::SetWidth(_))
     })
     .next() else {
         return;
     };
 
-    let Some((frame, entity)) = windows
+    let Some((_, entity, state)) = windows
         .focused()
-        .and_then(|(_, entity)| windows.frame(entity).zip(Some(entity)))
+        .and_then(|(_, entity)| windows.get_tracked(entity))
     else {
+        return;
+    };
+    let Some(frame) = windows.frame(entity) else {
         return;
     };
     if windows.full_width(entity).is_some()
@@ -736,36 +944,33 @@ fn resize_window(
     }
 
     let viewport = active_display.actual_bounds(&config);
-    let current_ratio = f64::from(frame.width()) / f64::from(viewport.width());
-    let widths = config.preset_column_widths();
-    let fallback = *widths.first().unwrap_or(&0.5);
-    let cycle = config.window_resize_cycle();
-    let next_ratio = match operation {
-        Operation::SetWidth(ratio) if ratio.is_finite() && *ratio > 0.0 => *ratio,
-        Operation::Resize(ResizeDirection::Grow) => widths
-            .iter()
-            .copied()
-            .find(|&r| r > current_ratio + 0.05)
-            .unwrap_or_else(|| {
-                if cycle {
-                    fallback
-                } else {
-                    *widths.last().unwrap_or(&fallback)
-                }
-            }),
-        Operation::Resize(ResizeDirection::Shrink) => widths
-            .iter()
-            .rev()
-            .copied()
-            .find(|&r| r < current_ratio - 0.05)
-            .unwrap_or_else(|| {
-                if cycle {
-                    *widths.last().unwrap_or(&fallback)
-                } else {
-                    fallback
-                }
-            }),
+    let (axis, direction) = match operation {
+        Operation::Resize { axis, direction } => (*axis, *direction),
+        Operation::SetWidth(_) => (ResizeAxis::Width, ResizeDirection::Grow),
         _ => return,
+    };
+
+    if state.is_floating() {
+        resize_floating_window(operation, entity, frame, viewport, &config, &mut commands);
+        return;
+    }
+
+    if axis == ResizeAxis::Height {
+        resize_tiled_height(
+            entity,
+            frame,
+            viewport,
+            direction,
+            active_display.active_strip(),
+            &config,
+            &mut commands,
+        );
+        return;
+    }
+
+    let current_ratio = f64::from(frame.width()) / f64::from(viewport.width());
+    let Some(next_ratio) = tiled_width_ratio(operation, current_ratio, &config) else {
+        return;
     };
 
     let new_width = round_px(next_ratio * f64::from(viewport.width()));
@@ -798,21 +1003,24 @@ fn resize_window(
     commands.reshuffle_around(entity);
 }
 
-fn full_width_window(
+fn maximize_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    if filter_window_operations(&mut messages, |op| matches!(op, Operation::FullWidth))
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::Maximize))
         .next()
         .is_none()
     {
         return;
     }
 
-    let Some((_, entity)) = windows.focused() else {
+    let Some((_, entity, state)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_tracked(entity))
+    else {
         return;
     };
 
@@ -822,10 +1030,29 @@ fn full_width_window(
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<FullWidthMarker>();
         }
-        let w = round_px(marker.width_ratio * f64::from(viewport.width()));
-        let bounds = active_display.actual_bounds(&config).size().with_x(w);
-        commands.resize_entity(entity, bounds);
+        if let Some(frame) = marker.floating_frame {
+            commands.reposition_entity(entity, frame.min);
+            commands.resize_entity(entity, frame.size());
+        } else {
+            let w = round_px(marker.width_ratio * f64::from(viewport.width()));
+            let bounds = active_display.actual_bounds(&config).size().with_x(w);
+            commands.resize_entity(entity, bounds);
+        }
     } else {
+        if state.is_floating() {
+            let Some(frame) = windows.frame(entity) else {
+                return;
+            };
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert(FullWidthMarker {
+                    width_ratio: f64::from(frame.width()) / f64::from(viewport.width()),
+                    floating_frame: Some(frame),
+                });
+            }
+            commands.reposition_entity(entity, viewport.min);
+            commands.resize_entity(entity, viewport.size());
+            return;
+        }
         let strip = active_display.active_strip();
         if strip
             .index_of(entity)
@@ -837,7 +1064,10 @@ fn full_width_window(
         }
         let width_ratio = windows.width_ratio(entity).unwrap_or(0.5);
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_insert(FullWidthMarker { width_ratio });
+            entity_commands.try_insert(FullWidthMarker {
+                width_ratio,
+                floating_frame: None,
+            });
         }
         commands.reposition_entity(entity, Origin::new(viewport.min.x, viewport.min.y));
         commands.resize_entity(entity, Size::new(viewport.width(), viewport.height()));
@@ -1037,8 +1267,8 @@ fn mouse_to_next_display(
     if !messages.read().any(|event| {
         matches!(
             event,
-            Event::Command {
-                command: Command::Mouse(MouseMove::ToNextDisplay),
+            Event::ActionRequested {
+                action: Action::Mouse(MouseMove::ToNextDisplay),
             }
         )
     }) {
@@ -1190,10 +1420,10 @@ fn snap_window(
         return;
     }
 
-    let Some((_, entity)) = windows.focused() else {
-        return;
-    };
-    let Some(layout_position) = windows.layout_position(entity) else {
+    let Some((_, entity, state)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_tracked(entity))
+    else {
         return;
     };
     let Some(mut frame) = windows.moving_frame(entity) else {
@@ -1208,23 +1438,33 @@ fn snap_window(
     frame.min = clamp_origin_to_viewport(frame.min, size, display_bounds);
     frame.max = frame.min + size;
 
+    if state.is_floating() {
+        commands.reposition_entity(entity, frame.min);
+        return;
+    }
+
+    let Some(layout_position) = windows.layout_position(entity) else {
+        return;
+    };
+
     let strip_position = frame.min - layout_position.0;
     commands.reposition_entity(active_display.active_strip_entity(), strip_position);
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
-pub fn stack_windows_handler(
+pub fn toggle_stack_handler(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
     // config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(Operation::Stack(stack)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::Stack(_))).next()
-    else {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::ToggleStack))
+        .next()
+        .is_none()
+    {
         return;
-    };
+    }
 
     if let Some((_, entity, state)) = windows
         .focused()
@@ -1238,10 +1478,15 @@ pub fn stack_windows_handler(
             entity_commands.try_remove::<FullWidthMarker>();
         }
         let strip = active_display.active_strip();
-        if *stack {
-            _ = strip.stack(entity);
-        } else {
+        let is_stacked = strip
+            .index_of(entity)
+            .ok()
+            .and_then(|index| strip.get(index).ok())
+            .is_some_and(|column| matches!(column, Column::Stack(_)));
+        if is_stacked {
             _ = strip.unstack(entity);
+        } else {
+            _ = strip.stack(entity);
         }
 
         // Stacking/unstacking moves the focused window to a new column slot
@@ -1272,8 +1517,8 @@ pub fn command_quit_handler(
     if messages.read().any(|event| {
         matches!(
             event,
-            Event::Command {
-                command: Command::Quit
+            Event::ActionRequested {
+                action: Action::Quit
             }
         )
     }) {
@@ -1286,8 +1531,8 @@ pub fn command_restart_handler(mut messages: MessageReader<Event>) {
     if messages.read().any(|event| {
         matches!(
             event,
-            Event::Command {
-                command: Command::Restart
+            Event::ActionRequested {
+                action: Action::Restart
             }
         )
     }) && let Err(err) = crate::platform::service::Service::request_restart()
@@ -1308,8 +1553,8 @@ fn print_internal_state_handler(
     if !messages.read().any(|event| {
         matches!(
             event,
-            Event::Command {
-                command: Command::PrintState,
+            Event::ActionRequested {
+                action: Action::PrintState,
             }
         )
     }) {

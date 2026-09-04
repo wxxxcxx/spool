@@ -1,0 +1,24 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e71c4d3..c9352d0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -127,6 +127,9 @@ impl Build {
+ 
+         // Copy release version file
+         let relver = build_dir.join(".relver");
++        if relver.exists() {
++            fs::remove_file(&relver).context(|| "Cannot remove copied '.relver'")?;
++        }
+         fs::copy(manifest_dir.join("luajit_relver.txt"), &relver)
+             .context(|| "Cannot copy 'luajit_relver.txt'")?;
+ 
+@@ -267,6 +270,9 @@ impl Build {
+ 
+         // Copy release version file
+         let relver = build_dir.join(".relver");
++        if relver.exists() {
++            fs::remove_file(&relver).context(|| "Cannot remove copied '.relver'")?;
++        }
+         fs::copy(manifest_dir.join("luajit_relver.txt"), &relver)
+             .context(|| "Cannot copy 'luajit_relver.txt'")?;
+ 

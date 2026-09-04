@@ -6,7 +6,7 @@ use spool_shared_types::wire::{Response, ScriptStateRequest};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use crate::commands::Command;
+use crate::commands::Action;
 use crate::config::Config;
 use crate::ecs::state::StateQueryKind;
 use crate::errors::Result;
@@ -284,8 +284,8 @@ pub enum Event {
     /// The system appearance (Light/Dark mode) has changed.
     ThemeChanged,
 
-    /// A command has been issued to the window manager.
-    Command { command: Command },
+    /// An action has been requested from the window manager.
+    ActionRequested { action: Action },
 
     /// A structured state query has been issued by a client.
     StateQuery {
@@ -301,6 +301,7 @@ pub enum Event {
     /// pushed to, which outlives the request that delivered it.
     StateSubscribe {
         subscriber: Arc<spool_local_ipc::Subscriber>,
+        raw: bool,
     },
 
     /// A client has read or written the script state store. Answered
@@ -313,6 +314,11 @@ pub enum Event {
 }
 
 impl Event {
+    /// Creates the single ECS entry event for every requested action.
+    pub const fn action_requested(action: Action) -> Self {
+        Self::ActionRequested { action }
+    }
+
     pub const fn window_focused(window_id: WinID) -> Self {
         Self::WindowFocused(FocusObservation::internal(window_id))
     }
@@ -395,5 +401,10 @@ impl EventSender {
         // go back to sleep past the event that woke it.
         self.waker.wake();
         Ok(())
+    }
+
+    /// Dispatches an action through the application's single action seam.
+    pub fn dispatch(&self, action: Action) -> Result<()> {
+        self.send(Event::action_requested(action))
     }
 }

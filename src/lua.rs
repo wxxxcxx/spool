@@ -1,16 +1,16 @@
 //! Embedded Lua scripting runtime (mlua).
 //!
 //! Lets a user's `init.lua` hook into window-manager events (`spool.on`),
-//! bind keys to Lua callbacks or commands (`spool.bind`), read state via
-//! `spool.query*`, and issue commands back via `spool.run`.
+//! bind keys to Lua callbacks or actions (`spool.bind`), read state via
+//! `spool.query*`, and dispatch actions via `spool.run`.
 //!
 //! The interpreter runs on its own thread (see [`worker`]), not the main
 //! thread: a handler is arbitrary user code of unbounded duration, and the
 //! main thread hosts the Cocoa event pump, which a slow handler must not
 //! freeze. As a result, `spool.query*` results are up to about a frame
-//! stale, and commands a handler issues reach the command bus a frame later
+//! stale, and actions a handler issues reach the action bus a frame later
 //! than synchronous dispatch would. Handlers in a batch run concurrently;
-//! commands from any one handler stay in the order it queued them, but
+//! actions from any one handler stay in the order it queued them, but
 //! ordering across handlers follows completion, not registration.
 //!
 //! Every system takes the worker as `Option<Res<LuaWorker>>` so the mock test
@@ -33,7 +33,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
 use notify::Watcher;
 
-use crate::commands::Command;
+use crate::commands::Action;
 use crate::config::Config;
 use crate::ecs::params::Windows;
 use crate::ecs::script_state::ScriptStateStore;
@@ -102,7 +102,7 @@ pub fn dispatch_lua_events(worker: Option<Res<LuaWorker>>, mut reader: MessageRe
     worker.send_events(events);
 }
 
-/// Handles `Command::Lua(id)` by handing the bound callback to the worker.
+/// Handles `Action::Lua(id)` by handing the bound callback to the worker.
 pub fn command_lua_handler(worker: Option<Res<LuaWorker>>, mut reader: MessageReader<Event>) {
     let Some(worker) = worker else {
         return;
@@ -110,8 +110,8 @@ pub fn command_lua_handler(worker: Option<Res<LuaWorker>>, mut reader: MessageRe
     let ids: Vec<u32> = reader
         .read()
         .filter_map(|event| match event {
-            Event::Command {
-                command: Command::Lua(id),
+            Event::ActionRequested {
+                action: Action::Lua(id),
             } => Some(*id),
             _ => None,
         })
@@ -153,7 +153,7 @@ pub fn serve_lua_queries(worker: Option<Res<LuaWorker>>, state: QueryStateParams
             }
             worker::WorldRequest::WindowSet { reply } => {
                 let _ = reply.try_send(extract_once(&mut extracted_set, || {
-                    state.extract_window_set()
+                    Ok(state.extract_window_set())
                 }));
             }
         }
@@ -206,7 +206,7 @@ fn extract_once<T>(
         .clone()
 }
 
-/// Puts what the callbacks queued onto the command bus.
+/// Puts what the callbacks queued onto the action bus.
 ///
 /// Also the landing point for a reloaded `spool.setup{...}`: the worker
 /// performs the rebuild, so the resulting config arrives here and is swapped
@@ -224,8 +224,8 @@ pub fn drain_lua_outbox(
     };
     for effect in worker.drain_outbox() {
         match effect {
-            FromLua::Command(command) => {
-                commands.trigger(SendMessageTrigger(Event::Command { command }));
+            FromLua::Action(action) => {
+                commands.trigger(SendMessageTrigger(Event::action_requested(action)));
             }
             FromLua::Flash { message, duration } => commands.flash_message(message, duration),
             FromLua::ConfigChanged => {

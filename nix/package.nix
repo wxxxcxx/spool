@@ -35,9 +35,26 @@
         ];
       };
 
+      # `luajit-src` copies its source tree into OUT_DIR and then overwrites
+      # `.relver`. Nix store files are read-only and the recursive copy keeps
+      # that mode, so remove the copied file before recreating it. Patch just
+      # this crate while vendoring instead of copying the entire dependency
+      # tree to a writable directory for every build.
+      cargoVendorDir = craneLib.vendorCargoDeps {
+        src = spoolSource;
+        overrideVendorCargoPackage =
+          package: drv:
+          if package.name == "luajit-src" then
+            drv.overrideAttrs (_old: {
+              patches = [ ./luajit-src-recreate-relver.patch ];
+            })
+          else
+            drv;
+      };
+
       # Arguments common to everything built from this workspace.
       commonArgs = {
-        inherit version;
+        inherit version cargoVendorDir;
         src = spoolSource;
         # The daemon links AppKit/etc.; nothing here runs tests as part of the
         # build.

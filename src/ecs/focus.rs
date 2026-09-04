@@ -61,11 +61,6 @@ struct TierMemory {
 pub(super) enum ObservedFocus {
     #[default]
     Unresolved,
-    Resolving {
-        generation: u64,
-        pid: Option<Pid>,
-        candidate: Option<WinID>,
-    },
     Tracked {
         entity: Entity,
         window_id: WinID,
@@ -77,6 +72,13 @@ pub(super) enum ObservedFocus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FocusResolution {
+    generation: u64,
+    pid: Option<Pid>,
+    candidate: Option<WinID>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FocusRequest {
     pub entity: Entity,
 }
@@ -85,6 +87,7 @@ pub(super) struct FocusRequest {
 pub(crate) struct FocusSnapshot {
     generation: u64,
     observed: ObservedFocus,
+    resolving: Option<FocusResolution>,
     requested: Option<FocusRequest>,
 }
 
@@ -118,6 +121,15 @@ impl FocusSnapshot {
             return true;
         }
 
+        if self.resolving.is_some_and(|resolution| {
+            resolution.pid == Some(pid)
+                && resolution
+                    .candidate
+                    .is_none_or(|candidate_id| candidate_id == window_id)
+        }) {
+            return false;
+        }
+
         !match self.observed {
             ObservedFocus::Tracked {
                 entity,
@@ -127,26 +139,13 @@ impl FocusSnapshot {
                 pid: known_pid,
                 window_id: Some(known_window_id),
             } => known_pid == Some(pid) && known_window_id == window_id,
-            ObservedFocus::Resolving {
-                pid: resolving_pid,
-                candidate,
-                ..
-            } => {
-                resolving_pid == Some(pid)
-                    && candidate.is_none_or(|candidate_id| candidate_id == window_id)
-            }
             ObservedFocus::Unresolved | ObservedFocus::Untracked { .. } => false,
         }
     }
 
     pub(crate) fn needs_resolution(self, pid: Pid) -> bool {
-        !matches!(
-            self.observed,
-            ObservedFocus::Resolving {
-                pid: Some(resolving_pid),
-                ..
-            } if resolving_pid == pid
-        )
+        self.resolving
+            .is_none_or(|resolution| resolution.pid != Some(pid))
     }
 }
 
@@ -205,6 +204,7 @@ impl FocusUpdate {
 pub struct FocusCoordinator {
     generation: u64,
     observed: ObservedFocus,
+    resolving: Option<FocusResolution>,
     requested: Option<FocusRequest>,
     by_workspace: HashMap<WorkspaceId, TierMemory>,
 }
@@ -217,11 +217,11 @@ impl FocusCoordinator {
 
     fn begin_resolution(&mut self, pid: Option<Pid>, candidate: Option<WinID>) -> u64 {
         let generation = self.next_generation();
-        self.observed = ObservedFocus::Resolving {
+        self.resolving = Some(FocusResolution {
             generation,
             pid,
             candidate,
-        };
+        });
         self.generation
     }
 
@@ -229,12 +229,10 @@ impl FocusCoordinator {
         if generation != self.generation {
             return false;
         }
-        match self.observed {
-            ObservedFocus::Resolving {
-                pid: expected_pid, ..
-            } => expected_pid.is_none() || pid.is_none() || expected_pid == pid,
-            _ => false,
-        }
+        self.resolving.is_some_and(|resolution| {
+            resolution.generation == generation
+                && (resolution.pid.is_none() || pid.is_none() || resolution.pid == pid)
+        })
     }
 
     pub(super) fn observe(&mut self, signal: FocusSignal) -> FocusUpdate {
@@ -252,11 +250,11 @@ impl FocusCoordinator {
                 if !self.accepts(generation, pid) {
                     return FocusUpdate::Stale;
                 }
-                self.observed = ObservedFocus::Resolving {
+                self.resolving = Some(FocusResolution {
                     generation,
                     pid,
                     candidate: Some(window_id),
-                };
+                });
                 FocusUpdate::Accepted(generation)
             }
             FocusSignal::Tracked {
@@ -268,6 +266,7 @@ impl FocusCoordinator {
                     return FocusUpdate::Stale;
                 }
                 self.observed = ObservedFocus::Tracked { entity, window_id };
+                self.resolving = None;
                 self.requested = None;
                 FocusUpdate::Accepted(generation)
             }
@@ -282,14 +281,16 @@ impl FocusCoordinator {
                     return FocusUpdate::Stale;
                 }
                 self.observed = ObservedFocus::Untracked { pid, window_id };
+                self.resolving = None;
                 self.requested = None;
                 FocusUpdate::Accepted(generation)
             }
             FocusSignal::Unresolved { generation } => {
-                if generation != self.generation {
+                if !self.accepts(generation, None) {
                     return FocusUpdate::Stale;
                 }
                 self.observed = ObservedFocus::Unresolved;
+                self.resolving = None;
                 self.requested = None;
                 FocusUpdate::Accepted(generation)
             }
@@ -307,6 +308,7 @@ impl FocusCoordinator {
                     return FocusUpdate::Stale;
                 }
                 let generation = self.next_generation();
+                self.resolving = None;
                 if observed_matches {
                     self.observed = ObservedFocus::Unresolved;
                 }
@@ -320,6 +322,7 @@ impl FocusCoordinator {
 
     pub(super) fn request(&mut self, entity: Entity) -> u64 {
         let generation = self.next_generation();
+        self.resolving = None;
         self.requested = Some(FocusRequest { entity });
         generation
     }
@@ -328,6 +331,7 @@ impl FocusCoordinator {
         FocusSnapshot {
             generation: self.generation,
             observed: self.observed,
+            resolving: self.resolving,
             requested: self.requested,
         }
     }
@@ -827,6 +831,37 @@ mod tests {
 
         assert_eq!(focus.snapshot().confirmed_entity(), Some(confirmed));
         assert_eq!(focus.snapshot().requested_entity(), None);
+    }
+
+    #[test]
+    fn resolving_a_new_focus_preserves_the_confirmed_window_until_observed() {
+        let mut world = World::new();
+        let confirmed = world.spawn(()).id();
+        let mut focus = FocusCoordinator::default();
+        let generation = focus
+            .observe(FocusSignal::Resolve {
+                pid: Some(100),
+                candidate: Some(10),
+            })
+            .generation()
+            .unwrap();
+        focus.observe(FocusSignal::Tracked {
+            generation,
+            entity: confirmed,
+            window_id: 10,
+        });
+
+        focus.observe(FocusSignal::Resolve {
+            pid: Some(100),
+            candidate: Some(11),
+        });
+
+        assert_eq!(
+            focus.snapshot().confirmed_entity(),
+            Some(confirmed),
+            "an in-flight AX query is not evidence that the old confirmed focus disappeared"
+        );
+        assert_eq!(focus.snapshot().confirmed_window_id(), Some(10));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! summary. The daemon and its clients otherwise speak typed postcard values.
 
 use spool_local_ipc::Client;
-use spool_shared_types::commands::{Command, MoveFocus};
+use spool_shared_types::commands::{Action, MoveFocus};
 use spool_shared_types::state::{
     ActiveState, Frame, SpaceKind, SpaceState, StateEvent, StateQueryKind, WindowState,
 };
@@ -23,46 +23,46 @@ fn connect() -> Result<Client> {
     })
 }
 
-/// Sends a command without waiting for a reply.
+/// Parses and dispatches an action, waiting only for daemon acceptance.
 ///
 /// # Errors
 ///
 /// If the daemon cannot be reached.
-pub fn send_command(argv: impl IntoIterator<Item = String>) -> Result<()> {
+pub fn dispatch_action(argv: impl IntoIterator<Item = String>) -> Result<()> {
     let argv = argv.into_iter().collect::<Vec<_>>();
     let borrowed = argv.iter().map(String::as_str).collect::<Vec<_>>();
-    let command = spool_shared_types::argv::parse_command(&borrowed)?;
+    let action = spool_shared_types::argv::parse_action(&borrowed)?;
 
     if matches!(
-        command,
-        Command::FocusSpace { .. }
-            | Command::MoveWindowToSpace { .. }
-            | Command::CreateSpace { .. }
-            | Command::DeleteSpace { .. }
+        action,
+        Action::FocusSpace { .. }
+            | Action::MoveWindowToSpace { .. }
+            | Action::CreateSpace { .. }
+            | Action::DeleteSpace { .. }
     ) {
         let response = connect()?.call(&Request::Query(StateQueryKind::State))?;
         let Response::Query(QueryPayload::State(state)) = response else {
             return Err(unexpected(&response));
         };
-        let available = match command {
-            Command::FocusSpace { .. } => state.capabilities.focus,
-            Command::MoveWindowToSpace {
+        let available = match action {
+            Action::FocusSpace { .. } => state.capabilities.focus,
+            Action::MoveWindowToSpace {
                 move_focus: MoveFocus::Follow,
                 ..
             } => state.capabilities.move_windows && state.capabilities.focus,
-            Command::MoveWindowToSpace { .. } => state.capabilities.move_windows,
-            Command::CreateSpace { .. } => state.capabilities.create,
-            Command::DeleteSpace { .. } => state.capabilities.delete,
+            Action::MoveWindowToSpace { .. } => state.capabilities.move_windows,
+            Action::CreateSpace { .. } => state.capabilities.create,
+            Action::DeleteSpace { .. } => state.capabilities.delete,
             _ => true,
         };
         if !available {
             return Err(Error::Generic(format!(
-                "Space capability unavailable for '{command:?}'"
+                "Space capability unavailable for '{action:?}'"
             )));
         }
     }
 
-    connect()?.send(&Request::Command(command))?;
+    connect()?.send(&Request::Dispatch(action))?;
     Ok(())
 }
 
@@ -85,10 +85,10 @@ pub fn query(kind: StateQueryKind, format: OutputFormat) -> Result<String> {
 /// # Errors
 ///
 /// If the daemon cannot be reached.
-pub fn subscribe(format: OutputFormat) -> Result<()> {
+pub fn subscribe(format: OutputFormat, raw: bool) -> Result<()> {
     use std::io::Write;
 
-    let mut events = connect()?.subscribe(&Request::Subscribe)?;
+    let mut events = connect()?.subscribe(&Request::Subscribe { raw })?;
     let mut stdout = std::io::stdout();
     if format == OutputFormat::Tsv
         && writeln!(
@@ -126,27 +126,30 @@ pub fn subscribe(format: OutputFormat) -> Result<()> {
 /// # Errors
 ///
 /// Whatever the subcommand reports.
-pub fn run(command: ClientCommand) -> Result<()> {
-    match command {
-        ClientCommand::Send(argv) => send_command(argv),
-        ClientCommand::Query { kind, format } => {
+pub fn run(request: ClientRequest) -> Result<()> {
+    match request {
+        ClientRequest::Action(argv) => dispatch_action(argv),
+        ClientRequest::Query { kind, format } => {
             println!("{}", query(kind, format)?);
             Ok(())
         }
-        ClientCommand::Subscribe(format) => subscribe(format),
+        ClientRequest::Subscribe { format, raw } => subscribe(format, raw),
     }
 }
 
 /// What a CLI invocation wants of the daemon, including how to print the
 /// answer. Distinct from [`Request`], which is only what crosses to the daemon.
 #[derive(Debug)]
-pub enum ClientCommand {
-    Send(Vec<String>),
+pub enum ClientRequest {
+    Action(Vec<String>),
     Query {
         kind: StateQueryKind,
         format: OutputFormat,
     },
-    Subscribe(OutputFormat),
+    Subscribe {
+        format: OutputFormat,
+        raw: bool,
+    },
 }
 
 /// How a CLI query or event stream is rendered.
@@ -393,6 +396,21 @@ fn render_event_tsv(event: &StateEvent) -> String {
             "-".to_string(),
             "-".to_string(),
         ),
+        StateEvent::RawEvent {
+            name,
+            display_id,
+            space_id,
+            window_id,
+            details,
+        } => (
+            "raw_event",
+            optional(*display_id),
+            optional(*space_id),
+            optional(*window_id),
+            "-".to_string(),
+            text_cell(name),
+            text_cell(details),
+        ),
     };
     format!("{name}\t{display_id}\t{space_id}\t{window_id}\t{bundle_id}\t{title}\t{details}")
 }
@@ -577,6 +595,18 @@ mod tests {
         assert_eq!(
             render_event_tsv(&visible),
             "on_screen_changed\t1\t42\t321\tcom.openai.chat\tfirst second\twindows=321,322"
+        );
+
+        let raw = StateEvent::RawEvent {
+            name: "window_moved".to_string(),
+            display_id: Some(1),
+            space_id: Some(42),
+            window_id: Some(321),
+            details: "incarnation=7".to_string(),
+        };
+        assert_eq!(
+            render_event_tsv(&raw),
+            "raw_event\t1\t42\t321\t-\twindow_moved\tincarnation=7"
         );
     }
 

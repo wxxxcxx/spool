@@ -42,11 +42,11 @@ use crate::manager::{check_ax_privilege, request_ax_privilege};
 use crate::menubar::MenuBarManager;
 use crate::platform::PlatformCallbacks;
 use accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
-use client::ClientCommand;
+use client::ClientRequest;
 use ecs::state::StateQueryKind;
 use errors::Result;
 use platform::service;
-use reader::CommandReader;
+use reader::RequestReader;
 
 #[cfg(feature = "lua")]
 pub const VERSION_STRING: &str = concat!(
@@ -67,14 +67,14 @@ pub const VERSION_STRING: &str = concat!(env!("CARGO_PKG_VERSION"));
     about = clap::crate_description!(),
 )]
 pub struct Spool {
-    /// The subcommand to execute (e.g., `launch`, `install`, `send-cmd`).
+    /// The subcommand to execute (e.g., `launch`, `install`, `action`).
     #[clap(subcommand)]
     subcmd: Option<SubCmd>,
 }
 
 /// `SubCmd` enumerates the available command-line subcommands for `spool`.
 /// These subcommands allow users to launch the daemon, install/uninstall it as a service,
-/// install/uninstall its app launcher, start/stop/restart the service, or send commands to
+/// install/uninstall its app launcher, start/stop/restart the service, or dispatch actions to
 /// a running daemon.
 #[derive(Clone, Debug, Default, Subcommand)]
 pub enum SubCmd {
@@ -106,10 +106,11 @@ pub enum SubCmd {
     /// Restarts the `spool` background service.
     Restart,
 
-    /// Sends a command via a Unix socket to the running `spool` daemon.
-    SendCmd {
-        #[arg(trailing_var_arg = true)]
-        cmd: Vec<String>,
+    /// Dispatches an action via a Unix socket to the running `spool` daemon.
+    #[command(alias = "send-cmd")]
+    Action {
+        #[arg(trailing_var_arg = true, required = true)]
+        action: Vec<String>,
     },
 
     /// Queries structured state from the running daemon.
@@ -123,6 +124,9 @@ pub enum SubCmd {
         /// Emits complete line-delimited JSON instead of the default TSV summary.
         #[arg(long)]
         json: bool,
+        /// Also emits uncoalesced source events for diagnostics.
+        #[arg(long)]
+        raw: bool,
     },
 
     /// Runs an isolated Lua client script against the running daemon.
@@ -185,7 +189,7 @@ pub enum QueryCmd {
 }
 
 /// The main entry point of the `spool` application.
-/// It sets up logging and dispatches commands accordingly.
+/// It sets up logging and handles the selected subcommand.
 ///
 /// # Returns
 ///
@@ -219,7 +223,7 @@ fn main() -> Result<()> {
                 let _ = sender_c.send(events::Event::Exit); // just drop the err. we are exiting anyway.
             })
             .expect("setting Ctrl-C handler should succeed");
-            let _command_reader = CommandReader::new(sender.clone()).start()?;
+            let _command_reader = RequestReader::new(sender.clone()).start()?;
             if !check_ax_privilege() && !wait_for_accessibility(sender.clone(), &receiver) {
                 return Ok(());
             }
@@ -243,14 +247,15 @@ fn main() -> Result<()> {
         SubCmd::Start => service()?.start()?,
         SubCmd::Stop => service()?.stop()?,
         SubCmd::Restart => service()?.restart()?,
-        SubCmd::SendCmd { cmd } => client::run(ClientCommand::Send(cmd))?,
+        SubCmd::Action { action } => client::run(ClientRequest::Action(action))?,
         SubCmd::Query { query } => {
             let (kind, format) = query.request();
-            client::run(ClientCommand::Query { kind, format })?;
+            client::run(ClientRequest::Query { kind, format })?;
         }
-        SubCmd::Subscribe { json } => client::run(ClientCommand::Subscribe(
-            client::OutputFormat::from_json(json),
-        ))?,
+        SubCmd::Subscribe { json, raw } => client::run(ClientRequest::Subscribe {
+            format: client::OutputFormat::from_json(json),
+            raw,
+        })?,
         #[cfg(feature = "lua")]
         SubCmd::Script(script) => {
             let (source, args) = script.request();
@@ -290,8 +295,8 @@ fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bo
         match receiver.try_recv() {
             Ok(
                 Event::Exit
-                | Event::Command {
-                    command: commands::Command::Quit,
+                | Event::ActionRequested {
+                    action: commands::Action::Quit,
                 },
             )
             | Err(TryRecvError::Disconnected) => return false,
@@ -418,5 +423,36 @@ mod cli_tests {
     #[test]
     fn removed_state_command_is_not_accepted() {
         assert!(Spool::try_parse_from(["spool", "state", "get", "key"]).is_err());
+    }
+
+    #[test]
+    fn action_is_the_public_dispatch_subcommand() {
+        let cli = Spool::try_parse_from(["spool", "action", "window", "focus", "east"])
+            .expect("action command");
+        assert!(matches!(
+            cli.subcmd,
+            Some(SubCmd::Action { action })
+                if action == ["window", "focus", "east"]
+        ));
+    }
+
+    #[test]
+    fn send_cmd_remains_a_compatibility_alias() {
+        let cli = Spool::try_parse_from(["spool", "send-cmd", "window", "focus", "east"])
+            .expect("compatibility alias");
+        assert!(matches!(cli.subcmd, Some(SubCmd::Action { .. })));
+    }
+
+    #[test]
+    fn subscribe_raw_requests_uncoalesced_source_events() {
+        let cli = Spool::try_parse_from(["spool", "subscribe", "--raw"])
+            .expect("raw subscription option");
+        assert!(matches!(
+            cli.subcmd,
+            Some(SubCmd::Subscribe {
+                json: false,
+                raw: true
+            })
+        ));
     }
 }

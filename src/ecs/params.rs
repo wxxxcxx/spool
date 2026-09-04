@@ -3,7 +3,7 @@ use bevy::{
         entity::Entity,
         hierarchy::ChildOf,
         query::{Has, With, Without},
-        system::{Commands, Query, Res, ResMut, Single, SystemParam},
+        system::{Commands, NonSend, Query, Res, ResMut, Single, SystemParam},
         world::Mut,
     },
     math::IRect,
@@ -21,6 +21,7 @@ use crate::{
         reconcile::WindowUnavailable,
     },
     manager::{Display, Origin, Size, Window},
+    overlay::OverlayManager,
     platform::{WinID, WindowIncarnation},
 };
 
@@ -202,6 +203,7 @@ pub struct FrameActivity<'w, 's> {
     window_motion: Query<'w, 's, (), With<WindowFrameMotion>>,
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
+    overlay_manager: Option<NonSend<'w, OverlayManager>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -213,6 +215,10 @@ impl FrameActivity<'_, '_> {
             || !self.window_motion.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
+            || self
+                .overlay_manager
+                .as_ref()
+                .is_some_and(|manager| manager.decorations_are_animating())
     }
 }
 
@@ -318,20 +324,23 @@ impl<'a> TrackedWindowState<'a> {
 
 impl Windows<'_, '_> {
     pub fn get_tracked(&self, entity: Entity) -> Option<(&Window, Entity, TrackedWindowState<'_>)> {
-        self.available
+        let (window, entity, _, floating, visibility) = self
+            .available
             .get(entity)
-            .inspect_err(|err| warn!("unable to find window: {err}"))
-            .ok()
-            .map(|(window, entity, _, floating, visibility)| {
-                (
-                    window,
-                    entity,
-                    TrackedWindowState {
-                        floating,
-                        visibility,
-                    },
-                )
+            .inspect_err(|error| {
+                if self.all.get(entity).is_err() {
+                    warn!("unable to find window: {error}");
+                }
             })
+            .ok()?;
+        Some((
+            window,
+            entity,
+            TrackedWindowState {
+                floating,
+                visibility,
+            },
+        ))
     }
 
     pub fn get(&self, entity: Entity) -> Option<&Window> {
@@ -366,6 +375,17 @@ impl Windows<'_, '_> {
             .get(entity)
             .ok()
             .map(|(window, entity, childof, _, _)| (window, entity, childof.parent()))
+    }
+
+    pub fn get_parent_any(&self, entity: Entity) -> Option<(&Window, Entity, Entity)> {
+        self.all
+            .get(entity)
+            .ok()
+            .map(|(window, entity, childof, _, _)| (window, entity, childof.parent()))
+    }
+
+    pub fn is_available(&self, entity: Entity) -> bool {
+        self.available.contains(entity)
     }
 
     pub fn find_parent_matching(

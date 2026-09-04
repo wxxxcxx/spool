@@ -13,7 +13,7 @@ use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::{FocusCoordinator, FocusSignal};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
+use crate::ecs::native_space::{NativeSpace, SpaceKind, VisibleNativeSpaceMarker};
 use crate::ecs::params::{FrameActivity, Windows};
 use crate::ecs::reconcile::WindowUnavailable;
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
@@ -36,14 +36,15 @@ use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, DesiredWindowFrame, DockPosition,
     FlashMessage, Floating, Initializing, LowPowerMode, MissionControlActive, ObservedWindowFrame,
     Position, PresentedWindowFrame, ReadDisplayProperties, RestoreWindowState, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, WidthRatio, WindowProperties, WindowVisibility,
+    SendMessageTrigger, SpawnCommandsExt, WidthRatio, WindowFrameCommitSuspended,
+    WindowFrameMotion, WindowProperties, WindowVisibility,
 };
 use crate::events::{Event, FocusSource, InputEvent};
 use crate::manager::{
     Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
-use crate::overlay::{FlashMessageManager, OverlayManager};
-use crate::platform::{PlatformCallbacks, WinID, WindowIncarnation};
+use crate::overlay::{FlashMessageManager, OverlayManager, SpaceOverlayTarget};
+use crate::platform::{PlatformCallbacks, WinID, WindowIncarnation, WorkspaceId};
 
 /// Keeps `WindowServer`'s per-window close notification subscription aligned
 /// with the ECS inventory on macOS versions that require explicit requests.
@@ -93,6 +94,7 @@ type PendingWindowFrames<'w, 's> = Query<
         Changed<PresentedWindowFrame>,
         Without<WindowUnavailable>,
         Without<WindowSpaceReassignmentPending>,
+        Without<WindowFrameCommitSuspended>,
     ),
 >;
 
@@ -902,12 +904,6 @@ pub(super) struct OverlayWindowConfigCache {
     detected_border_radius: Option<f64>,
 }
 
-impl OverlayWindowConfigCache {
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-}
-
 #[derive(Clone, Copy)]
 enum OverlayLayoutMode {
     Tiled,
@@ -931,9 +927,14 @@ fn is_overlay_target(state: OverlayTargetState) -> bool {
         }
 }
 
+fn overlay_target_is_eligible(visible: bool, fullscreen: bool) -> bool {
+    visible && !fullscreen
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OverlayDisposition {
     Render,
+    Preserve,
     Hide,
     Remove,
 }
@@ -945,19 +946,28 @@ enum OverlayWorkspaceState {
     Active,
 }
 
-fn overlay_disposition(
-    enabled: bool,
-    workspace: OverlayWorkspaceState,
-    has_target: bool,
-) -> OverlayDisposition {
-    if !enabled || matches!(workspace, OverlayWorkspaceState::Missing) {
+fn overlay_disposition(enabled: bool, workspace: OverlayWorkspaceState) -> OverlayDisposition {
+    if !enabled {
         OverlayDisposition::Remove
     } else if matches!(workspace, OverlayWorkspaceState::Suppressed) {
         OverlayDisposition::Hide
-    } else if !has_target {
-        OverlayDisposition::Remove
+    } else if matches!(workspace, OverlayWorkspaceState::Missing) {
+        OverlayDisposition::Preserve
     } else {
         OverlayDisposition::Render
+    }
+}
+
+fn overlay_workspace_state(
+    active_workspace: Option<(bool, &LayoutStrip)>,
+    mission_control_active: bool,
+) -> OverlayWorkspaceState {
+    match active_workspace {
+        None => OverlayWorkspaceState::Missing,
+        Some((swiping, _)) if swiping || mission_control_active => {
+            OverlayWorkspaceState::Suppressed
+        }
+        Some(_) => OverlayWorkspaceState::Active,
     }
 }
 
@@ -965,13 +975,19 @@ fn confirmed_overlay_frame(observed: Option<&ObservedWindowFrame>) -> Option<IRe
     observed.map(|frame| frame.0)
 }
 
+fn native_space_has_overlay(kind: SpaceKind) -> bool {
+    !matches!(kind, SpaceKind::Fullscreen)
+}
+
 #[cfg(test)]
 mod overlay_target_tests {
     use super::{
         OverlayDisposition, OverlayLayoutMode, OverlayTargetState, OverlayWorkspaceState,
-        confirmed_overlay_frame, is_overlay_target, overlay_disposition,
+        confirmed_overlay_frame, is_overlay_target, native_space_has_overlay, overlay_disposition,
+        overlay_target_is_eligible,
     };
     use crate::ecs::ObservedWindowFrame;
+    use crate::ecs::native_space::SpaceKind;
     use bevy::math::{IRect, IVec2};
 
     #[test]
@@ -991,7 +1007,18 @@ mod overlay_target_tests {
     }
 
     #[test]
-    fn rejects_hidden_fullscreen_and_off_space_focus() {
+    fn rejects_a_visible_fullscreen_focus_as_the_overlay_cutout() {
+        assert!(!overlay_target_is_eligible(true, true));
+    }
+
+    #[test]
+    fn creates_overlays_only_for_ordinary_native_spaces() {
+        assert!(native_space_has_overlay(SpaceKind::User));
+        assert!(!native_space_has_overlay(SpaceKind::Fullscreen));
+    }
+
+    #[test]
+    fn rejects_hidden_and_off_space_focus() {
         let mut state = OverlayTargetState {
             mode: OverlayLayoutMode::Floating,
             eligible: false,
@@ -1012,35 +1039,27 @@ mod overlay_target_tests {
     #[test]
     fn overlay_lifecycle_removes_when_configuration_is_disabled() {
         assert_eq!(
-            overlay_disposition(false, OverlayWorkspaceState::Active, true),
+            overlay_disposition(false, OverlayWorkspaceState::Active),
             OverlayDisposition::Remove
         );
     }
 
     #[test]
-    fn overlay_lifecycle_removes_without_an_active_workspace() {
+    fn overlay_lifecycle_preserves_surfaces_without_an_active_workspace() {
         assert_eq!(
-            overlay_disposition(true, OverlayWorkspaceState::Missing, true),
-            OverlayDisposition::Remove
-        );
-    }
-
-    #[test]
-    fn overlay_lifecycle_removes_when_the_target_disappears() {
-        assert_eq!(
-            overlay_disposition(true, OverlayWorkspaceState::Active, false),
-            OverlayDisposition::Remove
+            overlay_disposition(true, OverlayWorkspaceState::Missing),
+            OverlayDisposition::Preserve
         );
     }
 
     #[test]
     fn overlay_lifecycle_hides_only_for_temporary_suppression() {
         assert_eq!(
-            overlay_disposition(true, OverlayWorkspaceState::Suppressed, true),
+            overlay_disposition(true, OverlayWorkspaceState::Suppressed),
             OverlayDisposition::Hide
         );
         assert_eq!(
-            overlay_disposition(true, OverlayWorkspaceState::Active, true),
+            overlay_disposition(true, OverlayWorkspaceState::Active),
             OverlayDisposition::Render
         );
     }
@@ -1074,6 +1093,7 @@ pub(super) struct OverlayInputs<'w, 's> {
     windows: Windows<'w, 's>,
     focus: Res<'w, FocusCoordinator>,
     applications: Query<'w, 's, &'static Application>,
+    displays: Query<'w, 's, &'static Display>,
     observed_frames: Query<'w, 's, &'static ObservedWindowFrame>,
     window_manager: Res<'w, WindowManager>,
     mission_control_active: Res<'w, MissionControlActive>,
@@ -1083,10 +1103,8 @@ pub(super) struct OverlayInputs<'w, 's> {
 fn resolve_overlay_target(
     inputs: &OverlayInputs,
     active_strip: &LayoutStrip,
+    entity: Entity,
 ) -> crate::errors::Result<Option<(NSRect, Entity)>> {
-    let Some(entity) = inputs.focus.snapshot().confirmed_entity() else {
-        return Ok(None);
-    };
     let Some((window, _, state)) = inputs.windows.get_tracked(entity) else {
         return Ok(None);
     };
@@ -1108,7 +1126,7 @@ fn resolve_overlay_target(
         } else {
             OverlayLayoutMode::Tiled
         },
-        eligible: state.is_visible() && !window.is_full_screen(),
+        eligible: overlay_target_is_eligible(state.is_visible(), window.is_full_screen()),
         in_active_strip: active_strip.contains(entity),
         in_active_space,
     };
@@ -1129,6 +1147,41 @@ fn resolve_overlay_target(
         ),
     );
     Ok(Some((frame, entity)))
+}
+
+fn resolve_space_overlay_target(
+    inputs: &OverlayInputs,
+    strip: &LayoutStrip,
+    active: bool,
+    visible: bool,
+) -> crate::errors::Result<Option<(NSRect, Entity)>> {
+    // A Space visible on an unfocused display remains fully dimmed. Hidden
+    // Spaces retain their last navigation target so WindowServer already has
+    // complete contents when it begins a Space transition.
+    if visible && !active {
+        return Ok(None);
+    }
+
+    let snapshot = inputs.focus.snapshot();
+    let candidates = if active {
+        [
+            snapshot.requested_entity(),
+            snapshot.confirmed_entity(),
+            inputs.focus.navigation_entity(strip.id()),
+        ]
+    } else {
+        [inputs.focus.navigation_entity(strip.id()), None, None]
+    };
+
+    let mut visited = HashSet::new();
+    for entity in candidates.into_iter().flatten() {
+        if visited.insert(entity)
+            && let Some(target) = resolve_overlay_target(inputs, strip, entity)?
+        {
+            return Ok(Some(target));
+        }
+    }
+    Ok(None)
 }
 
 fn overlay_border_params(
@@ -1165,13 +1218,25 @@ fn overlay_border_params(
     })
 }
 
+type OverlaySpaces<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Has<Scrolling>,
+        &'static LayoutStrip,
+        &'static NativeSpace,
+        &'static ChildOf,
+        Has<ActiveWorkspaceMarker>,
+        Has<VisibleNativeSpaceMarker>,
+    ),
+    Without<PendingSpaceDestruction>,
+>;
+
 pub(super) fn update_overlays(
-    // Gating lives in the `overlay_dirty` run condition; this query just
-    // resolves the current active workspace.
-    active_workspace: Query<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
+    spaces: OverlaySpaces,
     inputs: OverlayInputs,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
-    mut window_config_cache: Local<OverlayWindowConfigCache>,
+    mut window_config_cache: Local<HashMap<WorkspaceId, OverlayWindowConfigCache>>,
 ) {
     let Some(mut overlay_mgr) = overlay_mgr else {
         return;
@@ -1181,19 +1246,18 @@ pub(super) fn update_overlays(
     let border_enabled = inputs.config.border_active_window();
     let enabled = dim_opacity != 0.0 || border_enabled;
 
-    // Hide overlays during swipe, mission control, native fullscreen spaces,
-    // or briefly after a space change (macOS space-switch animation).
-    let active_workspace = active_workspace.iter().next();
-    let workspace_state = match active_workspace {
-        None => OverlayWorkspaceState::Missing,
-        Some((swiping, strip))
-            if swiping || inputs.mission_control_active.0 || strip.is_fullscreen() =>
-        {
-            OverlayWorkspaceState::Suppressed
-        }
-        Some(_) => OverlayWorkspaceState::Active,
-    };
-    match overlay_disposition(enabled, workspace_state, true) {
+    if spaces.is_empty() {
+        overlay_mgr.remove_all();
+        window_config_cache.clear();
+        return;
+    }
+
+    let active_workspace = spaces
+        .iter()
+        .find_map(|(scrolling, strip, _, _, active, _)| active.then_some((scrolling, strip)));
+    let workspace_state =
+        overlay_workspace_state(active_workspace, inputs.mission_control_active.0);
+    match overlay_disposition(enabled, workspace_state) {
         OverlayDisposition::Remove => {
             overlay_mgr.remove_all();
             window_config_cache.clear();
@@ -1201,77 +1265,77 @@ pub(super) fn update_overlays(
         }
         OverlayDisposition::Hide => {
             overlay_mgr.hide_all();
-            window_config_cache.clear();
             return;
         }
+        OverlayDisposition::Preserve => return,
         OverlayDisposition::Render => {}
     }
-    let Some((_, active_strip)) = active_workspace else {
-        unreachable!("overlay disposition rejects a missing active workspace")
-    };
 
-    // Tiled membership belongs to ECS; floating Space membership belongs to
-    // macOS. Both require a confirmed observed frame.
-    let overlay_target = match resolve_overlay_target(&inputs, active_strip) {
-        Ok(target) => target,
-        Err(error) => {
-            // Space membership is a transient private-API read. Preserve the
-            // overlay allocation and retry on the periodic refresh instead of
-            // turning one failed query into a persistent missing border.
-            warn!(%error, "unable to resolve overlay target in active Space");
-            overlay_mgr.hide_all();
-            window_config_cache.clear();
-            return;
-        }
-    };
-    if overlay_disposition(
-        enabled,
-        OverlayWorkspaceState::Active,
-        overlay_target.is_some(),
-    ) == OverlayDisposition::Remove
-    {
-        // The target is no longer part of the authoritative inventory. Destroy
-        // the surfaces so a missed close notification cannot leave a ghost border.
-        overlay_mgr.remove_all();
+    if !border_enabled {
         window_config_cache.clear();
-        return;
     }
-    let Some((focused_abs_cg, focused_entity)) = overlay_target else {
-        unreachable!("overlay disposition rejects a missing target")
-    };
-    let Some((focused_window, _, focused_application)) = inputs.windows.get_parent(focused_entity)
-    else {
-        overlay_mgr.remove_all();
-        window_config_cache.clear();
-        return;
-    };
-    let focused_window_id = focused_window.id();
 
-    let border_params = if border_enabled {
-        let Some(params) = overlay_border_params(
-            &inputs,
-            focused_window,
-            focused_application,
-            &mut window_config_cache,
-        ) else {
-            overlay_mgr.remove_all();
-            window_config_cache.clear();
-            return;
+    let mut target_space_ids = HashSet::new();
+    let mut targets = Vec::new();
+    for (_, strip, native_space, child, active, visible) in &spaces {
+        if !native_space_has_overlay(native_space.kind) {
+            continue;
+        }
+        let Ok(display) = inputs.displays.get(child.parent()) else {
+            continue;
         };
-        Some(params)
-    } else {
-        window_config_cache.clear();
-        None
-    };
+        target_space_ids.insert(strip.id());
+
+        let focused = match resolve_space_overlay_target(&inputs, strip, active, visible) {
+            Ok(focused) => focused,
+            Err(error) => {
+                // Space membership is a transient private-API read. Keep all
+                // existing Space surfaces unchanged and retry on the periodic
+                // refresh rather than publishing a dim-only intermediate.
+                warn!(space_id = strip.id(), %error, "unable to resolve Space overlay target");
+                return;
+            }
+        };
+
+        let (focused_abs_cg, focused_window_id, border) = if let Some((frame, entity)) = focused {
+            let Some((window, _, application)) = inputs.windows.get_parent(entity) else {
+                continue;
+            };
+            let border = if border_enabled {
+                let cache = window_config_cache.entry(strip.id()).or_default();
+                overlay_border_params(&inputs, window, application, cache)
+            } else {
+                None
+            };
+            (Some(frame), Some(window.id()), border)
+        } else {
+            window_config_cache.remove(&strip.id());
+            (None, None, None)
+        };
+
+        targets.push(SpaceOverlayTarget {
+            space_id: strip.id(),
+            display_id: display.id(),
+            focused_abs_cg,
+            focused_window_id,
+            border,
+        });
+    }
+    window_config_cache.retain(|space_id, _| target_space_ids.contains(space_id));
 
     let dim_color = inputs.config.dim_inactive_color();
-    overlay_mgr.update(
-        dim_opacity,
-        dim_color,
-        Some(focused_abs_cg),
-        Some(focused_window_id),
-        border_params.as_ref(),
-    );
+    overlay_mgr.update(dim_opacity, dim_color, &targets);
+}
+
+pub(super) fn animate_decoration_overlay(
+    time: Res<Time>,
+    config: Res<Config>,
+    overlay_mgr: Option<NonSendMut<OverlayManager>>,
+) {
+    let Some(mut overlay_mgr) = overlay_mgr else {
+        return;
+    };
+    overlay_mgr.animate_decorations(time.delta_secs_f64(), config.animation_speed());
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -1342,8 +1406,24 @@ pub(super) fn commit_window_frame(
             }
             Err(error) => {
                 warn!(window_id = window.id(), %error, "unable to commit window frame");
+                // AX frame writes are not transactional: a failed size write
+                // may still have moved or partially resized the physical
+                // window. Stop the per-frame presentation loop immediately
+                // and refresh physical truth. The central reconciler owns the
+                // subsequent bounded retry budget.
+                let readback = window.update_frame();
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_remove::<ObservedWindowFrame>();
+                    entity_commands.try_remove::<WindowFrameMotion>();
+                    entity_commands.try_insert(WindowFrameCommitSuspended::new(desired.0));
+                    match readback {
+                        Ok(frame) => {
+                            entity_commands.try_insert(ObservedWindowFrame(frame));
+                        }
+                        Err(read_error) => {
+                            warn!(window_id = window.id(), %read_error, "unable to read back failed window frame write");
+                            entity_commands.try_remove::<ObservedWindowFrame>();
+                        }
+                    }
                 }
             }
         }

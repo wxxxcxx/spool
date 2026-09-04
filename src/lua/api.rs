@@ -1,9 +1,9 @@
 //! Installs the global `spool` API table into a Lua state.
 //!
-//! The command-issuing half (`spool.run`, `spool.window.*`,
-//! `spool.workspace.*`, `spool.mouse.*`) comes from [`spool_lua`], shared
+//! The action-dispatching half (`spool.run`, `spool.action.*`) comes from
+//! [`spool_lua`], shared
 //! with the client module so both hosts expose the same surface over a typed
-//! [`Command`] dispatcher — here onto the command bus, there onto the daemon
+//! [`Action`] dispatcher — here onto the action bus, there onto the daemon
 //! socket.
 //!
 //! What's installed here is embedded-only: `spool.on` (event handlers),
@@ -12,6 +12,7 @@
 //! directly instead of over the socket).
 
 use std::cell::RefCell;
+use std::process::Command as ProcessCommand;
 use std::rc::Rc;
 
 use mlua::{IntoLua, Lua, LuaSerdeExt, Table, Value};
@@ -22,10 +23,10 @@ use spool_shared_types::script_state::{ScriptStateWrite, WriteOutcome};
 
 use super::convert::LuaEvent;
 use super::runtime::{
-    HandlerEntry, Outbox, SharedRegistry, from_lua_value, store_error, to_lua_value,
+    BindHandler, HandlerEntry, Outbox, SharedRegistry, from_lua_value, store_error, to_lua_value,
 };
 use super::world::DispatchWorld;
-use crate::commands::Command;
+use crate::commands::Action;
 use crate::config::{Config, config_from_lua, resolve_chord};
 use crate::ecs::state::StateQueryKind;
 use spool_shared_types::windowset_lua::returned_ops;
@@ -57,9 +58,7 @@ fn spawn_exec_pool() -> async_channel::Sender<ExecJob> {
             .name(format!("spool-lua-exec-{worker}"))
             .spawn(move || {
                 while let Ok(job) = queue.recv_blocking() {
-                    let output = std::process::Command::new(&job.program)
-                        .args(&job.args)
-                        .output();
+                    let output = ProcessCommand::new(&job.program).args(&job.args).output();
                     // The handler that asked may already be gone; its reply
                     // channel closing is not an error worth reporting.
                     let _ = job.reply.send_blocking(output);
@@ -90,19 +89,16 @@ pub(super) fn install(
     let spool = lua.create_table()?;
     lua.globals().set("spool", spool.clone())?;
 
-    // Queues the command onto the command bus; the primitive the shared API
+    // Queues the action onto the action bus; the primitive the shared interface
     // is built on.
     let dispatch = {
         let outbox = Rc::clone(outbox);
-        move |_: &Lua, command: Command| {
-            outbox.borrow_mut().commands.push(command);
+        move |_: &Lua, action: Action| {
+            outbox.borrow_mut().actions.push(action);
             Ok(true)
         }
     };
     shared::install(lua, &spool, &(Rc::new(dispatch) as shared::Dispatch))?;
-    // `cmd` is the embedded runtime's historical alias for `run`.
-    let run: mlua::Function = spool.get("run")?;
-    spool.set("cmd", run)?;
 
     install_query(lua, &spool, world)?;
     install_script_state(lua, &spool, world)?;
@@ -235,31 +231,31 @@ pub(super) fn install(
     };
     spool.set("on", on)?;
 
-    // spool.bind(chord, handler) — register a keybind. `handler` is a Lua
-    // function (receives a state snapshot) or a command string.
+    // spool.bind(chord_or_chords, handler) — register one action function or
+    // callback under one or more plus-separated chords.
     let bind = {
         let registry = Rc::clone(registry);
-        lua.create_function(move |_, (chord, handler): (String, Value)| {
-            register_bind(&registry, &chord, handler)
+        lua.create_function(move |lua, (chords, handler): (Value, Value)| {
+            let chords = chord_strings(&chords)?;
+            for chord in chords {
+                register_bind(lua, &registry, &chord, handler.clone())?;
+            }
+            Ok(())
         })?
     };
     spool.set("bind", bind)?;
 
     // spool.setup(table) — declare the whole configuration from Lua. Mirrors
-    // the TOML sections; a `bindings` sub-table is desugared onto the same
-    // path as `spool.bind` and stripped before the rest is deserialized into
-    // a `Config`.
+    // the TOML sections. Bindings stay in explicit `spool.bind` calls so they
+    // can reference first-class action functions or user callbacks.
     let setup = {
-        let registry = Rc::clone(registry);
         let config_cell = Rc::clone(config_cell);
         lua.create_function(move |lua, table: Table| {
-            if let Some(bindings) = table.get::<Option<Table>>("bindings")? {
-                for pair in bindings.pairs::<String, String>() {
-                    let (command, chord) = pair?;
-                    let handler = Value::String(lua.create_string(&command)?);
-                    register_bind(&registry, &chord, handler)?;
-                }
-                table.set("bindings", Value::Nil)?;
+            if table.contains_key("bindings")? {
+                return Err(mlua::Error::RuntimeError(
+                    "spool.setup.bindings was removed; use spool.bind(chord, spool.action.*)"
+                        .into(),
+                ));
             }
             let config = config_from_lua(lua, Value::Table(table))?;
             *config_cell.borrow_mut() = Some(config);
@@ -288,7 +284,7 @@ pub(super) fn install(
                 if ops.is_empty() {
                     return Ok(false);
                 }
-                outbox.borrow_mut().commands.push(Command::Layout(ops));
+                outbox.borrow_mut().actions.push(Action::Layout(ops));
                 Ok(true)
             }
         })?
@@ -298,20 +294,25 @@ pub(super) fn install(
     Ok(())
 }
 
-/// Registers one keybind into the shared registry: validates the handler is a
-/// Lua function or a command string, resolves the chord to `(keycode,
-/// modifiers)`, and records it for publishing to the event tap. Shared by
-/// `spool.bind` and the `bindings` sub-table of `spool.setup`.
-fn register_bind(registry: &SharedRegistry, chord: &str, handler: Value) -> mlua::Result<()> {
-    match &handler {
-        Value::Function(_) | Value::String(_) => {}
+/// Registers one keybind into the shared registry: validates the handler is an
+/// action function or Lua callback, resolves the chord to `(keycode,
+/// modifiers)`, and records it for publishing to the event tap.
+fn register_bind(
+    lua: &Lua,
+    registry: &SharedRegistry,
+    chord: &str,
+    handler: Value,
+) -> mlua::Result<()> {
+    let handler = match handler {
+        Value::Function(function) => shared::action_for_function(lua, &function)?
+            .map_or(BindHandler::Function(function), BindHandler::Action),
         other => {
             return Err(mlua::Error::RuntimeError(format!(
-                "spool.bind: handler must be a function or command string, got {}",
+                "spool.bind: handler must be an action function or callback, got {}",
                 other.type_name()
             )));
         }
-    }
+    };
     let (code, modifiers) = resolve_chord(chord)
         .map_err(|err| mlua::Error::RuntimeError(format!("spool.bind: {err}")))?;
 
@@ -321,6 +322,20 @@ fn register_bind(registry: &SharedRegistry, chord: &str, handler: Value) -> mlua
         .map_err(|_| mlua::Error::RuntimeError("spool.bind: too many binds".into()))?;
     registry.keybinds.push((code, modifiers, id));
     Ok(())
+}
+
+fn chord_strings(value: &Value) -> mlua::Result<Vec<String>> {
+    match value {
+        Value::String(chord) => Ok(vec![chord.to_str()?.to_string()]),
+        Value::Table(chords) => chords
+            .clone()
+            .sequence_values::<String>()
+            .collect::<mlua::Result<Vec<_>>>(),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "spool.bind: chord must be a string or an array of strings, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 /// Installs the state-query half of the API, matching the client module's

@@ -26,6 +26,8 @@ use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WorkspaceId;
 use crate::util::round_px;
 
+use super::reconcile::WindowUnavailable;
+
 pub struct LayoutEventsPlugin;
 
 /// A strip, its entity, origin, display, and whether it's the active one.
@@ -81,6 +83,7 @@ type WindowFrames<'w, 's> = Query<
         &'static Position,
         &'static mut Bounds,
         &'static mut LayoutPosition,
+        Option<&'static WindowUnavailable>,
     ),
     (
         Without<LayoutStrip>,
@@ -1100,8 +1103,11 @@ fn layout_strip_changed(
     let get_window_frame = |entity| {
         windows
             .get(entity)
-            .map(|(position, bounds, _)| IRect::from_corners(position.0, position.0 + bounds.0))
             .ok()
+            .filter(|(_, _, _, unavailable)| {
+                unavailable.is_none_or(|state| !state.excludes_from_layout_projection())
+            })
+            .map(|(position, bounds, _, _)| IRect::from_corners(position.0, position.0 + bounds.0))
     };
 
     let changed = changed_strips
@@ -1119,7 +1125,7 @@ fn layout_strip_changed(
         .collect::<Vec<_>>();
 
     for (entity, frame) in changed {
-        if let Ok((_, mut bounds, mut layout_position)) = windows.get_mut(entity) {
+        if let Ok((_, mut bounds, mut layout_position, _)) = windows.get_mut(entity) {
             if layout_position.0 != frame.min {
                 layout_position.0 = frame.min;
             }

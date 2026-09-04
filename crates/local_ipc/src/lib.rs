@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver as MessageReceiver, SyncSender, TrySendErro
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(2);
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(1);
@@ -926,8 +926,8 @@ mod tests {
         let client = thread::spawn(move || {
             Client::connect(&client_name)
                 .expect("connect")
-                .send(&Request::Command(
-                    spool_shared_types::commands::Command::Quit,
+                .send(&Request::Dispatch(
+                    spool_shared_types::commands::Action::Quit,
                 ))
         });
 
@@ -951,7 +951,7 @@ mod tests {
         let client = thread::spawn(move || {
             let mut events = Client::connect(&client_name)
                 .expect("connect")
-                .subscribe(&Request::Subscribe)
+                .subscribe(&Request::Subscribe { raw: false })
                 .expect("subscribe");
             events.recv_blocking().expect("event")
         });

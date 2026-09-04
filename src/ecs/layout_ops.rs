@@ -15,7 +15,7 @@ use bevy::platform::collections::HashSet;
 use spool_shared_types::windowset::LayoutOp;
 use tracing::debug;
 
-use crate::commands::{Command, MoveFocus};
+use crate::commands::{Action, MoveFocus};
 use crate::ecs::focus::FocusWindow;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
@@ -35,8 +35,8 @@ pub(crate) fn apply_layout_ops(
     let batches: Vec<Vec<LayoutOp>> = messages
         .read()
         .filter_map(|message| match message {
-            Event::Command {
-                command: Command::Layout(ops),
+            Event::ActionRequested {
+                action: Action::Layout(ops),
             } => Some(ops.clone()),
             _ => None,
         })
@@ -113,8 +113,8 @@ fn apply(
             let Some(window) = windows.get(entity) else {
                 return;
             };
-            commands.trigger(SendMessageTrigger(Event::Command {
-                command: Command::MoveWindowToSpace {
+            commands.trigger(SendMessageTrigger(Event::action_requested(
+                Action::MoveWindowToSpace {
                     window_id: window.id(),
                     space_id,
                     move_focus: if follow {
@@ -123,13 +123,13 @@ fn apply(
                         MoveFocus::Stay
                     },
                 },
-            }));
+            )));
         }
 
         LayoutOp::View { space_id } => {
-            commands.trigger(SendMessageTrigger(Event::Command {
-                command: Command::FocusSpace { space_id },
-            }));
+            commands.trigger(SendMessageTrigger(Event::action_requested(
+                Action::FocusSpace { space_id },
+            )));
         }
 
         LayoutOp::SetFloating { floating, .. } => {

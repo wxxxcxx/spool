@@ -149,11 +149,14 @@ focus_follows_mouse = true
 mouse_follows_focus = true
 
 [bindings]
-window_focus_west = "cmd - h"
-window_focus_east = "cmd - l"
-window_resize = "alt - r"
-window_center = "alt - c"
-quit = "ctrl + alt - q"
+window_focus_west = "cmd+h"
+window_focus_east = "cmd+l"
+window_focus_next = "alt+n"
+window_focus_previous = "alt+p"
+window_shrink_width = "alt+minus"
+window_grow_width = "alt+equal"
+window_center = "alt+c"
+quit = "ctrl+alt+q"
 ```
 
 Alternatively, the embedded Lua runtime can declare the entire configuration
@@ -164,12 +167,11 @@ via `spool.setup{...}`, making the TOML file optional — see the
 -- init.lua
 spool.setup {
   options = { focus_follows_mouse = true, mouse_follows_focus = true },
-  bindings = {
-    ["window focus west"] = "cmd - h",
-    ["window focus east"] = "cmd - l",
-    ["quit"] = "ctrl + alt - q",
-  },
 }
+
+spool.bind("cmd+h", spool.action.window.focus_west)
+spool.bind("cmd+l", spool.action.window.focus_east)
+spool.bind("ctrl+alt+q", spool.action.quit)
 ```
 
 ### Live reloading
@@ -235,38 +237,39 @@ $ spool uninstall-app
 $ spool
 ```
 
-### Sending Commands
+### Dispatching Actions
 
-Spool exposes a `send-cmd` subcommand that lets you control the running
+Spool exposes an `action` subcommand that lets you control the running
 instance from the command line over its authenticated Unix socket. Any
-command that can be bound to a hotkey can also be sent programmatically:
+action that can be bound to a hotkey can also be dispatched programmatically:
 
 ```shell
-$ spool send-cmd <command> [args...]
+$ spool action <action> [args...]
 ```
 
-#### Available commands
+`send-cmd` remains accepted as a hidden compatibility alias. New scripts and
+integrations should use `action`.
 
-| Command                    | Description                                      |
+#### Available actions
+
+| Action                     | Description                                      |
 | -------------------------- | ------------------------------------------------ |
-| `window focus <direction\|number\|tiled\|floating>` | Move focus by direction, column number, tiled or floating |
-| `window swap <direction>`  | Swap the focused window with a neighbour         |
-| `window center`            | Center the focused window on screen              |
-| `window resize`            | Cycle through `preset_column_widths`             |
-| `window grow`              | Grow to the next preset width                    |
-| `window shrink`            | Shrink to the previous preset width              |
-| `window fullwidth`         | Toggle full-width mode for the focused window    |
-| `window togglefloating`    | Toggle between tiled and floating state          |
+| `window focus <direction\|number\|next\|previous\|tiled\|floating\|other-layer>` | Focus within or between tiled/floating layers; the result is raised when needed |
+| `window move <direction>`  | Reorder a tiled window or nudge a floating window |
+| `window center`            | Center the focused tiled or floating window      |
+| `window grow width` / `window shrink width` | Cycle tiled width presets or resize a floating window horizontally |
+| `window grow height` / `window shrink height` | Resize a tiled stack member or floating window vertically |
+| `window maximize`          | Toggle tiled full-width or floating maximize/restore |
+| `window toggle floating`   | Toggle between tiled and floating state          |
 | `window equalize`          | Distribute equal heights in the focused stack    |
 | `window balance`           | Make all columns match the focused window width  |
-| `window stack`             | Stack the focused window onto its left neighbour |
-| `window unstack`           | Unstack the focused window into its own column   |
+| `window toggle stack`      | Stack the focused tiled window, or unstack it when already stacked |
 | `window nextdisplay`       | Move the focused window to the next display      |
 | `window nextdisplaysend`   | Move the window to the next display but stay here |
 | `window move-to-space <window-id> <space-id> stay` | Experimentally move a window to a user Space |
 | `window move-to-space <window-id> <space-id> follow` | Move a window, switch to its Space, and focus it after reconciliation |
 | `space focus <space-id>` | Focus a Space when the runtime reports support |
-| `space create <display-id>` / `space delete <space-id>` | Space lifecycle commands when supported |
+| `space create <display-id>` / `space delete <space-id>` | Space lifecycle actions when supported |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
 | `printstate`               | Print the internal ECS state to the debug log    |
@@ -280,37 +283,43 @@ Window numbers are 1-based and count columns from left to right.
 
 ```shell
 # Move focus one window to the right.
-$ spool send-cmd window focus east
+$ spool action window focus east
 
-# Swap the current window to the left.
-$ spool send-cmd window swap west
+# Move to the next window in the current tiled/floating tier.
+$ spool action window focus next
 
-# Center and resize in one shot (two separate calls).
-$ spool send-cmd window center && spool send-cmd window resize
+# Move backward in the current tier; the full word is required.
+$ spool action window focus previous
+
+# Move the current window left. Tiled windows reorder; floating windows nudge.
+$ spool action window move west
+
+# Center and grow width in one shot (two separate calls).
+$ spool action window center && spool action window grow width
 
 # Balance all columns to the focused window's width.
-$ spool send-cmd window balance
+$ spool action window balance
 
-# Cycle backward through preset widths.
-$ spool send-cmd window shrink
+# Shrink width using the behavior for the focused window type.
+$ spool action window shrink width
 
 # Jump to the left-most window.
-$ spool send-cmd window focus first
+$ spool action window focus first
 
 # Jump to the second window from the left.
-$ spool send-cmd window focus 2
+$ spool action window focus 2
 
 # Focus an exact Spool-known window id.
-$ spool send-cmd window focusid 321
+$ spool action window focusid 321
 
 # Move that window to a stable Space ID without following it.
-$ spool send-cmd window move-to-space 321 42 stay
+$ spool action window move-to-space 321 42 stay
 
 # Move that window, switch to its Space, and focus it.
-$ spool send-cmd window move-to-space 321 42 follow
+$ spool action window move-to-space 321 42 follow
 
 # Focus a stable Space ID on the active display.
-$ spool send-cmd space focus 42
+$ spool action space focus 42
 ```
 
 ### Querying and Subscribing to State
@@ -338,14 +347,24 @@ $ spool subscribe --json
 
 `query` prints one snapshot and exits. `subscribe` keeps the channel open and
 prints a header followed by one TSV summary row per event; `subscribe --json`
-instead emits one complete JSON object per line. Events cover focus changes,
-Space changes, window-list changes, title changes, and display changes. See
+instead emits one complete JSON object per line. Stable notifications are
+coalesced: window animation frames do not repeatedly publish an unchanged
+visible set. Add `--raw` only while debugging to include the uncoalesced source
+events alongside stable notifications:
+
+```shell
+$ spool subscribe --raw
+$ spool subscribe --json --raw
+```
+
+Events cover focus changes, Space changes, window-list changes, visible-set
+changes, title changes, and display changes. See
 [`QUERY_AND_SUBSCRIBE_FORMAT.md`](./QUERY_AND_SUBSCRIBE_FORMAT.md) for the
 full payload contract.
 
 ### Running Client Scripts
 
-For logic that is more involved than one `send-cmd`, run an isolated Lua
+For logic that is more involved than one `action`, run an isolated Lua
 client (available in the default Lua-enabled build). The script runs in the
 invoking CLI process, while its `spool.*` calls talk to the running daemon over
 the Unix socket:
@@ -362,7 +381,7 @@ $ printf 'print(spool.state.get("mode"))' | spool script -
 ```
 
 Both the global `spool` value and `require("spool")` refer to the client API.
-It can query state, persist script-owned values, send window commands,
+It can query state, persist script-owned values, dispatch window actions,
 transform window sets, and subscribe to changes. It deliberately cannot call
 configuration-only functions such as `spool.setup`, `spool.bind`, or
 `spool.on`.
@@ -374,22 +393,22 @@ error is written to stderr with a traceback and produces a non-zero exit.
 
 #### Scripting ideas
 
-Because `send-cmd` talks to the running daemon, you can drive Spool from shell
+Because `action` talks to the running daemon, you can drive Spool from shell
 scripts, `cron` jobs, or other automation tools:
 
 - **Launch-and-arrange workflow.** Open an application and immediately position
-  it: `open -a Safari && sleep 0.5 && spool send-cmd window resize`.
-- **One-key layout reset.** Use `spool send-cmd window balance` to make every
+  it: `open -a Safari && sleep 0.5 && spool action window grow width`.
+- **One-key layout reset.** Use `spool action window balance` to make every
   column the same width as the focused window — great for resetting layouts
   after unplugging a monitor or when windows get shuffled.
 - **Integration with other tools.** Pipe focus events from tools like
   [Hammerspoon](https://www.hammerspoon.org) or
-  [skhd](https://github.com/koekeishiya/skhd) into `spool send-cmd` for
+  [skhd](https://github.com/koekeishiya/skhd) into `spool action` for
   compound actions that go beyond a single hotkey.
 - **Multi-display orchestration.** Move a window to the next display and
   immediately warp the mouse there:
   ```shell
-  spool send-cmd window nextdisplay && spool send-cmd mouse nextdisplay
+  spool action window nextdisplay && spool action mouse nextdisplay
   ```
 - **Status bar integration.** Use `spool query state --json` to render the
   initial workspace labels, then keep them current with `spool subscribe --json`.
@@ -397,7 +416,7 @@ scripts, `cron` jobs, or other automation tools:
 
 ## Future Enhancements
 
-- More commands for manipulating windows: finegrained size adjustments, touchpad resizing, etc.
+- More actions for manipulating windows: finegrained size adjustments, touchpad resizing, etc.
 - Deeper scriptability building on the embedded Lua runtime, which already
   supports full configuration (`spool.setup`), event hooks (`spool.on`),
   keybindings (`spool.bind`), and state queries — see the **[Lua Scripting Guide](./SCRIPTING.md)**.

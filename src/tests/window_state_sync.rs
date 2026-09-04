@@ -2,6 +2,7 @@ use bevy::ecs::system::RunSystemOnce as _;
 use bevy::prelude::*;
 
 use crate::assert_focused;
+use crate::commands::{Action, Direction, Operation};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::focus::FocusCoordinator;
 use crate::ecs::layout::LayoutStrip;
@@ -239,10 +240,16 @@ fn a_recovered_focus_starts_a_new_no_focus_episode() {
     });
     harness.pump_frames(12);
 
+    assert_focused!(harness.world(), 0);
+    harness.pump_frames(12);
+
     let mut focused = harness
         .world()
         .query_filtered::<Entity, With<FocusedMarker>>();
-    assert!(focused.iter(harness.world()).next().is_none());
+    assert!(
+        focused.iter(harness.world()).next().is_none(),
+        "a repeated no-focus episode clears confirmation only after its bounded AX retry expires"
+    );
 }
 
 #[test]
@@ -709,7 +716,7 @@ fn window_frame_commit_publishes_confirmed_geometry_without_notification() {
 }
 
 #[test]
-fn failed_geometry_readback_invalidates_the_overlay_projection() {
+fn failed_geometry_setter_preserves_a_successful_followup_readback() {
     let mut harness = TestHarness::new().with_windows(1);
     harness.pump_frames(15);
 
@@ -735,9 +742,46 @@ fn failed_geometry_readback_invalidates_the_overlay_projection() {
     harness.pump_frames(1);
 
     assert_eq!(harness.mock_state.actual_window_frame(0), Some(target));
+    assert_eq!(
+        harness
+            .world()
+            .get::<ObservedWindowFrame>(entity)
+            .expect("fresh physical readback")
+            .0,
+        target,
+        "a successful follow-up AX read is authoritative even when the setter reported an error"
+    );
+}
+
+#[test]
+fn failed_geometry_setter_and_followup_read_invalidate_the_overlay_projection() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(15);
+
+    let entity = find_window_entity(0, harness.world());
+    let current = harness
+        .world()
+        .get::<ObservedWindowFrame>(entity)
+        .expect("confirmed frame")
+        .0;
+    let target = IRect::from_corners(
+        current.min + IVec2::new(30, 20),
+        current.max + IVec2::new(90, 20),
+    );
+    harness.mock_state.fail_frame_write_readbacks(0, 1);
+    harness.mock_state.fail_frame_updates(0, 1);
+    harness
+        .world()
+        .entity_mut(entity)
+        .get_mut::<PresentedWindowFrame>()
+        .expect("presented frame")
+        .0 = target;
+
+    harness.pump_frames(1);
+
     assert!(
         harness.world().get::<ObservedWindowFrame>(entity).is_none(),
-        "a failed AX readback must hide the border instead of retaining stale geometry"
+        "without a confirmed follow-up read, the overlay must not retain stale geometry"
     );
 }
 
@@ -1266,7 +1310,7 @@ fn tiled_move_burst_defers_layout_adoption_until_geometry_settles() {
 }
 
 #[test]
-fn window_state_sync_stale_ax_inventory_does_not_block_future_tiling() {
+fn window_state_sync_stale_ax_inventory_suspends_without_losing_layout_state() {
     let mut harness = TestHarness::new().with_windows(3);
     harness.pump_frames(10);
 
@@ -1281,8 +1325,15 @@ fn window_state_sync_stale_ax_inventory_does_not_block_future_tiling() {
     assert!(
         strips
             .iter(harness.world())
-            .all(|strip| !strip.contains(stale)),
-        "a WindowServer-missing window must be isolated even while AX is stale"
+            .any(|strip| strip.contains(stale)),
+        "a pending close must retain declarative layout state until destruction is confirmed"
+    );
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::reconcile::WindowUnavailable>(stale)
+            .is_some(),
+        "the stale AX handle must be excluded from the projected layout"
     );
     assert_eq!(
         window_x(harness.world(), 2) - window_x(harness.world(), 0),
@@ -1677,7 +1728,7 @@ fn ignored_window_reusing_an_id_retires_the_old_tiled_entity() {
 }
 
 #[test]
-fn failed_ax_inventory_isolates_window_server_missing_windows() {
+fn failed_ax_inventory_suspends_window_server_missing_windows() {
     let mut harness = TestHarness::new().with_windows(2);
     harness.pump_frames(15);
 
@@ -1703,8 +1754,18 @@ fn failed_ax_inventory_isolates_window_server_missing_windows() {
     assert!(
         strips
             .iter(harness.world())
-            .all(|strip| { entities.iter().all(|entity| !strip.contains(*entity)) })
+            .any(|strip| entities.iter().all(|entity| strip.contains(*entity))),
+        "an incomplete destruction decision must retain the declarative layout"
     );
+    for entity in entities {
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::reconcile::WindowUnavailable>(entity)
+                .is_some(),
+            "WindowServer-missing windows must be excluded from the projected layout"
+        );
+    }
 
     harness
         .mock_state
@@ -1781,6 +1842,182 @@ fn incomplete_ax_inventory_omission_keeps_a_live_window_tiled() {
         .omit_window_from_application_inventory(TEST_PROCESS_ID, 0, false);
     harness.pump_frames(20);
     assert!(harness.world().get_entity(entity).is_ok());
+}
+
+#[test]
+fn space_change_ax_withdrawal_preserves_layout_order() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.pump_frames(15);
+
+    harness.mock_state.focus_window(1);
+    harness.pump_frames(5);
+    harness
+        .world()
+        .write_message(crate::events::Event::ActionRequested {
+            action: Action::Window(Operation::Move(Direction::West)),
+        });
+    harness.pump_frames(5);
+    assert_eq!(layout_window_ids(harness.world()), vec![1, 0, 2]);
+
+    for id in 0..3 {
+        harness.mock_state.os_withdraw_window(id);
+    }
+    harness
+        .world()
+        .write_message(crate::events::Event::SpaceChanged);
+    harness.pump_frames(2);
+
+    assert_eq!(
+        layout_window_ids(harness.world()),
+        vec![1, 0, 2],
+        "a Space observation must not detach live WindowServer surfaces from LayoutStrip"
+    );
+    for id in 0..3 {
+        let entity = find_window_entity(id, harness.world());
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::reconcile::WindowUnavailable>(entity)
+                .is_some(),
+            "AX-withdrawn window {id} must pause macOS operations while retaining layout state"
+        );
+    }
+
+    harness.mock_state.os_restore_withdrawn_window(0);
+    harness
+        .world()
+        .write_message(crate::events::Event::SpaceChanged);
+    harness.pump_frames(2);
+
+    assert_eq!(layout_window_ids(harness.world()), vec![1, 0, 2]);
+    assert_window_suspended(harness.world(), 0, false);
+    assert_window_suspended(harness.world(), 1, true);
+    assert_window_suspended(harness.world(), 2, true);
+
+    harness.mock_state.os_restore_withdrawn_window(1);
+    harness.mock_state.os_restore_withdrawn_window(2);
+    harness
+        .world()
+        .write_message(crate::events::Event::SpaceChanged);
+    harness.pump_frames(12);
+
+    assert_eq!(layout_window_ids(harness.world()), vec![1, 0, 2]);
+    for id in 0..3 {
+        assert_window_suspended(harness.world(), id, false);
+    }
+}
+
+#[test]
+fn confirmed_close_removes_only_the_destroyed_layout_member() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.pump_frames(15);
+
+    harness.mock_state.focus_window(1);
+    harness.pump_frames(5);
+    harness
+        .world()
+        .write_message(crate::events::Event::ActionRequested {
+            action: Action::Window(Operation::Move(Direction::West)),
+        });
+    harness.pump_frames(5);
+    assert_eq!(layout_window_ids(harness.world()), vec![1, 0, 2]);
+
+    let closed = find_window_entity(0, harness.world());
+    harness.mock_state.os_withdraw_window(0);
+    harness
+        .world()
+        .write_message(crate::events::Event::SpaceChanged);
+    harness.pump_frames(2);
+    assert_eq!(layout_window_ids(harness.world()), vec![1, 0, 2]);
+    assert_window_suspended(harness.world(), 0, true);
+
+    harness.mock_state.os_settle_withdrawn_surface(0);
+    harness
+        .world()
+        .write_message(crate::events::Event::SpaceChanged);
+    harness.pump_frames(2);
+
+    assert!(harness.world().get_entity(closed).is_err());
+    assert_eq!(layout_window_ids(harness.world()), vec![1, 2]);
+}
+
+#[test]
+fn transient_window_server_omission_restores_projection_without_mutating_layout() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.pump_frames(15);
+
+    harness
+        .mock_state
+        .omit_window_from_window_server_inventory(1, true);
+    harness
+        .world()
+        .write_message(crate::events::Event::SpaceChanged);
+    harness.pump_frames(2);
+
+    assert_eq!(layout_window_ids(harness.world()), vec![0, 1, 2]);
+    assert_window_suspended(harness.world(), 1, true);
+    assert_eq!(
+        window_x(harness.world(), 2) - window_x(harness.world(), 0),
+        TEST_WINDOW_WIDTH,
+        "a missing surface must be excluded from the rendered layout while confirmation is pending"
+    );
+
+    harness
+        .mock_state
+        .omit_window_from_window_server_inventory(1, false);
+    harness
+        .world()
+        .write_message(crate::events::Event::SpaceChanged);
+    harness.pump_frames(2);
+
+    assert_eq!(layout_window_ids(harness.world()), vec![0, 1, 2]);
+    assert_window_suspended(harness.world(), 1, false);
+    assert_eq!(
+        window_x(harness.world(), 2) - window_x(harness.world(), 0),
+        TEST_WINDOW_WIDTH * 2,
+        "the original projection must return when WindowServer confirms the surface again"
+    );
+}
+
+#[test]
+fn space_change_ax_withdrawal_preserves_stack_and_tab_shape() {
+    let mut harness = TestHarness::new().with_windows(4);
+    harness.pump_frames(15);
+
+    let tab_leader = find_window_entity(0, harness.world());
+    let tab_follower = find_window_entity(1, harness.world());
+    let stacked = find_window_entity(2, harness.world());
+    {
+        let mut strips = harness.world().query::<&mut LayoutStrip>();
+        let mut strip = strips
+            .iter_mut(harness.world())
+            .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+            .expect("test workspace layout strip");
+        strip
+            .convert_to_tabs(tab_leader, tab_follower)
+            .expect("build native-tab fixture");
+        strip.stack(stacked).expect("build stack fixture");
+    }
+    harness.pump_frames(2);
+    let expected = layout_description(harness.world());
+
+    for id in 0..4 {
+        harness.mock_state.os_withdraw_window(id);
+    }
+    harness
+        .world()
+        .write_message(crate::events::Event::SpaceChanged);
+    harness.pump_frames(2);
+    assert_eq!(layout_description(harness.world()), expected);
+
+    for id in 0..4 {
+        harness.mock_state.os_restore_withdrawn_window(id);
+    }
+    harness
+        .world()
+        .write_message(crate::events::Event::SpaceChanged);
+    harness.pump_frames(2);
+    assert_eq!(layout_description(harness.world()), expected);
 }
 
 #[test]
@@ -2086,6 +2323,95 @@ fn changing_constrained_readbacks_do_not_reset_frame_retry_budget() {
 }
 
 #[test]
+fn failed_ax_writes_stop_the_animation_commit_loop_and_preserve_readback() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(32.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.pump_frames(15);
+
+    let entity = find_window_entity(0, harness.world());
+    let original_bounds = harness.world().get::<Bounds>(entity).expect("bounds").0;
+    let target = original_bounds + IVec2::new(240, 0);
+
+    // AX setters are not transactional: the frame can change even when the
+    // final readback reports an error. Repeating every intermediate animation
+    // frame then walks the window through a series of unintended geometries.
+    harness.mock_state.reject_frame_writes(0, true);
+    let baseline_attempts = harness.mock_state.frame_write_attempts(0);
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(ResizeMarker(target));
+
+    harness.pump_frames(50);
+
+    let attempts = harness.mock_state.frame_write_attempts(0) - baseline_attempts;
+    assert!(
+        attempts <= 4,
+        "one animation write plus the three-attempt reconciliation budget is allowed, but per-frame commits are not; got {attempts} writes"
+    );
+    assert!(
+        harness.world().get::<ObservedWindowFrame>(entity).is_some(),
+        "a successful read after a failed AX setter must remain the physical source of truth"
+    );
+}
+
+#[test]
+fn suspended_animation_commit_recovers_through_bounded_reconciliation() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(32.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(1);
+    harness.pump_frames(15);
+
+    let entity = find_window_entity(0, harness.world());
+    let original = harness.world().get::<Bounds>(entity).expect("bounds").0;
+    let target = original + IVec2::new(240, 0);
+    harness.mock_state.reject_frame_writes(0, true);
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(ResizeMarker(target));
+    harness.pump_frames(10);
+
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::WindowFrameCommitSuspended>(entity)
+            .is_some(),
+        "a failed animation commit must remain suspended between retry bursts"
+    );
+
+    harness.mock_state.reject_frame_writes(0, false);
+    harness.pump_frames(70);
+
+    let desired = harness
+        .world()
+        .get::<crate::ecs::DesiredWindowFrame>(entity)
+        .expect("desired frame")
+        .0;
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(desired));
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::WindowFrameCommitSuspended>(entity)
+            .is_none(),
+        "successful bounded reconciliation must resume normal projection"
+    );
+}
+
+#[test]
 fn constrained_resize_animation_preserves_tiled_bounds_intent() {
     let mut harness = TestHarness::new().with_windows(1);
     harness.pump_frames(15);
@@ -2134,4 +2460,39 @@ fn window_state_sync_retries_window_server_notification_subscription() {
 fn window_x(world: &mut World, id: i32) -> i32 {
     let entity = find_window_entity(id, world);
     world.get::<Position>(entity).expect("window position").0.x
+}
+
+fn layout_window_ids(world: &mut World) -> Vec<i32> {
+    let entities = {
+        let mut strips = world.query::<&LayoutStrip>();
+        strips
+            .iter(world)
+            .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+            .expect("test workspace layout strip")
+            .all_windows()
+    };
+    entities
+        .into_iter()
+        .map(|entity| world.get::<Window>(entity).expect("tracked window").id())
+        .collect()
+}
+
+fn layout_description(world: &mut World) -> String {
+    let mut strips = world.query::<&LayoutStrip>();
+    strips
+        .iter(world)
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .map(ToString::to_string)
+        .expect("test workspace layout strip")
+}
+
+fn assert_window_suspended(world: &mut World, id: i32, expected: bool) {
+    let entity = find_window_entity(id, world);
+    assert_eq!(
+        world
+            .get::<crate::ecs::reconcile::WindowUnavailable>(entity)
+            .is_some(),
+        expected,
+        "window {id} suspension state"
+    );
 }

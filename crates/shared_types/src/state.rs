@@ -251,7 +251,8 @@ impl QueryState {
 pub enum StateEvent {
     /// The visible native Space changed.
     SpaceChanged { active: ActiveState },
-    /// The tracked window list of the current Space changed.
+    /// The tracked window membership, order, visibility or floating state of a
+    /// Space changed. Focus, title and frame-only changes have their own paths.
     WindowsChanged {
         space_id: Option<u64>,
         active: ActiveState,
@@ -263,8 +264,8 @@ pub enum StateEvent {
         title: Option<String>,
         space_id: Option<u64>,
     },
-    /// The set of windows actually visible on screen changed — including plain
-    /// moves and resizes, which no other event covers.
+    /// The set of windows actually visible on screen, or their display
+    /// assignment, changed. Animation frames within one display are coalesced.
     OnScreenChanged {
         windows: Vec<WindowState>,
         active: ActiveState,
@@ -274,6 +275,14 @@ pub enum StateEvent {
     /// Display configuration changed. `display_id` is `null` for a global
     /// change Spool cannot pin to one display.
     DisplayChanged { display_id: Option<u32> },
+    /// An uncoalesced source event requested explicitly with `subscribe --raw`.
+    RawEvent {
+        name: String,
+        display_id: Option<u32>,
+        space_id: Option<u64>,
+        window_id: Option<i32>,
+        details: String,
+    },
 }
 
 impl StateEvent {
@@ -339,6 +348,25 @@ mod tests {
             postcard::from_bytes::<StateEvent>(&bytes).unwrap(),
             event,
             "clients must decode exactly what the daemon emits"
+        );
+
+        let raw = StateEvent::RawEvent {
+            name: "window_moved".to_string(),
+            display_id: Some(1),
+            space_id: Some(42),
+            window_id: Some(7),
+            details: "incarnation=2".to_string(),
+        };
+        assert_eq!(
+            raw.to_json().unwrap(),
+            serde_json::json!({
+                "event": "raw_event",
+                "name": "window_moved",
+                "display_id": 1,
+                "space_id": 42,
+                "window_id": 7,
+                "details": "incarnation=2"
+            })
         );
     }
 

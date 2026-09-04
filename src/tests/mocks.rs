@@ -43,6 +43,7 @@ pub(crate) struct MockWindowData {
     pub(crate) subrole: String,
     pub(crate) identifier: String,
     pub(crate) is_full_screen: bool,
+    pub(crate) resizable: bool,
     pub(crate) border_radius: Option<f64>,
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
@@ -64,6 +65,7 @@ impl Default for MockWindowData {
             subrole: "AXStandardWindow".to_string(),
             identifier: "testid".to_string(),
             is_full_screen: false,
+            resizable: true,
             border_radius: None,
             horizontal_padding: 0,
             vertical_padding: 0,
@@ -106,6 +108,7 @@ struct MockStateInner {
     native_space_intents: Vec<crate::manager::NativeSpaceIntent>,
     focus_requests: Vec<WinID>,
     window_server_inventory_available: bool,
+    window_server_inventory_omissions: HashSet<WinID>,
     workspace_membership_scripts:
         HashMap<WorkspaceId, VecDeque<std::result::Result<Vec<WinID>, ()>>>,
     active_space_query_scripts: HashMap<u32, VecDeque<std::result::Result<WorkspaceId, ()>>>,
@@ -119,10 +122,12 @@ struct MockStateInner {
     full_screen_query_failures: HashMap<WinID, u32>,
     application_liveness_failures: HashMap<Pid, u32>,
     constrained_frame_writes: HashSet<WinID>,
+    rejected_frame_writes: HashSet<WinID>,
     progressive_frame_writes: HashSet<WinID>,
     frame_write_attempts: HashMap<WinID, u32>,
     resize_write_attempts: HashMap<WinID, u32>,
     frame_write_readback_failures: HashMap<WinID, u32>,
+    frame_update_failures: HashMap<WinID, u32>,
     applied_horizontal_padding: HashMap<WinID, i32>,
     applied_vertical_padding: HashMap<WinID, i32>,
     notification_request_failures: u32,
@@ -161,6 +166,7 @@ impl MockState {
                 native_space_intents: Vec::new(),
                 focus_requests: Vec::new(),
                 window_server_inventory_available: true,
+                window_server_inventory_omissions: HashSet::new(),
                 workspace_membership_scripts: HashMap::new(),
                 active_space_query_scripts: HashMap::new(),
                 present_display_topology_scripts: HashMap::new(),
@@ -173,10 +179,12 @@ impl MockState {
                 full_screen_query_failures: HashMap::new(),
                 application_liveness_failures: HashMap::new(),
                 constrained_frame_writes: HashSet::new(),
+                rejected_frame_writes: HashSet::new(),
                 progressive_frame_writes: HashSet::new(),
                 frame_write_attempts: HashMap::new(),
                 resize_write_attempts: HashMap::new(),
                 frame_write_readback_failures: HashMap::new(),
+                frame_update_failures: HashMap::new(),
                 applied_horizontal_padding: HashMap::new(),
                 applied_vertical_padding: HashMap::new(),
                 notification_request_failures: 0,
@@ -463,6 +471,15 @@ impl MockState {
         self.inner.force_write().window_server_inventory_available = available;
     }
 
+    pub fn omit_window_from_window_server_inventory(&self, id: WinID, omit: bool) {
+        let mut inner = self.inner.force_write();
+        if omit {
+            inner.window_server_inventory_omissions.insert(id);
+        } else {
+            inner.window_server_inventory_omissions.remove(&id);
+        }
+    }
+
     pub fn fail_window_observer_attempts(&self, id: WinID, attempts: u32) {
         self.inner
             .force_write()
@@ -522,6 +539,15 @@ impl MockState {
         }
     }
 
+    pub fn reject_frame_writes(&self, id: WinID, rejected: bool) {
+        let mut inner = self.inner.force_write();
+        if rejected {
+            inner.rejected_frame_writes.insert(id);
+        } else {
+            inner.rejected_frame_writes.remove(&id);
+        }
+    }
+
     pub fn progress_frame_writes(&self, id: WinID, progressive: bool) {
         let mut inner = self.inner.force_write();
         if progressive {
@@ -535,6 +561,13 @@ impl MockState {
         self.inner
             .force_write()
             .frame_write_readback_failures
+            .insert(id, attempts);
+    }
+
+    pub fn fail_frame_updates(&self, id: WinID, attempts: u32) {
+        self.inner
+            .force_write()
+            .frame_update_failures
             .insert(id, attempts);
     }
 
@@ -807,6 +840,16 @@ impl MockState {
         mw.expect_incarnation().return_const(incarnation);
 
         let s = self.clone();
+        mw.expect_is_resizable().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|window| window.resizable)
+                .ok_or(Error::InvalidWindow)
+        });
+
+        let s = self.clone();
         mw.expect_pid().returning(move || {
             let inner = s.inner.force_read();
             inner
@@ -872,6 +915,9 @@ impl MockState {
         mw.expect_set_frame().returning(move |frame| {
             let mut inner = s.inner.force_write();
             *inner.frame_write_attempts.entry(id).or_default() += 1;
+            if inner.rejected_frame_writes.contains(&id) {
+                return Err(Error::Generic("mock AX frame write rejected".to_string()));
+            }
             if inner.progressive_frame_writes.contains(&id) {
                 let Some(window) = inner.windows.get_mut(&id) else {
                     return Err(Error::InvalidWindow);
@@ -933,6 +979,12 @@ impl MockState {
         let s = self.clone();
         mw.expect_update_frame().returning(move || {
             let mut inner = s.inner.force_write();
+            if let Some(remaining) = inner.frame_update_failures.get_mut(&id)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return Err(Error::Generic("mock AX frame update failure".to_string()));
+            }
             if let Some(frame) = inner.windows.get(&id).map(|window| window.frame) {
                 inner.cached_frames.insert(id, frame);
                 Ok(frame)
@@ -1359,6 +1411,7 @@ impl MockState {
                 .windows
                 .iter()
                 .chain(inner.withdrawn_surfaces.iter())
+                .filter(|(id, _)| !inner.window_server_inventory_omissions.contains(id))
                 .filter_map(|(id, window)| window.visible.then_some(id))
                 .copied()
                 .collect::<Vec<_>>();
@@ -1376,6 +1429,7 @@ impl MockState {
                     .windows
                     .iter()
                     .chain(inner.withdrawn_surfaces.iter())
+                    .filter(|(id, _)| !inner.window_server_inventory_omissions.contains(id))
                     .map(|(id, window)| (*id, window.pid))
                     .collect(),
             )

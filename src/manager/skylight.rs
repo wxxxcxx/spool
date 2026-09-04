@@ -36,6 +36,13 @@ unsafe extern "C" {
     /// extern int SLSMainConnectionID(void);
     pub fn SLSMainConnectionID() -> ConnID;
 
+    /// Moves windows owned by the caller to one managed Space.
+    ///
+    /// Spool uses this only for its own transparent overlay windows. Moving
+    /// foreign application windows still goes through the capability-gated
+    /// native Space command path.
+    pub fn SLSMoveWindowsToManagedSpace(cid: ConnID, windows: *const CFArray, space_id: u64);
+
     /// Requests per-window `WindowServer` notifications for the supplied IDs.
     /// On macOS 15 and newer this enables the `WindowClosed` notification.
     pub fn SLSRequestNotificationsForWindows(

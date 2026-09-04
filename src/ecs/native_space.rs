@@ -11,7 +11,7 @@ use bevy::ecs::system::{Commands, Local, Query, Res, SystemParam};
 use bevy::time::Time;
 use tracing::{Level, debug, error, instrument, warn};
 
-use crate::commands::{Command, MoveFocus};
+use crate::commands::{Action, MoveFocus};
 use crate::config::Config;
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
@@ -86,8 +86,8 @@ pub(crate) fn handle_focus_window_commands(
     mut commands: Commands,
 ) {
     for window_id in messages.read().filter_map(|event| match event {
-        Event::Command {
-            command: Command::FocusWindow { window_id },
+        Event::ActionRequested {
+            action: Action::FocusWindow { window_id },
         } => Some(*window_id),
         _ => None,
     }) {
@@ -113,34 +113,36 @@ pub(crate) fn handle_native_space_commands(
     window_manager: Res<WindowManager>,
     mut transactions: bevy::ecs::system::ResMut<NativeSpaceTransactions>,
 ) {
-    for command in messages.read().filter_map(|event| match event {
-        Event::Command { command } => Some(command),
+    for action in messages.read().filter_map(|event| match event {
+        Event::ActionRequested { action } => Some(action),
         _ => None,
     }) {
-        let Command::MoveWindowToSpace {
+        let Action::MoveWindowToSpace {
             window_id,
             space_id,
             move_focus,
-        } = command
+        } = action
         else {
-            let intent = match command {
-                Command::FocusSpace { space_id } => Some(NativeSpaceIntent::Focus {
+            let intent = match action {
+                Action::FocusSpace { space_id } => Some(NativeSpaceIntent::Focus {
                     space_id: *space_id,
                     animate: config.space_switch_animation(),
                 }),
-                Command::CreateSpace { display_id } => Some(NativeSpaceIntent::Create {
+                Action::CreateSpace { display_id } => Some(NativeSpaceIntent::Create {
                     display_id: *display_id,
                 }),
-                Command::DeleteSpace { space_id } => Some(NativeSpaceIntent::Delete {
+                Action::DeleteSpace { space_id } => Some(NativeSpaceIntent::Delete {
                     space_id: *space_id,
                 }),
                 _ => None,
             };
             if let Some(intent) = intent {
-                if !config.space_control_enabled() {
-                    warn!(?command, "Space control is disabled");
-                } else if let Err(error) = window_manager.perform_native_space_intent(&intent) {
-                    warn!(?command, %error, "Space capability unavailable");
+                if config.space_control_enabled() {
+                    if let Err(error) = window_manager.perform_native_space_intent(&intent) {
+                        warn!(?action, %error, "Space capability unavailable");
+                    }
+                } else {
+                    warn!(?action, "Space control is disabled");
                 }
             }
             continue;
@@ -231,11 +233,13 @@ pub(crate) fn reconcile_native_space_transactions(
                     animate: config.space_switch_animation(),
                 };
                 match window_manager.perform_native_space_intent(&intent) {
-                    Ok(()) => new_follows.push(PendingFollow {
-                        window_id,
-                        target_space_id: pending.target_space_id,
-                        submitted: Instant::now(),
-                    }),
+                    Ok(()) => {
+                        new_follows.push(PendingFollow {
+                            window_id,
+                            target_space_id: pending.target_space_id,
+                            submitted: Instant::now(),
+                        });
+                    }
                     Err(error) => warn!(
                         window_id,
                         space_id = pending.target_space_id,

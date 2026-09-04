@@ -1,8 +1,8 @@
 use accessibility_sys::{
-    AXUIElementCreateApplication, AXUIElementRef, AXValueCreate, AXValueGetValue,
-    kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute,
-    kAXStandardWindowSubrole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize,
-    kAXWindowRole,
+    AXUIElementCreateApplication, AXUIElementIsAttributeSettable, AXUIElementRef, AXValueCreate,
+    AXValueGetValue, kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction,
+    kAXSizeAttribute, kAXStandardWindowSubrole, kAXUnknownSubrole, kAXValueTypeCGPoint,
+    kAXValueTypeCGSize, kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -180,6 +180,7 @@ pub trait WindowApi: Send + Sync {
     /// Reads the native fullscreen attribute without collapsing an AX failure
     /// into `false`.
     fn try_is_full_screen(&self) -> Result<bool>;
+    fn is_resizable(&self) -> Result<bool>;
     fn is_full_screen(&self) -> bool;
     /// Requests a new origin and returns the frame read back from AX.
     fn reposition(&mut self, origin: Origin) -> Result<IRect>;
@@ -692,6 +693,20 @@ impl WindowApi for WindowOS {
 
     fn try_is_full_screen(&self) -> Result<bool> {
         self.ax_element.full_screen()
+    }
+
+    fn is_resizable(&self) -> Result<bool> {
+        let mut settable = 0;
+        let attribute = CFString::from_static_str(kAXSizeAttribute);
+        unsafe {
+            AXUIElementIsAttributeSettable(
+                self.ax_element.as_ptr(),
+                CFRetained::as_ptr(&attribute).as_ptr().cast(),
+                &raw mut settable,
+            )
+        }
+        .to_result(function_name!())?;
+        Ok(settable != 0)
     }
 
     #[instrument(level = Level::TRACE)]

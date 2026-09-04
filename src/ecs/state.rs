@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +28,27 @@ pub const STATE_FILE_NAME: &str = "state.json";
 const LEGACY_STATE_VERSION: u32 = 2;
 const SUPPORTED_STATE_VERSION: u32 = 3;
 const LEGACY_BACKUP_FILE_NAME: &str = "state.v2.backup.json";
+
+#[derive(Clone, Debug, Resource)]
+pub struct StateFilePath(PathBuf);
+
+impl StateFilePath {
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl From<PathBuf> for StateFilePath {
+    fn from(path: PathBuf) -> Self {
+        Self(path)
+    }
+}
+
+impl Default for StateFilePath {
+    fn default() -> Self {
+        Self(SpoolState::default_state_file_path())
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StateMigrationReport {
@@ -183,18 +204,34 @@ impl SavedWindow {
         windows: &Windows,
         apps: &Query<&Application>,
     ) -> Option<Self> {
-        let (window, _, app_entity) = windows.get_parent(entity)?;
+        let (window, _, app_entity) = windows.get_parent_any(entity)?;
         let app = apps.get(app_entity).ok()?;
+        let (title, identifier, role, subrole) = if windows.is_available(entity) {
+            (
+                window.title().unwrap_or_default(),
+                window.identifier().unwrap_or_default(),
+                window.role().unwrap_or_default(),
+                window.subrole().unwrap_or_default(),
+            )
+        } else {
+            // These are fallback matching hints, not canonical identity. Do
+            // not synchronously query a suspended AX element while saving.
+            Default::default()
+        };
 
         Some(Self {
             window_id: window.id(),
-            pid: window.pid().ok()?,
+            // Persistence serializes the canonical ECS layout, including a
+            // window whose AX element is temporarily unavailable on another
+            // Space. The owning Application remains the authoritative,
+            // locally cached source for process identity in that state.
+            pid: app.pid(),
             psn: app.psn(),
             bundle_id: app.bundle_id().unwrap_or_default().clone(),
-            title: window.title().unwrap_or_default(),
-            identifier: window.identifier().unwrap_or_default(),
-            role: window.role().unwrap_or_default(),
-            subrole: window.subrole().unwrap_or_default(),
+            title,
+            identifier,
+            role,
+            subrole,
         })
     }
 
@@ -356,6 +393,87 @@ impl SpoolState {
         Ok(())
     }
 
+    fn persistence_rejection_reason(&self) -> Option<&'static str> {
+        if self.displays.is_empty() {
+            return Some("no display projection");
+        }
+        if self.spaces.is_empty() {
+            return Some("no Native Space projection");
+        }
+
+        let Some(active_display_id) = self.active_display_id else {
+            return Some("no active display projection");
+        };
+        let active_displays = self
+            .displays
+            .iter()
+            .filter(|display| display.active)
+            .collect::<Vec<_>>();
+        if active_displays.len() != 1 || active_displays[0].display_id != active_display_id {
+            return Some("active display projection is inconsistent");
+        }
+
+        let mut spaces_by_display = HashMap::<CGDirectDisplayID, HashSet<WorkspaceId>>::new();
+        for display in &self.displays {
+            if spaces_by_display.contains_key(&display.display_id) {
+                return Some("duplicate display projection");
+            }
+            let space_ids = display.space_ids.iter().copied().collect::<HashSet<_>>();
+            if space_ids.is_empty() {
+                return Some("display has no Native Space projection");
+            }
+            if space_ids.len() != display.space_ids.len() {
+                return Some("display has duplicate Native Space projections");
+            }
+            spaces_by_display.insert(display.display_id, space_ids);
+        }
+
+        let mut projected_spaces = HashSet::new();
+        let mut active_spaces = Vec::new();
+        for space in &self.spaces {
+            if !projected_spaces.insert(space.space_id) {
+                return Some("duplicate Native Space projection");
+            }
+            let Some(display_id) = space.display_id else {
+                return Some("orphaned Native Space projection");
+            };
+            let Some(display_spaces) = spaces_by_display.get(&display_id) else {
+                return Some("Native Space references an absent display");
+            };
+            if !display_spaces.contains(&space.space_id) {
+                return Some("display and Native Space projections disagree");
+            }
+            if space.active {
+                active_spaces.push((space.space_id, display_id));
+            }
+        }
+
+        if spaces_by_display
+            .values()
+            .flatten()
+            .any(|space_id| !projected_spaces.contains(space_id))
+        {
+            return Some("display references an absent Native Space");
+        }
+        if active_spaces.len() != 1 || active_spaces[0].1 != active_display_id {
+            return Some("active Native Space projection is inconsistent");
+        }
+
+        None
+    }
+
+    fn into_trustworthy_restore_state(self, path: &Path) -> Option<Self> {
+        if let Some(reason) = self.persistence_rejection_reason() {
+            warn!(
+                %reason,
+                path = %path.display(),
+                "Ignoring incomplete persisted display/Space topology"
+            );
+            return None;
+        }
+        Some(self)
+    }
+
     pub fn load_from_file(path: &Path) -> Option<Self> {
         let data = fs::read_to_string(path).ok()?;
         let version = serde_json::from_str::<serde_json::Value>(&data)
@@ -363,7 +481,9 @@ impl SpoolState {
             .get("version")?
             .as_u64()?;
         match u32::try_from(version).ok()? {
-            SUPPORTED_STATE_VERSION => serde_json::from_str(&data).ok(),
+            SUPPORTED_STATE_VERSION => serde_json::from_str::<Self>(&data)
+                .ok()?
+                .into_trustworthy_restore_state(path),
             LEGACY_STATE_VERSION => {
                 let backup = path.with_file_name(LEGACY_BACKUP_FILE_NAME);
                 if !backup.exists()
@@ -378,7 +498,7 @@ impl SpoolState {
                     backup = %backup.display(),
                     "loaded v2 state using safe Space fold"
                 );
-                Some(state)
+                state.into_trustworthy_restore_state(path)
             }
             _ => None,
         }
@@ -436,6 +556,19 @@ impl SpoolState {
             applied: apply,
         })
     }
+}
+
+fn save_trustworthy_state(state: &SpoolState, path: &Path) -> Result<bool, std::io::Error> {
+    if let Some(reason) = state.persistence_rejection_reason() {
+        warn!(
+            %reason,
+            path = %path.display(),
+            "Skipping state save while display/Space topology is incomplete"
+        );
+        return Ok(false);
+    }
+    state.save_to_file(path)?;
+    Ok(true)
 }
 
 fn migrate_v2_state(legacy: LegacySpoolStateV2) -> SpoolState {
@@ -511,18 +644,17 @@ struct SavedSpaceBuilder {
 /// The world access [`QueryState::extract`] needs, bundled so callers (the
 /// socket query handler, the embedded Lua runtime) take one parameter instead
 /// of six.
+type QueryWorkspaceProjection = (
+    &'static ChildOf,
+    &'static LayoutStrip,
+    &'static NativeSpace,
+    Has<ActiveWorkspaceMarker>,
+    Has<VisibleNativeSpaceMarker>,
+);
+
 #[derive(SystemParam)]
 pub struct QueryStateParams<'w, 's> {
-    workspaces: Query<
-        'w,
-        's,
-        (
-            &'static ChildOf,
-            &'static LayoutStrip,
-            Has<ActiveWorkspaceMarker>,
-            Has<VisibleNativeSpaceMarker>,
-        ),
-    >,
+    workspaces: Query<'w, 's, QueryWorkspaceProjection>,
     displays: Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows<'w, 's>,
     apps: Query<'w, 's, &'static Application>,
@@ -559,7 +691,7 @@ impl QueryStateParams<'_, '_> {
 /// windows, this keeps the strip's column structure — needed for `ws:swap`,
 /// `ws:east`, `ws:stack` and friends to know what is beside what.
 impl QueryStateParams<'_, '_> {
-    pub fn extract_window_set(&self) -> crate::errors::Result<WindowSet> {
+    pub fn extract_window_set(&self) -> WindowSet {
         use spool_shared_types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
 
         let focused_entity = self.windows.focused().map(|(_, entity)| entity);
@@ -567,17 +699,19 @@ impl QueryStateParams<'_, '_> {
         let active_workspace_id = self
             .workspaces
             .iter()
-            .find_map(|(_, strip, active, _)| active.then_some(strip.id()));
+            .find_map(|(_, strip, _, active, _)| active.then_some(strip.id()));
 
         // Group the workspace strips by the display entity that owns them, so
         // each display can be built with its own workspaces in one pass.
         let mut strips_by_display: HashMap<Entity, Vec<WorkspaceSet>> = HashMap::new();
-        for (child, strip, active_workspace, visible_space) in self.workspaces {
+        for (child, strip, native, active_workspace, visible_space) in self.workspaces {
             // Only ask for floating windows on a workspace that's actually
             // showing, since this read goes out to the window server.
             let floating_entities =
                 if active_workspace || visible_space && active_workspace_id != Some(strip.id()) {
-                    self.window_manager.windows_in_workspace(strip.id())?
+                    self.window_manager
+                        .windows_in_workspace(strip.id())
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
@@ -638,7 +772,7 @@ impl QueryStateParams<'_, '_> {
                 .or_default()
                 .push(WorkspaceSet {
                     space_id: strip.id(),
-                    ordinal: 0,
+                    ordinal: native.ordinal,
                     active: active_workspace,
                     columns: std::sync::Arc::new(columns),
                     floating: std::sync::Arc::new(floating),
@@ -669,7 +803,7 @@ impl QueryStateParams<'_, '_> {
         let focused = focused_entity
             .and_then(|entity| self.windows.get(entity))
             .map(|window| window.id());
-        Ok(WindowSet::new(displays, focused))
+        WindowSet::new(displays, focused)
     }
 
     /// One window, as a script sees it. `None` for an entity that is no longer
@@ -722,12 +856,7 @@ fn column_kind(column: &Column) -> spool_shared_types::windowset::ColumnKind {
 
 pub trait QueryState: std::marker::Sized {
     fn extract(
-        workspaces: &Query<(
-            &ChildOf,
-            &LayoutStrip,
-            Has<ActiveWorkspaceMarker>,
-            Has<VisibleNativeSpaceMarker>,
-        )>,
+        workspaces: &Query<QueryWorkspaceProjection>,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
         windows: &Windows,
         apps: &Query<&Application>,
@@ -743,12 +872,7 @@ pub trait QueryState: std::marker::Sized {
 impl QueryState for SpoolQueryState {
     #[allow(clippy::too_many_lines)]
     fn extract(
-        workspaces: &Query<(
-            &ChildOf,
-            &LayoutStrip,
-            Has<ActiveWorkspaceMarker>,
-            Has<VisibleNativeSpaceMarker>,
-        )>,
+        workspaces: &Query<QueryWorkspaceProjection>,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
         windows: &Windows,
         apps: &Query<&Application>,
@@ -763,7 +887,7 @@ impl QueryState for SpoolQueryState {
             .find_map(|(display, entity, active)| active.then_some((display.id(), entity)));
         let active_workspace_id = workspaces
             .iter()
-            .find_map(|(_, strip, active, _)| active.then_some(strip.id()));
+            .find_map(|(_, strip, _, active, _)| active.then_some(strip.id()));
 
         let mut windows_by_space: HashMap<WorkspaceId, Vec<SpoolWindowState>> = HashMap::new();
         let mut active = SpoolActiveState {
@@ -771,10 +895,12 @@ impl QueryState for SpoolQueryState {
             ..SpoolActiveState::default()
         };
 
-        for (child, strip, active_workspace, visible_space) in workspaces {
+        for (child, strip, _, active_workspace, visible_space) in workspaces {
             let floating =
                 if active_workspace || visible_space && active_workspace_id != Some(strip.id()) {
-                    window_manager.windows_in_workspace(strip.id())?
+                    window_manager
+                        .windows_in_workspace(strip.id())
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -848,37 +974,46 @@ impl QueryState for SpoolQueryState {
             }
         }
 
+        let display_ids = displays
+            .iter()
+            .map(|(display, entity, _)| (entity, display.id()))
+            .collect::<HashMap<_, _>>();
+        let visible_spaces = workspaces
+            .iter()
+            .filter_map(|(child, strip, _, _, visible)| {
+                visible.then_some((child.parent(), strip.id()))
+            })
+            .collect::<HashMap<_, _>>();
         let mut display_states = displays
             .iter()
-            .map(|(display, _, display_active)| SpoolDisplayState {
+            .map(|(display, entity, display_active)| SpoolDisplayState {
                 display_id: display.id(),
                 active: display_active,
-                visible_space_id: window_manager.active_display_space(display.id()).ok(),
+                visible_space_id: visible_spaces.get(&entity).copied(),
             })
             .collect::<Vec<_>>();
         display_states.sort_by_key(|display| display.display_id);
 
         let mut spaces = Vec::new();
-        for (display, space_ids) in window_manager.present_displays() {
-            let visible_id = window_manager.active_display_space(display.id()).ok();
-            for (ordinal, space_id) in space_ids.into_iter().enumerate() {
-                let mut space_windows = windows_by_space.remove(&space_id).unwrap_or_default();
-                space_windows.sort_by_key(|window| window.window_id);
-                space_windows.dedup_by_key(|window| window.window_id);
-                spaces.push(SpoolSpaceState {
-                    space_id,
-                    display_id: display.id(),
-                    ordinal: ordinal.try_into().unwrap_or(u32::MAX),
-                    kind: if window_manager.workspace_is_fullscreen(space_id) {
-                        SpaceKind::Fullscreen
-                    } else {
-                        SpaceKind::User
-                    },
-                    visible: visible_id == Some(space_id),
-                    focused: active.space_id == Some(space_id),
-                    windows: space_windows,
-                });
-            }
+        for (child, strip, native, _, visible) in workspaces {
+            let Some(display_id) = display_ids.get(&child.parent()).copied() else {
+                continue;
+            };
+            let mut space_windows = windows_by_space.remove(&strip.id()).unwrap_or_default();
+            // The vector was built by traversing LayoutStrip columns, so its
+            // order is semantic. Deduplicate stably in case transient duplicate
+            // strips project the same entity; sorting by ID would falsify it.
+            let mut seen = HashSet::new();
+            space_windows.retain(|window| seen.insert(window.window_id));
+            spaces.push(SpoolSpaceState {
+                space_id: strip.id(),
+                display_id,
+                ordinal: native.ordinal,
+                kind: native.kind,
+                visible,
+                focused: active.space_id == Some(strip.id()),
+                windows: space_windows,
+            });
         }
         spaces.sort_by_key(|space| (space.display_id, space.ordinal));
 
@@ -919,13 +1054,13 @@ pub fn periodic_state_save(
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
+    path: Res<StateFilePath>,
 ) {
     let state = SpoolState::extract(&workspaces, &displays, &windows, &apps);
-    let path = SpoolState::default_state_file_path();
-    if let Err(e) = state.save_to_file(&path) {
-        warn!("Failed to save state: {e}");
-    } else {
-        debug!("State saved to {}", path.display());
+    match save_trustworthy_state(&state, path.as_path()) {
+        Ok(true) => debug!("State saved to {}", path.as_path().display()),
+        Ok(false) => {}
+        Err(error) => warn!("Failed to save state: {error}"),
     }
 }
 
@@ -940,13 +1075,13 @@ pub fn cleanup_on_exit(
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
+    path: Res<StateFilePath>,
 ) {
     if exit_events.read().next().is_some() {
         info!("Exiting, saving state...");
         let state = SpoolState::extract(&workspaces, &displays, &windows, &apps);
-        let path = SpoolState::default_state_file_path();
-        if let Err(e) = state.save_to_file(&path) {
-            error!("Failed to save state on exit: {e}");
+        if let Err(error) = save_trustworthy_state(&state, path.as_path()) {
+            error!("Failed to save state on exit: {error}");
         }
     }
 }

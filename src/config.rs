@@ -20,9 +20,9 @@ use tracing::{error, info, warn};
 use self::decorations::BorderRadiusOption;
 use self::swipe::SwipeGestureDirection;
 #[cfg(test)]
-use crate::commands::{Operation, ResizeDirection};
+use crate::commands::{FocusStep, Operation, ResizeAxis, ResizeDirection};
 use crate::{
-    commands::Command,
+    commands::Action,
     manager::ProcessApi,
     platform::{Modifiers, OSStatus, macos_major_version},
 };
@@ -148,13 +148,13 @@ const DEFAULT_LUA_SCRIPT: &str = "\
 -- Hook into window-manager events:
 --   spool.on(\"window_focused\", function(e) spool.log(\"focused \" .. e.window_id) end)
 --
--- Bind keys to commands (chord syntax matches [bindings]):
---   spool.bind(\"alt - b\", \"window balance\")
+-- Bind keys to actions (chord syntax matches [bindings]):
+--   spool.bind(\"alt+b\", spool.action.window.balance)
 --
 -- ...or to a function. Handlers are given the whole layout as a value they can
 -- transform; nothing moves until you return one, so computing a layout and
 -- discarding it costs nothing. See CONFIGURATION.md.
---   spool.bind(\"alt - j\", function(ws)
+--   spool.bind(\"alt+j\", function(ws)
 --     return ws:focus(ws:east(ws:focused()))
 --   end)
 ";
@@ -287,11 +287,11 @@ pub fn deprecated_options_in_file(path: &Path) -> Result<Vec<String>> {
     deprecated_options_in_input(&input)
 }
 
-/// Parses a command argument vector into a [`Command`] (e.g. `["window",
+/// Parses a command argument vector into a [`Action`] (e.g. `["window",
 /// "focus", "east"]`), mapping the shared vocabulary crate's parse error into
 /// this crate's configuration error.
-pub fn parse_command(argv: &[&str]) -> Result<Command> {
-    spool_shared_types::commands::parse_command(argv)
+pub fn parse_action(argv: &[&str]) -> Result<Action> {
+    spool_shared_types::commands::parse_action(argv)
         .map_err(|err| Error::InvalidConfig(format!("{}: {err}", function_name!())))
 }
 
@@ -402,8 +402,8 @@ impl Config {
     ///
     /// # Returns
     ///
-    /// `Some(Command)` if a matching keybinding is found, otherwise `None`.
-    pub fn find_keybind(&self, keycode: u8, mask: Modifiers) -> Option<Command> {
+    /// `Some(Action)` if a matching keybinding is found, otherwise `None`.
+    pub fn find_keybind(&self, keycode: u8, mask: Modifiers) -> Option<Action> {
         let config = self.inner();
         config
             .bindings
@@ -411,7 +411,7 @@ impl Config {
             .flat_map(|binds| binds.all())
             .find_map(|bind| {
                 (bind.code == keycode && bind.modifiers.matches(mask))
-                    .then_some(bind.command.clone())
+                    .then_some(bind.action.clone())
             })
     }
 
@@ -748,6 +748,20 @@ impl Config {
         self.options().window_resize_cycle.unwrap_or(true)
     }
 
+    pub fn floating_window_move_step(&self) -> i32 {
+        self.options()
+            .floating_window_move_step
+            .unwrap_or(20)
+            .max(1)
+    }
+
+    pub fn floating_window_resize_step(&self) -> i32 {
+        self.options()
+            .floating_window_resize_step
+            .unwrap_or(40)
+            .max(1)
+    }
+
     pub fn auto_center(&self) -> bool {
         self.options().auto_center.is_some_and(|center| center)
     }
@@ -931,7 +945,7 @@ impl InnerConfig {
         for (command, bindings) in &mut config.bindings {
             let argv = command.split('_').collect::<Vec<_>>();
             for binding in bindings.all_mut() {
-                binding.command = parse_command(&argv)?;
+                binding.action = parse_action(&argv)?;
 
                 if let Some(code) = keycode_for_key_name(&binding.key, virtual_keys) {
                     binding.code = code;
@@ -1051,6 +1065,12 @@ pub struct MainOptions {
     /// Default: true (cycles). Set to false to stop at the limits.
     pub window_resize_cycle: Option<bool>,
 
+    /// Pixel distance used by `window move <direction>` for floating windows.
+    pub floating_window_move_step: Option<i32>,
+
+    /// Pixel distance used by grow/shrink actions for floating windows.
+    pub floating_window_resize_step: Option<i32>,
+
     /// Disable detection of native macOS tabs. When set, newly-spawned windows are
     /// never auto-merged into a tab group with an existing same-app sibling.
     /// Default: false.
@@ -1077,12 +1097,12 @@ pub struct Keybinding {
     pub key: String,
     pub code: u8,
     pub modifiers: Modifiers,
-    pub command: Command,
+    pub action: Action,
 }
 
 impl<'de> Deserialize<'de> for Keybinding {
-    /// Deserializes a `Keybinding` from a string input. The input string is expected to be in a format like "`modifier+modifier-key`" or "`key`".
-    /// Examples: "`ctrl+alt-q`", "`shift-tab`", "`h`".
+    /// Deserializes a `Keybinding` from a plus-separated chord.
+    /// Examples: "`ctrl+alt+q`", "`shift+tab`", "`h`".
     ///
     /// # Arguments
     ///
@@ -1096,23 +1116,13 @@ impl<'de> Deserialize<'de> for Keybinding {
         D: Deserializer<'de>,
     {
         let input = String::deserialize(deserializer)?;
-        let mut parts = input.split('-').map(str::trim).collect::<Vec<_>>();
-        let key = parts.pop();
-
-        if parts.len() > 1 || key.is_none() {
-            return Err(de::Error::custom(format!("Too many dashes: {input:?}")));
-        }
-
-        let modifiers = match parts.pop() {
-            Some(modifiers) => parse_modifiers(modifiers).map_err(de::Error::custom)?,
-            None => Modifiers::empty(),
-        };
+        let (key, modifiers) = parse_chord_parts(&input).map_err(de::Error::custom)?;
 
         Ok(Keybinding {
-            key: key.unwrap().to_string(),
+            key: key.to_string(),
             code: 0,
             modifiers,
-            command: Command::Quit,
+            action: Action::Quit,
         })
     }
 }
@@ -1146,8 +1156,8 @@ pub struct WindowParams {
     /// Per-window override for the active window border corner radius.
     pub border_radius: Option<f64>,
     /// Keyboard shortcuts that should be passed through to this app instead of
-    /// being intercepted by spool. Uses the same `"modifier+modifier-key"`
-    /// format as `[bindings]` (e.g. `"ctrl+alt-h"`).
+    /// being intercepted by spool. Uses the same plus-separated format as
+    /// `[bindings]` (e.g. `"ctrl+alt+h"`).
     #[serde(default)]
     bindings_passthrough: Vec<String>,
     /// Resolved `(keycode, modifiers)` pairs from `bindings_passthrough`.
@@ -1270,7 +1280,7 @@ pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Resu
     })
 }
 
-/// Resolves a keybinding chord string like `"ctrl+alt-h"` into a `(keycode, Modifiers)`
+/// Resolves a keybinding chord string like `"ctrl+alt+h"` into a `(keycode, Modifiers)`
 /// pair, generating the layout-aware virtual keymap on demand.
 ///
 /// This is the entry point used by the Lua runtime's `spool.bind`, so scripted
@@ -1308,29 +1318,43 @@ fn virtual_keymap() -> &'static [(String, u8)] {
     VIRTUAL_KEYMAP.get_or_init(generate_virtual_keymap)
 }
 
-/// Resolves a keybinding string like `"ctrl+alt-h"` into a `(keycode, Modifiers)` pair.
+/// Resolves a keybinding string like `"ctrl+alt+h"` into a `(keycode, Modifiers)` pair.
 fn resolve_keybinding_str(input: &str, virtual_keys: &[(String, u8)]) -> Result<(u8, Modifiers)> {
-    let mut parts: Vec<&str> = input.split('-').map(str::trim).collect();
-    let key = parts
-        .pop()
-        .ok_or_else(|| Error::InvalidConfig("Empty keybinding string".to_string()))?;
-
-    let modifiers = match parts.pop() {
-        Some(mods) => parse_modifiers(mods)?,
-        None => Modifiers::empty(),
-    };
-
-    if !parts.is_empty() {
-        return Err(Error::InvalidConfig(format!(
-            "Too many dashes in keybinding: {input:?}"
-        )));
-    }
+    let (key, modifiers) = parse_chord_parts(input)?;
 
     let code = keycode_for_key_name(key, virtual_keys).ok_or_else(|| {
         Error::InvalidConfig(format!("Unknown key '{key}' in keybinding: {input:?}"))
     })?;
 
     Ok((code, modifiers))
+}
+
+/// Splits a chord whose last token is the physical key and whose preceding
+/// tokens are modifiers. The single `+` separator keeps Lua and TOML spelling
+/// identical: `alt+shift+minus`.
+fn parse_chord_parts(input: &str) -> Result<(&str, Modifiers)> {
+    if input.contains('-') {
+        return Err(Error::InvalidConfig(format!(
+            "Invalid keybinding {input:?}: use '+' between modifiers and the key"
+        )));
+    }
+
+    let mut parts = input.split('+').map(str::trim).collect::<Vec<_>>();
+    if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
+        return Err(Error::InvalidConfig(format!(
+            "Invalid keybinding: {input:?}"
+        )));
+    }
+
+    let key = parts
+        .pop()
+        .ok_or_else(|| Error::InvalidConfig("Empty keybinding string".to_string()))?;
+    let modifiers = if parts.is_empty() {
+        Modifiers::empty()
+    } else {
+        parse_modifiers(&parts.join("+"))?
+    };
+    Ok((key, modifiers))
 }
 
 fn keycode_for_key_name(key: &str, virtual_keys: &[(String, u8)]) -> Option<u8> {
@@ -1691,11 +1715,14 @@ fn test_config_parsing() {
 focus_follows_mouse = true
 
 [bindings]
-quit = "ctrl+alt-q"
-window_togglefloating = "ctrl+alt-t"
-window_stack = ["ctrl-s", "alt-s"]
-window_shrink = "alt-d"
-window_snap = "fn-x"
+quit = "ctrl+alt+q"
+window_toggle_floating = "ctrl+alt+t"
+window_focus_next = "alt+n"
+window_focus_previous = "alt+p"
+window_focus_other_layer = "alt+semicolon"
+window_toggle_stack = ["ctrl+s", "alt+s"]
+window_shrink_width = "alt+d"
+window_snap = "fn+x"
 
 [windows]
 
@@ -1724,80 +1751,106 @@ index = 1
     let keycode = find_key('q');
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::ALT | Modifiers::CTRL),
-        Some(Command::Quit)
+        Some(Action::Quit)
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::LALT | Modifiers::LCTRL),
-        Some(Command::Quit)
+        Some(Action::Quit)
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::RALT | Modifiers::RCTRL),
-        Some(Command::Quit)
+        Some(Action::Quit)
     ));
 
     let keycode = find_key('t');
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::ALT | Modifiers::CTRL),
-        Some(Command::Window(Operation::ToggleFloating))
+        Some(Action::Window(Operation::ToggleFloating))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::LALT | Modifiers::LCTRL),
-        Some(Command::Window(Operation::ToggleFloating))
+        Some(Action::Window(Operation::ToggleFloating))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::RALT | Modifiers::RCTRL),
-        Some(Command::Window(Operation::ToggleFloating))
+        Some(Action::Window(Operation::ToggleFloating))
+    ));
+
+    let keycode = find_key('n');
+    assert!(matches!(
+        config.find_keybind(keycode, Modifiers::ALT),
+        Some(Action::Window(Operation::FocusStep(FocusStep::Next)))
+    ));
+
+    let keycode = find_key('p');
+    assert!(matches!(
+        config.find_keybind(keycode, Modifiers::ALT),
+        Some(Action::Window(Operation::FocusStep(FocusStep::Previous)))
+    ));
+
+    assert!(matches!(
+        config.find_keybind(0x29, Modifiers::ALT),
+        Some(Action::Window(Operation::FocusOtherLayer))
     ));
 
     let keycode = find_key('s');
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::CTRL),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Action::Window(Operation::ToggleStack))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::LCTRL),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Action::Window(Operation::ToggleStack))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::RCTRL),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Action::Window(Operation::ToggleStack))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::ALT),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Action::Window(Operation::ToggleStack))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::LALT),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Action::Window(Operation::ToggleStack))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::RALT),
-        Some(Command::Window(Operation::Stack(true)))
+        Some(Action::Window(Operation::ToggleStack))
     ));
 
     let keycode = find_key('d');
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::ALT),
-        Some(Command::Window(Operation::Resize(ResizeDirection::Shrink)))
+        Some(Action::Window(Operation::Resize {
+            axis: ResizeAxis::Width,
+            direction: ResizeDirection::Shrink
+        }))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::LALT),
-        Some(Command::Window(Operation::Resize(ResizeDirection::Shrink)))
+        Some(Action::Window(Operation::Resize {
+            axis: ResizeAxis::Width,
+            direction: ResizeDirection::Shrink
+        }))
     ));
 
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::RALT),
-        Some(Command::Window(Operation::Resize(ResizeDirection::Shrink)))
+        Some(Action::Window(Operation::Resize {
+            axis: ResizeAxis::Width,
+            direction: ResizeDirection::Shrink
+        }))
     ));
 
     let props = config.find_window_properties("picture in picture", "com.something.apple");
@@ -1807,7 +1860,7 @@ index = 1
     let keycode = find_key('x');
     assert!(matches!(
         config.find_keybind(keycode, Modifiers::FN),
-        Some(Command::Window(Operation::Snap))
+        Some(Action::Window(Operation::Snap))
     ));
 
     let defaults = Config::default();
@@ -1818,28 +1871,50 @@ index = 1
 #[test]
 fn test_parse_resize_commands() {
     assert!(matches!(
-        parse_command(&["window", "resize"]).unwrap(),
-        Command::Window(Operation::Resize(ResizeDirection::Grow))
+        parse_action(&["window", "grow", "width"]).unwrap(),
+        Action::Window(Operation::Resize {
+            axis: ResizeAxis::Width,
+            direction: ResizeDirection::Grow
+        })
     ));
     assert!(matches!(
-        parse_command(&["window", "grow"]).unwrap(),
-        Command::Window(Operation::Resize(ResizeDirection::Grow))
+        parse_action(&["window", "shrink", "width"]).unwrap(),
+        Action::Window(Operation::Resize {
+            axis: ResizeAxis::Width,
+            direction: ResizeDirection::Shrink
+        })
     ));
     assert!(matches!(
-        parse_command(&["window", "resize", "shrink"]).unwrap(),
-        Command::Window(Operation::Resize(ResizeDirection::Shrink))
+        parse_action(&["window", "grow", "height"]).unwrap(),
+        Action::Window(Operation::Resize {
+            axis: ResizeAxis::Height,
+            direction: ResizeDirection::Grow
+        })
     ));
     assert!(matches!(
-        parse_command(&["window", "shrink"]).unwrap(),
-        Command::Window(Operation::Resize(ResizeDirection::Shrink))
+        parse_action(&["window", "shrink", "height"]).unwrap(),
+        Action::Window(Operation::Resize {
+            axis: ResizeAxis::Height,
+            direction: ResizeDirection::Shrink
+        })
+    ));
+    assert!(parse_action(&["window", "resize"]).is_err());
+    assert!(parse_action(&["window", "grow"]).is_err());
+    assert!(parse_action(&["window", "shrink"]).is_err());
+    assert!(matches!(
+        parse_action(&["window", "shrink", "width"]).unwrap(),
+        Action::Window(Operation::Resize {
+            axis: ResizeAxis::Width,
+            direction: ResizeDirection::Shrink
+        })
     ));
 }
 
 #[test]
 fn test_parse_restart_command() {
     assert!(matches!(
-        parse_command(&["restart"]).unwrap(),
-        Command::Restart
+        parse_action(&["restart"]).unwrap(),
+        Action::Restart
     ));
 }
 
@@ -2074,7 +2149,7 @@ fn test_static_virtual_key_names_can_be_bound() {
 [options]
 
 [bindings]
-window_grow = "alt - minus"
+window_grow_width = "alt+minus"
 "#,
     )
     .unwrap();
@@ -2084,8 +2159,26 @@ window_grow = "alt - minus"
 
     assert!(matches!(
         config.find_keybind(minus_keycode, Modifiers::ALT),
-        Some(Command::Window(Operation::Resize(ResizeDirection::Grow)))
+        Some(Action::Window(Operation::Resize {
+            axis: ResizeAxis::Width,
+            direction: ResizeDirection::Grow
+        }))
     ));
+}
+
+#[test]
+fn legacy_dash_chord_syntax_is_rejected() {
+    let err = Config::try_from(
+        r#"
+[options]
+
+[bindings]
+window_grow_width = "alt - equal"
+"#,
+    )
+    .expect_err("legacy dash-separated chords must not parse");
+
+    let _ = err;
 }
 
 #[cfg(all(test, feature = "lua"))]
@@ -2135,7 +2228,7 @@ mod lua_setup_tests {
     fn window_rule_passthrough_is_resolved() {
         let config = config_from_source(
             r#"return {
-                windows = { term = { title = "kitty", bindings_passthrough = { "ctrl+alt-h" } } },
+                windows = { term = { title = "kitty", bindings_passthrough = { "ctrl+alt+h" } } },
             }"#,
         );
         let rules = config.find_window_properties("kitty", "");

@@ -1,10 +1,10 @@
 //! The `spool` Lua API, in both the shapes it is used in.
 //!
-//! [`install`] puts the typed, host-agnostic API onto a table — `spool.run`,
-//! `spool.window.*`, `spool.space.*`, `spool.mouse.*` — built on a
+//! [`install`] puts the typed, host-agnostic interface onto a table —
+//! `spool.run` and `spool.action.*` — built on a
 //! caller-supplied dispatcher. The daemon's embedded runtime (`src/lua`) hands
-//! it one that queues the [`Command`] onto the command bus; [`client`] hands it
-//! one that writes the command to a running daemon's Unix socket, and adds the
+//! it one that queues the [`Action`] onto the action bus; [`client`] hands it
+//! one that dispatches the action to a running daemon's Unix socket, and adds the
 //! client-only `query_*` / `subscribe` helpers on top.
 //!
 //! With the `module` feature the crate additionally builds as a loadable Lua C
@@ -13,12 +13,14 @@
 //! ```lua
 //! local spool = require("spool")
 //!
-//! spool.window.focus({ direction = "east" })   -- directional
-//! spool.window.focus({ number = 3 })           -- by column number
-//! spool.window.balance()
-//! spool.space.focus(12345)
-//! spool.space.move_window({ window_id = 42, space_id = 12345 })
-//! spool.quit()
+//! spool.action.window.focus_east()
+//! spool.action.window.focus_next()
+//! spool.action.window.move_west()
+//! spool.action.window.grow_width()
+//! spool.action.window.toggle_floating()
+//! spool.action.space.focus(12345)
+//! spool.action.space.move_window({ window_id = 42, space_id = 12345 })
+//! spool.action.quit()
 //!
 //! for _, window in ipairs(spool.query_on_screen()) do  -- actually visible
 //!   print(window.app_name, window.title)
@@ -33,9 +35,10 @@
 //!
 //! spool.subscribe(nil, function(evt) ... end)  -- nil event = every event
 //! spool.subscribe({ "window_focused", "window_title_changed" }, function(evt) ... end)
+//! spool.subscribe("raw_event", function(evt) print(evt.name, evt.details) end, { raw = true })
 //! ```
 //!
-//! Every verb builds a real [`Command`]: option tables are deserialized into
+//! Every verb builds a real [`Action`]: option tables are deserialized into
 //! the actual enums with mlua's serde support, so `"east"` becomes
 //! [`Direction::East`] and an unknown value fails at the call site. Only the
 //! host-specific extras differ (`spool.on` / `spool.bind` are embedded-only;
@@ -52,14 +55,15 @@ use std::rc::Rc;
 
 use mlua::{Function, Lua, LuaSerdeExt, Result, Table, Value};
 use regex::Regex;
-use serde::Deserialize;
-
 use spool_shared_types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection, parse_command,
+    Action, Direction, FocusStep, MouseMove, MoveFocus, Operation, ResizeAxis, ResizeDirection,
+    parse_action,
 };
 
-/// Issues a [`Command`]. The only thing the two hosts differ by.
-pub type Dispatch = Rc<dyn Fn(&Lua, Command) -> Result<bool>>;
+/// Dispatches an [`Action`]. The only thing the two hosts differ by.
+pub type Dispatch = Rc<dyn Fn(&Lua, Action) -> Result<bool>>;
+
+const ACTION_FUNCTIONS_REGISTRY: &str = "spool.action.functions";
 
 /// Installs the shared API onto the `spool` table, building every verb on
 /// `dispatch`.
@@ -68,28 +72,29 @@ pub type Dispatch = Rc<dyn Fn(&Lua, Command) -> Result<bool>>;
 ///
 /// Returns an error if any Lua table/function creation or assignment fails.
 pub fn install(lua: &Lua, spool: &Table, dispatch: &Dispatch) -> Result<()> {
-    // spool.run(cmd) / spool.command(cmd) — the escape hatch: a command
-    // string, an argv table, or a structured command table.
+    // spool.run(value) — the escape hatch: an action
+    // string, an argv table, or a structured action table.
     let run = {
         let dispatch = Rc::clone(dispatch);
-        lua.create_function(move |lua, command: Value| dispatch(lua, to_command(lua, &command)?))?
+        lua.create_function(move |lua, action: Value| dispatch(lua, to_action(lua, &action)?))?
     };
     spool.set("run", run.clone())?;
-    spool.set("command", run)?;
 
-    spool.set("window", window_table(lua, dispatch)?)?;
-    spool.set("space", space_table(lua, dispatch)?)?;
+    let action = lua.create_table()?;
+    action.set("window", window_table(lua, dispatch)?)?;
+    action.set("space", space_table(lua, dispatch)?)?;
 
     let mouse = lua.create_table()?;
     mouse.set(
         "next_display",
-        verb(lua, dispatch, Command::Mouse(MouseMove::ToNextDisplay))?,
+        verb(lua, dispatch, Action::Mouse(MouseMove::ToNextDisplay))?,
     )?;
-    spool.set("mouse", mouse)?;
+    action.set("mouse", mouse)?;
 
-    spool.set("quit", verb(lua, dispatch, Command::Quit)?)?;
-    spool.set("restart", verb(lua, dispatch, Command::Restart)?)?;
-    spool.set("print_state", verb(lua, dispatch, Command::PrintState)?)?;
+    action.set("quit", verb(lua, dispatch, Action::Quit)?)?;
+    action.set("restart", verb(lua, dispatch, Action::Restart)?)?;
+    action.set("print_state", verb(lua, dispatch, Action::PrintState)?)?;
+    spool.set("action", action)?;
 
     // spool.match{ app = …, bundle = …, title = …, floating = … }
     // builds a predicate over window records, for `ws:find`/`ws:filter`.
@@ -151,54 +156,83 @@ pub fn matcher(lua: &Lua, spec: Table) -> Result<Function> {
     })
 }
 
-/// Builds the `spool.window` sub-table.
+/// Builds the `spool.action.window` sub-table.
 fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     let window = lua.create_table()?;
 
-    window.set(
-        "focus",
-        directional(lua, dispatch, "window.focus", Operation::Focus)?,
-    )?;
-    window.set(
-        "swap",
-        directional(lua, dispatch, "window.swap", Operation::Swap)?,
-    )?;
-    window.set("resize", resize(lua, dispatch)?)?;
-    window.set(
-        "next_display",
-        follower(lua, dispatch, Operation::ToNextDisplay)?,
-    )?;
-
     for (name, operation) in [
+        ("focus_west", Operation::Focus(Direction::West)),
+        ("focus_east", Operation::Focus(Direction::East)),
+        ("focus_north", Operation::Focus(Direction::North)),
+        ("focus_south", Operation::Focus(Direction::South)),
+        ("focus_first", Operation::Focus(Direction::First)),
+        ("focus_last", Operation::Focus(Direction::Last)),
+        ("focus_next", Operation::FocusStep(FocusStep::Next)),
+        ("focus_previous", Operation::FocusStep(FocusStep::Previous)),
         ("focus_tiled", Operation::FocusTiled),
         ("focus_floating", Operation::FocusFloating),
+        ("focus_other_layer", Operation::FocusOtherLayer),
+        ("move_west", Operation::Move(Direction::West)),
+        ("move_east", Operation::Move(Direction::East)),
+        ("move_north", Operation::Move(Direction::North)),
+        ("move_south", Operation::Move(Direction::South)),
+        ("move_first", Operation::Move(Direction::First)),
+        ("move_last", Operation::Move(Direction::Last)),
+        (
+            "shrink_width",
+            Operation::Resize {
+                axis: ResizeAxis::Width,
+                direction: ResizeDirection::Shrink,
+            },
+        ),
+        (
+            "grow_width",
+            Operation::Resize {
+                axis: ResizeAxis::Width,
+                direction: ResizeDirection::Grow,
+            },
+        ),
+        (
+            "shrink_height",
+            Operation::Resize {
+                axis: ResizeAxis::Height,
+                direction: ResizeDirection::Shrink,
+            },
+        ),
+        (
+            "grow_height",
+            Operation::Resize {
+                axis: ResizeAxis::Height,
+                direction: ResizeDirection::Grow,
+            },
+        ),
         ("center", Operation::Center),
+        ("maximize", Operation::Maximize),
         ("snap", Operation::Snap),
         ("toggle_floating", Operation::ToggleFloating),
+        ("toggle_stack", Operation::ToggleStack),
         ("equalize", Operation::Equalize),
         ("balance", Operation::Balance),
-        ("stack", Operation::Stack(true)),
-        ("unstack", Operation::Stack(false)),
-        ("full_width", Operation::FullWidth),
-        ("grow", Operation::Resize(ResizeDirection::Grow)),
-        ("shrink", Operation::Resize(ResizeDirection::Shrink)),
-        ("raise_floating", Operation::RaiseFloating),
-        ("toggle_float_layer", Operation::ToggleFloatingLayer),
+        ("next_display", Operation::ToNextDisplay(MoveFocus::Follow)),
+        (
+            "next_display_send",
+            Operation::ToNextDisplay(MoveFocus::Stay),
+        ),
     ] {
-        window.set(name, verb(lua, dispatch, Command::Window(operation))?)?;
+        window.set(name, verb(lua, dispatch, Action::Window(operation))?)?;
     }
 
     Ok(window)
 }
 
-/// Builds the stable-ID `spool.space` sub-table.
+/// Builds the stable-ID `spool.action.space` sub-table.
 fn space_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     let space = lua.create_table()?;
 
     let focus = {
         let dispatch = Rc::clone(dispatch);
         lua.create_function(move |lua, space_id: u64| {
-            dispatch(lua, Command::FocusSpace { space_id })
+            dispatch(lua, Action::FocusSpace { space_id })
         })?
     };
     space.set("focus", focus)?;
@@ -213,7 +247,7 @@ fn space_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
             };
             dispatch(
                 lua,
-                Command::MoveWindowToSpace {
+                Action::MoveWindowToSpace {
                     window_id: opts.get("window_id")?,
                     space_id: opts.get("space_id")?,
                     move_focus,
@@ -226,7 +260,7 @@ fn space_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     let create = {
         let dispatch = Rc::clone(dispatch);
         lua.create_function(move |lua, display_id: u32| {
-            dispatch(lua, Command::CreateSpace { display_id })
+            dispatch(lua, Action::CreateSpace { display_id })
         })?
     };
     space.set("create", create)?;
@@ -234,7 +268,7 @@ fn space_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     let delete = {
         let dispatch = Rc::clone(dispatch);
         lua.create_function(move |lua, space_id: u64| {
-            dispatch(lua, Command::DeleteSpace { space_id })
+            dispatch(lua, Action::DeleteSpace { space_id })
         })?
     };
     space.set("delete", delete)?;
@@ -242,125 +276,61 @@ fn space_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     Ok(space)
 }
 
-/// A zero-argument verb issuing a fixed command.
-fn verb(lua: &Lua, dispatch: &Dispatch, command: Command) -> Result<Function> {
+/// A zero-argument verb dispatching a fixed action.
+fn verb(lua: &Lua, dispatch: &Dispatch, action: Action) -> Result<Function> {
     let dispatch = Rc::clone(dispatch);
-    lua.create_function(move |lua, ()| dispatch(lua, command.clone()))
+    // Embedded keybind handlers receive a WindowSet argument. Fixed action
+    // functions deliberately ignore it, while direct calls simply pass nil.
+    let dispatched = action.clone();
+    let function = lua.create_function(move |lua, _: Value| dispatch(lua, dispatched.clone()))?;
+    let functions = if let Ok(table) = lua.named_registry_value::<Table>(ACTION_FUNCTIONS_REGISTRY)
+    {
+        table
+    } else {
+        let table = lua.create_table()?;
+        lua.set_named_registry_value(ACTION_FUNCTIONS_REGISTRY, table.clone())?;
+        table
+    };
+    functions.set(function.clone(), lua.to_value(&action)?)?;
+    Ok(function)
 }
 
-/// A verb taking `{ direction = "east" }` or `{ number = 3 }` (or the bare
-/// value), e.g. `spool.window.focus{ number = 3 }`.
-fn directional(
-    lua: &Lua,
-    dispatch: &Dispatch,
-    what: &'static str,
-    operation: impl Fn(Direction) -> Operation + 'static,
-) -> Result<Function> {
-    let dispatch = Rc::clone(dispatch);
-    lua.create_function(move |lua, opts: Value| {
-        let direction = Opts::read(lua, &opts)?.target(what)?;
-        dispatch(lua, Command::Window(operation(direction)))
-    })
-}
-
-/// A verb taking `{ follow = false }`, defaulting to following the window.
-fn follower(
-    lua: &Lua,
-    dispatch: &Dispatch,
-    operation: impl Fn(MoveFocus) -> Operation + 'static,
-) -> Result<Function> {
-    let dispatch = Rc::clone(dispatch);
-    lua.create_function(move |lua, opts: Value| {
-        let follow = Opts::read(lua, &opts)?.follow();
-        dispatch(lua, Command::Window(operation(follow)))
-    })
-}
-
-/// `spool.window.resize{ direction = "grow" }`, defaulting to growing.
-fn resize(lua: &Lua, dispatch: &Dispatch) -> Result<Function> {
-    let dispatch = Rc::clone(dispatch);
-    lua.create_function(move |lua, opts: Value| {
-        let direction = ResizeOpts::read(lua, &opts)?;
-        dispatch(lua, Command::Window(Operation::Resize(direction)))
-    })
-}
-
-/// The options every verb accepts: `{ direction = "east" }`, `{ number = 3 }`,
-/// `{ follow = false }`, or the bare `"east"` / `3`.
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct Opts {
-    direction: Option<Direction>,
-    number: Option<Direction>,
-    follow: Option<bool>,
-}
-
-impl Opts {
-    /// Reads the options off a call argument. A bare scalar is the direction.
-    fn read(lua: &Lua, value: &Value) -> Result<Self> {
-        match value {
-            Value::Nil => Ok(Self::default()),
-            Value::Table(_) => lua.from_value(value.clone()),
-            bare => Ok(Self {
-                direction: Some(lua.from_value(bare.clone())?),
-                ..Self::default()
-            }),
-        }
-    }
-
-    /// The target of a directional verb; `what` names it in the error.
-    fn target(self, what: &str) -> Result<Direction> {
-        self.direction.or(self.number).ok_or_else(|| {
-            mlua::Error::RuntimeError(format!(
-                "{what} expects {{ direction = ... }} or {{ number = ... }}"
-            ))
-        })
-    }
-
-    /// Whether the focus follows a moved window. Following is the default.
-    fn follow(&self) -> MoveFocus {
-        MoveFocus::follows(self.follow.unwrap_or(true))
+/// Returns the typed action represented by one of the fixed functions under
+/// `spool.action`, or `None` for an ordinary user callback.
+///
+/// # Errors
+///
+/// Returns an error if the Lua registry entry cannot be read or deserialized.
+pub fn action_for_function(lua: &Lua, function: &Function) -> Result<Option<Action>> {
+    let Ok(functions) = lua.named_registry_value::<Table>(ACTION_FUNCTIONS_REGISTRY) else {
+        return Ok(None);
+    };
+    let value = functions.get::<Value>(function.clone())?;
+    match value {
+        Value::Nil => Ok(None),
+        value => lua.from_value(value).map(Some),
     }
 }
 
-/// `spool.window.resize` options: `{ direction = "grow" }` or a bare
-/// `"shrink"`, defaulting to growing.
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ResizeOpts {
-    direction: Option<ResizeDirection>,
-}
-
-impl ResizeOpts {
-    fn read(lua: &Lua, value: &Value) -> Result<ResizeDirection> {
-        let direction = match value {
-            Value::Nil => None,
-            Value::Table(_) => lua.from_value::<Self>(value.clone())?.direction,
-            bare => Some(lua.from_value(bare.clone())?),
-        };
-        Ok(direction.unwrap_or(ResizeDirection::Grow))
-    }
-}
-
-/// Converts a `spool.run` argument into a [`Command`]: a command string, an
+/// Converts a `spool.run` argument into an [`Action`]: an action string, an
 /// argv table, or a structured table deserialized straight into the enums.
-fn to_command(lua: &Lua, value: &Value) -> Result<Command> {
+fn to_action(lua: &Lua, value: &Value) -> Result<Action> {
     let parse = |argv: &[String]| {
         let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
-        parse_command(&borrowed).map_err(|err| mlua::Error::RuntimeError(err.to_string()))
+        parse_action(&borrowed).map_err(|err| mlua::Error::RuntimeError(err.to_string()))
     };
 
     match value {
-        Value::String(command) => {
-            let command = command.to_str()?;
-            let argv: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+        Value::String(action) => {
+            let action = action.to_str()?;
+            let argv: Vec<String> = action.split_whitespace().map(str::to_string).collect();
             if argv.is_empty() {
-                return Err(mlua::Error::RuntimeError("empty command".into()));
+                return Err(mlua::Error::RuntimeError("empty action".into()));
             }
             parse(&argv)
         }
         // A sequence is argv (`{"window", "focus", "east"}`); any other table is
-        // a structured command (`{ window = { focus = "east" } }`).
+        // a structured action (`{ window = { focus = "east" } }`).
         Value::Table(table) if table.raw_len() > 0 => {
             let argv: Vec<String> = table
                 .clone()
@@ -371,7 +341,7 @@ fn to_command(lua: &Lua, value: &Value) -> Result<Command> {
         }
         Value::Table(_) => lua.from_value(value.clone()),
         other => Err(mlua::Error::RuntimeError(format!(
-            "command must be a string, argv table or command table, got {}",
+            "action must be a string, argv table or action table, got {}",
             other.type_name()
         ))),
     }
@@ -385,7 +355,7 @@ fn scalar_token(value: &Value) -> Result<String> {
         Value::Integer(number) => Ok(number.to_string()),
         Value::Number(number) => Ok(format!("{number}")),
         other => Err(mlua::Error::RuntimeError(format!(
-            "command arguments must be strings or numbers, got {}",
+            "action arguments must be strings or numbers, got {}",
             other.type_name()
         ))),
     }
@@ -405,9 +375,9 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// Installs the API with a dispatcher that records commands instead of
+    /// Installs the interface with a dispatcher that records actions instead of
     /// issuing them, and runs `source`.
-    fn run(source: &str) -> mlua::Result<Vec<Command>> {
+    fn run(source: &str) -> mlua::Result<Vec<Action>> {
         let lua = Lua::new();
         let issued = Rc::new(RefCell::new(Vec::new()));
         let spool = lua.create_table()?;
@@ -415,8 +385,8 @@ mod tests {
 
         let recorder = {
             let issued = Rc::clone(&issued);
-            move |_: &Lua, command: Command| {
-                issued.borrow_mut().push(command);
+            move |_: &Lua, action: Action| {
+                issued.borrow_mut().push(action);
                 Ok(true)
             }
         };
@@ -427,27 +397,32 @@ mod tests {
         Ok(commands)
     }
 
-    fn debug(commands: &[Command]) -> Vec<String> {
+    fn debug(commands: &[Action]) -> Vec<String> {
         commands.iter().map(|c| format!("{c:?}")).collect()
     }
 
     #[test]
-    fn typed_verbs_build_typed_commands() {
-        let commands = run(r#"
-            spool.window.focus({ direction = "east" })
-            spool.window.focus({ number = 3 })
-            spool.window.balance()
-            spool.space.move_window({ window_id = 42, space_id = 123, follow = false })
-        "#)
+    fn typed_verbs_build_typed_actions() {
+        let commands = run(r"
+            spool.action.window.focus_east()
+            spool.action.window.focus_next()
+            spool.action.window.shrink_height()
+            spool.action.window.balance()
+            spool.action.space.move_window({ window_id = 42, space_id = 123, follow = false })
+        ")
         .unwrap();
 
         assert_eq!(
             debug(&commands),
             debug(&[
-                Command::Window(Operation::Focus(Direction::East)),
-                Command::Window(Operation::Focus(Direction::Nth(2))),
-                Command::Window(Operation::Balance),
-                Command::MoveWindowToSpace {
+                Action::Window(Operation::Focus(Direction::East)),
+                Action::Window(Operation::FocusStep(FocusStep::Next)),
+                Action::Window(Operation::Resize {
+                    axis: ResizeAxis::Height,
+                    direction: ResizeDirection::Shrink,
+                }),
+                Action::Window(Operation::Balance),
+                Action::MoveWindowToSpace {
                     window_id: 42,
                     space_id: 123,
                     move_focus: MoveFocus::Stay,
@@ -457,7 +432,18 @@ mod tests {
     }
 
     #[test]
-    fn run_accepts_strings_argv_and_command_tables() {
+    fn fixed_action_functions_are_first_class_values() {
+        let actions = run(r"
+            local action = spool.action.window.focus_previous
+            action()
+        ")
+        .unwrap();
+
+        assert_eq!(debug(&actions), vec!["Window(FocusStep(Previous))"]);
+    }
+
+    #[test]
+    fn run_accepts_strings_argv_and_action_tables() {
         let commands = run(r#"
             spool.run("window focus east")
             spool.run({ "window", "focus", 3 })
@@ -468,38 +454,35 @@ mod tests {
         assert_eq!(
             debug(&commands),
             debug(&[
-                Command::Window(Operation::Focus(Direction::East)),
-                Command::Window(Operation::Focus(Direction::Nth(2))),
-                Command::Window(Operation::Focus(Direction::East)),
+                Action::Window(Operation::Focus(Direction::East)),
+                Action::Window(Operation::Focus(Direction::Nth(2))),
+                Action::Window(Operation::Focus(Direction::East)),
             ])
         );
     }
 
     #[test]
     fn bad_arguments_fail_at_the_call_site() {
-        assert!(run(r#"spool.window.focus({ direction = "sideways" })"#).is_err());
-        assert!(run("spool.window.focus({})").is_err());
-        assert!(run(r#"spool.window.resize({ direction = "wider" })"#).is_err());
-        assert!(run("spool.window.manage()").is_err());
+        assert!(run("spool.window.focus_east()").is_err());
+        assert!(run("spool.actions.window.focus_east()").is_err());
+        assert!(run("spool.action.window.manage()").is_err());
         assert!(run("spool.match({ managed = true })").is_err());
-        assert!(run(r#"spool.run("not a command")"#).is_err());
+        assert!(run(r#"spool.run("not an action")"#).is_err());
     }
 
     #[test]
-    fn defaults_match_the_documented_behaviour() {
+    fn fixed_display_actions_encode_follow_behaviour() {
         let commands = run(r"
-            spool.window.resize()
-            spool.window.next_display()
-            spool.window.next_display({ follow = false })
+            spool.action.window.next_display()
+            spool.action.window.next_display_send()
         ")
         .unwrap();
 
         assert_eq!(
             debug(&commands),
             debug(&[
-                Command::Window(Operation::Resize(ResizeDirection::Grow)),
-                Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
-                Command::Window(Operation::ToNextDisplay(MoveFocus::Stay)),
+                Action::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+                Action::Window(Operation::ToNextDisplay(MoveFocus::Stay)),
             ])
         );
     }

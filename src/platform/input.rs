@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use stdext::function_name;
 use tracing::{error, info};
 
-use crate::commands::Command;
+use crate::commands::Action;
 use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
@@ -448,7 +448,7 @@ impl InputHandler {
     }
 
     /// Handles key press events. It determines the modifier mask and attempts to find a matching keybinding in the configuration.
-    /// If a binding is found, it sends a `Command` event and intercepts the key press.
+    /// If a binding is found, it sends a `Action` event and intercepts the key press.
     ///
     /// # Arguments
     ///
@@ -485,14 +485,14 @@ impl InputHandler {
                     .iter()
                     .find(|(c, m, _)| *c == keycode && m.matches(mask))
                 {
-                    return Some(Command::Lua(*id));
+                    return Some(Action::Lua(*id));
                 }
                 self.config.find_keybind(keycode, mask)
             })
-            .and_then(|command| {
+            .and_then(|action| {
                 events
-                    .send(Event::Command { command })
-                    .inspect_err(|err| error!("Error sending command: {err}"))
+                    .dispatch(action)
+                    .inspect_err(|err| error!("Error sending action: {err}"))
                     .ok()
             })
             .is_some()

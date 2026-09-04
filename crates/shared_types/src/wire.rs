@@ -20,7 +20,7 @@ pub fn service_name() -> String {
     SERVICE_NAME.to_string()
 }
 
-use crate::commands::Command;
+use crate::commands::Action;
 pub use crate::script_state::WriteOutcome;
 
 use crate::script_state::ScriptStateWrite;
@@ -31,22 +31,23 @@ use crate::windowset::{LayoutOp, WindowSet};
 /// Something a client asks the daemon to do.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request {
-    /// Run a command — the same one a hotkey binds to. Fire-and-forget: the
+    /// Dispatch an action — the same one a hotkey binds to. Fire-and-forget: the
     /// daemon applies it best-effort against the live world and a client that
     /// wants the result queries for it.
-    Command(Command),
+    Dispatch(Action),
     /// Read part of the state document.
     Query(StateQueryKind),
     /// Read the window set — the same layout tree a `spool.windows` handler is
     /// given inside the daemon, so a client script transforms an identical tree.
     WindowSet,
     /// Replay a transform's recorded operations against the live world.
-    /// Fire-and-forget, for the same reason [`Request::Command`] is.
+    /// Fire-and-forget, for the same reason [`Request::Dispatch`] is.
     WindowSetApply(Vec<LayoutOp>),
     /// Read or write the script-state store.
     ScriptState(ScriptStateRequest),
-    /// Ask for state events to be pushed as they happen.
-    Subscribe,
+    /// Ask for state events to be pushed as they happen. `raw` adds the
+    /// uncoalesced source events used to derive stable notifications.
+    Subscribe { raw: bool },
 }
 
 /// What a client wants of the script-state store.
@@ -108,7 +109,7 @@ pub enum ScriptStateResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Command, Direction, Operation};
+    use crate::commands::{Action, Direction, Operation};
     use crate::state::Frame;
     use std::sync::Arc;
 
@@ -123,13 +124,14 @@ mod tests {
 
     #[test]
     fn every_request_survives_the_wire() {
-        round_trip(&Request::Command(Command::Window(Operation::Focus(
+        round_trip(&Request::Dispatch(Action::Window(Operation::Focus(
             Direction::East,
         ))));
         round_trip(&Request::Query(StateQueryKind::Active));
         round_trip(&Request::WindowSet);
         round_trip(&Request::WindowSetApply(vec![LayoutOp::Focus(7)]));
-        round_trip(&Request::Subscribe);
+        round_trip(&Request::Subscribe { raw: false });
+        round_trip(&Request::Subscribe { raw: true });
         round_trip(&Request::ScriptState(ScriptStateRequest::Get {
             key: "pads.term".to_string(),
         }));

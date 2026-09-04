@@ -146,8 +146,10 @@ pub(crate) fn reconcile_displays(
     const DISPLAY_RETRY_TIMEOUT: u64 = 5;
     const DISPLAY_RETRIES: u8 = 3;
 
-    let needs_reconcile = messages.read().any(|event| {
-        matches!(
+    let mut needs_reconcile = false;
+    let mut explicit_removal = false;
+    for event in messages.read() {
+        needs_reconcile |= matches!(
             event,
             Event::SystemWoke { .. }
                 | Event::DisplayAdded { .. }
@@ -155,8 +157,9 @@ pub(crate) fn reconcile_displays(
                 | Event::DisplayMoved { .. }
                 | Event::DisplayResized { .. }
                 | Event::DisplayConfigured { .. }
-        )
-    });
+        );
+        explicit_removal |= matches!(event, Event::DisplayRemoved { .. });
+    }
     if !needs_reconcile {
         return;
     }
@@ -169,8 +172,11 @@ pub(crate) fn reconcile_displays(
         .into_iter()
         .map(|(display, workspaces)| (display.id(), (display, workspaces)))
         .collect();
-    if present_displays.is_empty() {
+    if present_displays.is_empty() && !explicit_removal {
         warn!("No present displays found... retrying again in {DISPLAY_RETRY_TIMEOUT} seconds.");
+        if *retries == 0 {
+            *retries = DISPLAY_RETRIES;
+        }
         *retries = retries.saturating_sub(1);
         if *retries > 0 {
             let retry_displays = move |mut messages: MessageWriter<Event>| {
@@ -185,6 +191,10 @@ pub(crate) fn reconcile_displays(
                 &mut commands,
             );
         }
+        // An empty active-display snapshot is normal while the displays are
+        // asleep. It is not authoritative evidence that every physical
+        // display was unplugged, so preserve the last good ECS projection.
+        return;
     }
     *retries = DISPLAY_RETRIES;
 
@@ -393,10 +403,6 @@ impl FloatingLayer {
             workspace_id,
             front: false,
         }
-    }
-
-    pub fn flip(&mut self) {
-        self.front = !self.front;
     }
 }
 

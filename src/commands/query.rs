@@ -10,11 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
-use super::{Command, Operation};
+use super::{Action, Operation};
 
 use crate::ecs::state::{
-    QueryStateParams, SpoolActiveState, SpoolQueryState, SpoolSpaceState, SpoolWindowState,
-    StateEvent,
+    QueryStateParams, SpoolActiveState, SpoolQueryState, SpoolSpaceState, StateEvent,
 };
 use crate::ecs::{ActiveWorkspaceMarker, FocusedMarker};
 use crate::events::Event;
@@ -30,6 +29,8 @@ use spool_shared_types::wire::Response;
 struct Subscriber {
     channel: Arc<spool_local_ipc::Subscriber>,
     alive: Arc<AtomicBool>,
+    raw: bool,
+    cache: StateBroadcastCache,
 }
 
 #[derive(Default, Resource)]
@@ -37,13 +38,94 @@ struct StateSubscribers {
     streams: Vec<Subscriber>,
 }
 
-#[derive(Default, Resource)]
+#[derive(Default)]
 struct StateBroadcastCache {
     workspace: Option<WorkspaceBroadcastSnapshot>,
     focus: Option<FocusBroadcastSnapshot>,
-    spaces: Option<Vec<SpoolSpaceState>>,
-    on_screen: Option<Vec<SpoolWindowState>>,
+    spaces: Option<Vec<SpaceWindowsBroadcastSnapshot>>,
+    on_screen: Option<Vec<OnScreenWindowBroadcastSnapshot>>,
     titles: BTreeMap<WinID, String>,
+}
+
+impl StateBroadcastCache {
+    fn from_state(state: &SpoolQueryState) -> Self {
+        Self {
+            workspace: Some(WorkspaceBroadcastSnapshot::from(&state.active)),
+            focus: Some(FocusBroadcastSnapshot::from(&state.active)),
+            spaces: Some(spaces_snapshot(&state.spaces)),
+            on_screen: Some(on_screen_snapshot(state)),
+            titles: state
+                .spaces
+                .iter()
+                .flat_map(|space| space.windows.iter())
+                .map(|window| (window.window_id, window.title.clone()))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpaceWindowsBroadcastSnapshot {
+    space_id: u64,
+    display_id: u32,
+    ordinal: u32,
+    kind: spool_shared_types::state::SpaceKind,
+    visible: bool,
+    windows: Vec<WindowListEntryBroadcastSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowListEntryBroadcastSnapshot {
+    window_id: WinID,
+    floating: bool,
+    visible: bool,
+}
+
+impl From<&SpoolSpaceState> for SpaceWindowsBroadcastSnapshot {
+    fn from(space: &SpoolSpaceState) -> Self {
+        Self {
+            space_id: space.space_id,
+            display_id: space.display_id,
+            ordinal: space.ordinal,
+            kind: space.kind,
+            visible: space.visible,
+            windows: space
+                .windows
+                .iter()
+                .map(|window| WindowListEntryBroadcastSnapshot {
+                    window_id: window.window_id,
+                    floating: window.floating,
+                    visible: window.visible,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OnScreenWindowBroadcastSnapshot {
+    display_id: Option<u32>,
+    window_id: WinID,
+}
+
+fn spaces_snapshot(spaces: &[SpoolSpaceState]) -> Vec<SpaceWindowsBroadcastSnapshot> {
+    spaces
+        .iter()
+        .map(SpaceWindowsBroadcastSnapshot::from)
+        .collect()
+}
+
+fn on_screen_snapshot(state: &SpoolQueryState) -> Vec<OnScreenWindowBroadcastSnapshot> {
+    let mut snapshot = state
+        .on_screen()
+        .into_iter()
+        .map(|window| OnScreenWindowBroadcastSnapshot {
+            display_id: window.display_id,
+            window_id: window.window_id,
+        })
+        .collect::<Vec<_>>();
+    snapshot.sort();
+    snapshot
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -119,8 +201,8 @@ impl StateBroadcastIntent {
                 | Event::WindowDestroyed { .. }
                 | Event::WindowMinimized { .. }
                 | Event::WindowDeminimized { .. }
-                | Event::Command {
-                    command: Command::Window(Operation::Swap(_)) | Command::MoveWindowToSpace { .. },
+                | Event::ActionRequested {
+                    action: Action::Window(Operation::Move(_)) | Action::MoveWindowToSpace { .. },
                 } => intent.windows_changed = true,
                 Event::WindowFocused(_) => intent.window_focused = true,
                 // Geometry alone decides what's on screen, so plain moves and
@@ -148,12 +230,11 @@ impl StateBroadcastIntent {
             }
         }
 
-        // Anything that rearranges windows, rows or displays also rearranges
-        // what is on screen; titles ride along in the on-screen payload.
-        intent.on_screen_changed |= intent.windows_changed
-            || intent.space_changed
-            || intent.active_display_changed
-            || !intent.title_changes.is_empty();
+        // Anything that rearranges windows, rows or displays may rearrange
+        // what's on screen. Titles have their own notification and do not
+        // invalidate the visible-window set.
+        intent.on_screen_changed |=
+            intent.windows_changed || intent.space_changed || intent.active_display_changed;
 
         intent
     }
@@ -177,7 +258,6 @@ pub(super) fn register_query_commands(app: &mut App) {
     };
 
     app.init_resource::<StateSubscribers>();
-    app.init_resource::<StateBroadcastCache>();
     app.add_systems(PreUpdate, (state_subscribe_handler, state_query_handler));
     app.add_systems(
         PostUpdate,
@@ -208,10 +288,7 @@ fn state_query_handler(mut messages: MessageReader<Event>, state: QueryStatePara
             ),
             Event::WindowSetQuery { respond_to } => reply(
                 respond_to,
-                state
-                    .extract_window_set()
-                    .map_err(|err| err.to_string())
-                    .map(|set| Response::WindowSet(Box::new(set))),
+                Ok(Response::WindowSet(Box::new(state.extract_window_set()))),
             ),
             _ => {}
         }
@@ -221,14 +298,31 @@ fn state_query_handler(mut messages: MessageReader<Event>, state: QueryStatePara
 fn state_subscribe_handler(
     mut messages: MessageReader<Event>,
     mut subscribers: ResMut<StateSubscribers>,
+    state: QueryStateParams,
 ) {
-    for event in messages.read() {
-        let Event::StateSubscribe { subscriber } = event else {
-            continue;
-        };
+    let incoming = messages
+        .read()
+        .filter_map(|event| {
+            let Event::StateSubscribe { subscriber, raw } = event else {
+                return None;
+            };
+            Some((subscriber.clone(), *raw))
+        })
+        .collect::<Vec<_>>();
+    if incoming.is_empty() {
+        return;
+    }
+
+    let baseline = state.extract().ok();
+    for (subscriber, raw) in incoming {
         subscribers.streams.push(Subscriber {
-            channel: subscriber.clone(),
+            channel: subscriber,
             alive: Arc::new(AtomicBool::new(true)),
+            raw,
+            cache: baseline.as_ref().map_or_else(
+                StateBroadcastCache::default,
+                StateBroadcastCache::from_state,
+            ),
         });
     }
 }
@@ -294,22 +388,26 @@ fn collect_state_broadcast_events_for_intent(
         }
     }
 
-    if intent.windows_changed && cache.spaces.as_ref() != Some(&state.spaces) {
-        outgoing.push(StateEvent::WindowsChanged {
-            space_id: state.active.space_id,
-            active: state.active.clone(),
-        });
-        cache.spaces = Some(state.spaces.clone());
+    if intent.windows_changed {
+        let spaces = spaces_snapshot(&state.spaces);
+        if cache.spaces.as_ref() != Some(&spaces) {
+            outgoing.push(StateEvent::WindowsChanged {
+                space_id: state.active.space_id,
+                active: state.active.clone(),
+            });
+            cache.spaces = Some(spaces);
+        }
     }
 
     if intent.on_screen_changed {
-        let on_screen = state.on_screen().into_iter().cloned().collect::<Vec<_>>();
-        if cache.on_screen.as_ref() != Some(&on_screen) {
+        let on_screen_snapshot = on_screen_snapshot(state);
+        if cache.on_screen.as_ref() != Some(&on_screen_snapshot) {
+            let on_screen = state.on_screen().into_iter().cloned().collect::<Vec<_>>();
             outgoing.push(StateEvent::OnScreenChanged {
-                windows: on_screen.clone(),
+                windows: on_screen,
                 active: state.active.clone(),
             });
-            cache.on_screen = Some(on_screen);
+            cache.on_screen = Some(on_screen_snapshot);
         }
     }
 
@@ -347,7 +445,6 @@ fn collect_state_broadcast_events_for_intent(
 fn state_event_broadcast_handler(
     mut messages: MessageReader<Event>,
     mut subscribers: ResMut<StateSubscribers>,
-    mut cache: ResMut<StateBroadcastCache>,
     focused_changes: Query<Entity, Added<FocusedMarker>>,
     active_workspace_changes: Query<Entity, Added<ActiveWorkspaceMarker>>,
     state: QueryStateParams,
@@ -372,8 +469,16 @@ fn state_event_broadcast_handler(
         }),
         window_focused: !focused_changes.is_empty(),
     };
-    let intent = StateBroadcastIntent::from_events(events, signals);
-    if intent.is_empty() {
+    let intent = StateBroadcastIntent::from_events(events.iter().copied(), signals);
+    let raw_events = if subscribers.streams.iter().any(|subscriber| subscriber.raw) {
+        events
+            .iter()
+            .filter_map(|event| raw_state_event(event))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if intent.is_empty() && raw_events.is_empty() {
         return;
     }
 
@@ -388,22 +493,6 @@ fn state_event_broadcast_handler(
     } else {
         None
     };
-    let outgoing = collect_state_broadcast_events_for_intent(
-        &intent,
-        document.as_ref(),
-        &mut cache,
-        |window_id| {
-            state
-                .windows()
-                .find(window_id)
-                .and_then(|(window, _)| window.title().ok())
-        },
-    );
-
-    if outgoing.is_empty() {
-        return;
-    }
-
     // Each send is non-blocking and bounded, so a stalled reader just drops the
     // event instead of blocking the main thread; an exited subscriber is
     // marked below and reaped here on the next broadcast.
@@ -411,9 +500,25 @@ fn state_event_broadcast_handler(
         .streams
         .retain(|subscriber| subscriber.alive.load(Ordering::Relaxed));
 
-    let events = Arc::new(outgoing);
-    for subscriber in &subscribers.streams {
-        for event in events.iter() {
+    for subscriber in &mut subscribers.streams {
+        let outgoing = collect_state_broadcast_events_for_intent(
+            &intent,
+            document.as_ref(),
+            &mut subscriber.cache,
+            |window_id| {
+                state
+                    .windows()
+                    .find(window_id)
+                    .and_then(|(window, _)| window.title().ok())
+            },
+        );
+        let events = subscriber
+            .raw
+            .then_some(raw_events.as_slice())
+            .into_iter()
+            .flatten()
+            .chain(outgoing.iter());
+        for event in events {
             match subscriber.channel.try_send(event) {
                 Ok(()) => {}
                 // The subscriber's process is gone; reaped on the next
@@ -429,6 +534,314 @@ fn state_event_broadcast_handler(
             }
         }
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive diagnostic projection keeps every raw event name in one auditable match"
+)]
+fn raw_state_event(event: &Event) -> Option<StateEvent> {
+    let raw = |name: &str,
+               display_id: Option<u32>,
+               space_id: Option<u64>,
+               window_id: Option<WinID>,
+               details: String| StateEvent::RawEvent {
+        name: name.to_string(),
+        display_id,
+        space_id,
+        window_id,
+        details,
+    };
+
+    Some(match event {
+        Event::Exit => raw("exit", None, None, None, String::new()),
+        Event::ProcessesLoaded => raw("processes_loaded", None, None, None, String::new()),
+        Event::InitialConfig(_) => raw("initial_config", None, None, None, String::new()),
+        Event::ConfigRefresh(event) => {
+            raw("config_refresh", None, None, None, format!("{event:?}"))
+        }
+        Event::ApplicationLaunched { psn, .. } => raw(
+            "application_launched",
+            None,
+            None,
+            None,
+            format!("psn={psn:?}"),
+        ),
+        Event::ApplicationTerminated { psn } => raw(
+            "application_terminated",
+            None,
+            None,
+            None,
+            format!("psn={psn:?}"),
+        ),
+        Event::ApplicationFrontSwitched { psn } => raw(
+            "application_front_switched",
+            None,
+            None,
+            None,
+            format!("psn={psn:?}"),
+        ),
+        Event::ApplicationActivated { pid } => raw(
+            "application_activated",
+            None,
+            None,
+            None,
+            format!("pid={pid}"),
+        ),
+        Event::ApplicationDeactivated { pid } => raw(
+            "application_deactivated",
+            None,
+            None,
+            None,
+            format!("pid={pid}"),
+        ),
+        Event::ApplicationVisible { pid } => raw(
+            "application_visible",
+            None,
+            None,
+            None,
+            format!("pid={pid}"),
+        ),
+        Event::ApplicationHidden { pid } => {
+            raw("application_hidden", None, None, None, format!("pid={pid}"))
+        }
+        Event::WindowCreated { .. } => raw("window_created", None, None, None, String::new()),
+        Event::WindowSpawned {
+            window_id,
+            pid,
+            bundle_id,
+            frame,
+            floating,
+            ..
+        } => raw(
+            "window_spawned",
+            None,
+            None,
+            Some(*window_id),
+            format!("pid={pid},bundle_id={bundle_id},frame={frame:?},floating={floating}"),
+        ),
+        Event::WindowDestroyed {
+            window_id,
+            source,
+            incarnation,
+        } => raw(
+            "window_destroyed",
+            None,
+            None,
+            Some(*window_id),
+            format!("source={source:?},incarnation={incarnation:?}"),
+        ),
+        Event::WindowFocused(observation) => raw(
+            "window_focused",
+            None,
+            None,
+            Some(observation.window_id),
+            format!(
+                "pid={:?},source={:?},generation={:?},incarnation={:?}",
+                observation.pid,
+                observation.source,
+                observation.generation,
+                observation.incarnation
+            ),
+        ),
+        Event::FocusRevalidationRequested { pid, source } => raw(
+            "focus_revalidation_requested",
+            None,
+            None,
+            None,
+            format!("pid={pid},source={source:?}"),
+        ),
+        Event::WindowMoved {
+            window_id,
+            incarnation,
+        } => raw(
+            "window_moved",
+            None,
+            None,
+            Some(*window_id),
+            format!("incarnation={incarnation}"),
+        ),
+        Event::WindowResized {
+            window_id,
+            incarnation,
+        } => raw(
+            "window_resized",
+            None,
+            None,
+            Some(*window_id),
+            format!("incarnation={incarnation}"),
+        ),
+        Event::WindowMinimized {
+            window_id,
+            incarnation,
+        } => raw(
+            "window_minimized",
+            None,
+            None,
+            Some(*window_id),
+            format!("incarnation={incarnation:?}"),
+        ),
+        Event::WindowDeminimized {
+            window_id,
+            incarnation,
+        } => raw(
+            "window_deminimized",
+            None,
+            None,
+            Some(*window_id),
+            format!("incarnation={incarnation:?}"),
+        ),
+        Event::WindowTitleChanged {
+            window_id,
+            incarnation,
+        } => raw(
+            "window_title_changed",
+            None,
+            None,
+            Some(*window_id),
+            format!("incarnation={incarnation:?}"),
+        ),
+        Event::ReconcileWindows { scope } => raw(
+            "reconcile_windows",
+            None,
+            None,
+            None,
+            format!("scope={scope:?}"),
+        ),
+        Event::MouseDown { point, modifiers } => raw(
+            "mouse_down",
+            None,
+            None,
+            None,
+            format!("point={point:?},modifiers={modifiers:?}"),
+        ),
+        Event::MouseUp { point, modifiers } => raw(
+            "mouse_up",
+            None,
+            None,
+            None,
+            format!("point={point:?},modifiers={modifiers:?}"),
+        ),
+        Event::MouseDragged { point, modifiers } => raw(
+            "mouse_dragged",
+            None,
+            None,
+            None,
+            format!("point={point:?},modifiers={modifiers:?}"),
+        ),
+        Event::MouseMoved { point, modifiers } => raw(
+            "mouse_moved",
+            None,
+            None,
+            None,
+            format!("point={point:?},modifiers={modifiers:?}"),
+        ),
+        Event::Swipe { delta, fingers } => raw(
+            "swipe",
+            None,
+            None,
+            None,
+            format!("delta={delta},fingers={fingers}"),
+        ),
+        Event::Scroll { delta } => raw("scroll", None, None, None, format!("delta={delta}")),
+        Event::TouchpadDown => raw("touchpad_down", None, None, None, String::new()),
+        Event::TouchpadUp => raw("touchpad_up", None, None, None, String::new()),
+        Event::SpaceCreated { space_id } => {
+            raw("space_created", None, Some(*space_id), None, String::new())
+        }
+        Event::SpaceDestroyed { space_id } => raw(
+            "space_destroyed",
+            None,
+            Some(*space_id),
+            None,
+            String::new(),
+        ),
+        Event::SpaceChanged => raw("space_changed", None, None, None, String::new()),
+        Event::DisplayAdded { display_id } => raw(
+            "display_added",
+            Some(*display_id),
+            None,
+            None,
+            String::new(),
+        ),
+        Event::DisplayRemoved { display_id } => raw(
+            "display_removed",
+            Some(*display_id),
+            None,
+            None,
+            String::new(),
+        ),
+        Event::DisplayMoved { display_id } => raw(
+            "display_moved",
+            Some(*display_id),
+            None,
+            None,
+            String::new(),
+        ),
+        Event::DisplayResized { display_id } => raw(
+            "display_resized",
+            Some(*display_id),
+            None,
+            None,
+            String::new(),
+        ),
+        Event::DisplayConfigured { display_id } => raw(
+            "display_configured",
+            Some(*display_id),
+            None,
+            None,
+            String::new(),
+        ),
+        Event::DisplayChanged => raw("display_changed", None, None, None, String::new()),
+        Event::MissionControlShowAllWindows => raw(
+            "mission_control_show_all_windows",
+            None,
+            None,
+            None,
+            String::new(),
+        ),
+        Event::MissionControlShowFrontWindows => raw(
+            "mission_control_show_front_windows",
+            None,
+            None,
+            None,
+            String::new(),
+        ),
+        Event::MissionControlShowDesktop => raw(
+            "mission_control_show_desktop",
+            None,
+            None,
+            None,
+            String::new(),
+        ),
+        Event::MissionControlExit => raw("mission_control_exit", None, None, None, String::new()),
+        Event::DockDidChangePref { msg } => {
+            raw("dock_did_change_pref", None, None, None, msg.clone())
+        }
+        Event::DockDidRestart { msg } => raw("dock_did_restart", None, None, None, msg.clone()),
+        Event::MenuOpened { window_id } => {
+            raw("menu_opened", None, None, Some(*window_id), String::new())
+        }
+        Event::MenuClosed { window_id } => {
+            raw("menu_closed", None, None, Some(*window_id), String::new())
+        }
+        Event::MenuBarHiddenChanged { msg } => {
+            raw("menu_bar_hidden_changed", None, None, None, msg.clone())
+        }
+        Event::SystemWoke { msg } => raw("system_woke", None, None, None, msg.clone()),
+        Event::ThemeChanged => raw("theme_changed", None, None, None, String::new()),
+        Event::ActionRequested { action } => raw(
+            "action_requested",
+            None,
+            None,
+            None,
+            format!("action={action:?}"),
+        ),
+        Event::StateQuery { .. }
+        | Event::WindowSetQuery { .. }
+        | Event::StateSubscribe { .. }
+        | Event::ScriptState { .. } => return None,
+    })
 }
 
 #[cfg(test)]
@@ -663,6 +1076,154 @@ mod tests {
     }
 
     #[test]
+    fn animation_frames_do_not_republish_an_unchanged_visible_window_set() {
+        let mut state = query_state_with_active_window(1, "com.example.app", "term", 1, vec![1, 2]);
+        let mut cache = StateBroadcastCache::default();
+        let spawned = SpoolEvent::WindowSpawned {
+            window_id: 1,
+            pid: 100,
+            app_name: "Test App".to_string(),
+            bundle_id: "com.example.app".to_string(),
+            title: "term".to_string(),
+            frame: Frame {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            floating: false,
+        };
+        let baseline = collect_state_broadcast_events(
+            [&spawned],
+            &state,
+            &mut cache,
+            |_| None,
+            StateBroadcastSignals::default(),
+        );
+        assert!(!baseline.is_empty());
+
+        state.spaces[0].windows[0].frame.as_mut().unwrap().x = 120;
+        let moved = SpoolEvent::WindowMoved {
+            window_id: 1,
+            incarnation: 1,
+        };
+        let outgoing = collect_state_broadcast_events(
+            [&moved],
+            &state,
+            &mut cache,
+            |_| None,
+            StateBroadcastSignals::default(),
+        );
+
+        assert!(
+            outgoing.is_empty(),
+            "an animation frame must not look like a visible-window-set change: {outgoing:?}"
+        );
+    }
+
+    #[test]
+    fn focus_and_frame_changes_do_not_republish_the_window_list() {
+        let mut state = query_state_with_active_window(1, "com.example.app", "one", 1, vec![1, 2]);
+        let mut cache = StateBroadcastCache::default();
+        let spawned = SpoolEvent::WindowSpawned {
+            window_id: 1,
+            pid: 100,
+            app_name: "Test App".to_string(),
+            bundle_id: "com.example.app".to_string(),
+            title: "one".to_string(),
+            frame: Frame {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            floating: false,
+        };
+        let _ = collect_state_broadcast_events(
+            [&spawned],
+            &state,
+            &mut cache,
+            |_| None,
+            StateBroadcastSignals::default(),
+        );
+
+        state.active.focused_window_id = Some(2);
+        state.active.focused_window_title = Some("one".to_string());
+        state.spaces[0].windows[0].focused = false;
+        state.spaces[0].windows[0].frame.as_mut().unwrap().x = -40;
+        state.spaces[0].windows[1].focused = true;
+        state.spaces[0].windows[1].frame.as_mut().unwrap().x = 760;
+        let moved = SpoolEvent::WindowMoved {
+            window_id: 1,
+            incarnation: 1,
+        };
+        let outgoing = collect_state_broadcast_events(
+            [&moved],
+            &state,
+            &mut cache,
+            |_| None,
+            StateBroadcastSignals {
+                windows_changed: true,
+                ..StateBroadcastSignals::default()
+            },
+        );
+
+        assert!(
+            outgoing.is_empty(),
+            "focus and animation are not window-list mutations: {outgoing:?}"
+        );
+    }
+
+    #[test]
+    fn title_change_does_not_also_emit_on_screen_changed() {
+        let mut state = query_state_with_active_window(1, "com.example.app", "old", 1, vec![1]);
+        let mut cache = StateBroadcastCache::default();
+        let spawned = SpoolEvent::WindowSpawned {
+            window_id: 1,
+            pid: 100,
+            app_name: "Test App".to_string(),
+            bundle_id: "com.example.app".to_string(),
+            title: "old".to_string(),
+            frame: Frame {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            floating: false,
+        };
+        let _ = collect_state_broadcast_events(
+            [&spawned],
+            &state,
+            &mut cache,
+            |_| Some("old".to_string()),
+            StateBroadcastSignals::default(),
+        );
+
+        state.spaces[0].windows[0].title = "new".to_string();
+        state.active.focused_window_title = Some("new".to_string());
+        let changed = SpoolEvent::WindowTitleChanged {
+            window_id: 1,
+            incarnation: None,
+        };
+        let outgoing = collect_state_broadcast_events(
+            [&changed],
+            &state,
+            &mut cache,
+            |_| Some("new".to_string()),
+            StateBroadcastSignals::default(),
+        );
+
+        assert_eq!(
+            outgoing,
+            vec![StateEvent::WindowTitleChanged {
+                window_id: 1,
+                title: "new".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn test_state_broadcast_emits_focus_when_focused_marker_changes_without_event_message() {
         let state = query_state_with_active_window(
             26_262,
@@ -745,5 +1306,24 @@ mod tests {
         assert_eq!(intent.display_changes, vec![Some(2)]);
         assert!(intent.requires_state());
         assert!(!intent.is_empty());
+    }
+
+    #[test]
+    fn raw_focus_event_preserves_the_uncoalesced_source_metadata() {
+        let event =
+            SpoolEvent::resolved_focus(42, 100, crate::events::FocusSource::AccessibilityWindow, 7);
+
+        assert_eq!(
+            raw_state_event(&event),
+            Some(StateEvent::RawEvent {
+                name: "window_focused".to_string(),
+                display_id: None,
+                space_id: None,
+                window_id: Some(42),
+                details:
+                    "pid=Some(100),source=AccessibilityWindow,generation=Some(7),incarnation=None"
+                        .to_string(),
+            })
+        );
     }
 }

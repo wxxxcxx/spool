@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::assert_window_size;
-use crate::commands::Command;
+use crate::commands::Action;
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{ActiveWorkspaceMarker, Bounds, SpawnWindowTrigger};
@@ -28,8 +28,8 @@ fn spawn_matching_native_tab(world: &mut World, state: &MockState, window_id: Wi
 fn test_native_tab_detection() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 }, // 0
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         }, // 1
     ];
 
@@ -55,11 +55,11 @@ fn test_native_tab_detection() {
 fn test_native_tab_resize_syncs_sibling_size() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -95,11 +95,11 @@ fn test_native_tab_resize_syncs_sibling_size() {
 fn test_native_tab_removal_keeps_remaining_window_column() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -137,8 +137,8 @@ fn test_offscreen_same_app_same_width_different_frame_not_tabbed() {
     // leader's full frame; partial matches must not trigger conversion.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -187,8 +187,8 @@ fn test_disable_native_tabs_skips_detection() {
     // when the new window's frame matches the leader exactly.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -226,8 +226,8 @@ fn test_disable_native_tabs_skips_detection() {
 fn test_same_app_same_frame_native_tab_reuses_existing_column() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 

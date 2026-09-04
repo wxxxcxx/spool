@@ -1,20 +1,87 @@
 use bevy::ecs::query::Has;
+use bevy::ecs::system::RunSystemOnce as _;
 use bevy::prelude::*;
 
 use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::native_space::NativeSpace;
+use crate::ecs::params::Windows;
 use crate::ecs::state::{
     SavedColumn, SavedDisplay, SavedRect, SavedSpace, SavedWindow, SpoolState,
 };
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
-use crate::ecs::{RestoreWindowState, SpawnWindowTrigger};
+use crate::ecs::{
+    ActiveDisplayMarker, ActiveWorkspaceMarker, RestoreWindowState, SpawnWindowTrigger,
+};
 use crate::events::Event;
-use crate::manager::Size;
+use crate::manager::{Application, Display, Size};
 use crate::platform::{ProcessSerialNumber, WorkspaceId};
 use crate::tests::{
     TEST_DISPLAY_HEIGHT, TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT, TEST_PROCESS_ID,
     TEST_WINDOW_HEIGHT, TEST_WINDOW_WIDTH, TEST_WORKSPACE_ID, TestHarness,
 };
 use spool_shared_types::state::SpaceKind;
+
+#[test]
+fn suspended_windows_remain_in_the_persisted_layout() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.pump_frames(15);
+
+    {
+        let mut strips = harness.world().query::<&mut LayoutStrip>();
+        let mut strip = strips
+            .iter_mut(harness.world())
+            .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+            .expect("test workspace strip");
+        strip.swap(0, 1);
+    }
+    harness.pump_frames(2);
+    for id in 0..3 {
+        harness.mock_state.os_withdraw_window(id);
+    }
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(2);
+
+    let state = harness
+        .world()
+        .run_system_once(extract_spool_state)
+        .expect("extract state");
+    let saved = state
+        .spaces
+        .iter()
+        .find(|space| space.space_id == TEST_WORKSPACE_ID)
+        .expect("saved test workspace");
+    let saved_ids = saved
+        .columns
+        .iter()
+        .map(|column| match column {
+            SavedColumn::Single(window) => window.window_id,
+            _ => panic!("expected single-column fixture"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(saved_ids, vec![1, 0, 2]);
+    for column in &saved.columns {
+        let SavedColumn::Single(window) = column else {
+            unreachable!("fixture only contains single columns");
+        };
+        assert_eq!(window.pid, TEST_PROCESS_ID);
+        assert_eq!(window.bundle_id, "test");
+        assert!(window.title.is_empty());
+    }
+}
+
+fn extract_spool_state(
+    workspaces: Query<(
+        Option<&ChildOf>,
+        &LayoutStrip,
+        &NativeSpace,
+        Has<ActiveWorkspaceMarker>,
+    )>,
+    displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+    windows: Windows,
+    apps: Query<&Application>,
+) -> SpoolState {
+    SpoolState::extract(&workspaces, &displays, &windows, &apps)
+}
 
 #[test]
 fn startup_restore_rebuilds_one_strip_for_a_native_space() {
@@ -61,6 +128,54 @@ fn startup_restore_rebuilds_one_strip_for_a_native_space() {
         strips[0].0.columns().next(),
         Some(Column::Single(_))
     ));
+}
+
+#[test]
+fn startup_restore_reflows_windows_to_the_saved_column_order() {
+    let state = SpoolState {
+        version: 3,
+        timestamp: 123,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![SavedDisplay {
+            display_id: TEST_DISPLAY_ID,
+            bounds: SavedRect {
+                min_x: 0,
+                min_y: TEST_MENUBAR_HEIGHT,
+                max_x: TEST_DISPLAY_WIDTH,
+                max_y: TEST_DISPLAY_HEIGHT,
+            },
+            active: true,
+            space_ids: vec![TEST_WORKSPACE_ID],
+        }],
+        spaces: vec![SavedSpace {
+            space_id: TEST_WORKSPACE_ID,
+            display_id: Some(TEST_DISPLAY_ID),
+            ordinal: Some(0),
+            kind: SpaceKind::User,
+            active: true,
+            columns: vec![
+                SavedColumn::Single(saved_window(0)),
+                SavedColumn::Single(saved_window(2)),
+                SavedColumn::Single(saved_window(1)),
+            ],
+        }],
+    };
+
+    let mut harness = TestHarness::new().with_windows(3).with_state(state);
+    harness.pump_frames(20);
+
+    let ordered_x = [0, 2, 1].map(|window_id| {
+        harness
+            .mock_state
+            .actual_window_frame(window_id)
+            .expect("restored window frame")
+            .min
+            .x
+    });
+    assert!(
+        ordered_x.windows(2).all(|pair| pair[0] < pair[1]),
+        "saved column order must drive the physical frame order: {ordered_x:?}"
+    );
 }
 
 #[test]

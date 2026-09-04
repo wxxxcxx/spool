@@ -5,7 +5,7 @@ use bevy::ecs::observer::On;
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
 
-use crate::commands::{Command, MouseMove, MoveFocus, Operation};
+use crate::commands::{Action, MouseMove, MoveFocus, Operation};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
@@ -44,8 +44,8 @@ fn simulate_visible_dock_after_refresh(
 fn test_multi_display_lifecycle() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         Event::DisplayRemoved {
             display_id: TEST_DISPLAY_ID,
@@ -127,8 +127,8 @@ fn test_multi_display_lifecycle() {
 fn test_multi_workspace_orphaning() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         Event::DisplayRemoved {
             display_id: TEST_DISPLAY_ID,
@@ -209,13 +209,13 @@ fn test_multi_display_no_height_crosstalk() {
 
     let commands = vec![
         Event::MenuOpened { window_id: 100 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         Event::DisplayChanged,
         Event::MenuOpened { window_id: 100 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -241,14 +241,14 @@ fn test_multi_display_no_height_crosstalk() {
 fn test_next_display_inserts_into_target_strip() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -273,8 +273,8 @@ fn test_next_display_inserts_into_target_strip() {
 fn test_floating_window_moves_to_next_display_without_becoming_tiled() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
         },
     ];
 
@@ -339,14 +339,14 @@ fn test_send_next_display_stays_on_source() {
 
     let commands = vec![
         Event::MenuOpened { window_id: 101 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::Window(Operation::ToNextDisplay(MoveFocus::Stay)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToNextDisplay(MoveFocus::Stay)),
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -366,14 +366,14 @@ fn test_send_next_display_stays_on_source() {
 fn test_mouse_to_next_display() {
     let commands = vec![
         Event::MenuOpened { window_id: 101 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::Mouse(MouseMove::ToNextDisplay),
+        Event::ActionRequested {
+            action: Action::Mouse(MouseMove::ToNextDisplay),
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
     let origin = Origin::new(0, 0);
@@ -445,11 +445,11 @@ fn test_init_keeps_windows_on_their_real_displays() {
         .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 100, frame);
 
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -489,8 +489,8 @@ fn test_wake_reconciles_unplugged_display() {
 
     let commands = vec![
         Event::MenuOpened { window_id: 100 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         Event::SystemWoke { msg: String::new() },
     ];
@@ -588,8 +588,8 @@ fn native_spaces_track_one_visible_space_per_display_at_startup() {
                 .expect("one globally active layout strip");
             assert_eq!(active.id(), TEST_WORKSPACE_ID);
         })
-        .run(vec![Event::Command {
-            command: Command::PrintState,
+        .run(vec![Event::ActionRequested {
+            action: Action::PrintState,
         }]);
 }
 
@@ -628,8 +628,8 @@ fn native_spaces_observe_switches_on_an_inactive_display() {
             assert_eq!(active.id(), TEST_WORKSPACE_ID);
         })
         .run(vec![
-            Event::Command {
-                command: Command::PrintState,
+            Event::ActionRequested {
+                action: Action::PrintState,
             },
             Event::SpaceChanged,
         ]);
@@ -796,4 +796,67 @@ fn startup_layout_uses_the_visible_dock_height_for_every_column() {
 
     assert_window_size!(harness.world(), 0, TEST_WINDOW_WIDTH, expected_height);
     assert_window_size!(harness.world(), 1, TEST_WINDOW_WIDTH, expected_height);
+}
+
+#[test]
+fn wake_after_zero_display_startup_discovers_existing_windows() {
+    let mut harness = TestHarness::new();
+    harness.mock_state.remove_display(TEST_DISPLAY_ID);
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+
+    harness.pump_frames(5);
+    assert_eq!(
+        harness
+            .world()
+            .query_filtered::<Entity, With<Display>>()
+            .iter(harness.world())
+            .count(),
+        0,
+        "startup while the display server is unavailable must not invent a display"
+    );
+    assert_eq!(
+        harness
+            .world()
+            .query_filtered::<Entity, With<Window>>()
+            .iter(harness.world())
+            .count(),
+        0,
+        "the existing window cannot be projected before its display and Space exist"
+    );
+
+    harness.mock_state.add_display(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+        vec![TEST_WORKSPACE_ID],
+    );
+    harness.world().write_message(Event::SystemWoke {
+        msg: "test display server recovery".to_string(),
+    });
+    harness.pump_frames(20);
+
+    assert_eq!(
+        harness
+            .world()
+            .query_filtered::<Entity, With<Display>>()
+            .iter(harness.world())
+            .count(),
+        1,
+        "wake reconciliation must restore the display projection"
+    );
+    let window = find_window_entity(0, harness.world());
+    let strip = harness
+        .world()
+        .query::<&LayoutStrip>()
+        .iter(harness.world())
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .expect("restored Space projection");
+    assert!(
+        strip.contains(window),
+        "the lifecycle heartbeat must discover and tile windows that existed during zero-topology startup"
+    );
 }

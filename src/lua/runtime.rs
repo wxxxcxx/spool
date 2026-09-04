@@ -1,7 +1,7 @@
 //! The embedded Lua interpreter and everything a script registers into it.
 //!
 //! This module knows nothing about Bevy: it takes source in, hands dispatched
-//! side effects back out as plain values ([`Command`]s and flash messages),
+//! side effects back out as plain values ([`Action`]s and flash messages),
 //! and reaches the world only through [`DispatchWorld`]. `mlua::Lua` is
 //! `!Send`, so the interpreter lives on a thread of its own with the ECS on
 //! the other side of a channel.
@@ -23,7 +23,7 @@ use tracing::{error, warn};
 
 use super::api;
 use super::world::DispatchWorld;
-use crate::commands::Command;
+use crate::commands::Action;
 use crate::config::Config;
 use crate::platform::Modifiers;
 
@@ -90,15 +90,20 @@ pub(super) struct HandlerEntry {
     pub(super) handler: Function,
 }
 
+#[derive(Clone)]
+pub(super) enum BindHandler {
+    Action(Action),
+    Function(Function),
+}
+
 /// Everything the script registered, kept on the Rust side so dispatch never
 /// has to reach back into Lua globals to find a callback.
 #[derive(Default)]
 pub(super) struct Registry {
     /// `spool.on` handlers, in registration order per event name.
     pub(super) handlers: HashMap<String, Vec<HandlerEntry>>,
-    /// `spool.bind` handlers indexed by `id - 1`: a Lua function, or a command
-    /// string to run as-is.
-    pub(super) binds: Vec<Value>,
+    /// `spool.bind` action functions and callbacks indexed by `id - 1`.
+    pub(super) binds: Vec<BindHandler>,
     /// Chords parallel to `binds`, for publishing to the event-tap registry.
     pub(super) keybinds: Vec<LuaKeybind>,
 }
@@ -110,19 +115,19 @@ pub(super) type SharedRegistry = Rc<RefCell<Registry>>;
 /// Pending side effects produced by Lua callbacks, drained after each dispatch.
 #[derive(Default)]
 pub(super) struct Outbox {
-    /// Commands queued via `spool.run` / `spool.cmd`.
-    pub(super) commands: Vec<Command>,
+    /// Actions queued via `spool.run` / `spool.action` / compatibility aliases.
+    pub(super) actions: Vec<Action>,
     /// Flash messages queued via `spool.flash` as `(message, duration_secs)`.
     pub(super) flashes: Vec<(String, f32)>,
 }
 
-/// The side effects one dispatch produced: commands to put on the bus and
+/// The side effects one dispatch produced: actions to put on the bus and
 /// flash messages to show.
 ///
 /// Script state writes are not among them: they are the one thing a handler
 /// has to see the result of, so they go and come back while the handler
 /// waits rather than being queued for later.
-pub(super) type Effects = (Vec<Command>, Vec<(String, f32)>);
+pub(super) type Effects = (Vec<Action>, Vec<(String, f32)>);
 
 /// The embedded Lua runtime and its shared registration state.
 pub struct LuaRuntime {
@@ -227,14 +232,16 @@ impl LuaRuntime {
         }
     }
 
-    /// Runs the handler bound to keybind `id`: a Lua function gets the window
-    /// set, a command string goes straight onto the outbox.
+    /// Runs the action function or callback bound to keybind `id`.
     pub(super) async fn dispatch_bind(&self, id: u32) {
         let handler = id
             .checked_sub(1)
             .and_then(|index| self.registry.borrow().binds.get(index as usize).cloned());
         match handler {
-            Some(Value::Function(handler)) => {
+            Some(BindHandler::Action(action)) => {
+                self.outbox.borrow_mut().actions.push(action);
+            }
+            Some(BindHandler::Function(handler)) => {
                 let context = format!("keybind handler {id}");
                 let _dispatch = self.world.enter();
                 let Some(window_set) = self.window_set_arg(&context).await else {
@@ -245,15 +252,7 @@ impl LuaRuntime {
                     Err(err) => error!("lua {context}: {err}"),
                 }
             }
-            Some(Value::String(command)) => {
-                let command = command.to_string_lossy();
-                let argv: Vec<&str> = command.split_whitespace().collect();
-                match crate::config::parse_command(&argv) {
-                    Ok(command) => self.outbox.borrow_mut().commands.push(command),
-                    Err(err) => error!("lua keybind {id} command '{command}': {err}"),
-                }
-            }
-            _ => warn!("lua keybind {id} has no handler"),
+            None => warn!("lua keybind {id} has no handler"),
         }
     }
 
@@ -285,7 +284,7 @@ impl LuaRuntime {
                 if let Ok(window_set) = data.borrow::<WindowSet>() {
                     let ops = window_set.ops();
                     if !ops.is_empty() {
-                        self.outbox.borrow_mut().commands.push(Command::Layout(ops));
+                        self.outbox.borrow_mut().actions.push(Action::Layout(ops));
                     }
                 } else {
                     warn!("lua {context} returned userdata that is not a window set");
@@ -302,7 +301,7 @@ impl LuaRuntime {
     pub(super) fn drain_outbox(&self) -> Effects {
         let mut outbox = self.outbox.borrow_mut();
         (
-            outbox.commands.drain(..).collect(),
+            outbox.actions.drain(..).collect(),
             outbox.flashes.drain(..).collect(),
         )
     }
@@ -469,15 +468,15 @@ mod tests {
     }
 
     /// Drains the outbox commands for assertions.
-    fn drained_commands(runtime: &LuaRuntime) -> Vec<Command> {
-        runtime.outbox.borrow_mut().commands.drain(..).collect()
+    fn drained_commands(runtime: &LuaRuntime) -> Vec<Action> {
+        runtime.outbox.borrow_mut().actions.drain(..).collect()
     }
 
     #[test]
     fn bind_registers_keybind_and_stores_handler() {
         let world = TestWorld::default();
         let runtime = world
-            .runtime(r#"spool.bind("alt - j", "window focus east")"#)
+            .runtime(r#"spool.bind("alt+j", spool.action.window.focus_east)"#)
             .unwrap();
         let binds = runtime.published_keybinds();
         assert_eq!(binds.len(), 1);
@@ -487,17 +486,42 @@ mod tests {
     }
 
     #[test]
-    fn setup_builds_config_and_desugars_bindings() {
+    fn bind_accepts_a_chord_array_for_one_action_function() {
+        let world = TestWorld::default();
+        let runtime = world
+            .runtime(r#"spool.bind({ "alt+k", "alt+pageup" }, spool.action.window.focus_north)"#)
+            .unwrap();
+        let binds = runtime.published_keybinds();
+        assert_eq!(binds.len(), 2);
+        assert_eq!(binds[0].1, Modifiers::ALT);
+        assert_eq!(binds[0].2, 1);
+        assert_eq!(binds[1].1, Modifiers::ALT);
+        assert_eq!(binds[1].2, 2);
+
+        let extract = || Err("action functions must not query the window set".to_string());
+        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive(&extract, runtime.dispatch_bind(2));
+        let actions = drained_commands(&runtime);
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|action| matches!(
+            action,
+            Action::Window(crate::commands::Operation::Focus(
+                crate::commands::Direction::North
+            ))
+        )));
+    }
+
+    #[test]
+    fn setup_builds_config_without_bindings() {
         let world = TestWorld::default();
         let runtime = world
             .runtime(
-                r#"spool.setup{
+                r"spool.setup{
                 options = { sliver_width = 7 },
-                bindings = { ["window focus east"] = "alt - j" },
-            }"#,
+            }",
             )
             .unwrap();
-        assert_eq!(runtime.published_keybinds().len(), 1);
+        assert!(runtime.published_keybinds().is_empty());
         let config = runtime.built_config().expect("setup should build a config");
         assert_eq!(config.sliver_width(), 7);
     }
@@ -506,16 +530,16 @@ mod tests {
     fn no_setup_call_leaves_config_to_toml() {
         let world = TestWorld::default();
         let runtime = world
-            .runtime(r#"spool.bind("alt - b", "window balance")"#)
+            .runtime(r#"spool.bind("alt+b", spool.action.window.balance)"#)
             .unwrap();
         assert!(runtime.built_config().is_none());
     }
 
     #[test]
-    fn string_keybind_dispatch_queues_command() {
+    fn action_function_keybind_dispatches_without_world_access() {
         let world = TestWorld::default();
         let runtime = world
-            .runtime(r#"spool.bind("alt - b", "window balance")"#)
+            .runtime(r#"spool.bind("alt+b", spool.action.window.balance)"#)
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
         world.drive(&extract, runtime.dispatch_bind(1));
@@ -523,9 +547,9 @@ mod tests {
         assert!(
             matches!(
                 commands.as_slice(),
-                [Command::Window(crate::commands::Operation::Balance)]
+                [Action::Window(crate::commands::Operation::Balance)]
             ),
-            "expected a balance command, got {commands:?}"
+            "expected a balance action, got {commands:?}"
         );
     }
 
@@ -533,7 +557,7 @@ mod tests {
     fn function_keybind_can_run_commands() {
         let world = TestWorld::default();
         let runtime = world
-            .runtime(r#"spool.bind("alt - j", function(state) spool.run("window focus east") end)"#)
+            .runtime(r#"spool.bind("alt+j", function(state) spool.run("window focus east") end)"#)
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
         world.drive(&extract, runtime.dispatch_bind(1));
@@ -558,10 +582,17 @@ mod tests {
     }
 
     #[test]
-    fn invalid_command_string_is_reported_not_panicking() {
+    fn invalid_run_action_string_is_reported_not_panicking() {
         let world = TestWorld::default();
-        // A bad command string surfaces as a Lua runtime error at bind time.
-        let result = world.runtime(r#"spool.run("definitely not a command")"#);
+        // A bad action string surfaces as a Lua runtime error at bind time.
+        let result = world.runtime(r#"spool.run("definitely not an action")"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bind_rejects_command_strings() {
+        let world = TestWorld::default();
+        let result = world.runtime(r#"spool.bind("alt+j", "window focus east")"#);
         assert!(result.is_err());
     }
 
@@ -607,7 +638,7 @@ mod tests {
         let runtime = world
             .runtime(
                 r#"
-            spool.bind("alt - q", function()
+            spool.bind("alt+q", function()
               local active = spool.query_active()
               spool.flash(active.focused_app_name)
               spool.flash(tostring(#spool.query_spaces()))
@@ -642,11 +673,11 @@ mod tests {
         let runtime = world
             .runtime(
                 r#"
-            spool.bind("alt - q", function()
+            spool.bind("alt+q", function()
               spool.query_active()
               spool.query_on_screen()
             end)
-            spool.bind("alt - w", function() spool.flash("no query here") end)
+            spool.bind("alt+w", function() spool.flash("no query here") end)
             "#,
             )
             .unwrap();
@@ -684,7 +715,7 @@ mod tests {
             .runtime(
                 r#"
             escaped = nil
-            spool.bind("alt - q", function() escaped = spool.query_state end)
+            spool.bind("alt+q", function() escaped = spool.query_state end)
             "#,
             )
             .unwrap();
@@ -745,7 +776,7 @@ mod tests {
         let runtime = world
             .runtime(
                 r#"
-            spool.bind("alt - b", function()
+            spool.bind("alt+b", function()
               spool.run("window balance")
               spool.flash("done", 3.0)
             end)
@@ -764,9 +795,7 @@ mod tests {
     /// Runs `source` as a keybind handler against `world`'s store.
     fn run_with_store(source: &str, world: &TestWorld) {
         let runtime = world
-            .runtime(&format!(
-                r#"spool.bind("alt - z", function() {source} end)"#
-            ))
+            .runtime(&format!(r#"spool.bind("alt+z", function() {source} end)"#))
             .expect("script should load");
         let extract = || Ok(Arc::new(test_state()));
         world.drive(&extract, runtime.dispatch_bind(1));
@@ -884,7 +913,7 @@ mod tests {
         let world = TestWorld::default();
         let runtime = world
             .runtime(
-                r#"spool.bind("alt - z", function()
+                r#"spool.bind("alt+z", function()
                        local result = spool.exec("/bin/echo", {"hello"})
                        code, out = result.code, result.stdout
                    end)"#,
@@ -910,7 +939,7 @@ mod tests {
         let world = TestWorld::default();
         let runtime = world
             .runtime(
-                r#"spool.bind("alt - z", function()
+                r#"spool.bind("alt+z", function()
                        local ok, err = pcall(function()
                            spool.exec("/nonexistent/spool-test-binary")
                        end)
@@ -973,7 +1002,7 @@ mod tests {
             .runtime(
                 r#"
             errored = false
-            spool.bind("alt - z", function()
+            spool.bind("alt+z", function()
               local ok = pcall(function() spool.state.set("fn", function() end) end)
               errored = not ok
             end)

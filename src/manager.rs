@@ -43,10 +43,10 @@ use skylight::{
     SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
     SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
     SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSRequestNotificationsForWindows, SLSSpaceGetType,
-    SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID,
-    SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
-    SLSWindowQueryWindows,
+    SLSManagedDisplayGetCurrentSpace, SLSMoveWindowsToManagedSpace,
+    SLSRequestNotificationsForWindows, SLSSpaceGetType, SLSWindowIteratorAdvance,
+    SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags,
+    SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
 };
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
 
@@ -63,6 +63,18 @@ mod windows;
 
 pub type Origin = IVec2;
 pub type Size = IVec2;
+
+/// Assigns one Spool-owned `AppKit` window to exactly one native Space.
+///
+/// This private `SkyLight` operation is permitted for windows owned by the
+/// calling process and does not require Dock injection or disabling SIP.
+pub(crate) fn move_owned_window_to_space(window_id: WinID, space_id: WorkspaceId) -> Result<()> {
+    let windows = create_array(&[window_id], CFNumberType::SInt32Type)?;
+    unsafe {
+        SLSMoveWindowsToManagedSpace(SLSMainConnectionID(), &raw const *windows, space_id);
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(
@@ -571,9 +583,15 @@ impl WindowManagerApi for WindowManagerOS {
                 let mut menubar_height: u32 = 0;
                 unsafe { SLSGetDisplayMenubarHeight(id, &raw mut menubar_height) };
                 debug!("menubar height: {menubar_height}");
-                let workspaces = Display::uuid_from_id(id)
+                let workspaces = match Display::uuid_from_id(id)
                     .and_then(|uuid| self.display_space_list(uuid.as_ref()))
-                    .ok()?;
+                {
+                    Ok(workspaces) => workspaces,
+                    Err(error) => {
+                        warn!(display_id = id, %error, "unable to read native Space topology for display");
+                        return None;
+                    }
+                };
 
                 Some((
                     Display::new(id, irect_from(bounds), menubar_height.cast_signed()),

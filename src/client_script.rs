@@ -104,7 +104,7 @@ mod tests {
                 assert(spool == require("spool"))
                 assert(type(spool.query_state) == "function")
                 assert(type(spool.state.get) == "function")
-                assert(type(spool.window.balance) == "function")
+                assert(type(spool.action.window.balance) == "function")
                 assert(arg[0] == "-e")
                 assert(arg[1] == "first")
                 assert(arg[2] == "second")

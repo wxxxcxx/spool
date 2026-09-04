@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::commands::{Command, Operation};
+use crate::commands::{Action, Operation};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::{DesiredWindowFrame, ObservedWindowFrame, PresentedWindowFrame};
 use crate::events::Event;
@@ -27,8 +27,8 @@ fn desired_layout_precedes_presentation_and_os_commit() {
         .expect("presented frame")
         .0;
 
-    harness.world().write_message(Event::Command {
-        command: Command::Window(Operation::SetWidth(0.75)),
+    harness.world().write_message(Event::ActionRequested {
+        action: Action::Window(Operation::SetWidth(0.75)),
     });
     harness.pump_frames(1);
 

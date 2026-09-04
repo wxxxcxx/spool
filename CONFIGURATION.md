@@ -26,14 +26,16 @@ General behavior settings for the window manager.
 | `mouse_follows_focus` | Boolean | `true` | If enabled, the mouse cursor will warp to the center of the focused window when focus changes via keyboard. |
 | `horizontal_mouse_warp` | Integer ``(-1, 1)`` | Off | If enabled, the mouse will warp to another screen above or below, when touching the left or right edge. The direction depends on the direction - a negative value will cause the left edge to warp to a screen above and the right edge to a screen below. This allows having horizontal positioning of displays while having them aligned in a virtual layout in macOS settings. The cursor lands at the *opposite* edge of the target display (preserving cursor flow), with the source's relative Y position. Carries pre-warp horizontal velocity to avoid a "standing start", and skips the warp when the equivalent Y has no position on the target — matching macOS's native side-by-side behavior for displays of unequal height. (inspired by https://github.com/mogenson/WarpMouse.spoon) |
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
-| `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
+| `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by tiled `window grow width` / `window shrink width` actions and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
 | `animation_speed` | Float | *None* | Speed of window animations. Comfortable range is from 8 to 20. Unset or set to a very high value to effectively disable animations. |
 | `auto_center` | Boolean | `false` | Automatically center the focused window on the screen when switching focus. |
 | `sliver_height` | Float (0.1–1.0) | `1.0` | Vertical ratio of off-screen windows kept visible to prevent macOS from relocating them. |
 | `sliver_width` | Integer (px) | `5` | Horizontal width of off-screen windows kept visible. |
 | `menubar_height` | Integer (px) | *Auto* | Manually override the detected macOS menubar height. |
 | `window_hidden_ratio` | Float (0.0–1.0) | `0.0` | How much of a window can be hidden before it's forced into view on focus change. `0.0` = eager, `1.0` = lazy. |
-| `window_resize_cycle` | Boolean | `true` | If disabled, `window_resize` and `window_shrink` stop at the largest/smallest preset instead of cycling back. |
+| `window_resize_cycle` | Boolean | `true` | If disabled, tiled width grow/shrink stops at the largest/smallest preset instead of cycling back. |
+| `floating_window_move_step` | Integer (px) | `20` | Distance a floating window moves for each directional `window move` action. |
+| `floating_window_resize_step` | Integer (px) | `40` | Width or height change applied to a floating window for each grow/shrink action. |
 | `mouse_resize_modifier` | String | *None* | If enabled allows window resizing using mouse movement. For example `cmd + shift` will allow resizing of the window when holding those keys. Proximity of the pointer to left or right window edge determines which side will be adjusted. |
 | `disable_native_tabs` | Boolean | `false` | If enabled, Spool will not auto-merge a newly-spawned window into a tab group with an existing same-app sibling that shares its frame. Use this if you find unrelated windows being grouped together. |
 | `experimental_space_control` | Boolean | `false` | Enables capability-probed private Space control. The current backend may focus a Space on the active display or move windows to a user Space; create/delete remain unavailable. This never injects into Dock and does not require disabling SIP. |
@@ -88,7 +90,7 @@ When `fingers_count` is omitted or set below 3, Spool does not intercept native 
 ### `[swipe.scroll]`
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `modifier` | String | `"alt"` | Modifier key(s) required to slide windows with the scroll wheel: `"alt"`, `"rcmd"`, `"ralt + cmd"`, `"lctrl + lalt + cmd"`, etc. |
+| `modifier` | String | `"alt"` | Modifier key(s) required to slide windows with the scroll wheel: `"alt"`, `"rcmd"`, `"ralt+cmd"`, `"lctrl+lalt+cmd"`, etc. |
 
 ---
 
@@ -118,7 +120,7 @@ opacity_night = -0.25
 
 Bindings map a key combination to an action. A binding can be a single string or an array of strings.
 
-Format: `"[modifiers-]key"`. For example `alt + cmd - j` and `cmd - j`.
+Format: `"modifier+modifier+key"`. For example `alt+shift+j` and `cmd+j`.
 
 Available modifiers are:
 - `alt`, `lalt`, `ralt`
@@ -137,36 +139,39 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | :--- | :--- |
 | `window_focus_west` / `_east` | Focus window to the left/right. |
 | `window_focus_north` / `_south` | Focus window above/below. If no window exists, switches focus to the display in that direction. |
+| `window_focus_next` / `_previous` | Cycle in stable order within the current tiled or floating tier, wrapping at the ends. |
 | `window_focus_first` / `_last` | Jump to the start/end of the strip. |
 | `window_focus_tiled` | Switch to a previously focused tiled window on this Space. |
 | `window_focus_floating` | Switch to a previously focused floating window on this Space. |
-| `window_swap_west` / `_east` | Swap current window with neighbor. |
-| `window_swap_north` / `_south` | Swap current window above/below. If no window exists, moves the window to the display in that direction. |
-| `window_swap_first` / `_last` | Move current window to start/end of strip. |
-| `window_center` | Center the current window in the viewport. |
-| `window_resize` | Cycle through preset widths (Grow). |
-| `window_grow` | Alias for `window_resize`. |
-| `window_shrink` | Cycle through preset widths (Shrink). |
-| `window_fullwidth` | Toggle full-width mode. |
-| `window_togglefloating` | Toggle between tiled and floating state. |
-| `window_stack` | Stack the current window into the column on the left. |
-| `window_unstack` | Pull a window out of a stack into its own column. |
+| `window_focus_other_layer` | Focus the last window in the other tiled/floating layer. Focus actions also raise the focused window when necessary. |
+| `window_move_west` / `_east` | Reorder a tiled window, or nudge a floating window horizontally. |
+| `window_move_north` / `_south` | Reorder within a tiled stack (or move displays at an edge), or nudge a floating window vertically. |
+| `window_move_first` / `_last` | Move a tiled window to the start/end of the strip. |
+| `window_center` | Center the current window. Floating windows are centered in the viewport. |
+| `window_shrink_width` / `window_grow_width` | Cycle tiled preset widths, or resize a floating window by `floating_window_resize_step`. |
+| `window_shrink_height` / `window_grow_height` | Resize a tiled stack member or a floating window vertically. |
+| `window_maximize` | Toggle a tiled full-width column or maximize/restore a floating window. |
+| `window_toggle_floating` | Toggle between tiled and floating state. |
+| `window_toggle_stack` | Stack the tiled window into the column on the left, or unstack it when already stacked. |
 | `window_equalize` | Make all windows in a stack equal height. |
 | `window_balance` | Make all columns in the strip the same width as the focused window. |
 | `window_nextdisplay` | Move focused window to the next monitor and follow it. |
 | `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
 | `window_snap` | Snap an overflowing window into the viewport. |
-| `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
-| `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
 | `quit` | Exit Spool. |
 | `restart` | Restart the Spool service (`spool restart`). |
 
 **Example:**
 ```toml
 [bindings]
-window_focus_west = "cmd - h"
-window_resize = ["alt - r", "ctrl - r"]
+window_focus_west = "cmd+h"
+window_focus_next = "alt+n"
+window_focus_previous = "alt+p"
+window_move_west = "alt+shift+h"
+window_shrink_width = "alt+minus"
+window_grow_width = "alt+equal"
+window_toggle_stack = "alt+s"
 ```
 
 ### Spaces
@@ -206,7 +211,7 @@ Define specific behaviors for applications based on their Title or Bundle ID.
 title = ".*"
 bundle_id = "com.apple.Terminal"
 horizontal_padding = 5
-bindings_passthrough = ["ctrl-h", "ctrl-l"]
+bindings_passthrough = ["ctrl+h", "ctrl+l"]
 ```
 
 ### Tracking LSUIElement or non-standard windows
@@ -347,11 +352,11 @@ radius = 12.0
 
 Spool embeds a Lua runtime that allows full configuration via `init.lua`, replacing `spool.toml` entirely. When a Lua configuration or script exists (`$SPOOL_LUA`, `$HOME/.spool.lua`, or `$XDG_CONFIG_HOME/spool/init.lua`), it takes over completely and no TOML config is read.
 
-All options, padding, gesture settings, window rules, and keybindings documented in sections 1–7 above are available under identical names via `spool.setup{...}`.
+All options, padding, gesture settings, and window rules documented in sections 1–7 above are available under identical names via `spool.setup{...}`. Keybindings are declared separately with `spool.bind` so they can refer directly to action functions.
 
 In addition to static configuration, Lua scripting allows:
 - **Event Hooks (`spool.on`)**: React to window creation (`window_spawned`), focus changes, or space switches with optional filter specs or regex matchers.
-- **Keybinding Callbacks (`spool.bind`)**: Map hotkeys to custom Lua callbacks or commands.
+- **Keybindings (`spool.bind`)**: Map hotkeys to `spool.action` functions or custom Lua callbacks.
 - **State Queries (`spool.query_*`)**: Read real-time window, workspace, and display layout state without round-trip shell executions.
 - **Persistent State (`spool.state`)**: Store and mutate data across reloads and daemon restarts.
 - **Programmatic Layout Transformations (`ws`)**: Pure layout operations (`ws:focus`, `ws:swap`, `ws:float`, `ws:shift`, `ws:view`, etc.) for custom workflows like named scratchpads.

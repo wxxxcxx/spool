@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use accessibility_sys::kAXErrorNoValue;
+use bevy::ecs::change_detection::DetectChangesMut as _;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -20,8 +21,8 @@ use crate::ecs::window_geometry::WindowGeometrySettling;
 use crate::ecs::workspace::WindowSpaceReassignmentPending;
 use crate::ecs::{
     Bounds, DesiredWindowFrame, Floating, Initializing, MissionControlActive, ObservedWindowFrame,
-    Position, PresentedWindowFrame, PreviousTiledStrip, RepositionMarker, ResizeMarker,
-    SendMessageTrigger, SpawnWindowTrigger, WindowDefaultsPending, WindowFrameMotion,
+    Position, PresentedWindowFrame, RepositionMarker, ResizeMarker, SendMessageTrigger,
+    SpawnWindowTrigger, WindowDefaultsPending, WindowFrameCommitSuspended, WindowFrameMotion,
     WindowVisibility,
 };
 use crate::errors::Error;
@@ -233,8 +234,8 @@ struct LifecycleAudit {
 }
 
 enum LifecycleAction {
-    Restore(Entity, bool),
-    Isolate(Entity),
+    Resume(Entity, bool),
+    Suspend(Entity, bool),
     Destroy(Entity),
     Spawn(Entity, Vec<Window>),
     RetireApplication(Entity),
@@ -243,7 +244,7 @@ enum LifecycleAction {
 impl LifecycleAction {
     fn priority(&self) -> u8 {
         match self {
-            Self::Restore(..) | Self::Isolate(_) => 0,
+            Self::Resume(..) | Self::Suspend(..) => 0,
             Self::Destroy(_) => 1,
             Self::Spawn(..) => 2,
             Self::RetireApplication(_) => 3,
@@ -349,18 +350,24 @@ impl LifecycleAudit {
 }
 
 /// The AX window is no longer usable, but `CoreGraphics` has not yet confirmed
-/// that its surface left the screen. Such windows are excluded from normal
-/// window queries immediately while retaining enough state to recover.
+/// that its surface left the screen. Such windows remain in Spool's declarative
+/// layout while being excluded from macOS reads, writes, and focus operations.
 #[derive(Component, Debug)]
 pub(crate) struct WindowUnavailable {
     confirmation: Timer,
+    layout_projection_invalidated: bool,
 }
 
 impl WindowUnavailable {
-    fn new() -> Self {
+    fn new(layout_projection_invalidated: bool) -> Self {
         Self {
             confirmation: Timer::new(CONFIRMATION_DELAY, TimerMode::Once),
+            layout_projection_invalidated,
         }
+    }
+
+    pub(crate) fn excludes_from_layout_projection(&self) -> bool {
+        self.layout_projection_invalidated
     }
 }
 
@@ -389,7 +396,6 @@ type ReconcileWindowData = (
 pub(super) struct ReconcileState<'w, 's> {
     applications: Query<'w, 's, (Entity, &'static mut Application)>,
     windows: Query<'w, 's, ReconcileWindowData>,
-    previous_strips: Query<'w, 's, &'static PreviousTiledStrip>,
     workspaces: Query<'w, 's, &'static mut LayoutStrip, Without<Window>>,
     focus: ResMut<'w, FocusCoordinator>,
     mission_control: Res<'w, MissionControlActive>,
@@ -441,7 +447,7 @@ impl ReconcileState<'_, '_> {
             let Ok(inventory) = app.window_inventory(config).inspect_err(|error| {
                 warn!(pid, %error, "window reconciliation skipped application");
             }) else {
-                isolate_windows_missing_from_window_server(
+                suspend_windows_missing_from_window_server(
                     app_entity,
                     pid,
                     &mut self.windows,
@@ -509,15 +515,20 @@ impl ReconcileState<'_, '_> {
         audit.actions.sort_by_key(LifecycleAction::priority);
         for action in audit.actions.drain(..) {
             match action {
-                LifecycleAction::Restore(entity, space_reassignment_pending) => restore_window(
+                LifecycleAction::Resume(entity, layout_projection_invalidated) => resume_window(
                     entity,
-                    space_reassignment_pending,
-                    &self.previous_strips,
+                    layout_projection_invalidated,
                     &mut self.workspaces,
                     commands,
                 ),
-                LifecycleAction::Isolate(entity) => {
-                    isolate_window(entity, &mut self.workspaces, &mut self.focus, commands);
+                LifecycleAction::Suspend(entity, invalidate_layout_projection) => {
+                    suspend_window(
+                        entity,
+                        invalidate_layout_projection,
+                        &mut self.workspaces,
+                        &mut self.focus,
+                        commands,
+                    );
                 }
                 LifecycleAction::Destroy(entity) => {
                     let Ok((_, window, parent, ..)) = self.windows.get_mut(entity) else {
@@ -740,15 +751,41 @@ impl ReconcileState<'_, '_> {
                 let Some(confirmed) =
                     sync.converge_tiled_frame(entity, window_id, &mut window, frame, target, now)
                 else {
-                    remove_observed_frame(entity, commands);
+                    // The AX setter may have partially succeeded even though
+                    // it returned an error. Keep a fresh physical readback so
+                    // overlays and diagnostics never fall back to stale or
+                    // missing geometry while the bounded retry is pending.
+                    match window.update_frame() {
+                        Ok(readback) => {
+                            if let Some(mut observed) = observed {
+                                if observed.0 != readback {
+                                    observed.0 = readback;
+                                }
+                            } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                                entity_commands.try_insert(ObservedWindowFrame(readback));
+                            }
+                        }
+                        Err(error) => {
+                            warn!(window_id, %error, "unable to read back constrained tiled window frame");
+                            remove_observed_frame(entity, commands);
+                        }
+                    }
                     continue;
                 };
                 frame = confirmed;
                 if presented.0 != frame {
                     presented.0 = frame;
                 }
+                if frames_equivalent(frame, target)
+                    && let Ok(mut entity_commands) = commands.get_entity(entity)
+                {
+                    entity_commands.try_remove::<WindowFrameCommitSuspended>();
+                }
             } else if floating {
                 sync.frame_convergence.remove(&entity);
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<WindowFrameCommitSuspended>();
+                }
             }
 
             if let Some(mut observed) = observed {
@@ -865,13 +902,13 @@ fn audit_application_windows(
     audit: &mut LifecycleAudit,
 ) -> HashMap<WindowKey, Entity> {
     let mut tracked = HashMap::new();
-    for (entity, window, parent, unavailable, .., flags) in windows.iter_mut() {
-        let space_reassignment_pending = flags.4;
+    for (entity, window, parent, unavailable, ..) in windows.iter_mut() {
         if parent.parent() != inventory.entity {
             continue;
         }
         let window_id = window.id();
         let key = WindowKey::new(&window);
+        let surface_present = audit.contains_window(window_id, inventory.pid);
         tracked.insert(key, entity);
         if sync.is_key_retired(inventory.entity, key) {
             retire_tracked_window(inventory.entity, key, entity, sync, audit);
@@ -885,9 +922,7 @@ fn audit_application_windows(
                 ?entity,
                 "multiple AX incarnations claim one WindowServer ID; deferring selection"
             );
-            if unavailable.is_none() {
-                audit.actions.push(LifecycleAction::Isolate(entity));
-            }
+            request_suspension(audit, entity, unavailable.as_deref(), !surface_present);
             continue;
         }
         let observed_key = identities.and_then(|keys| keys.iter().next()).copied();
@@ -903,22 +938,18 @@ fn audit_application_windows(
             continue;
         }
         if replaced {
-            if unavailable.is_none() {
-                audit.actions.push(LifecycleAction::Isolate(entity));
-            }
+            request_suspension(audit, entity, unavailable.as_deref(), !surface_present);
             continue;
         }
-        match (
-            observed_key == Some(key),
-            audit.contains_window(window_id, inventory.pid),
-        ) {
+        match (observed_key == Some(key), surface_present) {
             (true, true) => {
                 audit.confirmed.insert(entity);
                 refresh_window_observer(entity, app, &window, sync);
-                if unavailable.is_some() {
-                    audit
-                        .actions
-                        .push(LifecycleAction::Restore(entity, space_reassignment_pending));
+                if let Some(unavailable) = unavailable.as_deref() {
+                    audit.actions.push(LifecycleAction::Resume(
+                        entity,
+                        unavailable.layout_projection_invalidated,
+                    ));
                 }
             }
             (false, false) if inventory.complete => {
@@ -937,16 +968,14 @@ fn audit_application_windows(
                 );
             }
             _ => {
-                if unavailable.is_none() {
-                    audit.actions.push(LifecycleAction::Isolate(entity));
-                }
+                request_suspension(audit, entity, unavailable.as_deref(), !surface_present);
             }
         }
     }
     tracked
 }
 
-fn isolate_windows_missing_from_window_server(
+fn suspend_windows_missing_from_window_server(
     app_entity: Entity,
     pid: Pid,
     windows: &mut Query<ReconcileWindowData>,
@@ -961,7 +990,24 @@ fn isolate_windows_missing_from_window_server(
             continue;
         }
         sync.frame_convergence.remove(&entity);
-        audit.actions.push(LifecycleAction::Isolate(entity));
+        request_suspension(audit, entity, unavailable.as_deref(), true);
+    }
+}
+
+fn request_suspension(
+    audit: &mut LifecycleAudit,
+    entity: Entity,
+    unavailable: Option<&WindowUnavailable>,
+    invalidate_layout_projection: bool,
+) {
+    let needs_transition = unavailable.is_none()
+        || invalidate_layout_projection
+            && unavailable.is_some_and(|state| !state.layout_projection_invalidated);
+    if needs_transition {
+        audit.actions.push(LifecycleAction::Suspend(
+            entity,
+            invalidate_layout_projection,
+        ));
     }
 }
 
@@ -1038,30 +1084,21 @@ pub(crate) fn frames_equivalent(left: IRect, right: IRect) -> bool {
     origin_delta.max_element() <= 1 && size_delta.max_element() <= 1
 }
 
-fn isolate_window(
+fn suspend_window(
     entity: Entity,
+    invalidate_layout_projection: bool,
     workspaces: &mut Query<&mut LayoutStrip, Without<Window>>,
     focus: &mut FocusCoordinator,
     commands: &mut Commands,
 ) {
     focus.observe(FocusSignal::Invalidated { entity });
-    let mut previous = None;
-    for mut strip in workspaces.iter_mut() {
-        if !strip.contains(entity) {
-            continue;
+    if invalidate_layout_projection {
+        for mut strip in workspaces.iter_mut().filter(|strip| strip.contains(entity)) {
+            strip.set_changed();
         }
-        previous.get_or_insert(PreviousTiledStrip {
-            workspace_id: strip.id(),
-            index: strip.index_of(entity).unwrap_or(strip.len()),
-        });
-        strip.remove(entity);
     }
-
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_insert(WindowUnavailable::new());
-        if let Some(previous) = previous {
-            entity_commands.try_insert(previous);
-        }
+        entity_commands.try_insert(WindowUnavailable::new(invalidate_layout_projection));
         entity_commands.remove::<(
             RepositionMarker,
             ResizeMarker,
@@ -1069,48 +1106,24 @@ fn isolate_window(
             ObservedWindowFrame,
         )>();
     }
-    debug!(?entity, "isolated unavailable window from layout and focus");
+    debug!(?entity, "suspended unavailable window operations and focus");
 }
 
-fn restore_window(
+fn resume_window(
     entity: Entity,
-    space_reassignment_pending: bool,
-    previous_strips: &Query<&PreviousTiledStrip>,
+    layout_projection_invalidated: bool,
     workspaces: &mut Query<&mut LayoutStrip, Without<Window>>,
     commands: &mut Commands,
 ) {
-    let previous = previous_strips.get(entity).copied().ok();
-    let restored = previous.is_none_or(|previous| {
-        let Some(mut strip) = workspaces
-            .iter_mut()
-            .find(|strip| strip.id() == previous.workspace_id)
-        else {
-            return false;
-        };
-        strip.insert_at(previous.index, entity);
-        true
-    });
-    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        if restored {
-            entity_commands.remove::<(WindowUnavailable, PreviousTiledStrip)>();
-        } else if space_reassignment_pending {
-            // The source Space tombstone can disappear while this window is
-            // temporarily unavailable. Keep its reassignment lease intact so
-            // the live WindowServer membership can select the destination.
-            entity_commands.try_remove::<WindowUnavailable>();
-        } else {
-            // The original Space disappeared while the window was isolated.
-            // Keep it tracked as floating rather than manufacturing a tiled
-            // window with no LayoutStrip membership.
-            entity_commands.try_insert(Floating);
-            entity_commands.remove::<(
-                WindowUnavailable,
-                PreviousTiledStrip,
-                WindowSpaceReassignmentPending,
-            )>();
+    if layout_projection_invalidated {
+        for mut strip in workspaces.iter_mut().filter(|strip| strip.contains(entity)) {
+            strip.set_changed();
         }
     }
-    debug!(?entity, "restored available window to layout");
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<WindowUnavailable>();
+    }
+    debug!(?entity, "resumed available window operations");
 }
 
 /// Rechecks only the owning application after the public CG surface has had a

@@ -38,6 +38,22 @@ pub struct PresentedWindowFrame(pub IRect);
 #[derive(bevy::ecs::component::Component, Clone, Copy, Debug, Default)]
 pub struct WindowFrameMotion;
 
+/// Suspends frame-by-frame macOS commits after an AX write fails.
+///
+/// The declarative desired frame remains intact; the central reconciler owns
+/// bounded retries. A genuinely new desired frame clears this suspension and
+/// starts a fresh presentation attempt.
+#[derive(bevy::ecs::component::Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowFrameCommitSuspended {
+    desired: IRect,
+}
+
+impl WindowFrameCommitSuspended {
+    pub(crate) fn new(desired: IRect) -> Self {
+        Self { desired }
+    }
+}
+
 type WindowFrameRequests<'w, 's> = Query<
     'w,
     's,
@@ -66,6 +82,35 @@ type AnimatedWindowFrames<'w, 's> = Query<
         Without<WindowSpaceReassignmentPending>,
     ),
 >;
+
+type SuspendedWindowFrames<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static DesiredWindowFrame,
+        &'static PresentedWindowFrame,
+        &'static WindowFrameCommitSuspended,
+    ),
+>;
+
+/// Re-enables projection only when layout state produces a new desired frame.
+pub(crate) fn resume_suspended_window_frame_commits(
+    windows: SuspendedWindowFrames,
+    mut commands: Commands,
+) {
+    for (entity, desired, presented, suspended) in &windows {
+        if desired.0 == suspended.desired {
+            continue;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<WindowFrameCommitSuspended>();
+            if presented.0 != desired.0 {
+                entity_commands.try_insert(WindowFrameMotion);
+            }
+        }
+    }
+}
 
 /// Adapts legacy movement/resize commands into declarative layout state.
 ///

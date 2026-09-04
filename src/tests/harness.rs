@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bevy::prelude::*;
@@ -14,7 +16,7 @@ use crate::ecs::focus::FocusEventsPlugin;
 use crate::ecs::layout::LayoutEventsPlugin;
 use crate::ecs::mouse::MouseEventsPlugin;
 use crate::ecs::scroll::ScrollEventsPlugin;
-use crate::ecs::state::SpoolState;
+use crate::ecs::state::{SpoolState, StateFilePath};
 use crate::ecs::workspace::WorkspaceEventsPlugin;
 use crate::ecs::{
     BProcess, ExistingMarker, FocusFollowsMouse, Initializing, MissionControlActive, SkipReshuffle,
@@ -31,13 +33,23 @@ pub(crate) struct TestHarness {
     pub(crate) app: App,
     pub(crate) mock_state: MockState,
     pub(crate) verifiers: HashMap<usize, VerifierFunc>,
+    state_file_path: PathBuf,
 }
+
+static NEXT_STATE_FILE: AtomicU64 = AtomicU64::new(1);
 
 impl TestHarness {
     pub(crate) fn new() -> Self {
         let pid = TEST_PROCESS_ID;
         let mut app = setup_world();
         let mut mock_state = MockState::new();
+        let state_file_path = std::env::temp_dir().join(format!(
+            "spool-test-state-{}-{}.json",
+            std::process::id(),
+            NEXT_STATE_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        app.world_mut()
+            .insert_resource(StateFilePath::from(state_file_path.clone()));
 
         // Setup default display
         mock_state.add_display(
@@ -64,6 +76,7 @@ impl TestHarness {
             app,
             mock_state,
             verifiers: HashMap::new(),
+            state_file_path,
         }
     }
 
@@ -223,6 +236,13 @@ impl TestHarness {
                 self.app.world_mut().write_message::<Event>(event);
             }
         }
+    }
+}
+
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        _ = std::fs::remove_file(&self.state_file_path);
+        _ = std::fs::remove_file(self.state_file_path.with_extension("json.tmp"));
     }
 }
 

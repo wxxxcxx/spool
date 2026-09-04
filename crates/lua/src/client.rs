@@ -13,7 +13,7 @@ use std::sync::{LazyLock, Mutex};
 
 use mlua::prelude::*;
 use spool_local_ipc::Client;
-use spool_shared_types::commands::{Command, MoveFocus};
+use spool_shared_types::commands::{Action, MoveFocus};
 use spool_shared_types::script_state::ScriptStateWrite;
 use spool_shared_types::script_value::ScriptValue;
 use spool_shared_types::state::{StateEvent, StateQueryKind};
@@ -59,39 +59,39 @@ fn send(request: &Request) -> LuaResult<()> {
     connect()?.send(request).map_err(LuaError::external)
 }
 
-fn dispatch(_: &Lua, command: Command) -> LuaResult<bool> {
+fn dispatch(_: &Lua, action: Action) -> LuaResult<bool> {
     if matches!(
-        command,
-        Command::FocusSpace { .. }
-            | Command::MoveWindowToSpace { .. }
-            | Command::CreateSpace { .. }
-            | Command::DeleteSpace { .. }
+        action,
+        Action::FocusSpace { .. }
+            | Action::MoveWindowToSpace { .. }
+            | Action::CreateSpace { .. }
+            | Action::DeleteSpace { .. }
     ) {
         let Response::Query(spool_shared_types::wire::QueryPayload::State(state)) =
             call(&Request::Query(StateQueryKind::State))?
         else {
             return Err(LuaError::RuntimeError(
-                "spool.space: daemon did not return a state document".to_string(),
+                "spool.action.space: daemon did not return a state document".to_string(),
             ));
         };
-        let available = match command {
-            Command::FocusSpace { .. } => state.capabilities.focus,
-            Command::MoveWindowToSpace {
+        let available = match action {
+            Action::FocusSpace { .. } => state.capabilities.focus,
+            Action::MoveWindowToSpace {
                 move_focus: MoveFocus::Follow,
                 ..
             } => state.capabilities.move_windows && state.capabilities.focus,
-            Command::MoveWindowToSpace { .. } => state.capabilities.move_windows,
-            Command::CreateSpace { .. } => state.capabilities.create,
-            Command::DeleteSpace { .. } => state.capabilities.delete,
+            Action::MoveWindowToSpace { .. } => state.capabilities.move_windows,
+            Action::CreateSpace { .. } => state.capabilities.create,
+            Action::DeleteSpace { .. } => state.capabilities.delete,
             _ => true,
         };
         if !available {
             return Err(LuaError::RuntimeError(format!(
-                "native Space capability unavailable for '{command:?}'"
+                "native Space capability unavailable for '{action:?}'"
             )));
         }
     }
-    send(&Request::Command(command))?;
+    send(&Request::Dispatch(action))?;
     Ok(true)
 }
 
@@ -286,6 +286,7 @@ fn event_name(event: &StateEvent) -> Option<String> {
 /// process. `event` is the event name to filter on (e.g. `"window_focused"`), a
 /// table of several names, or `nil` for every event. Each event is a decoded Lua
 /// table unless `opts.decode == false` (then the raw JSON line string).
+/// `opts.raw == true` additionally includes uncoalesced `raw_event` diagnostics.
 fn subscribe(
     lua: &Lua,
     (event, callback, opts): (LuaValue, LuaFunction, Option<LuaTable>),
@@ -295,9 +296,13 @@ fn subscribe(
         .as_ref()
         .and_then(|opts| opts.get::<Option<bool>>("decode").ok().flatten())
         .unwrap_or(true);
+    let raw = opts
+        .as_ref()
+        .and_then(|opts| opts.get::<Option<bool>>("raw").ok().flatten())
+        .unwrap_or(false);
 
     let mut stream = connect()?
-        .subscribe(&Request::Subscribe)
+        .subscribe(&Request::Subscribe { raw })
         .map_err(LuaError::external)?;
 
     loop {

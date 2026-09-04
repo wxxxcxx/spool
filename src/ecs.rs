@@ -7,7 +7,7 @@ use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::change_detection::DetectChanges as _;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
-use bevy::ecs::query::{Added, Changed, With};
+use bevy::ecs::query::{Added, Changed, Or, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor, SystemCondition as _};
@@ -24,10 +24,20 @@ use bevy::{
 use derive_more::{Deref, DerefMut};
 use tracing::{Level, error, instrument, warn};
 
+type ChangedNativeSpaces<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    Or<(
+        Added<native_space::NativeSpace>,
+        Changed<native_space::NativeSpace>,
+    )>,
+>;
+
 use crate::commands::register_commands;
 use crate::config::{CONFIGURATION_FILE, Config, WindowParams};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::state::SpoolState;
+use crate::ecs::state::{SpoolState, StateFilePath};
 use crate::errors::Result;
 use crate::events::{Event, EventSender, FocusObservation, InputEvent};
 #[cfg(feature = "lua")]
@@ -59,7 +69,9 @@ pub mod window_frame;
 pub(crate) mod window_geometry;
 pub mod workspace;
 
-pub use window_frame::{DesiredWindowFrame, PresentedWindowFrame, WindowFrameMotion};
+pub use window_frame::{
+    DesiredWindowFrame, PresentedWindowFrame, WindowFrameCommitSuspended, WindowFrameMotion,
+};
 
 // Shared by the Lua reload system so a `spool.setup{...}` reload applies the
 // same menubar/passthrough side effects as a TOML reload.
@@ -95,6 +107,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
         |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
          focus_gained: Query<(), Added<FocusedMarker>>,
          workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
+         native_space_changed: ChangedNativeSpaces,
          focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>,
          focused_resized: Query<(), (With<FocusedMarker>, Changed<Bounds>)>,
          observed_moved: Query<(), (With<FocusedMarker>, Changed<ObservedWindowFrame>)>,
@@ -104,10 +117,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
          mut focus_lost: RemovedComponents<FocusedMarker>,
          mut workspace_lost: RemovedComponents<ActiveWorkspaceMarker>,
          mut observed_lost: RemovedComponents<ObservedWindowFrame>,
+         mut native_space_removed: RemovedComponents<native_space::NativeSpace>,
          mut window_removed: RemovedComponents<Window>| {
             !strip_changed.is_empty()
                 || !focus_gained.is_empty()
                 || !workspace_changed.is_empty()
+                || !native_space_changed.is_empty()
                 || !focused_moved.is_empty()
                 || !focused_resized.is_empty()
                 || !observed_moved.is_empty()
@@ -117,6 +132,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 || focus_lost.read().next().is_some()
                 || workspace_lost.read().next().is_some()
                 || observed_lost.read().next().is_some()
+                || native_space_removed.read().next().is_some()
                 || window_removed.read().next().is_some()
         };
     let native_tabs_enabled =
@@ -187,6 +203,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::animate_entities.run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             systems::animate_resize_entities
                 .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
+            window_frame::resume_suspended_window_frame_commits
+                .before(window_frame::animate_presented_window_frames),
             window_frame::animate_presented_window_frames
                 .after(systems::animate_entities)
                 .after(systems::animate_resize_entities)
@@ -203,6 +221,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::update_overlays
                     .after(systems::commit_window_frame)
                     .run_if(overlay_dirty.or_eager(on_timer(Duration::from_secs(1)))),
+                systems::animate_decoration_overlay,
                 systems::update_flash_messages,
             )
                 .chain(),
@@ -363,6 +382,9 @@ pub struct NativeFullscreenMarker {
 #[derive(Component)]
 pub struct FullWidthMarker {
     pub width_ratio: f64,
+    /// Original floating frame restored by a second maximize action. Tiled
+    /// windows keep using `width_ratio` and leave this empty.
+    pub floating_frame: Option<bevy::math::IRect>,
 }
 
 /// Marks a tracked window that does not participate in the tiling layout.
@@ -784,10 +806,11 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_non_send(menu_bar_manager)
         .insert_non_send(receiver);
 
-    if let Some(previous_state) = SpoolState::load_from_file(&SpoolState::default_state_file_path())
-    {
+    let state_file_path = StateFilePath::default();
+    if let Some(previous_state) = SpoolState::load_from_file(state_file_path.as_path()) {
         app.insert_resource(previous_state);
     }
+    app.insert_resource(state_file_path);
 
     // Overwrites the empty store `register_commands` put there, which is what
     // the mock harness keeps: only the real app reads the user's file.

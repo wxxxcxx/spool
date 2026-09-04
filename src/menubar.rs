@@ -7,15 +7,16 @@ use objc2_app_kit::{
     NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSObject, NSString};
+use std::process::Command as ProcessCommand;
 use tracing::warn;
 
 use crate::accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
-use crate::commands::{Command, Operation};
+use crate::commands::{Action, Operation};
 use crate::config::Config;
 use crate::ecs::native_space::NativeSpace;
 use crate::ecs::params::ActiveDisplay;
 use crate::ecs::{ActiveWorkspaceMarker, Bounds, Floating, FocusedMarker};
-use crate::events::{Event, EventSender};
+use crate::events::EventSender;
 use crate::manager::request_ax_privilege;
 use crate::util::round_px;
 
@@ -39,22 +40,22 @@ define_class!(
                 return;
             };
             let ratio = f64::from(percentage) / 100.0;
-            self.send_command(Command::Window(Operation::SetWidth(ratio)));
+            self.dispatch_action(Action::Window(Operation::SetWidth(ratio)));
         }
 
         #[unsafe(method(centerWindow:))]
         fn center_window(&self, _: &NSMenuItem) {
-            self.send_command(Command::Window(Operation::Center));
+            self.dispatch_action(Action::Window(Operation::Center));
         }
 
         #[unsafe(method(toggleFloating:))]
         fn toggle_floating(&self, _: &NSMenuItem) {
-            self.send_command(Command::Window(Operation::ToggleFloating));
+            self.dispatch_action(Action::Window(Operation::ToggleFloating));
         }
 
         #[unsafe(method(openAccessibilitySettings:))]
         fn open_accessibility_settings(&self, _: &NSMenuItem) {
-            if let Err(error) = std::process::Command::new("/usr/bin/open")
+            if let Err(error) = ProcessCommand::new("/usr/bin/open")
                 .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
                 .spawn()
             {
@@ -78,7 +79,7 @@ define_class!(
 
         #[unsafe(method(quitSpool:))]
         fn quit_spool(&self, _: &NSMenuItem) {
-            self.send_command(Command::Quit);
+            self.dispatch_action(Action::Quit);
         }
     }
 );
@@ -89,9 +90,9 @@ impl MenuActionTarget {
         unsafe { msg_send![super(this), init] }
     }
 
-    fn send_command(&self, command: Command) {
-        if let Err(error) = self.ivars().events.send(Event::Command { command }) {
-            warn!(%error, "unable to send menu bar command");
+    fn dispatch_action(&self, action: Action) {
+        if let Err(error) = self.ivars().events.dispatch(action) {
+            warn!(%error, "unable to dispatch menu bar action");
         }
     }
 }

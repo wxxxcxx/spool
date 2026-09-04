@@ -1,13 +1,13 @@
-//! The Spool command vocabulary.
+//! The Spool action vocabulary.
 //!
 //! Every way of telling the window manager to do something funnels through
-//! [`Command`]: the TOML `[bindings]` table, the `send-cmd` socket protocol, an
+//! [`Action`]: the TOML `[bindings]` table, the `spool action` interface, an
 //! embedded Lua `init.lua`, and the loadable Lua client module. This crate owns
-//! the types and their argv encoding ([`parse_command`] / [`Command::to_argv`]).
+//! the types and their argv encoding ([`parse_action`] / [`Action::to_argv`]).
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::argv::{ParseError, parse_command};
+pub use crate::argv::{ParseError, parse_action};
 
 /// Represents a cardinal or directional choice for window manipulation.
 ///
@@ -149,12 +149,59 @@ impl<'de> Deserialize<'de> for Direction {
     }
 }
 
-/// Direction used when cycling preset resize widths.
+/// Axis affected by a window resize action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResizeAxis {
+    Width,
+    Height,
+}
+
+impl ResizeAxis {
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if `input` is not a recognized resize axis.
+    pub fn parse(input: &str) -> Result<Self, ParseError> {
+        Ok(match input {
+            "width" => Self::Width,
+            "height" => Self::Height,
+            other => return Err(ParseError::new(format!("unhandled resize axis '{other}'"))),
+        })
+    }
+
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Width => "width",
+            Self::Height => "height",
+        }
+    }
+}
+
+/// Direction used when growing or shrinking a window dimension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResizeDirection {
     Grow,
     Shrink,
+}
+
+/// Direction used when focusing the next window in a stable tier order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusStep {
+    Next,
+    Previous,
+}
+
+impl FocusStep {
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Next => "next",
+            Self::Previous => "previous",
+        }
+    }
 }
 
 impl ResizeDirection {
@@ -204,16 +251,20 @@ impl MoveFocus {
 pub enum Operation {
     /// Focuses on a window in the specified `Direction`.
     Focus(Direction),
-    /// Swaps the current window with another in the specified `Direction`.
-    Swap(Direction),
+    /// Moves the current window in the specified `Direction`. Tiled windows
+    /// are reordered in the layout; floating windows move geometrically.
+    Move(Direction),
     /// Centers the currently focused window on the display.
     Center,
-    /// Resizes the focused window in the given direction.
-    Resize(ResizeDirection),
+    /// Grows or shrinks one dimension of the focused window.
+    Resize {
+        axis: ResizeAxis,
+        direction: ResizeDirection,
+    },
     /// Resizes the focused window to an exact display-width ratio.
     SetWidth(f64),
-    /// Toggles the focused window to full width or a preset width.
-    FullWidth,
+    /// Maximizes the focused window, or restores its previous size.
+    Maximize,
     /// Moves the focused window to the next available display.
     ToNextDisplay(MoveFocus),
     /// Distributes heights equally among windows in the focused stack.
@@ -222,8 +273,9 @@ pub enum Operation {
     Balance,
     /// Toggles the focused window between tiled and floating layout modes.
     ToggleFloating,
-    /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
-    Stack(bool),
+    /// Toggles the focused tiled item between an independent column and a
+    /// stack on its left.
+    ToggleStack,
     /// Resizes and repositions the focused window to fit within the visible viewport
     /// (including edge padding).
     Snap,
@@ -231,13 +283,11 @@ pub enum Operation {
     FocusFloating,
     /// Focuses the Space's last-focused tiled window.
     FocusTiled,
-    /// Raises all visible floating windows on the active display and focuses
-    /// the last-floating window (idempotent — repeat presses behave the same).
-    RaiseFloating,
-    /// Alt-tab between the floating and tiled tiers of the active workspace.
-    /// Flips `FloatingLayer`, raises the other windows in the new top tier,
-    /// and focuses the tier's last-focused window.
-    ToggleFloatingLayer,
+    /// Focuses the other tiled/floating tier, raising it as part of focus.
+    FocusOtherLayer,
+    /// Focuses the next or previous window in the current tiled/floating tier.
+    /// Kept at the end so existing postcard discriminants remain stable.
+    FocusStep(FocusStep),
 }
 
 /// Defines operations that can be performed on the mouse.
@@ -248,13 +298,15 @@ pub enum MouseMove {
     ToNextDisplay,
 }
 
-/// Represents a command that can be issued to the window manager.
+/// A serializable request for the window manager to perform a state transition
+/// or runtime effect. Dispatching an action may legitimately be a no-op when
+/// its preconditions are not met.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Command {
-    /// A command targeting a window with a specific `Operation`.
+pub enum Action {
+    /// An action targeting a window with a specific `Operation`.
     Window(Operation),
-    /// A command targeting the mouse with a specific `MouseOperation`.
+    /// An action targeting the mouse with a specific `MouseMove`.
     Mouse(MouseMove),
     /// Focuses the exact Spool-known window. If it belongs to a parked virtual
     /// workspace, that row is selected first.
@@ -279,9 +331,9 @@ pub enum Command {
     DeleteSpace {
         space_id: u64,
     },
-    /// A command to quit the window manager application.
+    /// Quits the window manager application.
     Quit,
-    /// A command to restart the window manager service.
+    /// Restarts the window manager service.
     Restart,
     PrintState,
     /// Reconciles Spool's tracked windows with the current macOS inventory.
@@ -290,7 +342,7 @@ pub enum Command {
     /// `crate::lua`). Never produced by parsing; the runtime issues it directly.
     Lua(u32),
     /// Layout operations a Lua handler produced by transforming a `WindowSet`.
-    /// Window-addressed, unlike every other command here, and applied
+    /// Window-addressed, unlike every other action here, and applied
     /// best-effort: see `ecs::layout_ops`. Never produced by parsing.
     Layout(Vec<crate::windowset::LayoutOp>),
 }

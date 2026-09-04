@@ -50,7 +50,7 @@ final class SpoolClient: SpoolControlling {
     }
 
     func focus(windowID: Int32) {
-        send(["send-cmd", "window", "focusid", String(windowID)])
+        send(["action", "window", "focusid", String(windowID)])
     }
 
     func selectWorkspace(displayID: UInt32, number: UInt32) {
@@ -61,7 +61,7 @@ final class SpoolClient: SpoolControlling {
                 }),
                 latestState?.capabilities.focus == true
             else { return }
-            self.sendNow(["send-cmd", "space", "focus", String(space.spaceID)])
+            self.sendNow(["action", "space", "focus", String(space.spaceID)])
         }
     }
 
@@ -79,7 +79,7 @@ final class SpoolClient: SpoolControlling {
                 latestState?.capabilities.moveWindows == true
             else { return }
             self.sendNow([
-                "send-cmd", "window", "move-to-space", String(windowID),
+                "action", "window", "move-to-space", String(windowID),
                 String(space.spaceID), follow ? "follow" : "stay",
             ])
         }
@@ -101,10 +101,10 @@ final class SpoolClient: SpoolControlling {
             try process.run()
             process.waitUntilExit()
             if process.terminationStatus != 0 {
-                report("Spool command failed: \(arguments.joined(separator: " "))")
+                report("Spool action failed: \(arguments.joined(separator: " "))")
             }
         } catch {
-            report("Unable to run Spool command: \(error.localizedDescription)")
+            report("Unable to dispatch Spool action: \(error.localizedDescription)")
         }
     }
 

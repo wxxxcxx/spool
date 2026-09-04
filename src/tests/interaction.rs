@@ -1,8 +1,8 @@
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
 
-use crate::commands::{Command, Direction, MoveFocus, Operation};
-use crate::config::{Config, MainOptions, WindowParams, parse_command};
+use crate::commands::{Action, Direction, MoveFocus, Operation};
+use crate::config::{Config, MainOptions, WindowParams, parse_action};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::native_space::VisibleNativeSpaceMarker;
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
@@ -94,8 +94,8 @@ fn native_fullscreen_transition_removes_window_from_original_strip_without_focus
             );
         })
         .run(vec![
-            Event::Command {
-                command: Command::PrintState,
+            Event::ActionRequested {
+                action: Action::PrintState,
             },
             Event::SpaceChanged,
             Event::SpaceDestroyed {
@@ -1201,15 +1201,15 @@ fn restored_unavailable_pending_window_rehomes_while_source_still_exists() {
             .world()
             .get::<WindowSpaceReassignmentPending>(entity)
             .is_some(),
-        "transient lifecycle isolation must preserve Space reassignment"
+        "transient lifecycle suspension must preserve Space reassignment"
     );
     let mut strips = harness.world().query::<&LayoutStrip>();
     assert!(
         strips
             .iter(harness.world())
             .find(|strip| strip.id() == FULLSCREEN_WORKSPACE_ID)
-            .is_some_and(|strip| !strip.contains(entity) && strip.contains(sibling)),
-        "the sibling must keep the source available for lifecycle restoration"
+            .is_some_and(|strip| strip.contains(entity) && strip.contains(sibling)),
+        "lifecycle suspension must preserve the source layout until membership can settle"
     );
 
     harness.mock_state.os_restore_withdrawn_window(0);
@@ -1254,7 +1254,7 @@ fn restored_unavailable_pending_window_rehomes_while_source_still_exists() {
 }
 
 #[test]
-fn unavailable_before_space_destroy_rehomes_after_source_is_gone() {
+fn unavailable_before_space_destroy_waits_in_source_then_rehomes() {
     const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
 
     let mut harness = TestHarness::new()
@@ -1307,14 +1307,15 @@ fn unavailable_before_space_destroy_rehomes_after_source_is_gone() {
             .world()
             .get::<WindowSpaceReassignmentPending>(entity)
             .is_some(),
-        "destroy invalidation must include unavailable windows detached from the source strip"
+        "destroy invalidation must include unavailable windows retained in the source strip"
     );
     let mut strips = harness.world().query::<&LayoutStrip>();
     assert!(
         strips
             .iter(harness.world())
-            .all(|strip| strip.id() != FULLSCREEN_WORKSPACE_ID),
-        "an empty destroyed source should be retired while the window is isolated"
+            .find(|strip| strip.id() == FULLSCREEN_WORKSPACE_ID)
+            .is_some_and(|strip| strip.contains(entity)),
+        "the destroyed source must remain as a tombstone while its window is suspended"
     );
 
     harness.mock_state.os_restore_withdrawn_window(0);
@@ -1615,8 +1616,8 @@ fn native_window_move_submits_stable_space_intent_and_reconciles_os_membership()
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },
-            Event::Command {
-                command: Command::MoveWindowToSpace {
+            Event::ActionRequested {
+                action: Action::MoveWindowToSpace {
                     window_id: 0,
                     space_id: TARGET_SPACE_ID,
                     move_focus: MoveFocus::Stay,
@@ -1672,8 +1673,8 @@ fn native_window_move_follow_switches_space_and_refocuses_window() {
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },
-            Event::Command {
-                command: Command::MoveWindowToSpace {
+            Event::ActionRequested {
+                action: Action::MoveWindowToSpace {
                     window_id: 0,
                     space_id: TARGET_SPACE_ID,
                     move_focus: MoveFocus::Follow,
@@ -1704,7 +1705,7 @@ fn native_space_focus_submits_stable_space_id() {
     harness.mock_state.enable_native_space_control();
 
     harness
-        .on_iteration(0, |_world, state| {
+        .on_iteration(0, |_, state| {
             assert_eq!(
                 state.native_space_intents(),
                 vec![crate::manager::NativeSpaceIntent::Focus {
@@ -1713,8 +1714,8 @@ fn native_space_focus_submits_stable_space_id() {
                 }]
             );
         })
-        .run(vec![Event::Command {
-            command: Command::FocusSpace {
+        .run(vec![Event::ActionRequested {
+            action: Action::FocusSpace {
                 space_id: TARGET_SPACE_ID,
             },
         }]);
@@ -1751,8 +1752,8 @@ fn returning_to_a_space_focuses_its_previous_window() {
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },
-            Event::Command {
-                command: Command::PrintState,
+            Event::ActionRequested {
+                action: Action::PrintState,
             },
             Event::SpaceChanged,
             Event::SpaceChanged,
@@ -1916,14 +1917,14 @@ fn floating_grid_window_uses_active_display_usable_origin() {
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },
-            Event::Command {
-                command: Command::PrintState,
+            Event::ActionRequested {
+                action: Action::PrintState,
             },
-            Event::Command {
-                command: Command::PrintState,
+            Event::ActionRequested {
+                action: Action::PrintState,
             },
-            Event::Command {
-                command: Command::PrintState,
+            Event::ActionRequested {
+                action: Action::PrintState,
             },
         ]);
 }
@@ -1932,14 +1933,14 @@ fn floating_grid_window_uses_active_display_usable_origin() {
 fn test_dont_focus() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 }, // 0
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::Last)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::Last)),
         }, // 1
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::First)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::First)),
         }, // 2
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         }, // 3
     ];
 
@@ -1972,8 +1973,8 @@ fn test_dont_focus() {
 
 #[test]
 fn test_focus_window_by_number() {
-    assert!(parse_command(&["window", "focus", "0"]).is_err());
-    let command = parse_command(&["window", "focus", "2"]).unwrap();
+    assert!(parse_action(&["window", "focus", "0"]).is_err());
+    let action = parse_action(&["window", "focus", "2"]).unwrap();
 
     TestHarness::new()
         .with_windows(3)
@@ -1982,13 +1983,65 @@ fn test_focus_window_by_number() {
         .on_iteration(3, |world, _state| assert_focused!(world, 2))
         .run(vec![
             Event::MenuOpened { window_id: 0 },
-            Event::Command {
-                command: command.clone(),
+            Event::ActionRequested {
+                action: action.clone(),
             },
-            Event::Command {
-                command: Command::Window(Operation::ToggleFloating),
+            Event::ActionRequested {
+                action: Action::Window(Operation::ToggleFloating),
             },
-            Event::Command { command },
+            Event::ActionRequested { action },
+        ]);
+}
+
+#[test]
+fn focus_next_and_previous_wrap_in_tiled_order() {
+    let next = parse_action(&["window", "focus", "next"]).unwrap();
+    let previous = parse_action(&["window", "focus", "previous"]).unwrap();
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(1, |world, _state| assert_focused!(world, 1))
+        .on_iteration(2, |world, _state| assert_focused!(world, 2))
+        .on_iteration(3, |world, _state| assert_focused!(world, 0))
+        .on_iteration(4, |world, _state| assert_focused!(world, 2))
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::ActionRequested {
+                action: next.clone(),
+            },
+            Event::ActionRequested {
+                action: next.clone(),
+            },
+            Event::ActionRequested { action: next },
+            Event::ActionRequested { action: previous },
+        ]);
+}
+
+#[test]
+fn focus_next_and_previous_use_stable_floating_order() {
+    let mut params = WindowParams::new(".*", None);
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let next = parse_action(&["window", "focus", "next"]).unwrap();
+    let previous = parse_action(&["window", "focus", "previous"]).unwrap();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_window(30, |_| {})
+        .with_window(20, |_| {})
+        .with_window(10, |_| {})
+        .with_focused_window(20)
+        .on_iteration(0, |world, _state| assert_focused!(world, 20))
+        .on_iteration(1, |world, _state| assert_focused!(world, 30))
+        .on_iteration(2, |world, _state| assert_focused!(world, 10))
+        .on_iteration(3, |world, _state| assert_focused!(world, 30))
+        .run(vec![
+            Event::MenuOpened { window_id: 20 },
+            Event::ActionRequested {
+                action: next.clone(),
+            },
+            Event::ActionRequested { action: next },
+            Event::ActionRequested { action: previous },
         ]);
 }
 
@@ -1998,8 +2051,8 @@ fn test_offscreen_windows_preserve_height() {
 
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::First)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::First)),
         },
     ];
 
@@ -2022,14 +2075,14 @@ fn test_sliver_smaller_than_edge_padding() {
 
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::Last)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::Last)),
         },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::First)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::First)),
         },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::Last)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::Last)),
         },
     ];
 
@@ -2076,21 +2129,21 @@ fn test_sliver_smaller_than_edge_padding() {
 fn test_scrolling() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::Last)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::Last)),
         },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::First)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::First)),
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
         Event::Swipe {
             delta: 0.2,
             fingers: 3,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -2161,8 +2214,8 @@ fn test_window_hidden_ratio() {
             delta: 0.3,
             fingers: 3,
         },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::First)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::First)),
         },
     ];
 
@@ -2200,17 +2253,17 @@ fn test_window_swap_brings_focused_into_view() {
     // left.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::Window(Operation::Center),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Center),
         },
-        Event::Command {
-            command: Command::Window(Operation::Swap(Direction::Last)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Move(Direction::Last)),
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -2254,11 +2307,11 @@ fn test_window_swap_keeps_strip_when_in_view() {
     // old position.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::Last)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::Last)),
         },
-        Event::Command {
-            command: Command::Window(Operation::Swap(Direction::West)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Move(Direction::West)),
         },
     ];
 
@@ -2288,18 +2341,18 @@ fn test_rapid_focus_not_swallowed() {
 
     harness.run(vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::Last)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::Last)),
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ]);
 
     assert_focused!(harness.world(), 4);
 
-    let focus_west = Event::Command {
-        command: Command::Window(Operation::Focus(Direction::West)),
+    let focus_west = Event::ActionRequested {
+        action: Action::Window(Operation::Focus(Direction::West)),
     };
     for _ in 0..3 {
         harness
@@ -2327,15 +2380,55 @@ fn test_rapid_focus_not_swallowed() {
 }
 
 #[test]
+fn keyboard_focus_request_makes_the_target_visible_without_a_second_confirmed_reflow() {
+    let mut harness = TestHarness::new().with_windows(5);
+    harness.pump_frames(15);
+    assert_focused!(harness.world(), 0);
+
+    let strip_position = |world: &mut World| {
+        let mut strips =
+            world.query_filtered::<&Position, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>();
+        strips.single(world).expect("active strip position").0
+    };
+    let before = strip_position(harness.world());
+
+    harness
+        .world()
+        .write_message::<Event>(Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::Last)),
+        });
+    harness.app.update();
+
+    assert_focused!(harness.world(), 0);
+    let requested = strip_position(harness.world());
+    assert_ne!(
+        requested, before,
+        "requested focus is layout state and must make the target visible even when AX confirmation is delayed"
+    );
+
+    for event in harness.mock_state.drain_events() {
+        harness.world().write_message::<Event>(event);
+    }
+    harness.pump_frames(5);
+
+    assert_focused!(harness.world(), 4);
+    assert_eq!(
+        strip_position(harness.world()),
+        requested,
+        "confirming an already projected focus request must not move the strip a second time"
+    );
+}
+
+#[test]
 fn test_stale_focus_event_ignored() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
         },
         Event::window_focused(4),
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -2354,18 +2447,18 @@ fn test_stale_focus_event_ignored() {
 fn stale_known_focus_event_does_not_trigger_automatic_recovery() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
         },
         Event::window_focused(4),
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -2393,8 +2486,8 @@ fn unknown_focus_clears_confirmed_focus_but_preserves_navigation() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::window_focused(999),
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
         },
     ];
 
@@ -2422,8 +2515,8 @@ fn ui_element_focus_notification_revalidates_the_app_focused_window() {
             pid: TEST_PROCESS_ID,
             source: FocusSource::AccessibilityUiElement,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -2455,8 +2548,8 @@ fn stale_focus_retry_cannot_override_a_newer_app_focus_resolution() {
             pid: SECOND_PID,
             source: FocusSource::AccessibilityUiElement,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -2488,11 +2581,11 @@ fn mouse_hit_on_an_untracked_window_confirms_focus_outside_spool() {
     const EXTERNAL_WINDOW_ID: i32 = 999;
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -2539,8 +2632,8 @@ fn focus_query_timeout_never_focuses_an_arbitrary_window() {
             source: FocusSource::AccessibilityWindow,
         },
     ];
-    commands.extend((0..7).map(|_| Event::Command {
-        command: Command::PrintState,
+    commands.extend((0..7).map(|_| Event::ActionRequested {
+        action: Action::PrintState,
     }));
 
     TestHarness::new()
@@ -2568,17 +2661,17 @@ fn focus_query_timeout_never_focuses_an_arbitrary_window() {
 fn test_repeated_external_focus_reshuffles_already_focused_window() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -2673,8 +2766,8 @@ fn remove_focused_from_all_strips(world: &mut World) {
 fn test_focus_recovers_when_focused_window_is_outside_strip() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
         },
     ];
 
@@ -2708,8 +2801,8 @@ fn test_focus_recovers_when_focused_window_is_outside_strip() {
 fn test_focus_west_from_outside_strip_enters_at_last_column() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::West)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::West)),
         },
     ];
 
@@ -2742,8 +2835,8 @@ fn mouse_in_bottom_right_corner_does_not_change_focus() {
     // FFM event would shift focus to window 0; with the gate it should not.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::West)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::West)),
         },
         Event::MouseMoved {
             point: CGPoint {
@@ -2778,8 +2871,8 @@ fn mouse_outside_corner_still_changes_focus() {
     // window 0.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::West)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::West)),
         },
         Event::MouseMoved {
             point: CGPoint { x: 500.0, y: 400.0 },
@@ -2797,7 +2890,7 @@ fn mouse_outside_corner_still_changes_focus() {
 }
 
 #[test]
-fn toggle_floating_layer_flips_state() {
+fn focus_other_layer_tracks_the_focused_tier() {
     fn current_layer(world: &mut World) -> FloatingLayer {
         let mut query = world.query::<&FloatingLayer>();
         *query
@@ -2808,27 +2901,34 @@ fn toggle_floating_layer_flips_state() {
     }
 
     let commands = vec![
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::Window(Operation::ToggleFloatingLayer),
+        Event::ActionRequested {
+            action: Action::Window(Operation::FocusTiled),
         },
-        Event::Command {
-            command: Command::Window(Operation::ToggleFloatingLayer),
+        Event::ActionRequested {
+            action: Action::Window(Operation::FocusOtherLayer),
+        },
+        Event::ActionRequested {
+            action: Action::Window(Operation::FocusOtherLayer),
         },
     ];
 
+    let mut floating = WindowParams::new("^Window 2$", None);
+    floating.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![floating]).into();
+
     TestHarness::new()
-        .with_config(Config::default())
+        .with_config(config)
         .with_windows(3)
         .on_iteration(0, |world, _state| {
             assert!(!current_layer(world).front);
         })
-        .on_iteration(1, |world, _state| {
+        .on_iteration(2, |world, _state| {
             assert!(current_layer(world).front);
         })
-        .on_iteration(2, |world, _state| {
+        .on_iteration(3, |world, _state| {
             assert!(!current_layer(world).front);
         })
         .run(commands);
@@ -2851,14 +2951,14 @@ fn focus_floating_ignores_floats_from_other_spaces() {
 
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::FocusFloating),
+        Event::ActionRequested {
+            action: Action::Window(Operation::FocusFloating),
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
         },
     ];
 
@@ -2905,10 +3005,10 @@ fn test_reshuffle_leftmost_pins_strip_to_left_edge_with_stale_frame() {
     // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
     let mut h = TestHarness::new().with_config(config).with_windows(5);
 
-    let pump = |h: &mut TestHarness, c: Command| {
+    let pump = |h: &mut TestHarness, c: Action| {
         h.app
             .world_mut()
-            .write_message::<Event>(Event::Command { command: c });
+            .write_message::<Event>(Event::ActionRequested { action: c });
         for _ in 0..10 {
             h.app.update();
             for e in h.mock_state.drain_events() {
@@ -2918,7 +3018,7 @@ fn test_reshuffle_leftmost_pins_strip_to_left_edge_with_stale_frame() {
     };
 
     // Boot the strip; column 0 (window id 0) sits at layout x 0.
-    pump(&mut h, Command::PrintState);
+    pump(&mut h, Action::PrintState);
 
     let leftmost = find_window_entity(0, h.app.world_mut());
 
@@ -2992,8 +3092,8 @@ fn test_stack_unstack_brings_focused_window_into_view() {
 
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::East)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::Focus(Direction::East)),
         },
         // Swipe windows 0 and 1 off screen.
         Event::Swipe {
@@ -3002,8 +3102,8 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         },
         // Noop to let the scroll settle.
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Stack(true)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToggleStack),
         },
         // Now swipe the stacked windows off screen again.
         Event::Swipe {
@@ -3012,8 +3112,8 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         },
         // Noop to let the scroll settle.
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Stack(false)),
+        Event::ActionRequested {
+            action: Action::Window(Operation::ToggleStack),
         },
     ];
 
@@ -3045,11 +3145,11 @@ fn test_stack_unstack_brings_focused_window_into_view() {
 fn test_foreign_window_move_is_adopted() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
-        Event::Command {
-            command: Command::PrintState,
+        Event::ActionRequested {
+            action: Action::PrintState,
         },
     ];
 
@@ -3137,8 +3237,8 @@ fn targeted_window_focus_uses_window_id() {
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },
-            Event::Command {
-                command: Command::FocusWindow { window_id: 1 },
+            Event::ActionRequested {
+                action: Action::FocusWindow { window_id: 1 },
             },
         ]);
 }
