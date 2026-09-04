@@ -17,7 +17,7 @@ use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEvent,
     CGEventField, CGEventFlags, CGEventTapLocation, CGGetActiveDisplayList,
     CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
-    kCGWindowNumber, kCGWindowOwnerPID,
+    kCGWindowAlpha, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -845,13 +845,32 @@ fn window_owners_matching(options: CGWindowListOption) -> Option<HashMap<WinID, 
         let array = unsafe { window_info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
         array
             .iter()
-            .filter_map(|dict| {
-                let window_id = dict.get(unsafe { kCGWindowNumber })?.as_i32()?;
-                let owner_pid = dict.get(unsafe { kCGWindowOwnerPID })?.as_i32()?;
-                Some((window_id, owner_pid))
-            })
+            .filter_map(|description| window_owner_from_description(&description))
             .collect()
     })
+}
+
+fn window_owner_from_description(
+    description: &CFDictionary<CFString, CFNumber>,
+) -> Option<(WinID, Pid)> {
+    let window_id = description.get(unsafe { kCGWindowNumber })?.as_i32()?;
+    let owner_pid = description.get(unsafe { kCGWindowOwnerPID })?.as_i32()?;
+    let layer = description
+        .get(unsafe { kCGWindowLayer })
+        .and_then(|layer| layer.as_i32());
+    let alpha = description
+        .get(unsafe { kCGWindowAlpha })
+        .and_then(|alpha| alpha.as_f64());
+
+    // Some applications retain the closed window's WindowServer ID as an
+    // invisible, non-normal-level surface after removing it from their AX
+    // window inventory. It is not evidence that the tracked window remains
+    // alive. Missing metadata stays fail-open so an incomplete CoreGraphics
+    // dictionary cannot cause a destructive lifecycle decision.
+    if matches!((layer, alpha), (Some(layer), Some(alpha)) if layer != 0 && alpha <= 0.0) {
+        return None;
+    }
+    Some((window_id, owner_pid))
 }
 
 /// Retrieves a list of window IDs for specified spaces and connection, with an option to include minimized windows.
@@ -1147,6 +1166,59 @@ impl notify::EventHandler for ConfigHandler {
 #[cfg(test)]
 mod native_space_runtime_tests {
     use super::*;
+
+    fn window_description(
+        window_id: WinID,
+        owner_pid: Pid,
+        layer: i32,
+        alpha: f64,
+    ) -> CFRetained<CFDictionary<CFString, CFNumber>> {
+        let window_id = CFNumber::new_i32(window_id);
+        let owner_pid = CFNumber::new_i32(owner_pid);
+        let layer = CFNumber::new_i32(layer);
+        let alpha = CFNumber::new_f64(alpha);
+        CFDictionary::from_slices(
+            &[
+                unsafe { kCGWindowNumber },
+                unsafe { kCGWindowOwnerPID },
+                unsafe { kCGWindowLayer },
+                unsafe { kCGWindowAlpha },
+            ],
+            &[
+                window_id.as_ref(),
+                owner_pid.as_ref(),
+                layer.as_ref(),
+                alpha.as_ref(),
+            ],
+        )
+    }
+
+    #[test]
+    fn lifecycle_inventory_excludes_transparent_non_normal_surface() {
+        let description = window_description(695, 1505, 101, 0.0);
+
+        assert_eq!(window_owner_from_description(&description), None);
+    }
+
+    #[test]
+    fn lifecycle_inventory_keeps_transparent_normal_surface() {
+        let description = window_description(42, 1000, 0, 0.0);
+
+        assert_eq!(
+            window_owner_from_description(&description),
+            Some((42, 1000))
+        );
+    }
+
+    #[test]
+    fn lifecycle_inventory_keeps_visible_non_normal_surface() {
+        let description = window_description(42, 1000, 3, 1.0);
+
+        assert_eq!(
+            window_owner_from_description(&description),
+            Some((42, 1000))
+        );
+    }
 
     #[test]
     #[ignore = "requires macOS 26.4+ private SkyLight runtime"]
