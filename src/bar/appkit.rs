@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -30,6 +30,8 @@ use super::motion::{BarMotion, VisualItem};
 use super::preferences::{BarPreferences, NotchSide};
 use super::toolbar;
 
+const DRAG_RELEASE_GRACE: Duration = Duration::from_millis(250);
+
 #[derive(Debug)]
 struct ViewState {
     display: BarDisplay,
@@ -40,14 +42,27 @@ struct ViewState {
     can_focus_spaces: bool,
     can_move_windows: bool,
     pressed: Option<BarDrag>,
+    release_observed_at: Option<Instant>,
     floating_order: HashMap<u64, Vec<i32>>,
     icons: HashMap<String, Retained<NSImage>>,
     preferences: BarPreferences,
 }
 
 impl ViewState {
+    fn drag_release_expired(&mut self, mouse_down: bool, now: Instant) -> bool {
+        if mouse_down || !self.pressed.as_ref().is_some_and(|drag| drag.active) {
+            self.release_observed_at = None;
+            return false;
+        }
+        // Global button state can lead the queued mouseUp. This is only a
+        // missing-event watchdog; normal releases must finish via mouseUp.
+        let released = self.release_observed_at.get_or_insert(now);
+        now.saturating_duration_since(*released) >= DRAG_RELEASE_GRACE
+    }
+
     fn press_at(&mut self, point: NSPoint) -> Option<Action> {
         self.pressed = None;
+        self.release_observed_at = None;
         let hit_layout = self.motion.presented.interaction_layout(&self.layout);
         if let Some(item) = window_at(&hit_layout, point)
             && let ItemKind::Window { space_id, .. } = item.kind
@@ -77,6 +92,7 @@ impl ViewState {
     }
 
     fn drag_to(&mut self, point: NSPoint, inside_view: bool) {
+        self.release_observed_at = None;
         let hit_layout = self.motion.presented.interaction_layout(&self.layout);
         if let Some(drag) = &mut self.pressed {
             drag.move_pointer((point.x, point.y));
@@ -347,6 +363,7 @@ impl BarView {
                 can_focus_spaces,
                 can_move_windows,
                 pressed: None,
+                release_observed_at: None,
                 floating_order: HashMap::new(),
                 icons: HashMap::new(),
                 preferences,
@@ -835,7 +852,13 @@ impl BarManager {
                 .as_ref()
                 .is_some_and(|drag| drag.active);
             if dragging {
-                if NSEvent::pressedMouseButtons() & 1 == 0 {
+                let release_expired = record
+                    .view
+                    .ivars()
+                    .state
+                    .borrow_mut()
+                    .drag_release_expired(NSEvent::pressedMouseButtons() & 1 != 0, now);
+                if release_expired {
                     record.view.cancel_drag();
                 } else {
                     record.view.sync_drag_preview();
@@ -1329,6 +1352,7 @@ mod tests {
                 can_focus_spaces: true,
                 can_move_windows: true,
                 pressed,
+                release_observed_at: None,
                 floating_order: HashMap::new(),
                 icons: HashMap::new(),
                 preferences,
@@ -1368,6 +1392,82 @@ mod tests {
         assert!(state.pressed.is_none());
         assert_eq!(state.display, original);
         assert_eq!(state.layout, original_layout);
+    }
+
+    #[test]
+    fn drag_survives_button_release_before_the_native_mouse_up_arrives() {
+        for cross_space in [false, true] {
+            let (mut state, reorder_point) = drag_state();
+            let source = state
+                .layout
+                .items
+                .iter()
+                .find(|item| matches!(item.kind, ItemKind::Window { window_id: 1, .. }))
+                .unwrap()
+                .rect;
+            state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0));
+            let point = if cross_space {
+                let target = state.motion.presented.space_rect(10).unwrap();
+                NSPoint::new(target.x + target.width / 2.0, target.y + 2.0)
+            } else {
+                reorder_point
+            };
+            state.drag_to(point, true);
+            assert!(state.pressed.as_ref().unwrap().target.is_some());
+            let now = Instant::now();
+            for millis in [0, 16, 100, 249] {
+                assert!(
+                    !state.drag_release_expired(false, now + Duration::from_millis(millis)),
+                    "global button state must not cancel a native mouseUp that has not arrived yet"
+                );
+            }
+            let expected = if cross_space {
+                Action::MoveColumnToSpace {
+                    window_id: 1,
+                    space_id: 10,
+                    move_focus: spool_shared_types::commands::MoveFocus::Follow,
+                }
+            } else {
+                Action::ReorderColumn {
+                    window_id: 1,
+                    anchor_window_id: 3,
+                    placement: spool_shared_types::commands::Placement::After,
+                }
+            };
+            assert_eq!(state.release_drag(point, true), Some(expected));
+            assert!(
+                state.release_drag(point, true).is_none(),
+                "release dispatches only once"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_mouse_up_expires_but_native_pointer_events_reset_the_watchdog() {
+        let (mut state, point) = drag_state();
+        state.drag_to(point, true);
+        let now = Instant::now();
+        assert!(!state.drag_release_expired(false, now));
+        assert!(!state.drag_release_expired(false, now + Duration::from_millis(249)));
+        assert!(state.drag_release_expired(false, now + DRAG_RELEASE_GRACE));
+
+        assert!(!state.drag_release_expired(true, now + Duration::from_millis(300)));
+        assert!(!state.drag_release_expired(false, now + Duration::from_millis(600)));
+        state.drag_to(point, true);
+        assert!(!state.drag_release_expired(false, now + Duration::from_millis(900)));
+
+        let source = state
+            .motion
+            .presented
+            .items
+            .iter()
+            .find(|item| matches!(item.item.kind, ItemKind::Window { window_id: 1, .. }))
+            .unwrap()
+            .item
+            .rect;
+        state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0));
+        state.drag_to(point, true);
+        assert!(!state.drag_release_expired(false, now + Duration::from_secs(2)));
     }
 
     #[test]
