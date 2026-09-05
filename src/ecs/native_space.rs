@@ -14,7 +14,7 @@ use tracing::{Level, debug, error, instrument, warn};
 use crate::commands::{Action, MoveFocus};
 use crate::config::Config;
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::PendingSpaceDestruction;
 use crate::ecs::{
@@ -63,7 +63,14 @@ struct PendingMove {
     window_ids: Vec<i32>,
     target_space_id: WorkspaceId,
     follow_window_id: Option<i32>,
+    layout: PendingMoveLayout,
     submitted: Instant,
+}
+
+#[derive(Debug)]
+enum PendingMoveLayout {
+    AssociatedWindows,
+    Column(Column),
 }
 
 #[derive(Debug)]
@@ -106,9 +113,11 @@ pub(crate) fn handle_focus_window_commands(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn handle_native_space_commands(
     mut messages: MessageReader<Event>,
     windows: Windows,
+    spaces: Query<&LayoutStrip>,
     config: Res<Config>,
     window_manager: Res<WindowManager>,
     mut transactions: bevy::ecs::system::ResMut<NativeSpaceTransactions>,
@@ -117,12 +126,43 @@ pub(crate) fn handle_native_space_commands(
         Event::ActionRequested { action } => Some(action),
         _ => None,
     }) {
-        let Action::MoveWindowToSpace {
-            window_id,
-            space_id,
-            move_focus,
-        } = action
-        else {
+        let move_request = match action {
+            Action::MoveWindowToSpace {
+                window_id,
+                space_id,
+                move_focus,
+            } => Some((*window_id, *space_id, *move_focus, None)),
+            Action::MoveColumnToSpace {
+                window_id,
+                space_id,
+                move_focus,
+            } => {
+                let Some((_, entity)) = windows.find(*window_id) else {
+                    warn!(window_id, "window is not tracked");
+                    continue;
+                };
+                let Some((_, _, state)) = windows.get_tracked(entity) else {
+                    continue;
+                };
+                if state.is_floating() {
+                    warn!(
+                        window_id,
+                        "a floating window does not belong to a tiled column"
+                    );
+                    continue;
+                }
+                let Some(column) = spaces
+                    .iter()
+                    .find_map(|strip| strip.column_containing(entity))
+                else {
+                    warn!(window_id, "window is not in a layout column");
+                    continue;
+                };
+                Some((*window_id, *space_id, *move_focus, Some(column)))
+            }
+            _ => None,
+        };
+        let Some((window_id, space_id, move_focus, column)) = move_request else {
             let intent = match action {
                 Action::FocusSpace { space_id } => Some(NativeSpaceIntent::Focus {
                     space_id: *space_id,
@@ -155,30 +195,48 @@ pub(crate) fn handle_native_space_commands(
             .present_displays()
             .into_iter()
             .flat_map(|(_, spaces)| spaces)
-            .any(|candidate| candidate == *space_id);
-        if !target_is_known || window_manager.workspace_is_fullscreen(*space_id) {
+            .any(|candidate| candidate == space_id);
+        if !target_is_known || window_manager.workspace_is_fullscreen(space_id) {
             warn!(space_id, "target is not a known user Space");
             continue;
         }
-        if windows.find(*window_id).is_none() {
+        if windows.find(window_id).is_none() {
             warn!(window_id, "window is not tracked");
             continue;
         }
-        let mut window_ids = window_manager.get_associated_windows(*window_id);
-        if !window_ids.contains(window_id) {
-            window_ids.push(*window_id);
+        let members = column.as_ref().map_or_else(
+            || {
+                windows
+                    .find(window_id)
+                    .map(|(_, entity)| vec![entity])
+                    .unwrap_or_default()
+            },
+            |column| column.window_iter().collect(),
+        );
+        let mut window_ids = Vec::new();
+        for member in members {
+            let Some((window, _, _)) = windows.get_tracked(member) else {
+                continue;
+            };
+            let member_id = window.id();
+            window_ids.extend(window_manager.get_associated_windows(member_id));
+            window_ids.push(member_id);
         }
         window_ids.sort_unstable();
         window_ids.dedup();
         let intent = NativeSpaceIntent::MoveWindows {
             window_ids: window_ids.clone(),
-            space_id: *space_id,
+            space_id,
         };
         match window_manager.perform_native_space_intent(&intent) {
             Ok(()) => transactions.moves.push(PendingMove {
                 window_ids,
-                target_space_id: *space_id,
-                follow_window_id: (*move_focus == MoveFocus::Follow).then_some(*window_id),
+                target_space_id: space_id,
+                follow_window_id: (move_focus == MoveFocus::Follow).then_some(window_id),
+                layout: column.map_or(
+                    PendingMoveLayout::AssociatedWindows,
+                    PendingMoveLayout::Column,
+                ),
                 submitted: Instant::now(),
             }),
             Err(error) => warn!(%error, "Space operation rejected"),
@@ -186,6 +244,7 @@ pub(crate) fn handle_native_space_commands(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn reconcile_native_space_transactions(
     window_manager: Res<WindowManager>,
     windows: Windows,
@@ -213,14 +272,27 @@ pub(crate) fn reconcile_native_space_transactions(
                 .iter()
                 .filter_map(|window_id| windows.find(*window_id).map(|(_, entity)| entity))
                 .collect::<Vec<_>>();
+            let mut target_anchor = None;
             for (mut strip, _) in &mut spaces {
                 if strip.id() == pending.target_space_id {
-                    strip.append_tab_group(&moved_entities);
+                    match &pending.layout {
+                        PendingMoveLayout::AssociatedWindows => {
+                            strip.append_tab_group(&moved_entities);
+                            target_anchor = moved_entities.first().copied();
+                        }
+                        PendingMoveLayout::Column(column) => {
+                            strip.append_column(column.clone());
+                            target_anchor = column.top();
+                        }
+                    }
                 } else {
                     for entity in &moved_entities {
                         strip.remove(*entity);
                     }
                 }
+            }
+            if let Some(anchor) = target_anchor {
+                commands.reshuffle_around(anchor);
             }
             debug!(
                 space_id = pending.target_space_id,

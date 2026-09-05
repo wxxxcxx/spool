@@ -821,7 +821,7 @@ pub(crate) fn gather_initial_processes(
         return;
     };
     let mut initial_processes: Vec<BProcess> = Vec::new();
-    let mut toml_config = None;
+    let mut initial_config = None;
     loop {
         match receiver.recv().expect("error reading initial processes") {
             Event::ProcessesLoaded | Event::Exit => break,
@@ -834,19 +834,19 @@ pub(crate) fn gather_initial_processes(
                 }
             }
             Event::InitialConfig(config) => {
-                toml_config = Some(config);
+                initial_config = Some(config);
             }
             event => warn!("Stray event during initial process gathering: {event:?}"),
         }
     }
 
     // A Lua `spool.setup{...}` config is inserted at build time and wins; the
-    // TOML config drained from the channel is only the fallback. Use whichever
+    // initial config drained from the channel is only the fallback. Use whichever
     // is authoritative for the force-track and menubar decisions below.
     let effective = existing_config
         .as_deref()
         .cloned()
-        .or_else(|| toml_config.clone());
+        .or_else(|| initial_config.clone());
 
     if let Some(config) = &effective {
         let height = config.menubar_height();
@@ -884,7 +884,7 @@ pub(crate) fn gather_initial_processes(
     // `spool.setup{...}` builds a fresh handle, so its settings must be
     // published into the tap's existing handle rather than replacing it, or
     // gestures would keep reading stale settings.
-    match (existing_config.as_deref(), toml_config) {
+    match (existing_config.as_deref(), initial_config) {
         #[cfg(feature = "lua")]
         (Some(lua_config), Some(shared)) => {
             shared.replace_inner_from(lua_config);
@@ -962,11 +962,12 @@ fn overlay_workspace_state(
     active_workspace: Option<(bool, &LayoutStrip)>,
     mission_control_active: bool,
 ) -> OverlayWorkspaceState {
+    if mission_control_active {
+        return OverlayWorkspaceState::Suppressed;
+    }
     match active_workspace {
         None => OverlayWorkspaceState::Missing,
-        Some((swiping, _)) if swiping || mission_control_active => {
-            OverlayWorkspaceState::Suppressed
-        }
+        Some((true, _)) => OverlayWorkspaceState::Suppressed,
         Some(_) => OverlayWorkspaceState::Active,
     }
 }
@@ -984,7 +985,7 @@ mod overlay_target_tests {
     use super::{
         OverlayDisposition, OverlayLayoutMode, OverlayTargetState, OverlayWorkspaceState,
         confirmed_overlay_frame, is_overlay_target, native_space_has_overlay, overlay_disposition,
-        overlay_target_is_eligible,
+        overlay_target_is_eligible, overlay_workspace_state,
     };
     use crate::ecs::ObservedWindowFrame;
     use crate::ecs::native_space::SpaceKind;
@@ -1049,6 +1050,18 @@ mod overlay_target_tests {
         assert_eq!(
             overlay_disposition(true, OverlayWorkspaceState::Missing),
             OverlayDisposition::Preserve
+        );
+    }
+
+    #[test]
+    fn mission_control_hides_overlays_even_without_an_active_workspace() {
+        assert_eq!(
+            overlay_disposition(true, overlay_workspace_state(None, true)),
+            OverlayDisposition::Hide,
+        );
+        assert_eq!(
+            overlay_disposition(true, overlay_workspace_state(None, false)),
+            OverlayDisposition::Preserve,
         );
     }
 
@@ -1670,10 +1683,10 @@ mod tests {
     /// *that* handle rather than in a fresh one only the ECS can see.
     #[test]
     fn lua_config_reaches_the_handle_the_event_tap_holds() {
-        let lua_config: Config = "[options]\n[swipe.gesture]\nfingers_count = 3\n"
+        let lua_config: Config = r#"{"swipe":{"gesture":{"fingers_count":3}}}"#
             .try_into()
             .expect("config should parse");
-        let tap_config = Config::defaults().expect("defaults should parse");
+        let tap_config = Config::default();
         assert_eq!(tap_config.swipe_gesture_fingers(), None);
 
         let (sender, receiver) = channel();

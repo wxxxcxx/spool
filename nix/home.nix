@@ -44,15 +44,6 @@
           };
         };
 
-        # TOML config (spool.toml). The spool.setup{...} in `config` (init.lua)
-        # takes precedence over the options declared here.
-        xdg.configFile."spool/spool.toml" = lib.mkIf (config.xdg.enable && cfg.settings != null) {
-          source = cfg.settingsFile;
-        };
-        home.file.".spool.toml" = lib.mkIf (!config.xdg.enable && cfg.settings != null) {
-          source = cfg.settingsFile;
-        };
-
         # Lua config (init.lua), following spool's discovery order:
         # $XDG_CONFIG_HOME/spool/init.lua, else ~/.spool.lua.
         xdg.configFile."spool/init.lua" = lib.mkIf (config.xdg.enable && cfg.config != null) {

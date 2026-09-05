@@ -94,6 +94,11 @@ pub fn install(lua: &Lua, spool: &Table, dispatch: &Dispatch) -> Result<()> {
     action.set("quit", verb(lua, dispatch, Action::Quit)?)?;
     action.set("restart", verb(lua, dispatch, Action::Restart)?)?;
     action.set("print_state", verb(lua, dispatch, Action::PrintState)?)?;
+    action.set(
+        "mission_control",
+        verb(lua, dispatch, Action::MissionControl)?,
+    )?;
+    action.set("show_desktop", verb(lua, dispatch, Action::ShowDesktop)?)?;
     spool.set("action", action)?;
 
     // spool.match{ app = …, bundle = …, title = …, floating = … }
@@ -440,6 +445,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(debug(&actions), vec!["Window(FocusStep(Previous))"]);
+    }
+
+    #[test]
+    fn system_overview_verbs_and_strings_dispatch_the_same_actions() {
+        let actions = run(r#"
+            spool.action.mission_control()
+            spool.action.show_desktop()
+            spool.run("mission-control")
+            spool.run({ "show-desktop" })
+        "#)
+        .unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::MissionControl,
+                Action::ShowDesktop,
+                Action::MissionControl,
+                Action::ShowDesktop,
+            ]
+        );
     }
 
     #[test]

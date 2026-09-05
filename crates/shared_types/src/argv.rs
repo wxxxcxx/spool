@@ -1,7 +1,6 @@
 //! The argv encoding of an [`Action`]: `["window", "focus", "east"]`.
 //!
-//! This is the argument shape of the `spool action` interface and the shape the
-//! TOML `[bindings]` keys are split into, so parsing and formatting live
+//! This is the argument shape of `spool action` and Lua's `spool.run`, so parsing and formatting live
 //! together here and are checked against each other by round-trip tests.
 
 use crate::commands::{
@@ -44,6 +43,8 @@ pub fn parse_action(argv: &[&str]) -> Result<Action> {
     Ok(match action {
         "printstate" => Action::PrintState,
         "reconcile-windows" => Action::ReconcileWindows,
+        "mission-control" if argv.len() == 1 => Action::MissionControl,
+        "show-desktop" if argv.len() == 1 => Action::ShowDesktop,
         "window" => parse_window_action(&argv[1..])?,
         "space" => parse_space_action(&argv[1..])?,
         "mouse" => Action::Mouse(parse_mouse_move(&argv[1..])?),
@@ -167,8 +168,7 @@ fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
 impl Action {
     /// The argv encoding of this action, as understood by [`parse_action`].
     ///
-    /// [`Action::Lua`] and [`Action::Layout`] have no encoding — they are
-    /// only ever issued in-process — and yield `None`.
+    /// Internal-only actions have no encoding and yield `None`.
     #[must_use]
     pub fn to_argv(&self) -> Option<Vec<String>> {
         let argv = match self {
@@ -221,7 +221,12 @@ impl Action {
             Action::Restart => vec!["restart".to_string()],
             Action::PrintState => vec!["printstate".to_string()],
             Action::ReconcileWindows => vec!["reconcile-windows".to_string()],
-            Action::Lua(_) | Action::Layout(_) => return None,
+            Action::MissionControl => vec!["mission-control".to_string()],
+            Action::ShowDesktop => vec!["show-desktop".to_string()],
+            Action::Lua(_)
+            | Action::Layout(_)
+            | Action::ReorderColumn { .. }
+            | Action::MoveColumnToSpace { .. } => return None,
         };
         Some(argv)
     }
@@ -312,6 +317,8 @@ mod tests {
             Action::Restart,
             Action::PrintState,
             Action::ReconcileWindows,
+            Action::MissionControl,
+            Action::ShowDesktop,
             Action::Mouse(MouseMove::ToNextDisplay),
             Action::FocusWindow { window_id: 42 },
             Action::FocusSpace { space_id: 99 },
@@ -324,6 +331,27 @@ mod tests {
             Action::DeleteSpace { space_id: 99 },
         ] {
             assert_eq!(format!("{:?}", round_trip(&action)), format!("{action:?}"));
+        }
+    }
+
+    #[test]
+    fn system_overview_actions_parse_and_round_trip_without_extra_arguments() {
+        for name in ["mission-control", "show-desktop"] {
+            let action = parse_action(&[name]).expect("system overview action");
+            assert_eq!(action.to_argv().unwrap(), vec![name]);
+            assert!(parse_action(&[name, "unexpected"]).is_err());
+        }
+    }
+
+    #[test]
+    fn system_overview_actions_have_stable_wire_names() {
+        for (action, name) in [
+            (Action::MissionControl, "mission_control"),
+            (Action::ShowDesktop, "show_desktop"),
+        ] {
+            let value = serde_json::to_value(&action).unwrap();
+            assert_eq!(value, serde_json::json!(name));
+            assert_eq!(serde_json::from_value::<Action>(value).unwrap(), action);
         }
     }
 

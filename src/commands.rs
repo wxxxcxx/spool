@@ -71,6 +71,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // answer from; the real app overwrites it from disk.
     app.init_resource::<crate::ecs::script_state::ScriptStateStore>();
     app.add_systems(PreUpdate, crate::ecs::script_state::script_state_handler);
+    app.add_systems(PreUpdate, command_system_overview);
     app.add_systems(
         PreUpdate,
         (
@@ -92,9 +93,57 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_focus_tiled,
             command_focus_other_layer,
             command_move_window,
+            command_reorder_column,
             snap_window,
         ),
     );
+}
+
+/// Applies the exact insertion produced by a Bar drag. Both identifiers may
+/// name any member of their columns; the complete source column moves.
+fn command_reorder_column(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    mut strips: Query<&mut LayoutStrip>,
+    mut commands: Commands,
+) {
+    for (window_id, anchor_window_id, placement) in messages.read().filter_map(|event| {
+        let Event::ActionRequested {
+            action:
+                Action::ReorderColumn {
+                    window_id,
+                    anchor_window_id,
+                    placement,
+                },
+        } = event
+        else {
+            return None;
+        };
+        Some((*window_id, *anchor_window_id, *placement))
+    }) {
+        let Some((_, entity)) = windows.find(window_id) else {
+            debug!(window_id, "dragged window is no longer tracked");
+            continue;
+        };
+        let Some((_, anchor)) = windows.find(anchor_window_id) else {
+            debug!(anchor_window_id, "drop target window is no longer tracked");
+            continue;
+        };
+        let Some(mut strip) = strips
+            .iter_mut()
+            .find(|strip| strip.contains(entity) && strip.contains(anchor))
+        else {
+            debug!(
+                window_id,
+                anchor_window_id, "dragged columns share no Space"
+            );
+            continue;
+        };
+        if strip.move_column_relative(entity, anchor, placement) {
+            commands.reshuffle_around(entity);
+            commands.ensure_visible(entity);
+        }
+    }
 }
 
 fn reconcile_windows_handler(mut messages: MessageReader<Event>, mut commands: Commands) {
@@ -109,6 +158,25 @@ fn reconcile_windows_handler(mut messages: MessageReader<Event>, mut commands: C
         commands.trigger(SendMessageTrigger(Event::ReconcileWindows {
             scope: ReconcileScope::All,
         }));
+    }
+}
+
+fn command_system_overview(mut messages: MessageReader<Event>, manager: Res<WindowManager>) {
+    use crate::platform::mission_control::SystemOverview;
+
+    for event in messages.read() {
+        let overview = match event {
+            Event::ActionRequested {
+                action: Action::MissionControl,
+            } => SystemOverview::MissionControl,
+            Event::ActionRequested {
+                action: Action::ShowDesktop,
+            } => SystemOverview::ShowDesktop,
+            _ => continue,
+        };
+        if let Err(error) = manager.perform_system_overview(overview) {
+            error!(?overview, %error, "unable to request system overview");
+        }
     }
 }
 
@@ -1633,6 +1701,54 @@ fn print_internal_state_handler(
 mod tests {
     use super::*;
     use bevy::prelude::*;
+
+    #[test]
+    fn system_overview_actions_reach_the_platform_once_per_request_even_after_failure() {
+        use crate::events::Event;
+        use crate::manager::MockWindowManagerApi;
+        use crate::platform::mission_control::SystemOverview;
+        use std::sync::{Arc, Mutex};
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&received);
+        let mut manager = MockWindowManagerApi::new();
+        manager
+            .expect_perform_system_overview()
+            .times(3)
+            .returning(move |overview| {
+                recorded.lock().unwrap().push(overview);
+                if overview == SystemOverview::ShowDesktop {
+                    Err(crate::errors::Error::Generic(
+                        "mock launch failure".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+        let mut app = App::new();
+        app.add_message::<Event>()
+            .insert_resource(WindowManager(Box::new(manager)))
+            .add_systems(PreUpdate, command_system_overview);
+        for action in [
+            Action::MissionControl,
+            Action::ShowDesktop,
+            Action::MissionControl,
+        ] {
+            app.world_mut()
+                .write_message(Event::ActionRequested { action });
+        }
+        app.world_mut().write_message(Event::MissionControlExit);
+        app.update();
+        app.update();
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![
+                SystemOverview::MissionControl,
+                SystemOverview::ShowDesktop,
+                SystemOverview::MissionControl,
+            ]
+        );
+    }
 
     fn setup_world_with_layout() -> (World, LayoutStrip, Vec<Entity>) {
         let mut world = World::new();

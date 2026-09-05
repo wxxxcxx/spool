@@ -1,165 +1,48 @@
 use arc_swap::{ArcSwap, Guard};
 use bevy::ecs::resource::Resource;
+#[cfg(feature = "lua")]
 use objc2_core_foundation::{CFData, CFString};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, de};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+#[cfg(feature = "lua")]
 use std::{
-    collections::HashMap,
     env,
     ffi::c_void,
-    fs::{OpenOptions, create_dir_all, read_to_string},
+    fs::{OpenOptions, create_dir_all},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
     ptr::NonNull,
-    sync::{Arc, LazyLock},
-    time::Duration,
+    sync::LazyLock,
 };
 use stdext::function_name;
+#[cfg(feature = "lua")]
 use tracing::{error, info, warn};
 
 use self::decorations::BorderRadiusOption;
 use self::swipe::SwipeGestureDirection;
 #[cfg(test)]
-use crate::commands::{FocusStep, Operation, ResizeAxis, ResizeDirection};
+use crate::commands::{Action, Operation, ResizeAxis, ResizeDirection};
+use crate::errors::{Error, Result};
 use crate::{
-    commands::Action,
     manager::ProcessApi,
-    platform::{Modifiers, OSStatus, macos_major_version},
+    platform::{Modifiers, macos_major_version},
 };
+#[cfg(feature = "lua")]
 use crate::{
-    errors::{Error, Result},
-    util::MacResult,
+    platform::{CFStringRef, OSStatus},
+    util::{AXUIWrapper, MacResult},
 };
-use crate::{platform::CFStringRef, util::AXUIWrapper};
 
 pub mod decorations;
 pub mod padding;
 pub mod swipe;
 
-/// A `LazyLock` that determines the path to the application's configuration file.
-/// It checks the `SPOOL_CONFIG` environment variable first, then standard XDG locations and user home directory.
-/// If no configuration file is found, a minimal one is created in the user's
-/// XDG configuration directory so a fresh app installation can start with the
-/// built-in defaults.
-/// The TOML configuration file, if there is one to use. `None` when an
-/// `init.lua` exists, since a script disables the TOML entirely (see
-/// [`Config::defaults`]).
-pub static CONFIGURATION_FILE: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
-    #[cfg(feature = "lua")]
-    if let Some(script) = discover_lua_file() {
-        info!(
-            "{}: {} is in charge; the TOML configuration is ignored",
-            function_name!(),
-            script.display()
-        );
-        return None;
-    }
-    if let Some(path) = discover_configuration_file() {
-        return Some(path);
-    }
-    Some(create_default_configuration_file().unwrap_or_else(|error| {
-        panic!(
-            "{}: Unable to create default configuration: {error}",
-            function_name!()
-        )
-    }))
-});
-
-const DEFAULT_CONFIGURATION: &str = "# Spool configuration\n\n[options]\n\n[bindings]\n";
-
-fn default_configuration_file() -> std::io::Result<PathBuf> {
-    let config_home = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::NotFound,
-                "neither XDG_CONFIG_HOME nor HOME is set",
-            )
-        })?;
-
-    Ok(config_home.join("spool").join("spool.toml"))
-}
-
-fn create_default_configuration_file() -> std::io::Result<PathBuf> {
-    let path = default_configuration_file()?;
-    if create_configuration_file_at(&path)? {
-        info!("Created default configuration at {}", path.display());
-    }
-    Ok(path)
-}
-
-fn create_configuration_file_at(path: &Path) -> std::io::Result<bool> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(ErrorKind::InvalidInput, "configuration path has no parent")
-    })?;
-    create_dir_all(parent)?;
-
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            file.write_all(DEFAULT_CONFIGURATION.as_bytes())?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-/// Finds the first existing configuration file from supported locations.
-/// Unlike [`CONFIGURATION_FILE`], this does not panic when no file is found.
-pub fn discover_configuration_file() -> Option<PathBuf> {
-    if let Ok(path_str) = env::var("SPOOL_CONFIG") {
-        let path = PathBuf::from(path_str);
-        if path.exists() {
-            return Some(path);
-        }
-        warn!(
-            "{}: $SPOOL_CONFIG is set to {}, but the file does not exist. Falling back to default locations.",
-            function_name!(),
-            path.display()
-        );
-    }
-
-    let standard_paths = [
-        env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".spool")),
-        env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".spool.toml")),
-    ];
-
-    let xdg_dirs = xdg::BaseDirectories::with_prefix("spool");
-    let xdg_config_paths = xdg_dirs.find_config_files("spool.toml");
-
-    standard_paths
-        .into_iter()
-        .flatten()
-        .chain(xdg_config_paths)
-        .find(|path| path.exists())
-}
-
 /// The default Lua init script, written on first launch when no script exists so the
 /// file watcher always has a concrete path to observe for hot reloading.
 #[cfg(feature = "lua")]
-const DEFAULT_LUA_SCRIPT: &str = "\
--- Spool Lua configuration (hot-reloaded on save).
---
--- Hook into window-manager events:
---   spool.on(\"window_focused\", function(e) spool.log(\"focused \" .. e.window_id) end)
---
--- Bind keys to actions (chord syntax matches [bindings]):
---   spool.bind(\"alt+b\", spool.action.window.balance)
---
--- ...or to a function. Handlers are given the whole layout as a value they can
--- transform; nothing moves until you return one, so computing a layout and
--- discarding it costs nothing. See CONFIGURATION.md.
---   spool.bind(\"alt+j\", function(ws)
---     return ws:focus(ws:east(ws:focused()))
---   end)
-";
+pub(crate) const DEFAULT_LUA_SCRIPT: &str = include_str!("../config/default.lua");
 
-/// Returns the default location for the Lua init script (`<config>/spool/init.lua`).
 #[cfg(feature = "lua")]
 fn default_lua_file() -> std::io::Result<PathBuf> {
     let config_home = env::var_os("XDG_CONFIG_HOME")
@@ -175,8 +58,7 @@ fn default_lua_file() -> std::io::Result<PathBuf> {
     Ok(config_home.join("spool").join("init.lua"))
 }
 
-/// Finds the first existing Lua init script from supported locations, mirroring
-/// [`discover_configuration_file`]. Honors `$SPOOL_LUA` first.
+/// Finds the first existing Lua init script. Honors `$SPOOL_LUA` first.
 #[cfg(feature = "lua")]
 pub fn discover_lua_file() -> Option<PathBuf> {
     if let Ok(path_str) = env::var("SPOOL_LUA") {
@@ -207,28 +89,16 @@ pub fn discover_lua_file() -> Option<PathBuf> {
 
 /// Returns the path to the Lua init script, creating a default one at the XDG
 /// location if none exists.
-///
-/// Returns `Ok(None)` instead if a `spool.toml` already exists: planting a
-/// script beside an existing TOML would silently override it (see
-/// [`CONFIGURATION_FILE`]).
 #[cfg(feature = "lua")]
-pub fn ensure_lua_file() -> std::io::Result<Option<PathBuf>> {
+pub fn ensure_lua_file() -> std::io::Result<PathBuf> {
     if let Some(path) = discover_lua_file() {
-        return Ok(Some(path));
-    }
-    if let Some(toml) = discover_configuration_file() {
-        info!(
-            "{}: {} is the active configuration; not creating a default init.lua",
-            function_name!(),
-            toml.display()
-        );
-        return Ok(None);
+        return std::path::absolute(path);
     }
     let path = default_lua_file()?;
     if create_lua_file_at(&path)? {
         info!("Created default Lua script at {}", path.display());
     }
-    Ok(Some(path))
+    std::path::absolute(path)
 }
 
 #[cfg(feature = "lua")]
@@ -248,49 +118,11 @@ fn create_lua_file_at(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// Returns the list of deprecated top-level `[options]` keys present in a TOML config.
-pub fn deprecated_options_in_input(input: &str) -> Result<Vec<String>> {
-    const DEPRECATED_KEYS: [&str; 16] = [
-        "padding_top",
-        "padding_bottom",
-        "padding_left",
-        "padding_right",
-        "dim_inactive_windows",
-        "dim_inactive_color",
-        "border_active_window",
-        "border_color",
-        "border_opacity",
-        "border_width",
-        "border_radius",
-        "swipe_gesture_fingers",
-        "swipe_gesture_direction",
-        "continuous_swipe",
-        "swipe_sensitivity",
-        "swipe_deceleration",
-    ];
-
-    let value: toml::Value = toml::from_str(input)?;
-    let Some(options) = value.get("options").and_then(toml::Value::as_table) else {
-        return Ok(Vec::new());
-    };
-
-    Ok(DEPRECATED_KEYS
-        .into_iter()
-        .filter(|key| options.contains_key(*key))
-        .map(str::to_string)
-        .collect())
-}
-
-/// Returns deprecated top-level `[options]` keys present in the config file.
-pub fn deprecated_options_in_file(path: &Path) -> Result<Vec<String>> {
-    let input = read_to_string(path)?;
-    deprecated_options_in_input(&input)
-}
-
 /// Parses a command argument vector into a [`Action`] (e.g. `["window",
 /// "focus", "east"]`), mapping the shared vocabulary crate's parse error into
 /// this crate's configuration error.
-pub fn parse_action(argv: &[&str]) -> Result<Action> {
+#[cfg(test)]
+pub(crate) fn parse_action(argv: &[&str]) -> Result<Action> {
     spool_shared_types::commands::parse_action(argv)
         .map_err(|err| Error::InvalidConfig(format!("{}: {err}", function_name!())))
 }
@@ -303,57 +135,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Creates a new `Config` instance by loading the configuration from the specified path.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - A reference to the path of the configuration file.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Self)` if the configuration is loaded successfully, otherwise `Err(Error)` with an error message.
-    pub fn new(path: &Path) -> Result<Self> {
-        let input = read_to_string(path)?;
-        Ok(Config {
-            inner: Arc::new(ArcSwap::from_pointee(InnerConfig::new(&input)?)),
-        })
-    }
-
-    /// The configuration with every option left at its default, used when
-    /// there is no TOML file (e.g. a Lua-only setup; see [`CONFIGURATION_FILE`]).
-    /// Parses the same text the generated stub would contain.
-    pub fn defaults() -> Result<Self> {
-        Ok(Config {
-            inner: Arc::new(ArcSwap::from_pointee(InnerConfig::new(
-                DEFAULT_CONFIGURATION,
-            )?)),
-        })
-    }
-
-    /// Loads `path` if there is one, otherwise falls back to the defaults.
-    pub fn load(path: Option<&Path>) -> Result<Self> {
-        match path {
-            Some(path) => Self::new(path),
-            None => Self::defaults(),
-        }
-    }
-
-    /// Reloads the configuration from the specified path, updating the internal options and keybindings.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - A reference to the path of the new configuration file.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the configuration is reloaded successfully, otherwise `Err(Error)` with an error message.
-    pub fn reload_config(&mut self, path: &Path) -> Result<()> {
-        let input = read_to_string(path)?;
-        let new = InnerConfig::new(&input)?;
-        self.inner.store(Arc::new(new));
-        Ok(())
-    }
-
     /// Atomically adopts another config's inner data via a lock-free
     /// `ArcSwap::store`, so every shared handle to this `Config` observes the
     /// new settings. Used by the Lua hot-reload path.
@@ -380,6 +161,10 @@ impl Config {
         self.inner().options.clone()
     }
 
+    pub fn bar_preferences(&self) -> crate::bar::BarPreferences {
+        self.inner().bar.clone()
+    }
+
     // Exponential ease-out decay rate (per second) consumed by the animation
     // systems as `t = 1 - e^(-rate*dt)`. Higher values feel snappier; very large
     // values collapse to an instant snap.
@@ -391,28 +176,6 @@ impl Config {
             // effectively disabling animation.
             .unwrap_or(1_000_000.0)
             .max(0.0)
-    }
-
-    /// Finds a keybinding matching the given `keycode` and `modifier` mask.
-    ///
-    /// # Arguments
-    ///
-    /// * `keycode` - The raw key code of the keybinding to find.
-    /// * `mask` - The modifier mask (e.g., `Alt`, `Shift`, `Cmd`, `Ctrl`) of the keybinding.
-    ///
-    /// # Returns
-    ///
-    /// `Some(Action)` if a matching keybinding is found, otherwise `None`.
-    pub fn find_keybind(&self, keycode: u8, mask: Modifiers) -> Option<Action> {
-        let config = self.inner();
-        config
-            .bindings
-            .values()
-            .flat_map(|binds| binds.all())
-            .find_map(|bind| {
-                (bind.code == keycode && bind.modifiers.matches(mask))
-                    .then_some(bind.action.clone())
-            })
     }
 
     /// Finds window properties for a given `title` and `bundle_id`.
@@ -837,12 +600,13 @@ impl Default for Config {
     }
 }
 
+#[cfg(test)]
 impl TryFrom<&str> for Config {
     type Error = crate::errors::Error;
 
     fn try_from(input: &str) -> std::result::Result<Self, Self::Error> {
         Ok(Config {
-            inner: Arc::new(ArcSwap::from_pointee(InnerConfig::new(input)?)),
+            inner: Arc::new(ArcSwap::from_pointee(serde_json::from_str(input)?)),
         })
     }
 }
@@ -863,122 +627,19 @@ impl From<(MainOptions, Vec<WindowParams>)> for Config {
     }
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(untagged)]
-enum OneOrMore {
-    Single(Keybinding),
-    Multiple(Vec<Keybinding>),
-}
-
-impl OneOrMore {
-    fn all(&self) -> Vec<&Keybinding> {
-        match self {
-            OneOrMore::Single(one) => vec![one],
-            OneOrMore::Multiple(many) => many.iter().collect::<Vec<_>>(),
-        }
-    }
-
-    fn all_mut(&mut self) -> Vec<&mut Keybinding> {
-        match self {
-            OneOrMore::Single(one) => vec![one],
-            OneOrMore::Multiple(many) => many.iter_mut().collect::<Vec<_>>(),
-        }
-    }
-}
-
-/// `InnerConfig` holds the actual configuration data parsed from a file, including options, keybindings, and window parameters.
-/// It is typically accessed via an `Arc<RwLock<InnerConfig>>` within the `Config` struct.
+/// Configuration published atomically to the ECS and input handler.
 #[derive(Deserialize, Debug, Default)]
 struct InnerConfig {
     // Defaulted so a config may omit these; otherwise serde requires them.
     #[serde(default)]
     options: MainOptions,
     #[serde(default)]
-    bindings: HashMap<String, OneOrMore>,
+    bar: crate::bar::BarPreferences,
     windows: Option<HashMap<String, WindowParams>>,
     decorations: Option<decorations::DecorationsOptions>,
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
     restore: Option<RestoreOptions>,
-}
-
-impl InnerConfig {
-    /// Creates a new `InnerConfig` by reading and parsing the configuration file from the specified `path`.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - A reference to the path of the configuration file.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(InnerConfig)` if the configuration is parsed successfully, otherwise `Err(Error)` with an error message.
-    fn new(input: &str) -> Result<InnerConfig> {
-        InnerConfig::parse_config(input)
-    }
-
-    /// Parses the configuration from a string `input`.
-    /// It populates the `code` and `command` fields of `Keybinding` by looking up virtual keys and literal keycodes.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - The string content of the configuration file.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(InnerConfig)` if the parsing is successful, otherwise `Err(Error)` with an error message.
-    fn parse_config(input: &str) -> Result<InnerConfig> {
-        let config: InnerConfig = toml::from_str(input)?;
-        if !config.needs_virtual_keys() {
-            return Ok(config);
-        }
-
-        let virtual_keys = generate_virtual_keymap();
-        Self::parse_config_with_virtual_keys(input, &virtual_keys)
-    }
-
-    fn parse_config_with_virtual_keys(
-        input: &str,
-        virtual_keys: &[(String, u8)],
-    ) -> Result<InnerConfig> {
-        let mut config: InnerConfig = toml::from_str(input)?;
-
-        for (command, bindings) in &mut config.bindings {
-            let argv = command.split('_').collect::<Vec<_>>();
-            for binding in bindings.all_mut() {
-                binding.action = parse_action(&argv)?;
-
-                if let Some(code) = keycode_for_key_name(&binding.key, virtual_keys) {
-                    binding.code = code;
-                    info!("bind: {binding:?}");
-                } else {
-                    error!("{}: invalid key '{}'", function_name!(), &binding.key);
-                }
-            }
-        }
-
-        // Resolve passthrough keybinding strings into (keycode, modifiers) pairs.
-        if let Some(windows) = &mut config.windows {
-            for params in windows.values_mut() {
-                for input in &params.bindings_passthrough {
-                    match resolve_keybinding_str(input, virtual_keys) {
-                        Ok(pair) => params.parsed_passthrough.push(pair),
-                        Err(err) => error!("passthrough: {err}"),
-                    }
-                }
-            }
-        }
-
-        Ok(config)
-    }
-
-    fn needs_virtual_keys(&self) -> bool {
-        !self.bindings.is_empty()
-            || self.windows.as_ref().is_some_and(|windows| {
-                windows
-                    .values()
-                    .any(|params| !params.bindings_passthrough.is_empty())
-            })
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -996,7 +657,7 @@ pub struct RestoreOptions {
 
 /// `MainOptions` represents the primary configuration options for the window manager.
 /// These options control various behaviors such as mouse focus, gesture recognition, and window animation.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct MainOptions {
     /// Enables or disables focus follows mouse behavior.
     pub focus_follows_mouse: Option<bool>,
@@ -1085,46 +746,50 @@ pub struct MainOptions {
     pub space_switch_animation: Option<bool>,
 }
 
+impl Default for MainOptions {
+    fn default() -> Self {
+        Self {
+            focus_follows_mouse: None,
+            mouse_follows_focus: None,
+            horizontal_mouse_warp: None,
+            horizontal_mouse_warp_offset: None,
+            preset_column_widths: default_preset_column_widths(),
+            animation_speed: None,
+            auto_center: None,
+            sliver_height: None,
+            sliver_width: None,
+            padding_top: None,
+            padding_bottom: None,
+            padding_left: None,
+            padding_right: None,
+            dim_inactive_windows: None,
+            dim_inactive_color: None,
+            border_active_window: None,
+            border_color: None,
+            border_opacity: None,
+            border_width: None,
+            border_radius: None,
+            swipe_gesture_fingers: None,
+            swipe_gesture_direction: None,
+            continuous_swipe: None,
+            swipe_sensitivity: None,
+            swipe_deceleration: None,
+            mouse_resize_modifier: None,
+            menubar_height: None,
+            window_hidden_ratio: None,
+            window_resize_cycle: None,
+            floating_window_move_step: None,
+            floating_window_resize_step: None,
+            disable_native_tabs: None,
+            experimental_space_control: None,
+            space_switch_animation: None,
+        }
+    }
+}
+
 /// Returns a default set of column widths.
 pub fn default_preset_column_widths() -> Vec<f64> {
     vec![0.25, 0.33333, 0.50, 0.66667, 0.75, 1.0, 1.5, 2.0]
-}
-
-/// `Keybinding` represents a keyboard shortcut and the command it triggers.
-/// It includes the key, its raw keycode, modifier keys, and the associated command.
-#[derive(Debug)]
-pub struct Keybinding {
-    pub key: String,
-    pub code: u8,
-    pub modifiers: Modifiers,
-    pub action: Action,
-}
-
-impl<'de> Deserialize<'de> for Keybinding {
-    /// Deserializes a `Keybinding` from a plus-separated chord.
-    /// Examples: "`ctrl+alt+q`", "`shift+tab`", "`h`".
-    ///
-    /// # Arguments
-    ///
-    /// * `deserializer` - The deserializer used to parse the input.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Self)` if the deserialization is successful, otherwise `Err(D::Error)` with a custom error message.
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let input = String::deserialize(deserializer)?;
-        let (key, modifiers) = parse_chord_parts(&input).map_err(de::Error::custom)?;
-
-        Ok(Keybinding {
-            key: key.to_string(),
-            code: 0,
-            modifiers,
-            action: Action::Quit,
-        })
-    }
 }
 
 /// `WindowParams` defines rules and properties for specific windows based on their title or bundle ID.
@@ -1157,8 +822,9 @@ pub struct WindowParams {
     pub border_radius: Option<f64>,
     /// Keyboard shortcuts that should be passed through to this app instead of
     /// being intercepted by spool. Uses the same plus-separated format as
-    /// `[bindings]` (e.g. `"ctrl+alt+h"`).
+    /// `spool.bind` (e.g. `"ctrl+alt+h"`).
     #[serde(default)]
+    #[cfg_attr(not(feature = "lua"), allow(dead_code))]
     bindings_passthrough: Vec<String>,
     /// Resolved `(keycode, modifiers)` pairs from `bindings_passthrough`.
     #[serde(skip)]
@@ -1232,9 +898,7 @@ where
 }
 
 /// Builds a [`Config`] from the Lua table passed to `spool.setup{...}`,
-/// reusing the same serde `Deserialize` that parses the TOML file. Keybindings
-/// are not read here — they go through the Lua keybind pipeline via
-/// `spool.bind` — so any `bindings` field is cleared.
+/// Keybindings are registered separately through `spool.bind`.
 ///
 /// # Errors
 ///
@@ -1250,10 +914,9 @@ pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Resu
     }
 
     let mut inner: InnerConfig = lua.from_value(value)?;
-    inner.bindings.clear();
+    inner.bar.validate().map_err(mlua::Error::RuntimeError)?;
 
-    // Resolve window passthrough chords into keycodes, mirroring the TOML
-    // second pass. `parsed_passthrough` is `#[serde(skip)]`, so it starts empty.
+    // Resolve window passthrough chords into keycodes. `parsed_passthrough` is `#[serde(skip)]`, so it starts empty.
     let needs_keys = inner.windows.as_ref().is_some_and(|windows| {
         windows
             .values()
@@ -1284,7 +947,7 @@ pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Resu
 /// pair, generating the layout-aware virtual keymap on demand.
 ///
 /// This is the entry point used by the Lua runtime's `spool.bind`, so scripted
-/// keybinds accept the exact same chord syntax as the TOML `[bindings]` table.
+/// keybinds use the same chord syntax as window passthrough rules.
 #[cfg(feature = "lua")]
 pub(crate) fn resolve_chord(input: &str) -> Result<(u8, Modifiers)> {
     // Fast path: avoids the virtual keymap for common chords, keeping this
@@ -1319,6 +982,7 @@ fn virtual_keymap() -> &'static [(String, u8)] {
 }
 
 /// Resolves a keybinding string like `"ctrl+alt+h"` into a `(keycode, Modifiers)` pair.
+#[cfg(feature = "lua")]
 fn resolve_keybinding_str(input: &str, virtual_keys: &[(String, u8)]) -> Result<(u8, Modifiers)> {
     let (key, modifiers) = parse_chord_parts(input)?;
 
@@ -1330,8 +994,9 @@ fn resolve_keybinding_str(input: &str, virtual_keys: &[(String, u8)]) -> Result<
 }
 
 /// Splits a chord whose last token is the physical key and whose preceding
-/// tokens are modifiers. The single `+` separator keeps Lua and TOML spelling
+/// tokens are modifiers. The single `+` separator keeps chord spelling
 /// identical: `alt+shift+minus`.
+#[cfg(feature = "lua")]
 fn parse_chord_parts(input: &str) -> Result<(&str, Modifiers)> {
     if input.contains('-') {
         return Err(Error::InvalidConfig(format!(
@@ -1357,6 +1022,7 @@ fn parse_chord_parts(input: &str) -> Result<(&str, Modifiers)> {
     Ok((key, modifiers))
 }
 
+#[cfg(feature = "lua")]
 fn keycode_for_key_name(key: &str, virtual_keys: &[(String, u8)]) -> Option<u8> {
     virtual_keys
         .iter()
@@ -1405,6 +1071,7 @@ fn parse_modifiers(input: &str) -> Result<Modifiers> {
     Ok(out)
 }
 
+#[cfg(feature = "lua")]
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     /// Returns a reference to the currently selected keyboard layout input source that is ASCII-capable.
@@ -1475,6 +1142,7 @@ unsafe extern "C" {
 /// # Returns
 ///
 /// An iterator yielding references to `(&'static str, u8)` tuples.
+#[cfg(feature = "lua")]
 fn virtual_keycode() -> impl Iterator<Item = &'static (&'static str, u8)> {
     /*
      *  Summary:
@@ -1570,6 +1238,7 @@ fn virtual_keycode() -> impl Iterator<Item = &'static (&'static str, u8)> {
 /// # Returns
 ///
 /// An iterator yielding references to `(&'static str, u8)` tuples.
+#[cfg(feature = "lua")]
 fn literal_keycode() -> impl Iterator<Item = &'static (&'static str, u8)> {
     /* keycodes for keys that are independent of keyboard layout*/
     static LITERAL_KEYCODE: LazyLock<Vec<(&'static str, u8)>> = LazyLock::new(|| {
@@ -1629,6 +1298,7 @@ fn literal_keycode() -> impl Iterator<Item = &'static (&'static str, u8)> {
 }
 
 /// Represents the action of a key, used in `UCKeyTranslate`.
+#[cfg(feature = "lua")]
 enum UCKeyAction {
     /// The key is going down.
     Down = 0, // key is going down
@@ -1645,6 +1315,7 @@ enum UCKeyAction {
 /// # Returns
 ///
 /// A `Vec<(String, u8)>` containing the translated key names and their keycodes. Returns an empty vector if an error occurs during keyboard layout fetching.
+#[cfg(feature = "lua")]
 fn generate_virtual_keymap() -> Vec<(String, u8)> {
     let keyboard = AXUIWrapper::from_retained(unsafe {
         TISCopyCurrentASCIICapableKeyboardLayoutInputSource()
@@ -1697,175 +1368,6 @@ fn generate_virtual_keymap() -> Vec<(String, u8)> {
         })
         .flatten()
         .collect()
-}
-
-#[cfg(test)]
-fn test_virtual_keymap() -> Vec<(String, u8)> {
-    virtual_keycode()
-        .map(|(key, code)| ((*key).to_string(), *code))
-        .collect()
-}
-
-#[test]
-#[allow(clippy::float_cmp)]
-#[allow(clippy::too_many_lines)]
-fn test_config_parsing() {
-    let input = r#"
-[options]
-focus_follows_mouse = true
-
-[bindings]
-quit = "ctrl+alt+q"
-window_toggle_floating = "ctrl+alt+t"
-window_focus_next = "alt+n"
-window_focus_previous = "alt+p"
-window_focus_other_layer = "alt+semicolon"
-window_toggle_stack = ["ctrl+s", "alt+s"]
-window_shrink_width = "alt+d"
-window_snap = "fn+x"
-
-[windows]
-
-[windows.pip]
-title = "picture.*picture"
-bundle_id = "com.something.apple"
-floating = true
-index = 1
-"#;
-    let virtual_keys = test_virtual_keymap();
-    let config = Config {
-        inner: Arc::new(ArcSwap::from_pointee(
-            InnerConfig::parse_config_with_virtual_keys(input, &virtual_keys)
-                .expect("Failed to parse config"),
-        )),
-    };
-    let find_key = |k| {
-        virtual_keycode()
-            .find_map(|(s, v)| (format!("{k}") == *s).then_some(*v))
-            .unwrap()
-    };
-
-    assert_eq!(config.inner().options.focus_follows_mouse, Some(true));
-
-    // Modifiers: alt = 1<<0, ctrl = 1<<3.
-    let keycode = find_key('q');
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::ALT | Modifiers::CTRL),
-        Some(Action::Quit)
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::LALT | Modifiers::LCTRL),
-        Some(Action::Quit)
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::RALT | Modifiers::RCTRL),
-        Some(Action::Quit)
-    ));
-
-    let keycode = find_key('t');
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::ALT | Modifiers::CTRL),
-        Some(Action::Window(Operation::ToggleFloating))
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::LALT | Modifiers::LCTRL),
-        Some(Action::Window(Operation::ToggleFloating))
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::RALT | Modifiers::RCTRL),
-        Some(Action::Window(Operation::ToggleFloating))
-    ));
-
-    let keycode = find_key('n');
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::ALT),
-        Some(Action::Window(Operation::FocusStep(FocusStep::Next)))
-    ));
-
-    let keycode = find_key('p');
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::ALT),
-        Some(Action::Window(Operation::FocusStep(FocusStep::Previous)))
-    ));
-
-    assert!(matches!(
-        config.find_keybind(0x29, Modifiers::ALT),
-        Some(Action::Window(Operation::FocusOtherLayer))
-    ));
-
-    let keycode = find_key('s');
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::CTRL),
-        Some(Action::Window(Operation::ToggleStack))
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::LCTRL),
-        Some(Action::Window(Operation::ToggleStack))
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::RCTRL),
-        Some(Action::Window(Operation::ToggleStack))
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::ALT),
-        Some(Action::Window(Operation::ToggleStack))
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::LALT),
-        Some(Action::Window(Operation::ToggleStack))
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::RALT),
-        Some(Action::Window(Operation::ToggleStack))
-    ));
-
-    let keycode = find_key('d');
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::ALT),
-        Some(Action::Window(Operation::Resize {
-            axis: ResizeAxis::Width,
-            direction: ResizeDirection::Shrink
-        }))
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::LALT),
-        Some(Action::Window(Operation::Resize {
-            axis: ResizeAxis::Width,
-            direction: ResizeDirection::Shrink
-        }))
-    ));
-
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::RALT),
-        Some(Action::Window(Operation::Resize {
-            axis: ResizeAxis::Width,
-            direction: ResizeDirection::Shrink
-        }))
-    ));
-
-    let props = config.find_window_properties("picture in picture", "com.something.apple");
-    assert_eq!(props[0].floating, Some(true));
-    assert_eq!(props[0].index, Some(1));
-
-    let keycode = find_key('x');
-    assert!(matches!(
-        config.find_keybind(keycode, Modifiers::FN),
-        Some(Action::Window(Operation::Snap))
-    ));
-
-    let defaults = Config::default();
-    assert_eq!(defaults.swipe_sensitivity(), 0.35);
-    assert_eq!(defaults.swipe_deceleration(), 4.0);
 }
 
 #[test]
@@ -2025,57 +1527,11 @@ fn test_config_defaults() {
 }
 
 #[test]
-fn test_first_launch_creates_parseable_config_without_overwriting_it() {
-    let unique = format!(
-        "spool-first-launch-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let directory = std::env::temp_dir().join(unique);
-    let path = directory.join("spool.toml");
-
-    assert!(create_configuration_file_at(&path).unwrap());
-    Config::new(&path).expect("generated configuration should parse");
-
-    let custom = "[options]\nauto_center = false\n\n[bindings]\n";
-    std::fs::write(&path, custom).unwrap();
-    assert!(!create_configuration_file_at(&path).unwrap());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
-
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
-fn defaults_config_matches_the_generated_stub() {
-    let stub = InnerConfig::new(DEFAULT_CONFIGURATION).expect("the stub should parse");
-    let defaults = Config::defaults().expect("defaults should always build");
-    assert_eq!(
-        format!("{stub:?}"),
-        format!("{:?}", defaults.inner.load()),
-        "a missing TOML should behave exactly like the generated stub"
-    );
-}
-
-#[test]
 fn test_window_rules_track() {
-    let input = r#"
-[options]
-
-[bindings]
-
-[windows.btt_main]
-bundle_id = "com.hegenberg.BetterTouchTool"
-title = "BetterTouchTool"
-track = true
-
-[windows.btt_floating]
-bundle_id = "com.hegenberg.BetterTouchTool"
-title = "Screenshot.*"
-floating = true
-"#;
+    let input = r#"{"windows": {
+    "btt_main": {"bundle_id": "com.hegenberg.BetterTouchTool", "title": "BetterTouchTool", "track": true},
+    "btt_floating": {"bundle_id": "com.hegenberg.BetterTouchTool", "title": "Screenshot.*", "floating": true}
+}}"#;
     let config = Config::try_from(input).expect("config should parse");
 
     // Main window should match the canonical track rule.
@@ -2091,7 +1547,7 @@ floating = true
 
 #[test]
 fn test_restore_config_defaults() {
-    let config = Config::try_from("[options]\n\n[bindings]\n").expect("config should parse");
+    let config = Config::try_from("{}").expect("config should parse");
 
     assert!(config.restore_enabled());
     assert_eq!(config.restore_startup_grace(), Duration::from_secs(2));
@@ -2104,16 +1560,7 @@ fn test_restore_config_defaults() {
 #[test]
 fn test_restore_config_explicit_values() {
     let config = Config::try_from(
-        r#"
-[options]
-
-[restore]
-enabled = false
-startup_grace_ms = 750
-missing_windows = "ignore"
-
-[bindings]
-"#,
+        r#"{"restore": {"enabled": false, "startup_grace_ms": 750, "missing_windows": "ignore"}}"#,
     )
     .expect("config should parse");
 
@@ -2127,58 +1574,10 @@ missing_windows = "ignore"
 
 #[test]
 fn test_restore_config_rejects_unsupported_missing_window_policy() {
-    let err = Config::try_from(
-        r#"
-[options]
-
-[restore]
-missing_windows = "reserve"
-
-[bindings]
-"#,
-    )
-    .expect_err("unsupported restore missing-window policy should fail");
+    let err = Config::try_from(r#"{"restore": {"missing_windows": "reserve"}}"#)
+        .expect_err("unsupported restore missing-window policy should fail");
 
     assert!(err.to_string().contains("unknown variant"));
-}
-
-#[test]
-fn test_static_virtual_key_names_can_be_bound() {
-    let config = Config::try_from(
-        r#"
-[options]
-
-[bindings]
-window_grow_width = "alt+minus"
-"#,
-    )
-    .unwrap();
-    let minus_keycode = virtual_keycode()
-        .find_map(|(key, code)| (*key == "minus").then_some(*code))
-        .unwrap();
-
-    assert!(matches!(
-        config.find_keybind(minus_keycode, Modifiers::ALT),
-        Some(Action::Window(Operation::Resize {
-            axis: ResizeAxis::Width,
-            direction: ResizeDirection::Grow
-        }))
-    ));
-}
-
-#[test]
-fn legacy_dash_chord_syntax_is_rejected() {
-    let err = Config::try_from(
-        r#"
-[options]
-
-[bindings]
-window_grow_width = "alt - equal"
-"#,
-    )
-    .expect_err("legacy dash-separated chords must not parse");
-
-    let _ = err;
 }
 
 #[cfg(all(test, feature = "lua"))]
@@ -2192,6 +1591,107 @@ mod lua_setup_tests {
         let lua = Lua::new();
         let value: mlua::Value = lua.load(source).eval().expect("lua chunk should evaluate");
         config_from_lua(&lua, value).expect("config_from_lua should succeed")
+    }
+
+    #[test]
+    fn default_lua_matches_builtin_configuration() {
+        let source = format!(
+            "local configured; spool = {{ setup = function(value) configured = value end }};\n{DEFAULT_LUA_SCRIPT}\nreturn configured"
+        );
+        let generated = config_from_source(&source);
+        let defaults = Config::default();
+        assert_eq!(generated.bar_preferences(), defaults.bar_preferences());
+        assert_eq!(
+            format!("{:?}", generated.inner()),
+            format!("{:?}", defaults.inner()),
+        );
+        let omitted = config_from_source("return {}");
+        assert_eq!(
+            omitted.preset_column_widths(),
+            default_preset_column_widths()
+        );
+    }
+
+    #[test]
+    fn first_launch_creates_lua_without_overwriting_existing_configuration() {
+        let directory = std::env::temp_dir().join(format!(
+            "spool-default-lua-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let legacy = directory.join("spool.toml");
+        std::fs::write(&legacy, "legacy configuration left untouched").unwrap();
+        let path = directory.join("init.lua");
+        assert!(create_lua_file_at(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_LUA_SCRIPT);
+        let custom = "spool.setup { bar = { show_workspace_labels = false } }";
+        std::fs::write(&path, custom).unwrap();
+        assert!(!create_lua_file_at(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+        assert_eq!(
+            std::fs::read_to_string(legacy).unwrap(),
+            "legacy configuration left untouched"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bar_settings_share_configuration_and_reset_when_omitted() {
+        let config = config_from_source(
+            "return { options = { sliver_width = 9 }, bar = { show_workspace_labels = false, height = 40 } }",
+        );
+        let shared = config.clone();
+        assert!(!shared.bar_preferences().show_workspace_labels);
+        assert_eq!(shared.bar_preferences().background_color, "#00000000");
+        assert!((shared.bar_preferences().height - 40.0).abs() < f64::EPSILON);
+        config.replace_inner_from(&config_from_source("return {}"));
+        assert_eq!(
+            shared.bar_preferences(),
+            crate::bar::BarPreferences::default()
+        );
+        assert_eq!(shared.sliver_width(), Config::default().sliver_width());
+    }
+
+    #[test]
+    fn invalid_bar_settings_are_rejected() {
+        let lua = Lua::new();
+        let value = lua
+            .load("return { bar = { show_workspace_labels = 'no' } }")
+            .eval()
+            .unwrap();
+        assert!(config_from_lua(&lua, value).is_err());
+        for source in [
+            "return { bar = { height = 0/0 } }",
+            "return { bar = { icon_size = math.huge } }",
+        ] {
+            let value = lua.load(source).eval().unwrap();
+            assert!(config_from_lua(&lua, value).is_err());
+        }
+    }
+
+    #[test]
+    fn bar_customization_is_loaded_through_lua() {
+        let config = config_from_source(
+            r##"return { bar = {
+            embed_in_menu_bar = false, height = 40, top_offset = 8,
+            max_width = 900, screen_padding = 20, notch_side = "left",
+            icon_size = 20, label_font_size = 13, foreground_color = "#112233FF",
+            inactive_workspace_color = "#00000010", workspace_corner_radius = 6,
+            show_mission_control = false, show_desktop = true,
+        } }"##,
+        );
+        let preferences = config.bar_preferences();
+        assert!(!preferences.embed_in_menu_bar);
+        assert!(!preferences.show_mission_control);
+        assert!(preferences.show_desktop);
+        assert_eq!(preferences.foreground_color, "#112233FF");
+        assert_eq!(preferences.inactive_workspace_color, "#00000010");
+        assert!((preferences.height - 40.0).abs() < f64::EPSILON);
+        assert!((preferences.toolbar_width() - 38.0).abs() < f64::EPSILON);
     }
 
     #[test]

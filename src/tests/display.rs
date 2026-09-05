@@ -278,18 +278,8 @@ fn test_floating_window_moves_to_next_display_without_becoming_tiled() {
         },
     ];
 
-    let config = Config::try_from(
-        r#"
-[options]
-
-[bindings]
-
-[windows.test]
-title = ".*"
-floating = true
-"#,
-    )
-    .expect("floating test config should parse");
+    let config = Config::try_from(r#"{"windows": {"test": {"title": ".*", "floating": true}}}"#)
+        .expect("floating test config should parse");
 
     TestHarness::new()
         .with_config(config)

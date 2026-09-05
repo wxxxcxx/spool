@@ -6,10 +6,8 @@ use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With, Without};
-use bevy::ecs::system::{Commands, NonSendMut, Populated, Query, Res, ResMut, Single, SystemParam};
+use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single, SystemParam};
 use bevy::math::IRect;
-use notify::event::{DataChange, MetadataKind, ModifyKind};
-use notify::{EventKind, Watcher};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -39,7 +37,7 @@ use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
 };
 use crate::platform::{WinID, WindowIncarnation, WorkspaceId};
-use crate::util::{round_px, symlink_target};
+use crate::util::round_px;
 
 /// The display currently in front, paired with the Dock's edge — together they
 /// give the usable viewport a window has to be fitted into.
@@ -138,8 +136,8 @@ fn log_focus_query_failure(error: &crate::errors::Error) {
 
 /// Re-applies the configuration side effects that must follow any config change:
 /// the per-display menubar-height override and the focused window's passthrough
-/// keys. Shared by the TOML reload trigger ([`refresh_configuration_trigger`])
-/// and the Lua reload system so both config sources behave identically on reload.
+/// keys after a successful Lua reload.
+#[cfg(feature = "lua")]
 pub(crate) fn apply_config_side_effects(
     config: &Config,
     displays: &mut Query<&mut Display>,
@@ -1846,87 +1844,6 @@ pub(super) fn apply_window_positions(
             }
         }
         finish_pending_window_defaults(entity, &mut ctx.commands);
-    }
-}
-
-pub(super) fn refresh_configuration_trigger(
-    mut messages: MessageReader<Event>,
-    window_manager: Res<WindowManager>,
-    mut config: ResMut<Config>,
-    mut watcher: Option<NonSendMut<Box<dyn Watcher>>>,
-    windows: Windows,
-    mut displays: Query<&mut Display>,
-    applications: Query<&Application>,
-) {
-    for event in messages.read() {
-        let Event::ConfigRefresh(event) = event else {
-            continue;
-        };
-
-        let Some(ref mut watcher) = watcher else {
-            continue;
-        };
-
-        match &event.kind {
-            EventKind::Modify(
-                // When using the RecommendedWatcher, the event triggers on file data.
-                // When using PollWatcher, it triggers on modification time.
-                ModifyKind::Metadata(MetadataKind::WriteTime)
-                | ModifyKind::Data(DataChange::Content),
-            ) => (),
-            EventKind::Remove(_)
-            | EventKind::Create(_)
-            | EventKind::Modify(ModifyKind::Name(_)) => {
-                // Atomic saves replace the inode and invalidate a file-level
-                // watch. Rebuild the shared TOML/Lua watcher while the new path
-                // is present instead of permanently unwatching it.
-                for path in event.paths.iter().rev() {
-                    let Some(new_watcher) =
-                        crate::ecs::rewatch_configs(&window_manager, path.as_path())
-                    else {
-                        continue;
-                    };
-                    **watcher = new_watcher;
-                    break;
-                }
-            }
-            _ => continue,
-        }
-
-        // An init.lua disables the TOML path entirely, so there is nothing here
-        // to reload — see `CONFIGURATION_FILE`.
-        if crate::config::CONFIGURATION_FILE.is_none() {
-            continue;
-        }
-
-        for path in &event.paths {
-            // The Lua init script shares this watcher and `ConfigRefresh` event;
-            // it is reloaded separately by `lua_reload_system`. Skip it here so
-            // we never try to TOML-parse a Lua file.
-            if path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"))
-            {
-                continue;
-            }
-            if let Some(symlink) = symlink_target(path) {
-                debug!(
-                    "symlink '{}' changed, replacing the watcher.",
-                    symlink.display()
-                );
-                if let Some(new_watcher) =
-                    crate::ecs::rewatch_configs(&window_manager, path.as_path())
-                {
-                    **watcher = new_watcher;
-                }
-            }
-            info!("Reloading configuration file; {}", path.display());
-            _ = config.reload_config(path.as_path()).inspect_err(|err| {
-                error!("loading config '{}': {err}", path.display());
-            });
-        }
-
-        apply_config_side_effects(&config, &mut displays, &windows, &applications);
     }
 }
 

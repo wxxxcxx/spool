@@ -76,22 +76,10 @@
           system.primaryUser = "test-spool-user";
           services.spool = {
             enable = true;
-            settings = {
-              options = {
-                focus_follows_mouse = true;
-                mouse_follows_focus = true;
-              };
-              bindings = {
-                window_focus_west = "cmd+h";
-                window_focus_east = "cmd+l";
-                window_grow_width = "alt+equal";
-                window_center = "alt+c";
-                quit = "ctrl+alt+q";
-              };
-            };
             config = ''
               spool.setup {
                 options = { focus_follows_mouse = true },
+                bar = { show_workspace_labels = false },
               }
             '';
           };
@@ -101,7 +89,6 @@
               PATH=${
                 lib.makeBinPath [
                   pkgs.jq
-                  pkgs.toml2json
                   pkgs.xcbuild
                 ]
               }:$PATH
@@ -119,20 +106,12 @@
               <service.json jq -e ".StandardErrorPath == \"/tmp/spool.err.log\""
               <service.json jq -e ".StandardOutPath == \"/tmp/spool.log\""
 
-              confPath=`<service.json jq -r ".EnvironmentVariables.SPOOL_CONFIG"`
-              echo >&2 "checking config in $confPath"
-              conf=`<"$confPath" toml2json`
-              echo $conf | jq -e ".options.focus_follows_mouse == true"
-              echo $conf | jq -e ".options.mouse_follows_focus == true"
-              echo $conf | jq -e ".bindings.window_focus_west == \"cmd+h\""
-              echo $conf | jq -e ".bindings.window_focus_east == \"cmd+l\""
-              echo $conf | jq -e ".bindings.window_grow_width == \"alt+equal\""
-              echo $conf | jq -e ".bindings.window_center == \"alt+c\""
-              echo $conf | jq -e ".bindings.quit == \"ctrl+alt+q\""
+              <service.json jq -e '.EnvironmentVariables | has("SPOOL_CONFIG") | not'
 
               luaPath=`<service.json jq -r ".EnvironmentVariables.SPOOL_LUA"`
               echo >&2 "checking init.lua in $luaPath"
               grep -q "spool.setup" "$luaPath"
+              grep -q "show_workspace_labels = false" "$luaPath"
             '';
         }
       );

@@ -14,7 +14,6 @@
 }:
 let
   cfg = config.services.spool;
-  tomlFormat = pkgs.formats.toml { };
 
   luaPackages = cfg.package.luaModule.lua.pkgs;
   resolvedExtraLuaPackages = if cfg.luaConfig.enable then cfg.extraLuaPackages luaPackages else [ ];
@@ -126,31 +125,9 @@ in
           `lua` Cargo feature. Disable for a build with no Lua dependency. Only takes effect when
           `package` is left at its default (an overrideable `spool.override
           { enableLua = ...; }` derivation); implies `extraLuaPackages` and
-          `config` are ignored when `false`.
+          `config` are ignored when `false`. Such builds use built-in defaults
+          only; they do not support file-based configuration.
         '';
-      };
-    };
-
-    settings = lib.mkOption {
-      type = lib.types.nullOr lib.types.attrs;
-      default = null;
-      description = ''
-        Spool configuration, rendered to a `spool.toml`. Ignored for the
-        options a `config` (`init.lua`) `spool.setup{...}` call declares,
-        which take precedence — see the spool configuration guide.
-      '';
-      example = {
-        options = {
-          focus_follows_mouse = true;
-          mouse_follows_focus = true;
-        };
-        bindings = {
-          window_focus_west = "cmd+h";
-          window_focus_east = "cmd+l";
-          window_grow_width = "alt+equal";
-          window_center = "alt+c";
-          quit = "ctrl+alt+q";
-        };
       };
     };
 
@@ -160,6 +137,7 @@ in
       example = ''
         spool.setup {
           options = { focus_follows_mouse = true },
+          bar = { show_workspace_labels = true },
         }
         spool.bind("alt+l", spool.action.window.focus_east)
       '';
@@ -169,10 +147,9 @@ in
         `~/.spool.lua` when XDG is disabled). Mirrors Home Manager's
         `services.sketchybar.config`.
 
-        Requires `luaConfig.enable = true`. When the script calls
-        `spool.setup{...}` it becomes the authoritative configuration and the
-        TOML `settings` are ignored; otherwise the two coexist (see the spool
-        configuration guide). Unlike sketchybar's config it is not marked
+        Requires `luaConfig.enable = true`. The script configures both the
+        window manager and Bar via `spool.setup{...}`. Omitted values use
+        built-in defaults. Unlike sketchybar's config it is not marked
         executable — spool loads it, it is not run as a shell script.
       '';
     };
@@ -196,7 +173,7 @@ in
 
     # Computed, read-only: the generated config files the platform modules
     # write out (or reference via env vars), so neither has to repeat the
-    # path-or-lines / TOML-generation logic.
+    # path-or-lines logic.
     configFile = lib.mkOption {
       type = with lib.types; nullOr path;
       readOnly = true;
@@ -210,11 +187,5 @@ in
       description = "The generated `init.lua` file (from `config`), or `null`.";
     };
 
-    settingsFile = lib.mkOption {
-      type = with lib.types; nullOr path;
-      readOnly = true;
-      default = if cfg.settings == null then null else tomlFormat.generate "spool.toml" cfg.settings;
-      description = "The generated `spool.toml` file (from `settings`), or `null`.";
-    };
   };
 }

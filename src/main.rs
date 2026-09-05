@@ -13,6 +13,7 @@ use tracing::{error, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod accessibility_prompt;
+mod bar;
 mod client;
 #[cfg(feature = "lua")]
 mod client_script;
@@ -212,7 +213,6 @@ fn main() -> Result<()> {
     let service = || service::Service::try_new(service::ID);
 
     let subcmd = Spool::parse().subcmd.unwrap_or_default();
-    maybe_warn_deprecated_options_for_service(&subcmd);
 
     match subcmd {
         SubCmd::Launch => {
@@ -343,48 +343,6 @@ impl ScriptCmd {
             _ => unreachable!("script source must be validated by clap"),
         };
         (source, self.args)
-    }
-}
-
-fn should_check_deprecated_options(subcmd: &SubCmd) -> bool {
-    matches!(
-        subcmd,
-        SubCmd::Install | SubCmd::Uninstall | SubCmd::Start | SubCmd::Stop | SubCmd::Restart
-    )
-}
-
-fn maybe_warn_deprecated_options_for_service(subcmd: &SubCmd) {
-    if !should_check_deprecated_options(subcmd) {
-        return;
-    }
-
-    // An init.lua disables the TOML entirely, so its contents — deprecated keys
-    // included — are never read. Warning about them would be noise.
-    #[cfg(feature = "lua")]
-    if config::discover_lua_file().is_some() {
-        return;
-    }
-
-    let Some(path) = config::discover_configuration_file() else {
-        return;
-    };
-
-    match config::deprecated_options_in_file(&path) {
-        Ok(keys) if !keys.is_empty() => {
-            warn!(
-                "detected deprecated [options] keys in `{}` while running a service command: {}. \
-                 Please migrate to `[padding]`, `[swipe]`, and `[decorations.*]`.",
-                path.display(),
-                keys.join(", ")
-            );
-        }
-        Ok(_) => {}
-        Err(err) => {
-            warn!(
-                "could not inspect `{}` for deprecated options: {err}",
-                path.display()
-            );
-        }
     }
 }
 

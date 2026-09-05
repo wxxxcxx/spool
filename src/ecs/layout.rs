@@ -8,6 +8,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Populated, Query, Res};
 use bevy::math::IRect;
+use spool_shared_types::commands::Placement;
 use std::collections::VecDeque;
 use stdext::function_name;
 use tracing::{Level, instrument, trace};
@@ -470,6 +471,52 @@ impl LayoutStrip {
             return;
         }
         self.columns.push_back(Column::Single(entity));
+    }
+
+    /// Moves the complete column containing `entity` to one side of the
+    /// complete column containing `anchor`. Returns whether the order changed.
+    pub fn move_column_relative(
+        &mut self,
+        entity: Entity,
+        anchor: Entity,
+        placement: Placement,
+    ) -> bool {
+        let (Ok(source), Ok(anchor)) = (self.index_of(entity), self.index_of(anchor)) else {
+            return false;
+        };
+        if source == anchor {
+            return false;
+        }
+
+        let Some(column) = self.columns.remove(source) else {
+            return false;
+        };
+        let anchor = if source < anchor { anchor - 1 } else { anchor };
+        let destination = match placement {
+            Placement::Before => anchor,
+            Placement::After => anchor + 1,
+        };
+        self.columns.insert(destination, column);
+        source != destination
+    }
+
+    pub(crate) fn column_containing(&self, entity: Entity) -> Option<Column> {
+        self.index_of(entity)
+            .ok()
+            .and_then(|index| self.columns.get(index).cloned())
+    }
+
+    /// Appends an already grouped column, normalizing native fullscreen into a
+    /// regular tiled column when it leaves its fullscreen Space.
+    pub(crate) fn append_column(&mut self, column: Column) {
+        let column = match column {
+            Column::Fullscren(entity) => Column::Single(entity),
+            other => other,
+        };
+        for entity in column.window_iter().collect::<Vec<_>>() {
+            self.remove(entity);
+        }
+        self.columns.push_back(column);
     }
 
     pub(crate) fn append_strip(&mut self, other: &mut Self) {
@@ -2220,5 +2267,54 @@ mod tests {
         }
         assert_eq!(strip.right_neighbour(leader), Some(b));
         assert_eq!(strip.right_neighbour(follower), Some(b));
+    }
+
+    #[test]
+    fn move_column_relative_moves_the_whole_stack() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let c = world.spawn_empty().id();
+        let d = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(a);
+        strip.append(b);
+        strip.append(c);
+        strip.append(d);
+        strip.stack(c).expect("stack c onto b");
+
+        assert!(strip.move_column_relative(c, d, Placement::After));
+        assert_eq!(strip.all_windows(), vec![a, d, b, c]);
+        match strip.get(2).expect("moved column") {
+            Column::Stack(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(items[0].contains(b));
+                assert!(items[1].contains(c));
+            }
+            other => panic!("expected preserved stack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_column_preserves_tabs_and_normalizes_fullscreen() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let c = world.spawn_empty().id();
+
+        let mut source = LayoutStrip::default();
+        source.append(a);
+        source.convert_to_tabs(a, b).expect("tabs");
+        let tabs = source.column_containing(a).expect("tab column");
+
+        let mut target = LayoutStrip::default();
+        target.append(c);
+        target.append_column(tabs);
+        assert_eq!(target.all_windows(), vec![c, b, a]);
+        assert!(matches!(target.get(1), Ok(Column::Tabs(_))));
+
+        target.append_column(Column::Fullscren(a));
+        assert!(matches!(target.last(), Ok(Column::Single(entity)) if entity == a));
     }
 }

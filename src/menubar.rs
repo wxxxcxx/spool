@@ -1,24 +1,17 @@
-use bevy::ecs::query::{Has, With};
-use bevy::ecs::system::{NonSendMut, Query, Res, Single};
+use std::process::Command as ProcessCommand;
+
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage, NSMenu, NSMenuItem,
-    NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSFont, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSObject, NSString};
-use std::process::Command as ProcessCommand;
 use tracing::warn;
 
 use crate::accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
-use crate::commands::{Action, Operation};
-use crate::config::Config;
-use crate::ecs::native_space::NativeSpace;
-use crate::ecs::params::ActiveDisplay;
-use crate::ecs::{ActiveWorkspaceMarker, Bounds, Floating, FocusedMarker};
+use crate::commands::Action;
 use crate::events::EventSender;
 use crate::manager::request_ax_privilege;
-use crate::util::round_px;
 
 #[derive(Debug, Clone)]
 struct MenuActionTargetIvars {
@@ -34,25 +27,6 @@ define_class!(
     struct MenuActionTarget;
 
     impl MenuActionTarget {
-        #[unsafe(method(setWidth:))]
-        fn set_width(&self, item: &NSMenuItem) {
-            let Ok(percentage) = i32::try_from(item.tag()) else {
-                return;
-            };
-            let ratio = f64::from(percentage) / 100.0;
-            self.dispatch_action(Action::Window(Operation::SetWidth(ratio)));
-        }
-
-        #[unsafe(method(centerWindow:))]
-        fn center_window(&self, _: &NSMenuItem) {
-            self.dispatch_action(Action::Window(Operation::Center));
-        }
-
-        #[unsafe(method(toggleFloating:))]
-        fn toggle_floating(&self, _: &NSMenuItem) {
-            self.dispatch_action(Action::Window(Operation::ToggleFloating));
-        }
-
         #[unsafe(method(openAccessibilitySettings:))]
         fn open_accessibility_settings(&self, _: &NSMenuItem) {
             if let Err(error) = ProcessCommand::new("/usr/bin/open")
@@ -69,17 +43,16 @@ define_class!(
                 warn!("unable to show Accessibility instructions outside the main thread");
                 return;
             };
-
-            if show_accessibility_setup(main_thread_marker)
-                == AccessibilitySetupAction::Continue
-            {
+            if show_accessibility_setup(main_thread_marker) == AccessibilitySetupAction::Continue {
                 request_ax_privilege();
             }
         }
 
         #[unsafe(method(quitSpool:))]
         fn quit_spool(&self, _: &NSMenuItem) {
-            self.dispatch_action(Action::Quit);
+            if let Err(error) = self.ivars().events.dispatch(Action::Quit) {
+                warn!(%error, "unable to dispatch menu bar action");
+            }
         }
     }
 );
@@ -89,159 +62,55 @@ impl MenuActionTarget {
         let this = Self::alloc(mtm).set_ivars(MenuActionTargetIvars { events });
         unsafe { msg_send![super(this), init] }
     }
-
-    fn dispatch_action(&self, action: Action) {
-        if let Err(error) = self.ivars().events.dispatch(action) {
-            warn!(%error, "unable to dispatch menu bar action");
-        }
-    }
 }
 
+/// Minimal status item shown only while Spool waits for Accessibility access.
 pub struct MenuBarManager {
     mtm: MainThreadMarker,
     status_bar: Retained<NSStatusBar>,
     status_item: Retained<NSStatusItem>,
     menu: Retained<NSMenu>,
     action_target: Retained<MenuActionTarget>,
-    width_items: Vec<(i32, Retained<NSMenuItem>)>,
-    tiled_window_items: Vec<Retained<NSMenuItem>>,
-    toggle_floating_item: Option<Retained<NSMenuItem>>,
-    configured_widths: Vec<i32>,
-    current_label: Option<String>,
-}
-
-#[derive(Debug, PartialEq)]
-struct WindowMenuEnablement {
-    tiled_actions: bool,
-    toggle_floating: bool,
-}
-
-fn window_menu_enablement(
-    has_focused_window: bool,
-    focused_width_ratio: Option<f64>,
-) -> WindowMenuEnablement {
-    WindowMenuEnablement {
-        tiled_actions: focused_width_ratio.is_some(),
-        toggle_floating: has_focused_window,
-    }
 }
 
 impl MenuBarManager {
-    pub fn new(mtm: MainThreadMarker, events: EventSender) -> Self {
+    pub fn new_accessibility_required(mtm: MainThreadMarker, events: EventSender) -> Self {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
         let menu = NSMenu::new(mtm);
         let action_target = MenuActionTarget::new(mtm, events);
-
         menu.setAutoenablesItems(false);
         status_item.setMenu(Some(&menu));
         status_item.setVisible(true);
 
-        Self {
+        let manager = Self {
             mtm,
             status_bar,
             status_item,
             menu,
             action_target,
-            width_items: Vec::new(),
-            tiled_window_items: Vec::new(),
-            toggle_floating_item: None,
-            configured_widths: Vec::new(),
-            current_label: None,
-        }
-    }
-
-    pub fn new_accessibility_required(mtm: MainThreadMarker, events: EventSender) -> Self {
-        let mut manager = Self::new(mtm, events);
+        };
         manager.rebuild_accessibility_menu();
-        manager.show_label("!".to_owned());
+        manager.show_label();
         manager
     }
 
-    fn rebuild_accessibility_menu(&mut self) {
-        self.menu.removeAllItems();
-
-        let status = self.add_item("Spool — Accessibility Required", None);
+    fn rebuild_accessibility_menu(&self) {
+        let status = self.add_item("Spool - Accessibility Required", None);
         status.setEnabled(false);
-
         let hint = self.add_item("Grant access; Spool will start automatically", None);
         hint.setEnabled(false);
-
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
         self.add_item(
-            "Show Setup Instructions…",
+            "Show Setup Instructions...",
             Some(sel!(showAccessibilityInstructions:)),
         );
         self.add_item(
-            "Open Accessibility Settings…",
+            "Open Accessibility Settings...",
             Some(sel!(openAccessibilitySettings:)),
         );
-
         self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
         self.add_item("Quit Spool", Some(sel!(quitSpool:)));
-    }
-
-    pub fn update(
-        &mut self,
-        space_ordinal: u32,
-        preset_widths: &[f64],
-        has_focused_window: bool,
-        focused_width_ratio: Option<f64>,
-    ) {
-        let widths = normalized_width_percentages(preset_widths);
-        if self.configured_widths != widths {
-            self.rebuild_menu(&widths);
-        }
-
-        let enablement = window_menu_enablement(has_focused_window, focused_width_ratio);
-        for item in &self.tiled_window_items {
-            item.setEnabled(enablement.tiled_actions);
-        }
-        if let Some(toggle_floating_item) = &self.toggle_floating_item {
-            toggle_floating_item.setEnabled(enablement.toggle_floating);
-        }
-        for (percentage, item) in &self.width_items {
-            let selected = focused_width_ratio
-                .is_some_and(|ratio| (ratio.mul_add(100.0, -f64::from(*percentage))).abs() < 1.0);
-            item.setState(if selected {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
-        }
-
-        let label = native_space_label(space_ordinal);
-        self.show_label(label);
-    }
-
-    fn rebuild_menu(&mut self, widths: &[i32]) {
-        self.menu.removeAllItems();
-        self.width_items.clear();
-        self.tiled_window_items.clear();
-        self.toggle_floating_item = None;
-
-        let status = self.add_item("Spool — Running", None);
-        status.setEnabled(false);
-        self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
-
-        let width_header = self.add_item("Window width", None);
-        width_header.setEnabled(false);
-        for &percentage in widths {
-            let item = self.add_item(&format!("{percentage}%"), Some(sel!(setWidth:)));
-            item.setTag(isize::try_from(percentage).expect("width percentage fits in isize"));
-            self.tiled_window_items.push(item.clone());
-            self.width_items.push((percentage, item));
-        }
-
-        self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
-        let center = self.add_item("Center Window", Some(sel!(centerWindow:)));
-        let toggle_floating = self.add_item("Toggle Floating", Some(sel!(toggleFloating:)));
-        self.tiled_window_items.push(center);
-        self.toggle_floating_item = Some(toggle_floating);
-
-        self.menu.addItem(&NSMenuItem::separatorItem(self.mtm));
-        self.add_item("Quit Spool", Some(sel!(quitSpool:)));
-        self.configured_widths = widths.to_vec();
     }
 
     fn add_item(&self, title: &str, action: Option<objc2::runtime::Sel>) -> Retained<NSMenuItem> {
@@ -258,126 +127,29 @@ impl MenuBarManager {
         item
     }
 
-    fn show_label(&mut self, label: String) {
-        if self.current_label.as_deref() == Some(label.as_str()) {
-            return;
-        }
-
-        let tooltip = NSString::from_str("Spool window manager");
+    fn show_label(&self) {
         let Some(button) = self.status_item.button(self.mtm) else {
-            warn!("unable to update menu bar: status item has no button");
             return;
         };
-
-        if button.image().is_none() {
-            let icon = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                &NSString::from_str("fish.fill"),
-                None,
-            );
-            if let Some(icon) = &icon {
-                icon.setTemplate(true);
-            }
-            button.setImage(icon.as_deref());
-            button.setFont(Some(&NSFont::menuBarFontOfSize(8.0)));
-            button.setImageHugsTitle(true);
+        let icon = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str("exclamationmark.triangle.fill"),
+            None,
+        );
+        if let Some(icon) = &icon {
+            icon.setTemplate(true);
         }
-        button.setTitle(&NSString::from_str(&label));
-        button.setToolTip(Some(&tooltip));
-        self.current_label = Some(label);
+        button.setImage(icon.as_deref());
+        button.setFont(Some(&NSFont::menuBarFontOfSize(8.0)));
+        button.setImageHugsTitle(true);
+        button.setTitle(&NSString::from_str("!"));
+        button.setToolTip(Some(&NSString::from_str(
+            "Spool requires Accessibility access",
+        )));
     }
 }
 
 impl Drop for MenuBarManager {
     fn drop(&mut self) {
         self.status_bar.removeStatusItem(&self.status_item);
-    }
-}
-
-pub fn update_menu_bar(
-    active_display: ActiveDisplay,
-    active_space: Single<&NativeSpace, With<ActiveWorkspaceMarker>>,
-    focused: Query<(&Bounds, Has<Floating>), With<FocusedMarker>>,
-    config: Res<Config>,
-    menu_bar: Option<NonSendMut<MenuBarManager>>,
-) {
-    let Some(mut menu_bar) = menu_bar else {
-        return;
-    };
-    let viewport = active_display.actual_bounds(&config);
-
-    let focused_window = focused.iter().next();
-    let focused_width_ratio = focused_window.and_then(|(bounds, floating)| {
-        (!floating).then(|| f64::from(bounds.0.x) / f64::from(viewport.width()))
-    });
-
-    menu_bar.update(
-        active_space.ordinal,
-        &config.preset_column_widths(),
-        focused_window.is_some(),
-        focused_width_ratio,
-    );
-}
-
-pub(crate) fn native_space_label(ordinal: u32) -> String {
-    (ordinal + 1).to_string()
-}
-
-fn normalized_width_percentages(widths: &[f64]) -> Vec<i32> {
-    let mut percentages = widths
-        .iter()
-        .copied()
-        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
-        .map(|ratio| round_px(ratio.mul_add(100.0, 0.0)))
-        .filter(|percentage| *percentage > 0)
-        .collect::<Vec<_>>();
-    percentages.sort_unstable();
-    percentages.dedup();
-    percentages
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        WindowMenuEnablement, native_space_label, normalized_width_percentages,
-        window_menu_enablement,
-    };
-
-    #[test]
-    fn native_space_label_is_one_based() {
-        assert_eq!(native_space_label(0), "1");
-        assert_eq!(native_space_label(4), "5");
-    }
-
-    #[test]
-    fn menu_widths_are_sorted_deduplicated_and_valid() {
-        assert_eq!(
-            normalized_width_percentages(&[2.0, 0.5, 1.5, 0.5, 0.001, f64::NAN, -1.0]),
-            vec![50, 150, 200]
-        );
-    }
-
-    #[test]
-    fn floating_focus_only_enables_toggle_floating() {
-        assert_eq!(
-            window_menu_enablement(true, None),
-            WindowMenuEnablement {
-                tiled_actions: false,
-                toggle_floating: true,
-            }
-        );
-        assert_eq!(
-            window_menu_enablement(false, None),
-            WindowMenuEnablement {
-                tiled_actions: false,
-                toggle_floating: false,
-            }
-        );
-        assert_eq!(
-            window_menu_enablement(true, Some(1.0)),
-            WindowMenuEnablement {
-                tiled_actions: true,
-                toggle_floating: true,
-            }
-        );
     }
 }

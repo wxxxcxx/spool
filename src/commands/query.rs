@@ -202,7 +202,11 @@ impl StateBroadcastIntent {
                 | Event::WindowMinimized { .. }
                 | Event::WindowDeminimized { .. }
                 | Event::ActionRequested {
-                    action: Action::Window(Operation::Move(_)) | Action::MoveWindowToSpace { .. },
+                    action:
+                        Action::Window(Operation::Move(_))
+                        | Action::MoveWindowToSpace { .. }
+                        | Action::ReorderColumn { .. }
+                        | Action::MoveColumnToSpace { .. },
                 } => intent.windows_changed = true,
                 Event::WindowFocused(_) => intent.window_focused = true,
                 // Geometry alone decides what's on screen, so plain moves and

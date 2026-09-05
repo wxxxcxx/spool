@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::error;
 
-use crate::config::{CONFIGURATION_FILE, Config};
+use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
 use crate::manager::{check_ax_privilege, check_separate_spaces};
@@ -33,7 +33,7 @@ pub use workspace::WorkspaceObserver;
 pub(crate) mod app_launcher;
 mod display;
 pub(crate) mod input;
-mod mission_control;
+pub(crate) mod mission_control;
 pub mod notify;
 mod process;
 pub mod service;
@@ -325,7 +325,7 @@ impl PlatformCallbacks {
             ));
         }
 
-        let config = Config::load(CONFIGURATION_FILE.as_deref())?;
+        let config = Config::default();
         self.events.send(Event::InitialConfig(config.clone()))?;
         self.event_handler = Some(InputHandler::new(self.events.clone(), config).start()?);
 

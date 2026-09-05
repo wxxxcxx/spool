@@ -41,7 +41,6 @@ use crate::ecs::state::QueryStateParams;
 use crate::ecs::{SendMessageTrigger, SpawnCommandsExt, apply_config_side_effects};
 use crate::events::Event;
 use crate::manager::{Application, Display, WindowManager};
-use crate::util::symlink_target;
 
 use worker::FromLua;
 pub use worker::{LuaSource, LuaWorker};
@@ -230,7 +229,7 @@ pub fn drain_lua_outbox(
             FromLua::Flash { message, duration } => commands.flash_message(message, duration),
             FromLua::ConfigChanged => {
                 // Swap into the shared handle, then re-apply the same side
-                // effects a TOML reload does.
+                // effects a configuration reload does.
                 if let (Some(config), Some(built)) = (config.as_mut(), worker.built_config()) {
                     config.replace_inner_from(&built);
                     config.set_changed();
@@ -260,10 +259,10 @@ pub fn lua_reload_system(
         let Event::ConfigRefresh(event) = event else {
             continue;
         };
-        if event.paths.iter().any(|changed| paths_match(changed, path)) {
+        if config_event_changes_script(event, path) {
             // Editors that atomically replace files (write-new-then-rename)
-            // break the original watch; re-establish it like the TOML handler.
-            if let (Some(watcher), Some(_symlink)) = (watcher.as_mut(), symlink_target(path))
+            // break the original watch; re-establish it on the configured path.
+            if let Some(watcher) = watcher.as_mut()
                 && let Some(new_watcher) = crate::ecs::rewatch_configs(&window_manager, path)
             {
                 **watcher = new_watcher;
@@ -278,16 +277,57 @@ pub fn lua_reload_system(
     worker.send_reload(path.clone());
 }
 
-/// Whether a change notification path refers to the watched script (directly or
-/// by filename, covering atomic-save temp-file renames).
+/// Atomic rename events contain both paths; only the configured path matters.
 fn paths_match(changed: &Path, script: &Path) -> bool {
-    changed == script || changed.file_name() == script.file_name()
+    changed == script
+}
+
+fn config_event_changes_script(event: &notify::Event, script: &Path) -> bool {
+    matches!(
+        event.kind,
+        notify::EventKind::Create(_)
+            | notify::EventKind::Remove(_)
+            | notify::EventKind::Modify(_)
+            | notify::EventKind::Any
+    ) && event.paths.iter().any(|changed| {
+        paths_match(changed, script)
+            || crate::util::symlink_target(script).as_deref() == Some(changed.as_path())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn lua_watcher_handles_replacement_and_recreation_but_ignores_reads() {
+        use notify::{
+            Event, EventKind,
+            event::{AccessKind, CreateKind, ModifyKind, RemoveKind, RenameMode},
+        };
+        let script = Path::new("/tmp/spool-config-test/init.lua");
+        for kind in [
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Create(CreateKind::File),
+        ] {
+            let event = Event::new(kind)
+                .add_path(script.with_extension("lua.tmp"))
+                .add_path(script.to_owned());
+            assert!(config_event_changes_script(&event, script));
+        }
+        let read = Event::new(EventKind::Access(AccessKind::Any)).add_path(script.to_owned());
+        assert!(!config_event_changes_script(&read, script));
+        for other in [
+            "/tmp/spool-config-test/bar.toml",
+            "/tmp/spool-config-test/spool.toml",
+            "/tmp/other/init.lua",
+        ] {
+            let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(other.into());
+            assert!(!config_event_changes_script(&event, script));
+        }
+    }
 
     // Many concurrent waiters should share a single read of the world.
     #[test]

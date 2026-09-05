@@ -110,6 +110,10 @@ objc2-app-kit = { version = "0.3", features = [
   "NSStringDrawing",
   "NSImage",
   "NSControl",
+  "NSEvent",
+  "NSPanel",
+  "NSResponder",
+  "NSRunningApplication",
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 objc2-core-graphics = "0.3"
@@ -133,7 +137,6 @@ scopeguard = "1.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 stdext = "0.3"
-toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ctrlc = { version = "3.5", features = ["termination"] }

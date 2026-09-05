@@ -204,6 +204,7 @@ pub struct FrameActivity<'w, 's> {
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     overlay_manager: Option<NonSend<'w, OverlayManager>>,
+    bar_manager: Option<NonSend<'w, crate::bar::BarManager>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -219,6 +220,10 @@ impl FrameActivity<'_, '_> {
                 .overlay_manager
                 .as_ref()
                 .is_some_and(|manager| manager.decorations_are_animating())
+            || self
+                .bar_manager
+                .as_ref()
+                .is_some_and(|manager| manager.is_animating())
     }
 }
 

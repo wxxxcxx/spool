@@ -34,8 +34,7 @@ expose the same following options:
 | --- | --- | --- | --- |
 | `services.spool.enable` | `boolean` | `false` | Generate and enable the launchd agent |
 | `services.spool.package` | `package` | `self.packages.<system>.spool` | Package to use |
-| `services.spool.config` | `null`, lines, or path | `null` | Spool's `init.lua` (Lua source or a file). Written to `$XDG_CONFIG_HOME/spool/init.lua` (or `~/.spool.lua`). Mirrors Home Manager's `services.sketchybar.config`. A `spool.setup{...}` here takes precedence over `settings`. Requires `luaConfig.enable`. |
-| `services.spool.settings` | `null` or `attribute set` | `null` | Spool TOML configuration (See [`CONFIGURATION.md`](/CONFIGURATION.md)) |
+| `services.spool.config` | `null`, lines, or path | `null` | Spool's `init.lua` (Lua source or a file), including Bar settings. Written to `$XDG_CONFIG_HOME/spool/init.lua` (or `~/.spool.lua`). Requires `luaConfig.enable`. |
 | `services.spool.extraPackages` | `list of package` | `[ ]` | Extra packages on spool's `PATH` at runtime (e.g. `sketchybar`). |
 | `services.spool.luaConfig.enable` | `boolean` | `true` | Whether `package` is built with the complete Lua capability, including the embedded vendored LuaJIT and `init.lua`. Only takes effect when `package` is left at its default. |
 | `services.spool.extraLuaPackages` | `function` | `luaPs: [ ]` | Extra Lua packages available to `init.lua` via `require(...)` (e.g. [sbarlua](https://github.com/FelixKratz/SbarLua)). Same shape as Home Manager's `programs.sketchybar.extraLuaPackages` — a function from a Lua package set to a list of derivations. |
@@ -57,29 +56,29 @@ expose the same following options:
     enable = true;
     # Spool configuration
     # See CONFIGURATION.md for a list of all options
-    settings = {
-      options = {
-        focus_follows_mouse = true;
-        mouse_follows_focus = true;
-        preset_column_widths = [0.25 0.33 0.5 0.66 0.75];
-      };
-      bindings = {
-        window_focus_west = "cmd+h";
-        window_focus_east = "cmd+l";
-        window_grow_width = "alt+equal";
-        window_center = "alt+c";
-        window_balance = "alt+b";
-        quit = "ctrl+alt+q";
-      };
-    };
+    config = ''
+      spool.setup {
+        options = {
+          focus_follows_mouse = true,
+          mouse_follows_focus = true,
+          preset_column_widths = { 0.25, 0.33, 0.5, 0.66, 0.75 },
+        },
+        bar = { show_workspace_labels = true },
+      }
+      spool.bind("cmd+h", spool.action.window.focus_west)
+      spool.bind("cmd+l", spool.action.window.focus_east)
+      spool.bind("alt+equal", spool.action.window.grow_width)
+      spool.bind("alt+c", spool.action.window.center)
+      spool.bind("alt+b", spool.action.window.balance)
+      spool.bind("ctrl+alt+q", spool.action.quit)
+    '';
   };
 }
 ```
 
-Alternatively, configure spool entirely from Lua with `config` (the `init.lua`),
-the same way Home Manager's `services.sketchybar.config` works. A `spool.setup{...}`
-call is authoritative and makes `settings` unnecessary — see
-[`CONFIGURATION.md`](/CONFIGURATION.md#configuration-from-lua):
+An existing script can also be supplied as `config = ./init.lua;`. The former
+`settings` and `settingsFile` options have been removed; use `config` for both
+window-manager and Bar settings. For a minimal inline configuration:
 
 ```nix
 services.spool = {
@@ -87,6 +86,7 @@ services.spool = {
   config = ''
     spool.setup {
       options = { focus_follows_mouse = true, mouse_follows_focus = true },
+      bar = { show_workspace_labels = true },
     }
 
     spool.bind("cmd+h", spool.action.window.focus_west)

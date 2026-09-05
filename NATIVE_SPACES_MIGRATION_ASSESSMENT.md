@@ -305,19 +305,18 @@ Space 重建稳定性承诺；ordinal 又会受 MRU、全屏和用户重排影�
 [`CONFIGURATION.md:345`](./CONFIGURATION.md#L345)。原生 Space 恢复应维持同样
 的安全边界。
 
-### query/subscribe 与 SpoolBar
+### query/subscribe 与旧版 SpoolBar
+
+本节记录迁移前的 Swift 独立进程协议约束。该实现现已删除；内置 Rust Bar 直接从
+Bevy world 投影结构化列，不再经过 query/subscribe 或 CLI。
 
 当前 state document version 是 2，公开字段是 `native_workspace_id` 加
 `virtual_workspace_number`，主数组名为 `virtual_workspaces`：
 [`QUERY_AND_SUBSCRIBE_FORMAT.md:35`](./QUERY_AND_SUBSCRIBE_FORMAT.md#L35)、
 [`QUERY_AND_SUBSCRIBE_FORMAT.md:152`](./QUERY_AND_SUBSCRIBE_FORMAT.md#L152)。
 
-SpoolBar 直接解码这些字段，按 `(display_id, native_workspace_id)` 过滤虚拟 rows：
-[`bar/Sources/SpoolBar/Models.swift:3`](./bar/Sources/SpoolBar/Models.swift#L3)、
-[`bar/Sources/SpoolBar/Models.swift:28`](./bar/Sources/SpoolBar/Models.swift#L28)，
-并通过 `workspace select DISPLAY_ID WORKSPACE_NUMBER` 和
-`move-to-workspace ... follow` 操作：
-[`bar/README.md:75`](./bar/README.md#L75)。
+旧 SpoolBar 曾直接解码这些字段，并通过旧 workspace 命令操作；这些路径随
+Swift 工程一并移除。
 
 这不是内部重构，而是协议破坏。建议发布 state v3：
 
@@ -402,7 +401,7 @@ rows 的总和，而不是最大 row 数；它可能超过 Apple 的 16-Space �
 - Space/display/wake 事件后只读重扫拓扑、可见 Space、type 和 Window Server
   成员，所有私有写操作后也以回读结果收敛，不做乐观 ECS 更新；
 - state/query/subscribe 为 v3，只发布稳定 `space_id`；CLI、Lua WindowSet 和
-  SpoolBar 都以该 ID 寻址，旧虚拟 row 命令和配置已删除；
+  内置 Rust Bar 都以该 ID 寻址，旧虚拟 row 命令和配置已删除；
 - `spool migrate-state` 默认 dry-run，`--apply` 先保存 v2 原文备份，再按 row
   顺序安全折叠为一 Space 一 strip；
 - 默认严格 observe-only。只有显式设置

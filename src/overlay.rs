@@ -467,11 +467,12 @@ mod tests {
     }
 
     #[test]
-    fn decoration_overlay_belongs_to_exactly_one_non_fullscreen_space() {
+    fn decoration_overlay_is_transient_and_belongs_to_exactly_one_non_fullscreen_space() {
         let behavior = decoration_collection_behavior();
         assert!(behavior.contains(NSWindowCollectionBehavior::CanJoinAllApplications));
         assert!(!behavior.contains(NSWindowCollectionBehavior::Stationary));
-        assert!(!behavior.contains(NSWindowCollectionBehavior::Transient));
+        assert!(behavior.contains(NSWindowCollectionBehavior::Transient));
+        assert!(!behavior.contains(NSWindowCollectionBehavior::Managed));
         assert!(!behavior.contains(NSWindowCollectionBehavior::CanJoinAllSpaces));
         assert!(!behavior.contains(NSWindowCollectionBehavior::FullScreenAuxiliary));
         assert!(behavior.contains(NSWindowCollectionBehavior::FullScreenNone));
@@ -593,7 +594,10 @@ fn decoration_overlay_level() -> isize {
 }
 
 fn decoration_collection_behavior() -> NSWindowCollectionBehavior {
+    // Accessory NSWindows can retain managed WindowServer tags at elevated levels.
+    // Explicit Transient excludes them from Expose without joining other Spaces.
     NSWindowCollectionBehavior::IgnoresCycle
+        | NSWindowCollectionBehavior::Transient
         | NSWindowCollectionBehavior::CanJoinAllApplications
         | NSWindowCollectionBehavior::FullScreenNone
 }

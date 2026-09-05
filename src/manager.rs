@@ -6,6 +6,7 @@ use bevy::math::{IRect, IVec2};
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
+#[cfg(feature = "lua")]
 use notify::{RecursiveMode, Watcher};
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2::{msg_send, sel};
@@ -20,6 +21,7 @@ use objc2_core_graphics::{
     kCGWindowAlpha, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use std::collections::HashMap;
+#[cfg(feature = "lua")]
 use std::path::Path;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
@@ -32,7 +34,9 @@ use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
 use crate::manager::skylight::SLSSetWindowListBrightness;
 use crate::platform::{ConnID, Pid, ProcessSerialNumber, WinID, WorkspaceId};
-use crate::util::{AXUIWrapper, MacResult, create_array, round_px, symlink_target};
+#[cfg(feature = "lua")]
+use crate::util::symlink_target;
+use crate::util::{AXUIWrapper, MacResult, create_array, round_px};
 use app::ApplicationOS;
 pub use app::{Application, ApplicationApi};
 pub use display::Display;
@@ -234,6 +238,11 @@ pub fn irect_from(rect: CGRect) -> IRect {
 /// Defines the interface for a window manager, abstracting OS-specific operations.
 #[automock]
 pub trait WindowManagerApi: Send + Sync {
+    /// Submits a system overview request. Completion is observed through Dock events.
+    fn perform_system_overview(
+        &self,
+        overview: crate::platform::mission_control::SystemOverview,
+    ) -> Result<()>;
     /// Capabilities available without Dock injection or disabling SIP.
     fn native_space_capabilities(&self) -> NativeSpaceCapabilities;
     /// Submits a Space operation. Success means accepted by macOS, not
@@ -337,6 +346,7 @@ pub trait WindowManagerApi: Send + Sync {
     /// `Ok(())` if the exit event is sent successfully, otherwise `Err(Error)`.
     fn quit(&self) -> Result<()>;
 
+    #[cfg(feature = "lua")]
     fn setup_config_watcher(&self, path: &Path) -> Result<Box<dyn Watcher>>;
 
     /// Returns the current cursor position in absolute CG coordinates,
@@ -506,6 +516,14 @@ impl WindowManagerOS {
 }
 
 impl WindowManagerApi for WindowManagerOS {
+    fn perform_system_overview(
+        &self,
+        overview: crate::platform::mission_control::SystemOverview,
+    ) -> Result<()> {
+        overview.launch()?;
+        Ok(())
+    }
+
     fn native_space_capabilities(&self) -> NativeSpaceCapabilities {
         NativeSpaceCapabilities {
             move_windows: bridged_window_move_class().is_some(),
@@ -756,6 +774,7 @@ impl WindowManagerApi for WindowManagerOS {
         Some(cursor)
     }
 
+    #[cfg(feature = "lua")]
     fn setup_config_watcher(&self, path: &Path) -> Result<Box<dyn Watcher>> {
         let setup = notify::Config::default()
             .with_poll_interval(Duration::from_secs(3))
@@ -776,8 +795,18 @@ impl WindowManagerApi for WindowManagerOS {
                 setup,
             )?))
         }?;
-        debug!("watching config file {} for changes.", path.display());
-        watcher.watch(path, RecursiveMode::NonRecursive)?;
+        // Watch the parent as well: a removed file must be discoverable when
+        // an editor recreates it, even after its original inode is gone.
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            watcher.watch(parent, RecursiveMode::NonRecursive)?;
+        }
+        if path.exists() {
+            debug!("watching config file {} for changes.", path.display());
+            watcher.watch(path, RecursiveMode::NonRecursive)?;
+        }
         Ok(watcher)
     }
 
@@ -1145,8 +1174,10 @@ pub fn check_separate_spaces() -> bool {
 
 /// `ConfigHandler` is an implementation of `notify::EventHandler` that reloads the application configuration
 /// when the configuration file changes. It also dispatches a `ConfigRefresh` event.
+#[cfg(feature = "lua")]
 struct ConfigHandler(EventSender);
 
+#[cfg(feature = "lua")]
 impl notify::EventHandler for ConfigHandler {
     /// Handles file system events for the configuration file. When the content changes, it reloads the configuration.
     /// Specifically, it responds to `ModifyKind::Data(DataChange::Content)` events.

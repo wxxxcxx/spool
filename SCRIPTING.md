@@ -37,11 +37,24 @@ By default, Spool looks for a Lua script in the following locations (in order):
 2. `$HOME/.spool.lua`
 3. `$XDG_CONFIG_HOME/spool/init.lua`
 
-### TOML Replacement
+### One Configuration
 
-**A script replaces the TOML.** When any of those files exist, the TOML path is switched off completely: no `spool.toml` is read, created, or watched, and anything the script does not set takes its built-in default. Two authoritative configs cannot coexist, so a leftover TOML never quietly overrides the script. Conversely, no `init.lua` is created for you when a `spool.toml` already exists — TOML setups keep working untouched until you write a script yourself.
+Spool uses one Lua configuration for the window manager and built-in Bar.
+Configuration discovery checks these locations in order:
 
-Like the TOML config, the script is automatically reloaded when the file is saved.
+1. `$SPOOL_LUA` (an existing file)
+2. `$HOME/.spool.lua`
+3. `$XDG_CONFIG_HOME/spool/init.lua` (normally `~/.config/spool/init.lua`)
+
+If none exists, Spool creates the [default init.lua](config/default.lua) in the
+XDG config directory without overwriting an existing script. TOML configuration
+(`spool.toml`, `bar.toml`, `~/.spool`, and `SPOOL_CONFIG`) is no longer supported.
+Existing TOML files are left untouched but are not read, created, or watched.
+
+Save the active script to reload settings, Bar appearance, and keybindings.
+A failed reload keeps the last working configuration. Omitted settings use
+built-in defaults; removing `bar` or `spool.setup` also restores their defaults.
+Builds without the `lua` feature use built-in defaults only.
 
 ```lua
 spool.on("window_focused", function(event, ws)
@@ -55,7 +68,7 @@ spool.bind("alt+j", spool.action.window.focus_east)
 
 ## 2. Configuration from Lua (`spool.setup`)
 
-`spool.setup{...}` declares the whole configuration from Lua, so `init.lua` can replace `spool.toml` entirely. The table mirrors the TOML sections one-for-one: `options`, `padding`, `swipe`, `decorations`, `restore`, and `windows`.
+`spool.setup{...}` declares the whole configuration: `options`, `bar`, `padding`, `swipe`, `decorations`, `restore`, and `windows`. Merge all sections into one call; a later call replaces the earlier table.
 
 ```lua
 spool.setup {
@@ -64,6 +77,7 @@ spool.setup {
     sliver_width = 5,
     animation_speed = 12.0,   -- write floats with a decimal point
   },
+  bar = { show_workspace_labels = true, height = 0 },
   padding = { top = 10, bottom = 10, left = 8, right = 8 },
   swipe = { sensitivity = 0.4, scroll = { modifier = "alt" } },
   decorations = {
@@ -79,7 +93,7 @@ spool.setup {
 
 ### Keybindings
 
-`spool.bind(chord, handler)` accepts the same plus-separated chord syntax as the TOML `[bindings]` table. Put the chord first and pass either a function from `spool.action` or a custom Lua callback. A chord array binds every listed chord to the same handler:
+`spool.bind(chord, handler)` accepts plus-separated chords such as `alt+h`. Put the chord first and pass either a function from `spool.action` or a custom Lua callback. A chord array binds every listed chord to the same handler:
 
 ```lua
 spool.bind("alt+h", spool.action.window.focus_west)
@@ -93,15 +107,15 @@ end)
 
 Action functions live under the singular `spool.action` namespace. The main groups are `spool.action.window`, `spool.action.space`, and `spool.action.mouse`; lifecycle actions such as `spool.action.quit` and `spool.action.restart` live directly on it. Command strings remain available through the explicit `spool.run(...)` escape hatch, not as bind handlers. `spool.setup.bindings` is intentionally unsupported.
 
-### Precedence & Reloading
+### Reloading
 
-An `init.lua` disables the TOML entirely, whether or not it calls `spool.setup`. With `setup`, that table is the configuration; without it, the built-in defaults are used — never a `spool.toml` sitting next to the script. To keep using TOML, do not create a script.
-
-Editing and saving `init.lua` hot-reloads the whole configuration (including menubar and passthrough updates), just like editing the TOML file.
+Saving `init.lua` reloads the whole configuration, including Bar styling, menubar
+height, and passthrough rules. Failed reloads preserve the last working runtime
+and configuration. Missing sections use defaults; no TOML fallback exists.
 
 **Notes:**
 - Float-valued options (`animation_speed`, border `width`/`opacity`, window `width`, …) should be written with a decimal point (`12.0`, not `12`).
-- A reload that *removes* a previous `spool.setup` call keeps the last config it produced rather than reverting to TOML.
+- A successful reload that removes a previous `spool.setup` call restores built-in defaults. Removing only `bar` restores default Bar styling.
 - With Nix modules, set `services.spool.config` to this `init.lua` (Lua source or a path). See [`nix/README.md`](nix/README.md).
 
 ---

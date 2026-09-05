@@ -1,22 +1,28 @@
 # Configuration Guide
 
-Spool is configured via a TOML file *or* a Lua script — never both. By
-default, it looks for the TOML configuration in the following locations (in
-order):
+Spool uses one Lua configuration for the window manager and built-in Bar.
+Configuration discovery checks these locations in order:
 
-1.  `$SPOOL_CONFIG` (environment variable)
-2.  `$HOME/.spool`
-3.  `$HOME/.spool.toml`
-4.  `$XDG_CONFIG_HOME/spool/spool.toml`
+1. `$SPOOL_LUA` (an existing file)
+2. `$HOME/.spool.lua`
+3. `$XDG_CONFIG_HOME/spool/init.lua` (normally `~/.config/spool/init.lua`)
 
-The configuration is automatically reloaded when the file is saved.
+If none exists, Spool creates the [default init.lua](config/default.lua) in the
+XDG config directory without overwriting an existing script. TOML configuration
+(`spool.toml`, `bar.toml`, `~/.spool`, and `SPOOL_CONFIG`) is no longer supported.
+Existing TOML files are left untouched but are not read, created, or watched.
 
-If an `init.lua` exists (see [Lua Scripting Guide](./SCRIPTING.md)), it takes over
-completely and none of these TOML paths are read.
+Save the active script to reload settings, Bar appearance, and keybindings.
+A failed reload keeps the last working configuration. Omitted settings use
+built-in defaults; removing `bar` or `spool.setup` also restores their defaults.
+Builds without the `lua` feature use built-in defaults only.
+
+All sections below belong inside one `spool.setup { ... }` call.
+Examples show standalone calls; merge their sections when combining them.
 
 ---
 
-## 1. Global Options (`[options]`)
+## 1. Global Options (`options`)
 
 General behavior settings for the window manager.
 
@@ -55,7 +61,7 @@ behavior.
 
 ---
 
-## 2. Padding (`[padding]`)
+## 2. Padding (`padding`)
 
 Sets the margins at the edges of the screen.
 
@@ -68,7 +74,7 @@ Sets the margins at the edges of the screen.
 
 ---
 
-## 3. Swipe & Gestures (`[swipe]`)
+## 3. Swipe & Gestures (`swipe`)
 
 Configure trackpad gestures and scroll-wheel window sliding.
 
@@ -78,27 +84,27 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `deceleration` | Float (1.0–10.0) | `4.0` | Rate at which inertia slows down after a swipe. |
 | `continuous` | Boolean | `true` | If `true`, the windows are allowed to fully move across the desktop, potentially exposing the empty desktop space. If `false`, the window strip will not move further than the left or right most window. This also affects the windows during keyboard focus - if `false` the left or right most windows will snap to the edge of display. |
 
-### `[swipe.gesture]`
+### `swipe.gesture`
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `fingers_count` | Integer | *None* | Number of fingers for the swipe gesture. Set to 3 or more to enable. |
 | `direction` | String | `"Natural"` | Direction of movement: `"Natural"` or `"Reversed"`. |
 | `vertical` | Boolean | `true` | Let vertical gestures scroll the current Space's horizontal layout strip. Disable it to leave vertical gestures to macOS. |
 
-When `fingers_count` is omitted or set below 3, Spool does not intercept native macOS gestures. If macOS uses three-finger horizontal swipes for Spaces, prefer `[swipe.scroll]` with a modifier or configure a different finger count.
+When `fingers_count` is omitted or set below 3, Spool does not intercept native macOS gestures. If macOS uses three-finger horizontal swipes for Spaces, prefer `swipe.scroll` with a modifier or configure a different finger count.
 
-### `[swipe.scroll]`
+### `swipe.scroll`
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `modifier` | String | `"alt"` | Modifier key(s) required to slide windows with the scroll wheel: `"alt"`, `"rcmd"`, `"ralt+cmd"`, `"lctrl+lalt+cmd"`, etc. |
 
 ---
 
-## 4. Decorations (`[decorations]`)
+## 4. Decorations (`decorations`)
 
 Visual styling for workspaces, active and inactive windows.
 
-### `[decorations.inactive.dim] (Native macOS Dimming)`
+### `decorations.inactive.dim` (Native macOS Dimming)
 
 Spool supports native macOS window dimming. To use this mode, **only** set `opacity` (and optionally `opacity_night`). Do not set a `color`.
 
@@ -108,17 +114,15 @@ Spool supports native macOS window dimming. To use this mode, **only** set `opac
 | `opacity_night` | Float (-1.0 to 1.0) | *opacity* | Dimming intensity used when macOS is in Dark Mode. |
 
 **Example:**
-```toml
-[decorations.inactive.dim]
-opacity = -0.15
-opacity_night = -0.25
+```lua
+spool.setup { decorations = { inactive = { dim = { opacity = -0.15, opacity_night = -0.25 } } } }
 ```
 
 ---
 
-## 5. Keybindings (`[bindings]`)
+## 5. Keybindings (`spool.bind`)
 
-Bindings map a key combination to an action. A binding can be a single string or an array of strings.
+Use `spool.bind(chord, spool.action.window.focus_west)` to map a chord to an action. The first argument can also be an array of chord strings.
 
 Format: `"modifier+modifier+key"`. For example `alt+shift+j` and `cmd+j`.
 
@@ -129,49 +133,17 @@ Available modifiers are:
 - `shift`, `lshift`, `rshift`
 - `fn`
 
-For a full list of parseable keys (i.e. `leftarrow`) check the source:
-https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcccc/src/config.rs#L1466-L1601
+For key names, action functions, and callback examples, see the
+[Lua Scripting Guide](SCRIPTING.md#keybindings).
 
-
-### Window commands
-
-| Action | Description |
-| :--- | :--- |
-| `window_focus_west` / `_east` | Focus window to the left/right. |
-| `window_focus_north` / `_south` | Focus window above/below. If no window exists, switches focus to the display in that direction. |
-| `window_focus_next` / `_previous` | Cycle in stable order within the current tiled or floating tier, wrapping at the ends. |
-| `window_focus_first` / `_last` | Jump to the start/end of the strip. |
-| `window_focus_tiled` | Switch to a previously focused tiled window on this Space. |
-| `window_focus_floating` | Switch to a previously focused floating window on this Space. |
-| `window_focus_other_layer` | Focus the last window in the other tiled/floating layer. Focus actions also raise the focused window when necessary. |
-| `window_move_west` / `_east` | Reorder a tiled window, or nudge a floating window horizontally. |
-| `window_move_north` / `_south` | Reorder within a tiled stack (or move displays at an edge), or nudge a floating window vertically. |
-| `window_move_first` / `_last` | Move a tiled window to the start/end of the strip. |
-| `window_center` | Center the current window. Floating windows are centered in the viewport. |
-| `window_shrink_width` / `window_grow_width` | Cycle tiled preset widths, or resize a floating window by `floating_window_resize_step`. |
-| `window_shrink_height` / `window_grow_height` | Resize a tiled stack member or a floating window vertically. |
-| `window_maximize` | Toggle a tiled full-width column or maximize/restore a floating window. |
-| `window_toggle_floating` | Toggle between tiled and floating state. |
-| `window_toggle_stack` | Stack the tiled window into the column on the left, or unstack it when already stacked. |
-| `window_equalize` | Make all windows in a stack equal height. |
-| `window_balance` | Make all columns in the strip the same width as the focused window. |
-| `window_nextdisplay` | Move focused window to the next monitor and follow it. |
-| `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
-| `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
-| `window_snap` | Snap an overflowing window into the viewport. |
-| `quit` | Exit Spool. |
-| `restart` | Restart the Spool service (`spool restart`). |
-
-**Example:**
-```toml
-[bindings]
-window_focus_west = "cmd+h"
-window_focus_next = "alt+n"
-window_focus_previous = "alt+p"
-window_move_west = "alt+shift+h"
-window_shrink_width = "alt+minus"
-window_grow_width = "alt+equal"
-window_toggle_stack = "alt+s"
+```lua
+spool.bind("cmd+h", spool.action.window.focus_west)
+spool.bind("alt+n", spool.action.window.focus_next)
+spool.bind("alt+p", spool.action.window.focus_previous)
+spool.bind("alt+shift+h", spool.action.window.move_west)
+spool.bind("alt+minus", spool.action.window.shrink_width)
+spool.bind("alt+equal", spool.action.window.grow_width)
+spool.bind("alt+s", spool.action.window.toggle_stack)
 ```
 
 ### Spaces
@@ -187,7 +159,7 @@ structured `spool query` responses and `spool subscribe` event stream.
 
 ---
 
-## 6. Window Rules (`[windows]`)
+## 6. Window Rules (`windows`)
 
 Define specific behaviors for applications based on their Title or Bundle ID.
 
@@ -206,12 +178,15 @@ Define specific behaviors for applications based on their Title or Bundle ID.
 | `bindings_passthrough`| Array (String)| Keys that should bypass Spool and go directly to the app. |
 
 **Example:**
-```toml
-[windows.terminal]
-title = ".*"
-bundle_id = "com.apple.Terminal"
-horizontal_padding = 5
-bindings_passthrough = ["ctrl+h", "ctrl+l"]
+```lua
+spool.setup { windows = {
+  terminal = {
+    title = ".*",
+    bundle_id = "com.apple.Terminal",
+    horizontal_padding = 5,
+    bindings_passthrough = { "ctrl+h", "ctrl+l" },
+  },
+} }
 ```
 
 ### Tracking LSUIElement or non-standard windows
@@ -221,16 +196,19 @@ Some applications (e.g., BetterTouchTool, ProtonVPN) are flagged as background a
 or `AXTextField`. Spool normally ignores these processes and windows. Use `track = true`
 to opt in and forcibly track the matching windows.
 
-```toml
-[windows.btt_main]
-bundle_id = "com.hegenberg.BetterTouchTool"
-title = "BetterTouchTool"
-track = true
-
-[windows.btt_screenshot]
-bundle_id = "com.hegenberg.BetterTouchTool"
-title = "Screenshot.*"
-floating = true
+```lua
+spool.setup { windows = {
+  btt_main = {
+    bundle_id = "com.hegenberg.BetterTouchTool",
+    title = "BetterTouchTool",
+    track = true,
+  },
+  btt_screenshot = {
+    bundle_id = "com.hegenberg.BetterTouchTool",
+    title = "Screenshot.*",
+    floating = true,
+  },
+} }
 ```
 
 ### Session Restore
@@ -248,11 +226,11 @@ The saved session includes:
 - display/screen association
 - window identity for matching across restarts
 
-Matched startup windows use the saved session before static `[windows]` rules.
+Matched startup windows use the saved session before static `windows` rules.
 That means saved layout, Space, display, and tiled/floating state
 win over configured `index`, `floating`, `width`, and `grid` rules during
 restore. Unmatched startup windows, and all windows created after the restore
-grace period ends, keep normal `[windows]` behavior.
+grace period ends, keep normal `windows` behavior.
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -261,11 +239,12 @@ grace period ends, keep normal `[windows]` behavior.
 | `missing_windows` | String | `"ignore"` | Behavior when a saved window is not present during restore. Currently only `"ignore"` is supported, which drops the missing window and compacts the restored layout. |
 
 **Example:**
-```toml
-[restore]
-enabled = true
-startup_grace_ms = 2000
-missing_windows = "ignore"
+```lua
+spool.setup { restore = {
+  enabled = true,
+  startup_grace_ms = 2000,
+  missing_windows = "ignore",
+} }
 ```
 
 Restore matches windows first by stable startup identity:
@@ -312,7 +291,7 @@ create placeholder displays or off-screen state for disconnected monitors.
 ### Inactive Window Overlay Dimming
 Another dimming option that draws a translucent overlay on every inactive window to visually emphasize the focused one. 
 
-**Activation:** This mode is enabled by setting **both** `opacity` and `color` under `[decorations.inactive.dim]`. In this mode, `opacity` ranges from `0.0` to `1.0`.
+**Activation:** This mode is enabled by setting **both** `opacity` and `color` under `decorations.inactive.dim`. In this mode, `opacity` ranges from `0.0` to `1.0`.
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -320,10 +299,8 @@ Another dimming option that draws a translucent overlay on every inactive window
 | `color` | String (Hex) | `"#000000"` | Hex color for the dim overlay (default: black). |
 
 **Example:**
-```toml
-[decorations.inactive.dim]
-opacity = 0.3
-color = "#000000"
+```lua
+spool.setup { decorations = { inactive = { dim = { opacity = 0.3, color = "#000000" } } } }
 ```
 
 ### Active Window Border
@@ -338,19 +315,20 @@ Draws a colored border around the currently focused window.
 | `radius` | Number/String | `"auto"` | Corner radius in pixels or `"auto"` to match system. |
 
 **Example:**
-```toml
-[decorations.active.border]
-enabled = true
-color = "#89b4fa"
-width = 2.0
-radius = 12.0
+```lua
+spool.setup { decorations = { active = { border = {
+  enabled = true,
+  color = "#89b4fa",
+  width = 2.0,
+  radius = 12.0,
+} } } }
 ```
 
-> **Tip:** You can override the `border_radius` for specific applications in the `[windows]` section. See [Window Rules](#6-window-rules).
+> **Tip:** You can override the `border_radius` for specific applications in the `windows` section. See [Window Rules](#6-window-rules).
 
 ## 8. Lua Scripting
 
-Spool embeds a Lua runtime that allows full configuration via `init.lua`, replacing `spool.toml` entirely. When a Lua configuration or script exists (`$SPOOL_LUA`, `$HOME/.spool.lua`, or `$XDG_CONFIG_HOME/spool/init.lua`), it takes over completely and no TOML config is read.
+The same `init.lua` can register callbacks and run actions alongside its static configuration.
 
 All options, padding, gesture settings, and window rules documented in sections 1–7 above are available under identical names via `spool.setup{...}`. Keybindings are declared separately with `spool.bind` so they can refer directly to action functions.
 
@@ -362,3 +340,15 @@ In addition to static configuration, Lua scripting allows:
 - **Programmatic Layout Transformations (`ws`)**: Pure layout operations (`ws:focus`, `ws:swap`, `ws:float`, `ws:shift`, `ws:view`, etc.) for custom workflows like named scratchpads.
 
 For complete documentation, event specifications, API reference, and examples, see the **[Lua Scripting Guide](./SCRIPTING.md)**.
+
+## 9. Bar (`bar`)
+
+Bar styling is part of `spool.setup`, not a separate file. See [Bar Configuration](BAR.md#configuration)
+for all defaults and [config/default.lua](config/default.lua) for the generated startup script.
+
+```lua
+spool.setup {
+  options = {},
+  bar = { show_workspace_labels = false, height = 0 },
+}
+```

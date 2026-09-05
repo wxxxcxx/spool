@@ -139,7 +139,7 @@ pub struct LuaRuntime {
     /// are keyed by batch and revision, not by interpreter.
     world: Rc<DispatchWorld>,
     /// The `Config` a script declared via `spool.setup{...}`, if it called it.
-    /// `None` means the script left configuration to the TOML file.
+    /// `None` means the script uses built-in defaults.
     built_config: Option<Config>,
 }
 
@@ -186,7 +186,7 @@ impl LuaRuntime {
     }
 
     /// The `Config` the script declared via `spool.setup{...}`, or `None` if it
-    /// never called it (in which case the TOML config remains authoritative).
+    /// never called it (in which case built-in defaults apply).
     pub fn built_config(&self) -> Option<&Config> {
         self.built_config.as_ref()
     }
@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn no_setup_call_leaves_config_to_toml() {
+    fn no_setup_call_uses_builtin_defaults() {
         let world = TestWorld::default();
         let runtime = world
             .runtime(r#"spool.bind("alt+b", spool.action.window.balance)"#)

@@ -14,7 +14,7 @@ use objc2_foundation::{NSNumber, NSString, NSUserDefaults, ns_string};
 use std::{
     ffi::{CStr, OsStr, c_int, c_void},
     os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     ptr::null_mut,
 };
 use stdext::function_name;
@@ -339,7 +339,8 @@ pub fn exe_path() -> Option<PathBuf> {
     Some(OsStr::from_bytes(path.to_bytes()).into())
 }
 
-pub fn symlink_target(path: &Path) -> Option<PathBuf> {
+#[cfg(feature = "lua")]
+pub fn symlink_target(path: &std::path::Path) -> Option<PathBuf> {
     if let Ok(metadata) = std::fs::symlink_metadata(path)
         && metadata.file_type().is_symlink()
         && let Ok(target) = std::fs::canonicalize(path)

@@ -246,7 +246,7 @@ pub(super) fn install(
     spool.set("bind", bind)?;
 
     // spool.setup(table) — declare the whole configuration from Lua. Mirrors
-    // the TOML sections. Bindings stay in explicit `spool.bind` calls so they
+    // the configuration sections. Bindings stay in explicit `spool.bind` calls so they
     // can reference first-class action functions or user callbacks.
     let setup = {
         let config_cell = Rc::clone(config_cell);

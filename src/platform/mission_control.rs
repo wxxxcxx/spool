@@ -18,6 +18,64 @@ use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
 use crate::util::{AXUIWrapper, add_run_loop, remove_run_loop};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SystemOverview {
+    MissionControl,
+    ShowDesktop,
+}
+
+impl SystemOverview {
+    fn command(self) -> std::process::Command {
+        // Direct execution of the Docklet violates macOS AMFI launch constraints.
+        // Launch Services must start the bundle; -n delivers arguments on every click.
+        let mut command = std::process::Command::new("/usr/bin/open");
+        command.args(["-n", "/System/Applications/Mission Control.app", "--args"]);
+        command.arg(match self {
+            Self::MissionControl => "0",
+            Self::ShowDesktop => "1",
+        });
+        command
+    }
+
+    pub(crate) fn launch(self) -> std::io::Result<()> {
+        // Reap the helper off the UI thread; neither launching nor waiting may
+        // stall the main-thread AppKit event pump.
+        std::thread::Builder::new()
+            .name("spool-system-overview".to_owned())
+            .spawn(move || match self.command().status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => warn!(overview = ?self, %status, "system overview launch request failed"),
+                Err(error) => warn!(overview = ?self, %error, "unable to submit system overview launch request"),
+            })
+            .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::SystemOverview;
+
+    #[test]
+    fn overview_actions_launch_the_app_bundle_through_launch_services() {
+        for (action, argument) in [
+            (SystemOverview::MissionControl, "0"),
+            (SystemOverview::ShowDesktop, "1"),
+        ] {
+            let command = action.command();
+            assert_eq!(command.get_program(), "/usr/bin/open");
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                vec![
+                    "-n",
+                    "/System/Applications/Mission Control.app",
+                    "--args",
+                    argument,
+                ]
+            );
+        }
+    }
+}
+
 /// `MissionControlHandler` manages observation of Mission Control related accessibility events from the Dock process.
 /// It dispatches specific `Event` types when Mission Control actions (e.g., showing all windows, showing desktop) occur.
 #[derive(Debug)]

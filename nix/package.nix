@@ -25,13 +25,14 @@
       # One source tree for every derivation here: the daemon and the loadable
       # Lua module are members of the same workspace sharing one lock file, so
       # they vendor identical dependencies. `commonCargoSources` keeps only
-      # Rust/Cargo files, so the plists pulled in by `embed_plist!` /
-      # `include_str!` are added back.
+      # Rust/Cargo files, so the embedded plists and default Lua script
+      # are added back explicitly.
       spoolSource = lib.fileset.toSource {
         root = ../.;
         fileset = lib.fileset.unions [
           (craneLib.fileset.commonCargoSources ../.)
           (lib.fileset.fileFilter (file: file.hasExt "plist") ../.)
+          ../config/default.lua
         ];
       };
 

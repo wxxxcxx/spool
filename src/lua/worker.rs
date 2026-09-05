@@ -146,7 +146,7 @@ pub struct LuaWorker {
     /// wait.
     has_handlers: Arc<AtomicBool>,
     /// The `Config` the loaded script declared through `spool.setup{...}`,
-    /// or `None` if it left configuration to the TOML file.
+    /// or `None` at startup if it uses built-in defaults.
     built_config: Arc<Mutex<Option<Config>>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -320,13 +320,13 @@ fn reload(
     match LuaRuntime::from_file(path, world) {
         Ok(runtime) => {
             set_lua_keybinds(runtime.published_keybinds());
-            // A reloaded `spool.setup{...}` stays authoritative: if the
-            // edited script dropped `setup`, keep the config already in
-            // force rather than reverting to TOML.
-            if let Some(config) = runtime.built_config() {
-                publish_config(built_config, config);
-                let _ = to_main.try_send(FromLua::ConfigChanged);
-            }
+            // Each successful script replaces the entire configuration.
+            // Removing setup (or one of its sections) restores the defaults.
+            publish_config(
+                built_config,
+                &runtime.built_config().cloned().unwrap_or_default(),
+            );
+            let _ = to_main.try_send(FromLua::ConfigChanged);
             info!("Reloaded Lua script {}", path.display());
             flash(to_main, "Lua reloaded".to_string(), 1.5);
             Some(runtime)
@@ -500,6 +500,84 @@ mod tests {
 
     fn worker(source: &str) -> LuaWorker {
         spawn_with_store(LuaSource::Inline(source.to_string()))
+    }
+
+    #[test]
+    fn default_script_loads_bar_settings() {
+        let worker = worker(crate::config::DEFAULT_LUA_SCRIPT);
+        let config = worker.built_config().expect("default script calls setup");
+        assert_eq!(
+            config.bar_preferences(),
+            crate::bar::BarPreferences::default()
+        );
+        assert_eq!(
+            config.preset_column_widths(),
+            crate::config::default_preset_column_widths()
+        );
+    }
+
+    #[test]
+    fn bar_reload_is_atomic_and_removed_sections_reset() {
+        let directory =
+            std::env::temp_dir().join(format!("spool-bar-lua-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("init.lua");
+        std::fs::write(&script, "spool.setup { bar = { show_workspace_labels = false }, options = { sliver_width = 9 } }").unwrap();
+        let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision());
+        assert!(
+            !worker
+                .built_config()
+                .unwrap()
+                .bar_preferences()
+                .show_workspace_labels
+        );
+
+        for invalid in [
+            "spool.setup { bar = { height = 'invalid' } }",
+            "spool.setup { bar = { show_workspace_labels = true } }; error('abort reload')",
+        ] {
+            std::fs::write(&script, invalid).unwrap();
+            worker.send_reload(script.clone());
+            assert!(next_flash(&worker, "invalid Bar configuration").starts_with("Lua error:"));
+            let config = worker.built_config().unwrap();
+            assert!(!config.bar_preferences().show_workspace_labels);
+            assert_eq!(config.sliver_width(), 9);
+        }
+
+        for source in [
+            "spool.setup { options = { sliver_width = 11 } }",
+            "spool.setup { bar = { show_workspace_labels = false } }",
+            "-- setup removed",
+        ] {
+            let replacement = directory.join("init.lua.new");
+            std::fs::write(&replacement, source).unwrap();
+            std::fs::rename(replacement, &script).unwrap();
+            worker.send_reload(script.clone());
+            assert!(matches!(
+                next_effect(&worker, "new config"),
+                FromLua::ConfigChanged
+            ));
+            assert_eq!(next_flash(&worker, "reload notice"), "Lua reloaded");
+            let config = worker.built_config().unwrap();
+            if source.contains("false") {
+                assert!(!config.bar_preferences().show_workspace_labels);
+            } else {
+                assert_eq!(
+                    config.bar_preferences(),
+                    crate::bar::BarPreferences::default()
+                );
+            }
+            assert_eq!(
+                config.sliver_width(),
+                if source.contains("11") {
+                    11
+                } else {
+                    Config::default().sliver_width()
+                }
+            );
+        }
+        drop(worker);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// Spawns a worker with a fresh store behind it, wired to the stamp the
@@ -788,6 +866,10 @@ mod tests {
         )
         .unwrap();
         worker.send_reload(script.clone());
+        assert!(matches!(
+            next_effect(&worker, "the configuration reset"),
+            FromLua::ConfigChanged
+        ));
         assert_eq!(next_flash(&worker, "the reload notice"), "Lua reloaded");
         assert!(
             worker.has_event_handlers(),
@@ -874,8 +956,11 @@ mod tests {
         .unwrap();
         worker.send_reload(script.clone());
 
-        // The write is served along the way; the reload notice is the first
-        // effect either script produces.
+        // The write is served along the way, before the reset and reload notice.
+        assert!(matches!(
+            serve_until_effect(&worker, "the configuration reset"),
+            FromLua::ConfigChanged
+        ));
         let FromLua::Flash { message, .. } = serve_until_effect(&worker, "the reload notice")
         else {
             panic!("expected the reload notice");

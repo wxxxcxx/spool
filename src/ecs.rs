@@ -22,7 +22,9 @@ use bevy::{
     ecs::{component::Component, entity::Entity, schedule::IntoScheduleConfigs},
 };
 use derive_more::{Deref, DerefMut};
-use tracing::{Level, error, instrument, warn};
+#[cfg(feature = "lua")]
+use tracing::error;
+use tracing::{Level, instrument, warn};
 
 type ChangedNativeSpaces<'w, 's> = Query<
     'w,
@@ -34,8 +36,9 @@ type ChangedNativeSpaces<'w, 's> = Query<
     )>,
 >;
 
+use crate::bar::BarManager;
 use crate::commands::register_commands;
-use crate::config::{CONFIGURATION_FILE, Config, WindowParams};
+use crate::config::{Config, WindowParams};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::state::{SpoolState, StateFilePath};
 use crate::errors::Result;
@@ -43,9 +46,9 @@ use crate::events::{Event, EventSender, FocusObservation, InputEvent};
 #[cfg(feature = "lua")]
 use crate::lua;
 use crate::manager::{
-    Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi, WindowManagerOS,
+    Application, Display, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi,
+    WindowManagerOS,
 };
-use crate::menubar::MenuBarManager;
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
@@ -74,7 +77,7 @@ pub use window_frame::{
 };
 
 // Shared by the Lua reload system so a `spool.setup{...}` reload applies the
-// same menubar/passthrough side effects as a TOML reload.
+// menubar/passthrough side effects after a successful Lua reload.
 #[cfg(feature = "lua")]
 pub(crate) use triggers::apply_config_side_effects;
 
@@ -137,6 +140,34 @@ pub fn register_systems(app: &mut bevy::app::App) {
         };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
+    let bar_dirty =
+        |layout_changed: Query<(), Changed<LayoutStrip>>,
+         native_space_changed: ChangedNativeSpaces,
+         visible_space_gained: Query<(), Added<native_space::VisibleNativeSpaceMarker>>,
+         focus_gained: Query<(), Added<FocusedMarker>>,
+         floating_gained: Query<(), Added<Floating>>,
+         window_gained: Query<(), Added<Window>>,
+         display_changed: Query<(), Changed<Display>>,
+         config: Option<Res<Config>>,
+         mut visible_space_lost: RemovedComponents<native_space::VisibleNativeSpaceMarker>,
+         mut focus_lost: RemovedComponents<FocusedMarker>,
+         mut floating_lost: RemovedComponents<Floating>,
+         mut native_space_removed: RemovedComponents<native_space::NativeSpace>,
+         mut window_removed: RemovedComponents<Window>| {
+            !layout_changed.is_empty()
+                || !native_space_changed.is_empty()
+                || !visible_space_gained.is_empty()
+                || !focus_gained.is_empty()
+                || !floating_gained.is_empty()
+                || !window_gained.is_empty()
+                || !display_changed.is_empty()
+                || config.is_some_and(|config| config.is_changed())
+                || visible_space_lost.read().next().is_some()
+                || focus_lost.read().next().is_some()
+                || floating_lost.read().next().is_some()
+                || native_space_removed.read().next().is_some()
+                || window_removed.read().next().is_some()
+        };
 
     app.add_systems(
         Startup,
@@ -225,7 +256,11 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::update_flash_messages,
             )
                 .chain(),
-            crate::menubar::update_menu_bar.run_if(overlay_dirty),
+            (
+                crate::bar::update_bar.run_if(bar_dirty.or_eager(on_timer(Duration::from_secs(1)))),
+                crate::bar::animate_bar,
+            )
+                .chain(),
         ),
     );
     app.add_systems(Last, exit_restore::restore_launch_windows);
@@ -243,7 +278,6 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::dispatch_application_messages,
             triggers::window_destroyed_trigger,
             triggers::invalidate_window_title,
-            triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
             triggers::window_resize_verifier,
         ),
@@ -608,6 +642,7 @@ pub trait SpawnCommandsExt {
 
     fn focus_entity(&mut self, entity: Entity, raise: bool);
 
+    #[cfg(feature = "lua")]
     fn flash_message(&mut self, message: String, duration: f32);
 
     // Spawns a layout strip in a single place, to properly insert all components.
@@ -659,6 +694,7 @@ impl SpawnCommandsExt for Commands<'_, '_> {
         }
     }
 
+    #[cfg(feature = "lua")]
     #[instrument(level = Level::TRACE, skip(self))]
     fn flash_message(&mut self, message: String, duration: f32) {
         let timeout = Timeout::new(Duration::from_secs_f32(duration), None, self);
@@ -681,69 +717,25 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     }
 }
 
-/// Rebuilds the config watcher around `changed`, then re-registers every other
-/// config file. Editors that save atomically (write-new-then-rename) break the
-/// original watch, and since the TOML and Lua script share one watcher,
-/// rebuilding it for just the changed file would otherwise silently stop the
-/// other one from hot-reloading.
+/// Rebuilds the Lua watcher after an atomic save or symlink replacement.
+#[cfg(feature = "lua")]
 pub(crate) fn rewatch_configs(
     window_manager: &WindowManager,
-    changed: &std::path::Path,
+    path: &std::path::Path,
 ) -> Option<Box<dyn notify::Watcher>> {
-    let mut watcher = window_manager
-        .setup_config_watcher(changed)
-        .inspect_err(|err| error!("watching the config '{}': {err}", changed.display()))
-        .ok()?;
-
-    let others = [
-        CONFIGURATION_FILE.clone(),
-        #[cfg(feature = "lua")]
-        crate::config::discover_lua_file(),
-    ];
-    for other in others.into_iter().flatten() {
-        if other == changed {
-            continue;
-        }
-        if let Err(err) = watcher.watch(&other, notify::RecursiveMode::NonRecursive) {
-            warn!("re-watching config '{}': {err}", other.display());
-        }
-    }
-    Some(watcher)
+    window_manager
+        .setup_config_watcher(path)
+        .inspect_err(|err| error!("watching the config '{}': {err}", path.display()))
+        .ok()
 }
 
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
     let window_manager: Box<dyn WindowManagerApi> = Box::new(WindowManagerOS::new(sender.clone()));
 
-    // Discover (or create) the Lua init script first: whether it exists decides
-    // whether the TOML path runs at all, so it has to be settled before
-    // `CONFIGURATION_FILE` is first read.
     #[cfg(feature = "lua")]
-    let lua_path = crate::config::ensure_lua_file()
-        .inspect_err(|err| warn!("preparing Lua script: {err}"))
-        .ok()
-        .flatten();
-
-    // With an init.lua there is no TOML at all, so watch whichever config files
-    // actually exist. Both feed the same `ConfigRefresh` event.
-    let toml_path = CONFIGURATION_FILE.as_deref();
+    let lua_path = crate::config::ensure_lua_file()?;
     #[cfg(feature = "lua")]
-    let primary = toml_path.or(lua_path.as_deref());
-    #[cfg(not(feature = "lua"))]
-    let primary = toml_path;
-    let primary = primary.ok_or_else(|| {
-        crate::errors::Error::InvalidConfig("no configuration file to watch".to_string())
-    })?;
-
-    #[cfg_attr(not(feature = "lua"), allow(unused_mut))]
-    let mut watcher = window_manager.setup_config_watcher(primary)?;
-
-    #[cfg(feature = "lua")]
-    if let Some(path) = &lua_path
-        && path.as_path() != primary
-        && let Err(err) = watcher.watch(path, notify::RecursiveMode::NonRecursive)
-    {
-        warn!("watching Lua script '{}': {err}", path.display());
-    }
+    let watcher = window_manager.setup_config_watcher(&lua_path)?;
 
     let mut app = BevyApp::new();
 
@@ -764,7 +756,6 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_resource(MissionControlActive(false))
         .insert_resource(FocusFollowsMouse(None))
         .insert_resource(Initializing)
-        .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
         .add_plugins(scroll::ScrollEventsPlugin)
         .add_plugins(workspace::WorkspaceEventsPlugin)
@@ -772,6 +763,9 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .add_plugins(focus::FocusEventsPlugin)
         .add_plugins(display::DisplayEventsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
+
+    #[cfg(feature = "lua")]
+    app.insert_non_send(watcher);
 
     // Run every schedule inline rather than fanning systems out across the task
     // pool: the task-pool handoff measured ~45% of main-thread time against
@@ -793,17 +787,17 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         });
     }
 
-    let menu_events = sender.clone();
+    let bar_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
     let overlay_manager = OverlayManager::new(mtm);
     let flash_message_manager = FlashMessageManager::new(mtm);
-    let menu_bar_manager = MenuBarManager::new(mtm, menu_events);
+    let bar_manager = BarManager::new(mtm, bar_events);
     app.insert_non_send(platform_callbacks)
         .insert_non_send(overlay_manager)
         .insert_non_send(flash_message_manager)
-        .insert_non_send(menu_bar_manager)
+        .insert_non_send(bar_manager)
         .insert_non_send(receiver);
 
     let state_file_path = StateFilePath::default();
@@ -825,7 +819,8 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     // script finishes loading, so its keybinds are published before the event
     // tap can see a keypress.
     #[cfg(feature = "lua")]
-    if let Some(path) = lua_path {
+    {
+        let path = lua_path;
         // `spool.bind` resolves chords on the worker, and the layout-aware
         // keymap behind that goes through Carbon/TIS — must capture it here,
         // on the main thread, before the worker can ask for it.
@@ -838,10 +833,8 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
             .resource::<script_state::ScriptStateStore>()
             .revision_handle();
         let worker = lua::LuaWorker::spawn(lua::LuaSource::Path(path.clone()), revision);
-        // A script that called `spool.setup{...}` is authoritative: insert its
-        // config now, before `app.run()`, so it exists ahead of the Startup
-        // schedule and wins over the TOML `InitialConfig` (see
-        // `gather_initial_processes`). Without `setup`, the TOML config is used.
+        // Publish Lua settings before Startup; the input tap retains the same
+        // shared config handle in gather_initial_processes.
         if let Some(config) = worker.built_config() {
             app.insert_resource(config);
         }

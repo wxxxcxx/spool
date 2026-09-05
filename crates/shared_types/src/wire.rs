@@ -141,6 +141,39 @@ mod tests {
     }
 
     #[test]
+    fn overview_actions_append_wire_tags_without_renumbering_existing_actions() {
+        use crate::commands::{MoveFocus, Placement};
+
+        for (action, tag) in [
+            (Action::Lua(7), 11),
+            (Action::Layout(Vec::new()), 12),
+            (
+                Action::ReorderColumn {
+                    window_id: 1,
+                    anchor_window_id: 2,
+                    placement: Placement::After,
+                },
+                13,
+            ),
+            (
+                Action::MoveColumnToSpace {
+                    window_id: 1,
+                    space_id: 2,
+                    move_focus: MoveFocus::Stay,
+                },
+                14,
+            ),
+            (Action::MissionControl, 15),
+            (Action::ShowDesktop, 16),
+        ] {
+            let request = Request::Dispatch(action);
+            let bytes = postcard::to_allocvec(&request).unwrap();
+            assert_eq!(&bytes[..2], &[0, tag]);
+            round_trip(&request);
+        }
+    }
+
+    #[test]
     fn every_response_survives_the_wire() {
         round_trip(&Response::Query(QueryPayload::Active(Box::default())));
         round_trip(&Response::Query(QueryPayload::Spaces(Vec::new())));

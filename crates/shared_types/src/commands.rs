@@ -1,7 +1,7 @@
 //! The Spool action vocabulary.
 //!
 //! Every way of telling the window manager to do something funnels through
-//! [`Action`]: the TOML `[bindings]` table, the `spool action` interface, an
+//! [`Action`]: the built-in Bar, the `spool action` interface, an
 //! embedded Lua `init.lua`, and the loadable Lua client module. This crate owns
 //! the types and their argv encoding ([`parse_action`] / [`Action::to_argv`]).
 
@@ -237,6 +237,14 @@ pub enum MoveFocus {
     Stay,
 }
 
+/// Which side of an existing layout column receives a dragged column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Placement {
+    Before,
+    After,
+}
+
 impl MoveFocus {
     /// `follow = true` is the default everywhere a caller can choose.
     #[must_use]
@@ -345,4 +353,23 @@ pub enum Action {
     /// Window-addressed, unlike every other action here, and applied
     /// best-effort: see `ecs::layout_ops`. Never produced by parsing.
     Layout(Vec<crate::windowset::LayoutOp>),
+    /// Reorders the complete tiled column containing `window_id` relative to
+    /// the complete tiled column containing `anchor_window_id`.
+    ReorderColumn {
+        window_id: i32,
+        anchor_window_id: i32,
+        placement: Placement,
+    },
+    /// Moves the complete tiled column containing `window_id` to another
+    /// native Space while preserving stack/tab structure and member order.
+    MoveColumnToSpace {
+        window_id: i32,
+        space_id: u64,
+        move_focus: MoveFocus,
+    },
+    // Append new variants: postcard uses declaration order for the IPC tags.
+    /// Requests the system Mission Control overview.
+    MissionControl,
+    /// Requests the system Show Desktop overview.
+    ShowDesktop,
 }

@@ -159,5 +159,5 @@ after Spool reads the new membership back from macOS.
 
 v3 removes `virtual_workspaces`, `virtual_workspace_number`, and the
 `virtual_workspace_changed` event. Integrations must switch to `spaces`,
-`space_id`, and `space_changed`. SpoolBar can read a v2 snapshot during its
-upgrade transition, but the daemon emits v3 only.
+`space_id`, and `space_changed`. The built-in Rust Bar reads the v3 world state
+directly; external integrations receive v3 from the daemon.

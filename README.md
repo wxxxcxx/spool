@@ -37,12 +37,11 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
 - **Works with MacOS workspaces:** You can use existing workspaces and switch
   between them with keyboard or touchpad gestures - with a separate window strip
   on each. Drag and dropping windows between them works as well.
-- **Virtual Workspaces (Experimental):** Group your windows into tasks by
-  stacking multiple horizontal strips (rows) within a single space. Use native
-  macOS workspaces for broad segregation (e.g., 'Work', 'Personal') and virtual
-  workspaces to stay organized within each context.
-- **Menu bar workspace indicator:** Shows the currently active virtual
-  workspace in the macOS menu bar.
+- **One layout per native Space:** macOS owns Space topology and visibility;
+  Spool keeps an independent ordered column strip for every native Space.
+- **Built-in workspace Bar:** The Rust Bar runs inside the Spool process on
+  every display, showing all Spaces, the current Space's column layout,
+  floating windows, fullscreen/empty state, and exact focused window.
 - **Startup session restore:** Restores tracked window layouts, virtual
   workspaces, and display assignments from the last saved state when Spool
   starts.
@@ -124,49 +123,31 @@ See [`nix/README.md`](/nix/README.md).
 
 ### Configuration
 
-Spool checks for configuration in following locations:
+Spool uses one Lua configuration for the window manager and built-in Bar.
+Configuration discovery checks these locations in order:
 
-- `$HOME/.spool`
-- `$HOME/.spool.toml`
-- `$XDG_CONFIG_HOME/spool/spool.toml`
+1. `$SPOOL_LUA` (an existing file)
+2. `$HOME/.spool.lua`
+3. `$XDG_CONFIG_HOME/spool/init.lua` (normally `~/.config/spool/init.lua`)
 
-Additionally it allows overriding the location with `$SPOOL_CONFIG` environment variable.
-If none of these files exists, Spool creates
-`$XDG_CONFIG_HOME/spool/spool.toml` with the built-in defaults on first launch.
+If none exists, Spool creates the [default init.lua](config/default.lua) in the
+XDG config directory without overwriting an existing script. TOML configuration
+(`spool.toml`, `bar.toml`, `~/.spool`, and `SPOOL_CONFIG`) is no longer supported.
+Existing TOML files are left untouched but are not read, created, or watched.
 
-A Lua script (`$XDG_CONFIG_HOME/spool/init.lua`, `$HOME/.spool.lua`, or
-`$SPOOL_LUA`) replaces the TOML rather than layering on top of it: when one
-exists, no `spool.toml` is read, created, or watched.
+Save the active script to reload settings, Bar appearance, and keybindings.
+A failed reload keeps the last working configuration. Omitted settings use
+built-in defaults; removing `bar` or `spool.setup` also restores their defaults.
+Builds without the `lua` feature use built-in defaults only.
 
-You can use the following basic configuration as a starting point. For a
-complete guide to all available options, keybindings, and window rules, see the
-**[Configuration Guide](./CONFIGURATION.md)**.
-
-```toml
-# basic .spool.toml
-[options]
-focus_follows_mouse = true
-mouse_follows_focus = true
-
-[bindings]
-window_focus_west = "cmd+h"
-window_focus_east = "cmd+l"
-window_focus_next = "alt+n"
-window_focus_previous = "alt+p"
-window_shrink_width = "alt+minus"
-window_grow_width = "alt+equal"
-window_center = "alt+c"
-quit = "ctrl+alt+q"
-```
-
-Alternatively, the embedded Lua runtime can declare the entire configuration
-via `spool.setup{...}`, making the TOML file optional — see the
-**[Lua Scripting Guide](./SCRIPTING.md)**:
+See the **[Configuration Guide](./CONFIGURATION.md)** and
+**[Lua Scripting Guide](./SCRIPTING.md)** for options and actions.
 
 ```lua
 -- init.lua
 spool.setup {
   options = { focus_follows_mouse = true, mouse_follows_focus = true },
+  bar = { show_workspace_labels = true },
 }
 
 spool.bind("cmd+h", spool.action.window.focus_west)
@@ -193,7 +174,7 @@ Restore is startup-only. After the configured startup grace period expires, new
 or unmatched windows follow the normal configuration and window-rule behavior.
 Saved windows that are not present are ignored by default and the restored
 layout is compacted around the windows that were found. The behavior is
-configured with `[restore]`; see the
+configured with `spool.setup { restore = { ... } }`; see the
 **[Session Restore](./CONFIGURATION.md#session-restore)** section in the
 configuration guide.
 
@@ -272,6 +253,8 @@ integrations should use `action`.
 | `space create <display-id>` / `space delete <space-id>` | Space lifecycle actions when supported |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
+| `mission-control`          | Open or close the system Mission Control overview |
+| `show-desktop`             | Toggle the system Show Desktop overview          |
 | `printstate`               | Print the internal ECS state to the debug log    |
 | `quit`                     | Quit Spool                                      |
 | `restart`                  | Restart the Spool service                         |
@@ -410,8 +393,8 @@ scripts, `cron` jobs, or other automation tools:
   ```shell
   spool action window nextdisplay && spool action mouse nextdisplay
   ```
-- **Status bar integration.** Use `spool query state --json` to render the
-  initial workspace labels, then keep them current with `spool subscribe --json`.
+- **External status integration.** The built-in Bar needs no IPC. Other tools
+  can still use `spool query state --json` and `spool subscribe --json`.
 
 
 ## Future Enhancements

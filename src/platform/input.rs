@@ -84,8 +84,7 @@ impl Touch {
 }
 
 /// Keybinds registered by the Lua runtime as `(keycode, modifiers, handler_id)`,
-/// shared lock-free with the event tap. Checked before the config bindings so a
-/// scripted bind can override a TOML one.
+/// shared lock-free with the event tap as the sole hotkey registry.
 static LUA_KEYBINDS: LazyLock<ArcSwap<Vec<(u8, Modifiers, u32)>>> =
     LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
@@ -467,9 +466,9 @@ impl InputHandler {
 
         // On a native fullscreen space, keybindings are still intercepted so
         // that spool can actively switch back to the previous workspace.
-        // Non-spool keys pass through naturally (find_keybind returns None).
+        // Unbound keys pass through naturally.
 
-        let keycode = keycode.try_into().ok();
+        let keycode = u8::try_from(keycode).ok();
         keycode
             .and_then(|keycode| {
                 let passthrough = FOCUSED_PASSTHROUGH.load();
@@ -479,7 +478,6 @@ impl InputHandler {
                 {
                     return None;
                 }
-                // Lua-registered binds take precedence over the TOML config.
                 let lua_binds = LUA_KEYBINDS.load();
                 if let Some((_, _, id)) = lua_binds
                     .iter()
@@ -487,7 +485,7 @@ impl InputHandler {
                 {
                     return Some(Action::Lua(*id));
                 }
-                self.config.find_keybind(keycode, mask)
+                None
             })
             .and_then(|action| {
                 events
