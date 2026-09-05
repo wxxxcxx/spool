@@ -39,10 +39,10 @@ menus and status items. Use the width limit and notch side to avoid crowded area
   icons only horizontally. Icons beyond the four-card limit fade without
   moving vertically, including when a transition is interrupted.
 - Empty Spaces use a full-size outlined placeholder in the content region,
-  never a synthetic application icon. Native fullscreen Spaces use a muted
-  expand-arrows symbol beside the numeric label, retained when labels are hidden.
-  Their window icons carry a small matching bottom-right badge in expanded and
-  collapsed views. Fullscreen status never adds a Space outline or selection
+  never a synthetic application icon. Native fullscreen status is indicated only
+  by a small bottom-right expand-arrows badge on window icons, in both expanded
+  and collapsed views and with labels hidden. Space labels have no fullscreen
+  symbol or extra reserved width. Fullscreen status never adds a Space outline or selection
   color; the existing active-Space and focused-window accents remain independent.
 - The exact focused window has a moving accent fill, outline and bottom
   indicator. The indicator paints above icon decks so backing plates cannot
@@ -122,13 +122,30 @@ This does not relax focus or movement availability checks. Confirmed window
 destruction removes the tracked identity and its icon; the Bar does not retain
 a separate last-known snapshot of closed windows.
 
-Cold-start discovery is a separate limitation: a WindowServer surface that has
-never yielded an AX window has no tracked ECS identity yet. Startup enumerates
-native-Space window IDs and attempts a private AX-token scan with a 250ms budget
-per application, but unresolved IDs are not a Bar presentation source. The
-retained-identity projection above only helps after a window has been discovered.
-A future read-only WindowServer presentation fallback must stay separate from
-operational windows and must not fabricate layout columns or focus targets.
+Cold-start discovery can leave a native window without a tracked AX identity
+after the bounded startup scan. The Bar shows a read-only application icon for
+such a surface when its native ordered-window membership, ordinary nontransparent
+WindowServer layer, and known application bundle identity are available. These
+icons follow tracked windows in a stable process/window-ID order, including in
+collapsed decks. They do not invent tiled columns or floating status and cannot
+be focused or dragged. Clicking their Space still uses the normal Space action.
+
+Read-only candidates use the Space-local ordered-window list (`0x2`), not the
+broad discovery list (`0x7`). A closed application window can retain a full-size,
+normal-layer, opaque WindowServer surface in the latter list without having any
+AX windows, as Calendar does. Such ordered-out surfaces are not fallback icons.
+This does not require a window to be on the current screen; inactive Spaces are
+still queried individually. Tracked windows retain their existing broad membership
+and visibility policy, including minimized windows.
+
+AX discovery replaces a read-only icon with the tracked window's real layout
+role without duplicating it. Surfaces already identified by AX, including ignored
+or retired windows, are excluded from fallback while their native IDs survive.
+Fallback is rebuilt from fresh native observations on Bar updates; it disappears
+on close or failed inventory/membership reads instead of retaining stale icons.
+The renderer performs no extra AX scans. Missing bundle identity or uncertain
+native metadata still means no fallback icon; read-only icons are not included
+in operational queries or Lua window sets.
 
 ## Configuration
 
@@ -229,8 +246,9 @@ stability, whole-column and floating previews, command agreement, and the real
 mouse-event state path through release and cancellation. They do not create
 live native panels or operate the user's windows.
 Additional tests cover borderless collapsed icons, unchanged vertical geometry
-through interrupted transitions, and the current cold-start unresolved-identity
-boundary. The cold-start test documents the limitation; it does not fix it.
+through interrupted transitions, cold-start read-only icons and their handoff
+to AX discovery, inventory failures, closed/ignored-surface cleanup, and exclusion
+from focus, drag and operational queries.
 Live Space switching, drag gestures, multi-display behavior and
 the subjective animation/style review still require desktop acceptance; unit
 tests are not a substitute for that inspection.

@@ -1,10 +1,9 @@
 use spool_shared_types::commands::Placement;
 use spool_shared_types::state::SpaceKind;
 
+use super::model::BarSurface as UnresolvedSurface;
 use super::model::{BarColumn, BarDisplay, BarSpace, BarWindow};
 use super::toolbar::TOOLBAR_WIDTH;
-
-const FULLSCREEN_SPACE_EXTENT: f64 = 14.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -254,18 +253,10 @@ impl PlacedItem {
     pub fn fullscreen_badge_rect(&self) -> Option<Rect> {
         let rect = self.rect;
         match self.kind {
-            ItemKind::Space {
-                fullscreen: true, ..
-            } => {
-                let size = rect.height.min(10.0);
-                Some(Rect {
-                    x: rect.x + 3.0,
-                    y: rect.y + (rect.height - size) / 2.0,
-                    width: size,
-                    height: size,
-                })
-            }
             ItemKind::Window {
+                fullscreen: true, ..
+            }
+            | ItemKind::Surface {
                 fullscreen: true, ..
             } => {
                 let size = (rect.width / 2.0).min(9.0);
@@ -283,6 +274,14 @@ impl PlacedItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ItemKind {
+    Surface {
+        window_id: i32,
+        owner_pid: i32,
+        space_id: u64,
+        bundle_id: String,
+        collapsed: bool,
+        fullscreen: bool,
+    },
     Label {
         space_id: u64,
         ordinal: u32,
@@ -428,7 +427,7 @@ impl BarLayout {
             if metrics.label_width > 0.0 {
                 items.push(PlacedItem {
                     rect: Rect {
-                        x: space_rect.x + 3.0 + fullscreen_extent(space),
+                        x: space_rect.x + 3.0,
                         width: metrics.label_width,
                         ..space_rect
                     },
@@ -439,7 +438,7 @@ impl BarLayout {
                 });
             }
             if space.is_empty() {
-                let content = content_rect(space, space_rect, &metrics);
+                let content = content_rect(space_rect, &metrics);
                 items.push(PlacedItem {
                     rect: Rect {
                         x: content.x + (content.width - metrics.icon_size) / 2.0,
@@ -492,24 +491,24 @@ fn space_width(space: &BarSpace, metrics: &BarMetrics) -> f64 {
         let deck = deck
             .last()
             .map_or(metrics.icon_size, |icon| icon.x + icon.size);
-        return fullscreen_extent(space) + label_extent(metrics) + deck + 6.0;
+        return label_extent(metrics) + deck + 6.0;
     }
     let columns = space
         .columns
         .iter()
         .map(|column| column_icon_size(column, metrics) + metrics.icon_gap)
         .sum::<f64>();
-    let floating = count(space.floating.len()) * (metrics.icon_size + metrics.icon_gap);
+    let floating = count(space.floating.len() + space.unresolved.len())
+        * (metrics.icon_size + metrics.icon_gap);
     let separator = if !space.columns.is_empty() && !space.floating.is_empty() {
         metrics.item_gap - metrics.icon_gap
     } else {
         0.0
     };
-    fullscreen_extent(space)
-        + label_extent(metrics)
+    label_extent(metrics)
         + 6.0
         + (columns + separator + floating
-            - if space.columns.is_empty() && space.floating.is_empty() {
+            - if space.is_empty() {
                 0.0
             } else {
                 metrics.icon_gap
@@ -525,16 +524,8 @@ fn label_extent(metrics: &BarMetrics) -> f64 {
     }
 }
 
-fn fullscreen_extent(space: &BarSpace) -> f64 {
-    if space.kind == SpaceKind::Fullscreen {
-        FULLSCREEN_SPACE_EXTENT
-    } else {
-        0.0
-    }
-}
-
-fn content_rect(space: &BarSpace, rect: Rect, metrics: &BarMetrics) -> Rect {
-    let header = fullscreen_extent(space) + label_extent(metrics);
+fn content_rect(rect: Rect, metrics: &BarMetrics) -> Rect {
+    let header = label_extent(metrics);
     Rect {
         x: rect.x + 3.0 + header,
         width: rect.width - 6.0 - header,
@@ -555,14 +546,14 @@ fn column_icon_y(column: &BarColumn, index: usize, metrics: &BarMetrics) -> f64 
     count(index) * spread / count(column.windows.len().saturating_sub(1)).max(1.0)
 }
 
-struct CollapsedIcon<'a> {
-    window: &'a BarWindow,
+struct CollapsedIcon {
+    kind: ItemKind,
     size: f64,
     x: f64,
     y: f64,
 }
 
-fn collapsed_deck<'a>(space: &'a BarSpace, metrics: &BarMetrics) -> Vec<CollapsedIcon<'a>> {
+fn collapsed_deck(space: &BarSpace, metrics: &BarMetrics) -> Vec<CollapsedIcon> {
     let mut deck = space
         .columns
         .iter()
@@ -572,14 +563,20 @@ fn collapsed_deck<'a>(space: &'a BarSpace, metrics: &BarMetrics) -> Vec<Collapse
                 .iter()
                 .enumerate()
                 .map(move |(index, window)| CollapsedIcon {
-                    window,
+                    kind: collapsed_window_kind(space, window),
                     size: column_icon_size(column, metrics),
                     x: 0.0,
                     y: column_icon_y(column, index, metrics),
                 })
         })
         .chain(space.floating.iter().map(|window| CollapsedIcon {
-            window,
+            kind: collapsed_window_kind(space, window),
+            size: metrics.icon_size,
+            x: 0.0,
+            y: 0.0,
+        }))
+        .chain(space.unresolved.iter().map(|surface| CollapsedIcon {
+            kind: surface_kind(space, surface, true),
             size: metrics.icon_size,
             x: 0.0,
             y: 0.0,
@@ -596,7 +593,7 @@ fn collapsed_deck<'a>(space: &'a BarSpace, metrics: &BarMetrics) -> Vec<Collapse
 }
 
 fn place_expanded(space: &BarSpace, rect: Rect, metrics: &BarMetrics, items: &mut Vec<PlacedItem>) {
-    let mut x = content_rect(space, rect, metrics).x;
+    let mut x = content_rect(rect, metrics).x;
     for column in &space.columns {
         let Some(anchor) = column.anchor_window_id() else {
             continue;
@@ -686,6 +683,44 @@ fn place_expanded(space: &BarSpace, rect: Rect, metrics: &BarMetrics, items: &mu
         });
         x += metrics.icon_size + metrics.icon_gap;
     }
+    for surface in &space.unresolved {
+        items.push(PlacedItem {
+            rect: Rect {
+                x,
+                y: rect.y + (rect.height - metrics.icon_size) / 2.0,
+                width: metrics.icon_size,
+                height: metrics.icon_size,
+            },
+            kind: surface_kind(space, surface, false),
+        });
+        x += metrics.icon_size + metrics.icon_gap;
+    }
+}
+
+fn surface_kind(space: &BarSpace, surface: &UnresolvedSurface, collapsed: bool) -> ItemKind {
+    ItemKind::Surface {
+        window_id: surface.id,
+        owner_pid: surface.owner_pid,
+        space_id: space.id,
+        bundle_id: surface.bundle_id.clone(),
+        collapsed,
+        fullscreen: space.kind == SpaceKind::Fullscreen,
+    }
+}
+
+fn collapsed_window_kind(space: &BarSpace, window: &BarWindow) -> ItemKind {
+    ItemKind::Window {
+        window_id: window.id,
+        space_id: space.id,
+        column_window_id: None,
+        floating: false,
+        focused: false,
+        bundle_id: window.bundle_id.clone(),
+        title: window.title.clone(),
+        collapsed: true,
+        stacked: false,
+        fullscreen: space.kind == SpaceKind::Fullscreen,
+    }
 }
 
 fn place_collapsed(
@@ -695,11 +730,10 @@ fn place_collapsed(
     items: &mut Vec<PlacedItem>,
 ) {
     let deck = collapsed_deck(space, metrics);
-    let content = content_rect(space, rect, metrics);
+    let content = content_rect(rect, metrics);
     let width = deck.last().map_or(0.0, |icon| icon.x + icon.size);
     // Paint back to front: the first logical window remains the front card.
     for icon in deck.iter().rev() {
-        let window = icon.window;
         items.push(PlacedItem {
             rect: Rect {
                 x: content.x + (content.width - width) / 2.0 + icon.x,
@@ -707,18 +741,7 @@ fn place_collapsed(
                 width: icon.size,
                 height: icon.size,
             },
-            kind: ItemKind::Window {
-                window_id: window.id,
-                space_id: space.id,
-                column_window_id: None,
-                floating: false,
-                focused: false,
-                bundle_id: window.bundle_id.clone(),
-                title: window.title.clone(),
-                collapsed: true,
-                stacked: false,
-                fullscreen: space.kind == SpaceKind::Fullscreen,
-            },
+            kind: icon.kind.clone(),
         });
     }
 }
@@ -766,6 +789,7 @@ pub(super) mod tests {
                     focused: false,
                     columns: Vec::new(),
                     floating: Vec::new(),
+                    unresolved: Vec::new(),
                 },
                 BarSpace {
                     id: 11,
@@ -786,6 +810,7 @@ pub(super) mod tests {
                         },
                     ],
                     floating: vec![window(4, false)],
+                    unresolved: Vec::new(),
                 },
                 BarSpace {
                     id: 12,
@@ -799,8 +824,69 @@ pub(super) mod tests {
                         windows: vec![window(5, false), window(6, false), window(7, false)],
                     }],
                     floating: Vec::new(),
+                    unresolved: Vec::new(),
                 },
             ],
+        }
+    }
+
+    #[test]
+    fn unresolved_surfaces_use_real_icon_decks_without_inventing_columns() {
+        let mut display = display();
+        display.spaces.truncate(1);
+        display.spaces[0].unresolved = (20..26)
+            .map(|id| UnresolvedSurface {
+                id,
+                owner_pid: 1000,
+                bundle_id: format!("com.example.{id}"),
+            })
+            .collect();
+        for visible in [false, true] {
+            display.spaces[0].visible = visible;
+            display.spaces[0].kind = SpaceKind::Fullscreen;
+            let layout = BarLayout::resolve(&display, 1200.0, 0.0);
+            assert!(!layout.items.iter().any(|item| matches!(
+                item.kind,
+                ItemKind::Window { .. }
+                    | ItemKind::ColumnDrop { .. }
+                    | ItemKind::Placeholder { .. }
+                    | ItemKind::Focus { .. }
+            )));
+            let icons = layout
+                .items
+                .iter()
+                .filter(|item| matches!(item.kind, ItemKind::Surface { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(icons.len(), if visible { 6 } else { 4 });
+            let mut ids = Vec::new();
+            for icon in &icons {
+                let ItemKind::Surface {
+                    window_id,
+                    ref bundle_id,
+                    collapsed,
+                    ..
+                } = icon.kind
+                else {
+                    unreachable!()
+                };
+                ids.push(window_id);
+                assert_eq!(bundle_id, &format!("com.example.{window_id}"));
+                assert_eq!(collapsed, !visible);
+                assert!(icon.fullscreen_badge_rect().is_some());
+                assert!(icon.rect.x >= 0.0 && icon.rect.x + icon.rect.width <= layout.width);
+            }
+            assert_eq!(
+                ids,
+                if visible {
+                    vec![20, 21, 22, 23, 24, 25]
+                } else {
+                    vec![23, 22, 21, 20]
+                }
+            );
+            for pair in icons.windows(2) {
+                assert!((pair[0].rect.x - pair[1].rect.x).abs() >= 5.0);
+                assert!((pair[0].rect.y - pair[1].rect.y).abs() < f64::EPSILON);
+            }
         }
     }
 
@@ -877,7 +963,7 @@ pub(super) mod tests {
             let mut marked_windows = 0;
             for item in &layout.items {
                 match item.kind {
-                    ItemKind::Space { space_id, .. } | ItemKind::Window { space_id, .. } => {
+                    ItemKind::Window { space_id, .. } => {
                         assert_eq!(item.fullscreen_badge_rect().is_some(), space_id == 12);
                         if matches!(
                             item.kind,
@@ -904,11 +990,13 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn fullscreen_space_badge_has_its_own_lane_with_or_without_labels() {
+    fn fullscreen_status_adds_no_header_or_width_with_or_without_labels() {
         for label_width in [0.0, 24.0, 96.0] {
             for icon_size in [12.0, 22.0, 52.0] {
-                for empty in [false, true] {
+                for (visible, empty) in [(false, false), (true, false), (false, true), (true, true)]
+                {
                     let mut display = display();
+                    display.spaces[2].visible = visible;
                     if empty {
                         display.spaces[2].columns.clear();
                     }
@@ -927,15 +1015,25 @@ pub(super) mod tests {
                         .iter()
                         .find(|item| matches!(item.kind, ItemKind::Space { space_id: 12, .. }))
                         .unwrap();
-                    let badge = space.fullscreen_badge_rect().unwrap();
-                    for item in &layout.items {
-                        if matches!(
-                            item.kind,
-                            ItemKind::Label { space_id: 12, .. }
-                                | ItemKind::Window { space_id: 12, .. }
-                                | ItemKind::Placeholder { space_id: 12 }
-                        ) {
-                            assert!(item.rect.x >= badge.x + badge.width);
+                    assert!(space.fullscreen_badge_rect().is_none());
+                    display.spaces[2].kind = SpaceKind::User;
+                    let ordinary = BarLayout::resolve_with_metrics(
+                        &display,
+                        1200.0,
+                        0.0,
+                        BarMetrics {
+                            icon_size,
+                            label_width,
+                            ..BarMetrics::default()
+                        },
+                    );
+                    assert!((layout.content_width - ordinary.content_width).abs() < f64::EPSILON);
+                    assert_eq!(layout.items.len(), ordinary.items.len());
+                    for (fullscreen, ordinary) in layout.items.iter().zip(&ordinary.items) {
+                        assert_eq!(fullscreen.rect, ordinary.rect);
+                        if matches!(fullscreen.kind, ItemKind::Window { space_id: 12, .. }) {
+                            assert!(fullscreen.fullscreen_badge_rect().is_some());
+                            assert!(ordinary.fullscreen_badge_rect().is_none());
                         }
                     }
                     assert!((layout.height - icon_size - 12.0).abs() < f64::EPSILON);
@@ -1045,12 +1143,7 @@ pub(super) mod tests {
                         continue;
                     };
                     let space = layout.items.iter().find(|item| matches!(item.kind, ItemKind::Space { space_id: id, .. } if id == space_id)).unwrap();
-                    let model = display
-                        .spaces
-                        .iter()
-                        .find(|space| space.id == space_id)
-                        .unwrap();
-                    let content = content_rect(model, space.rect, &metrics);
+                    let content = content_rect(space.rect, &metrics);
                     assert!(content.contains(item.rect.x, item.rect.y));
                     assert!(content.contains(
                         item.rect.x + item.rect.width,

@@ -27,12 +27,13 @@ pub struct BarSpace {
     pub focused: bool,
     pub columns: Vec<BarColumn>,
     pub floating: Vec<BarWindow>,
+    pub unresolved: Vec<BarSurface>,
 }
 
 impl BarSpace {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.columns.is_empty() && self.floating.is_empty()
+        self.columns.is_empty() && self.floating.is_empty() && self.unresolved.is_empty()
     }
 
     pub fn windows(&self) -> impl Iterator<Item = &BarWindow> {
@@ -41,6 +42,15 @@ impl BarSpace {
             .flat_map(|column| column.windows.iter())
             .chain(self.floating.iter())
     }
+}
+
+/// A native surface with an application icon, but no AX identity or layout role.
+/// Deliberately separate from `BarWindow`: it cannot be focused or dragged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BarSurface {
+    pub id: i32,
+    pub owner_pid: i32,
+    pub bundle_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,6 +115,7 @@ impl BarSnapshot {
                             focused: state_space.is_some_and(|space| space.focused),
                             columns,
                             floating: workspace.floating.iter().map(BarWindow::from).collect(),
+                            unresolved: Vec::new(),
                         }
                     })
                     .collect::<Vec<_>>();

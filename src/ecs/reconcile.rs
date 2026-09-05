@@ -53,9 +53,30 @@ pub(crate) struct WindowStateSync {
     window_observers: HashSet<Entity>,
     focus_absent: HashMap<Entity, FocusSnapshot>,
     retired_window_incarnations: HashSet<(Entity, WindowKey)>,
+    // Keep AX-known IDs while their native surfaces survive so presentation
+    // fallback cannot resurrect an ignored or retired window as "undiscovered".
+    ax_observed_windows: HashMap<Entity, HashSet<WinID>>,
 }
 
 impl WindowStateSync {
+    pub(crate) fn has_observed_ax_window(&self, application: Entity, id: WinID) -> bool {
+        self.ax_observed_windows
+            .get(&application)
+            .is_some_and(|ids| ids.contains(&id))
+    }
+
+    fn remember_ax_windows(
+        &mut self,
+        application: Entity,
+        pid: Pid,
+        identities: &[(WinID, WindowIncarnation)],
+        owners: &HashMap<WinID, Pid>,
+    ) {
+        let observed = self.ax_observed_windows.entry(application).or_default();
+        observed.retain(|id| owners.get(id) == Some(&pid));
+        observed.extend(identities.iter().map(|(id, _)| *id));
+    }
+
     pub(crate) fn forget_window(&mut self, entity: Entity) {
         self.frame_convergence.remove(&entity);
         self.window_observers.remove(&entity);
@@ -77,6 +98,7 @@ impl WindowStateSync {
     }
 
     fn forget_application(&mut self, application: Entity) {
+        self.ax_observed_windows.remove(&application);
         self.application_observers.remove(&application);
         self.focus_absent.remove(&application);
         self.retired_window_incarnations
@@ -441,9 +463,9 @@ impl ReconcileState<'_, '_> {
                 }
             }
             refresh_application_observer(app_entity, &mut app, sync);
-            if audit.window_server.is_none() {
+            let Some(owners) = &audit.window_server else {
                 continue;
-            }
+            };
             let Ok(inventory) = app.window_inventory(config).inspect_err(|error| {
                 warn!(pid, %error, "window reconciliation skipped application");
             }) else {
@@ -456,6 +478,7 @@ impl ReconcileState<'_, '_> {
                 );
                 continue;
             };
+            sync.remember_ax_windows(app_entity, pid, &inventory.identities, owners);
             let buckets = inventory_buckets(inventory.identities, app_entity, sync);
             if !inventory.complete {
                 debug!(
@@ -497,6 +520,8 @@ impl ReconcileState<'_, '_> {
                 .retain(|entity, _| live_applications.contains(entity));
             sync.retired_window_incarnations
                 .retain(|(entity, _)| live_applications.contains(entity));
+            sync.ax_observed_windows
+                .retain(|entity, _| live_applications.contains(entity));
             let live_windows = self
                 .windows
                 .iter()

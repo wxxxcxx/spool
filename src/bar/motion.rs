@@ -20,7 +20,7 @@ impl VisualItem {
             ItemKind::Window {
                 collapsed: true,
                 ..
-            }
+            } | ItemKind::Surface { .. }
         ) {
             0.0
         } else {
@@ -32,6 +32,7 @@ impl VisualItem {
         match self.item.kind {
             ItemKind::Space { space_id, .. }
             | ItemKind::Window { space_id, .. }
+            | ItemKind::Surface { space_id, .. }
             | ItemKind::Label { space_id, .. }
             | ItemKind::Placeholder { space_id }
             | ItemKind::Focus { space_id }
@@ -39,16 +40,21 @@ impl VisualItem {
         }
     }
 
-    fn key(&self) -> (u64, u8, i32) {
-        let (kind, id) = match self.item.kind {
-            ItemKind::Space { .. } => (0, 0),
-            ItemKind::Window { window_id, .. } => (1, window_id),
-            ItemKind::Label { .. } => (2, 0),
-            ItemKind::Placeholder { .. } => (3, 0),
-            ItemKind::Focus { .. } => (4, 0),
+    fn key(&self) -> (u64, u8, i32, i32) {
+        let (kind, id, owner) = match self.item.kind {
+            ItemKind::Space { .. } => (0, 0, 0),
+            ItemKind::Window { window_id, .. } => (1, window_id, 0),
+            ItemKind::Label { .. } => (2, 0, 0),
+            ItemKind::Placeholder { .. } => (3, 0, 0),
+            ItemKind::Focus { .. } => (4, 0, 0),
+            ItemKind::Surface {
+                window_id,
+                owner_pid,
+                ..
+            } => (5, window_id, owner_pid),
             ItemKind::ColumnDrop { .. } => unreachable!("drop targets are not painted"),
         };
-        (self.space_id(), kind, id)
+        (self.space_id(), kind, id, owner)
     }
 }
 
@@ -84,6 +90,10 @@ impl Presentation {
                             collapsed: true,
                             ..
                         } | ItemKind::Window { stacked: true, .. }
+                            | ItemKind::Surface {
+                                collapsed: true,
+                                ..
+                            }
                     )),
                     item: item.clone(),
                     opacity: 1.0,
@@ -285,12 +295,16 @@ impl BarMotion {
 }
 
 fn entry_rect(item: &VisualItem, frame: &Presentation) -> Rect {
-    if matches!(item.item.kind, ItemKind::Window { .. })
-        && let Some(anchor) = frame.items.iter().rev().find(|other| {
-            other.space_id() == item.space_id()
-                && matches!(other.item.kind, ItemKind::Window { .. })
-        })
-    {
+    if matches!(
+        item.item.kind,
+        ItemKind::Window { .. } | ItemKind::Surface { .. }
+    ) && let Some(anchor) = frame.items.iter().rev().find(|other| {
+        other.space_id() == item.space_id()
+            && matches!(
+                other.item.kind,
+                ItemKind::Window { .. } | ItemKind::Surface { .. }
+            )
+    }) {
         return Rect {
             x: anchor.item.rect.x,
             ..item.item.rect

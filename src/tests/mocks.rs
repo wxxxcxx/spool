@@ -39,6 +39,7 @@ pub(crate) struct MockWindowData {
     pub(crate) minimized: bool,
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) visible: bool,
+    pub(crate) ordered_out: bool,
     pub(crate) role: String,
     pub(crate) subrole: String,
     pub(crate) identifier: String,
@@ -61,6 +62,7 @@ impl Default for MockWindowData {
             minimized: false,
             workspace_id: 0,
             visible: true,
+            ordered_out: false,
             role: "AXWindow".to_string(),
             subrole: "AXStandardWindow".to_string(),
             identifier: "testid".to_string(),
@@ -427,6 +429,7 @@ impl MockState {
         let mut windows = inner
             .windows
             .values()
+            .chain(inner.withdrawn_surfaces.values())
             .filter_map(|window| (window.workspace_id == workspace_id).then_some(window.id))
             .collect::<Vec<_>>();
         windows.sort_unstable();
@@ -1434,6 +1437,37 @@ impl MockState {
                     .collect(),
             )
         });
+
+        let s = self.clone();
+        wm.expect_presentation_window_owners().returning(move || {
+            let inner = s.inner.force_read();
+            inner.window_server_inventory_available.then(|| {
+                inner
+                    .windows
+                    .iter()
+                    .chain(inner.withdrawn_surfaces.iter())
+                    .filter(|(id, _)| !inner.window_server_inventory_omissions.contains(id))
+                    .map(|(id, window)| (*id, window.pid))
+                    .collect()
+            })
+        });
+
+        let s = self.clone();
+        wm.expect_presentation_windows_in_workspace()
+            .returning(move |workspace_id| {
+                let inner = s.inner.force_read();
+                Ok(inner
+                    .windows
+                    .values()
+                    .chain(inner.withdrawn_surfaces.values())
+                    .filter(|window| {
+                        window.workspace_id == workspace_id
+                            && !window.ordered_out
+                            && !window.minimized
+                    })
+                    .map(|window| window.id)
+                    .collect())
+            });
 
         let s = self.clone();
         wm.expect_request_window_notifications()
