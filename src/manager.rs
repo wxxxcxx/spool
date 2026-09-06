@@ -39,7 +39,7 @@ use crate::util::symlink_target;
 use crate::util::{AXUIWrapper, MacResult, create_array, round_px};
 use app::ApplicationOS;
 pub use app::{Application, ApplicationApi};
-pub use display::Display;
+pub use display::{Display, DisplayObservation};
 pub use process::{Process, ProcessApi};
 pub use skylight::AXUIElementCopyAttributeValue;
 use skylight::{
@@ -273,7 +273,16 @@ pub trait WindowManagerApi: Send + Sync {
     /// # Returns
     ///
     /// A `Vec<Display>` containing `Display` objects for all present displays.
-    fn present_displays(&self) -> Vec<(Display, Vec<WorkspaceId>)>;
+    fn present_displays(&self) -> Vec<(Display, Vec<WorkspaceId>)> {
+        self.observe_displays()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(DisplayObservation::into_known_topology)
+            .collect()
+    }
+    /// A failed physical inventory is not an empty inventory. Failed Space
+    /// reads retain their physical display in the successful observation.
+    fn observe_displays(&self) -> Result<Vec<DisplayObservation>>;
     /// Retrieves the `CGDirectDisplayID` of the active menu bar display.
     ///
     /// # Returns
@@ -292,8 +301,6 @@ pub trait WindowManagerApi: Send + Sync {
     fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId>;
     /// Returns `true` when `space_id` is a native macOS fullscreen Space.
     fn workspace_is_fullscreen(&self, space_id: WorkspaceId) -> bool;
-    /// Returns `true` if the current space on the given display is a native fullscreen space.
-    fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool;
     /// Centers the mouse cursor on a given window within its display bounds if it's not already within the window.
     ///
     /// # Arguments
@@ -589,42 +596,39 @@ impl WindowManagerApi for WindowManagerOS {
     ///
     /// A `Vec<Self>` containing `Display` objects for all present displays.
     #[instrument(level = Level::DEBUG, skip_all, ret)]
-    fn present_displays(&self) -> Vec<(Display, Vec<WorkspaceId>)> {
+    fn observe_displays(&self) -> Result<Vec<DisplayObservation>> {
         let mut count = 0u32;
         unsafe {
-            CGGetActiveDisplayList(0, null_mut(), &raw mut count);
+            CGGetActiveDisplayList(0, null_mut(), &raw mut count)
+                .to_result("count active displays")?;
         }
         if count < 1 {
-            return vec![];
+            return Ok(vec![]);
         }
-        let mut displays = Vec::with_capacity(count.try_into().unwrap());
+        let mut displays = vec![0; count.try_into()?];
         unsafe {
-            CGGetActiveDisplayList(count, displays.as_mut_ptr(), &raw mut count);
-            displays.set_len(count.try_into().unwrap());
+            CGGetActiveDisplayList(count, displays.as_mut_ptr(), &raw mut count)
+                .to_result("read active displays")?;
         }
-        displays
+        displays.truncate(count.try_into()?);
+        Ok(displays
             .into_iter()
-            .filter_map(|id| {
+            .map(|id| {
                 let bounds = CGDisplayBounds(id);
                 let mut menubar_height: u32 = 0;
                 unsafe { SLSGetDisplayMenubarHeight(id, &raw mut menubar_height) };
                 debug!("menubar height: {menubar_height}");
-                let workspaces = match Display::uuid_from_id(id)
+                let spaces = Display::uuid_from_id(id)
                     .and_then(|uuid| self.display_space_list(uuid.as_ref()))
-                {
-                    Ok(workspaces) => workspaces,
-                    Err(error) => {
+                    .inspect_err(|error| {
                         warn!(display_id = id, %error, "unable to read native Space topology for display");
-                        return None;
-                    }
-                };
-
-                Some((
-                    Display::new(id, irect_from(bounds), menubar_height.cast_signed()),
-                    workspaces,
-                ))
+                    });
+                DisplayObservation {
+                    display: Display::new(id, irect_from(bounds), menubar_height.cast_signed()),
+                    spaces,
+                }
             })
-            .collect()
+            .collect())
     }
 
     /// Retrieves the `CGDirectDisplayID` of the active menu bar display.
@@ -651,11 +655,6 @@ impl WindowManagerApi for WindowManagerOS {
 
     fn workspace_is_fullscreen(&self, space_id: WorkspaceId) -> bool {
         unsafe { SLSSpaceGetType(self.main_cid, space_id) == 4 }
-    }
-
-    fn is_fullscreen_space(&self, display_id: CGDirectDisplayID) -> bool {
-        self.active_display_space(display_id)
-            .is_ok_and(|space_id| self.workspace_is_fullscreen(space_id))
     }
 
     /// Centers the mouse cursor on the window if it's not already within the window's bounds.

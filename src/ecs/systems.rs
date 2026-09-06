@@ -1,5 +1,5 @@
 use bevy::app::AppExit;
-use bevy::ecs::change_detection::{DetectChanges, Ref};
+use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::RemovedComponents;
@@ -25,12 +25,12 @@ use super::{
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
-use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::{FocusCoordinator, FocusSignal};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_space::{NativeSpace, SpaceKind, VisibleNativeSpaceMarker};
 use crate::ecs::params::{FrameActivity, Windows};
-use crate::ecs::reconcile::WindowUnavailable;
+use crate::ecs::reconcile::{WindowStateSync, WindowUnavailable};
+use crate::ecs::window_frame::{DefaultWindowFrame, InteractiveWindowFrame, WindowFrameCorrection};
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, DesiredWindowFrame, DockPosition,
@@ -84,18 +84,31 @@ type PendingWindowFrames<'w, 's> = Query<
     (
         Entity,
         &'static mut Window,
-        Ref<'static, PresentedWindowFrame>,
-        &'static DesiredWindowFrame,
+        &'static mut PresentedWindowFrame,
+        &'static mut DesiredWindowFrame,
         &'static mut WidthRatio,
         Option<&'static mut ObservedWindowFrame>,
-        Has<Floating>,
+        (&'static mut Position, &'static mut Bounds),
+        (
+            Option<&'static DefaultWindowFrame>,
+            Has<super::WindowDefaultsPending>,
+        ),
+        (
+            Has<Floating>,
+            Option<&'static WindowFrameCorrection>,
+            Option<&'static InteractiveWindowFrame>,
+            Has<WindowFrameCommitSuspended>,
+            Has<WindowFrameMotion>,
+            Has<WindowUnavailable>,
+            Has<WindowSpaceReassignmentPending>,
+        ),
     ),
-    (
+    Or<(
         Changed<PresentedWindowFrame>,
-        Without<WindowUnavailable>,
-        Without<WindowSpaceReassignmentPending>,
-        Without<WindowFrameCommitSuspended>,
-    ),
+        With<WindowFrameCorrection>,
+        With<InteractiveWindowFrame>,
+        With<DefaultWindowFrame>,
+    )>,
 >;
 
 type PositionVerificationWindows<'w, 's> = Populated<
@@ -104,11 +117,16 @@ type PositionVerificationWindows<'w, 's> = Populated<
     (
         Entity,
         &'static mut Window,
-        &'static DesiredWindowFrame,
+        &'static mut PresentedWindowFrame,
         &'static mut VerifyWindowPosition,
         Option<&'static mut ObservedWindowFrame>,
     ),
-    Without<WindowSpaceReassignmentPending>,
+    (
+        Without<WindowSpaceReassignmentPending>,
+        Without<WindowUnavailable>,
+        Without<WindowFrameCommitSuspended>,
+        Without<WindowFrameMotion>,
+    ),
 >;
 
 type AnimatedPositions<'w, 's> = Populated<
@@ -164,43 +182,22 @@ const PUMP_MAX_EVENTS: usize = 256;
 ///
 /// * `window_manager` - The `WindowManager` resource for querying display information.
 /// * `commands` - Bevy commands to spawn entities.
-pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Commands) {
-    let Ok(active_display_id) = window_manager.active_display_id() else {
+pub fn gather_displays(topology: Res<super::topology::NativeTopology>, mut commands: Commands) {
+    let Some(active_display_id) = topology.active_display() else {
         error!("Unable to get active display id!");
         return;
     };
-    for (display, workspaces) in window_manager.present_displays() {
+    for observation in topology.displays().into_iter().flatten() {
+        let display = &observation.display;
         let display_id = display.id();
-        let origin = Position(display.bounds().min);
         let entity = if display_id == active_display_id {
-            commands.spawn((display, ActiveDisplayMarker))
+            commands.spawn((display.clone(), ActiveDisplayMarker))
         } else {
-            commands.spawn(display)
+            commands.spawn(display.clone())
         }
         .id();
 
         commands.trigger(ReadDisplayProperties(entity));
-
-        let Ok(visible_space) = window_manager.active_display_space(display_id) else {
-            error!(display_id, "Unable to get visible Space id");
-            continue;
-        };
-
-        for (ordinal, id) in workspaces.into_iter().enumerate() {
-            let visible = id == visible_space;
-            let active = display_id == active_display_id && visible;
-            let mut strip =
-                commands.spawn_layout_strip(LayoutStrip::new(id), origin.0, entity, active);
-            strip.insert(NativeSpace::new(
-                id,
-                ordinal,
-                window_manager.workspace_is_fullscreen(id),
-            ));
-            if visible {
-                strip.insert(VisibleNativeSpaceMarker);
-            }
-            commands.spawn((FloatingLayer::new(id), ChildOf(entity)));
-        }
     }
 }
 
@@ -1351,29 +1348,176 @@ pub(super) fn animate_decoration_overlay(
     overlay_mgr.animate_decorations(time.delta_secs_f64(), config.animation_speed());
 }
 
-#[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn commit_window_frame(
-    mut windows: PendingWindowFrames,
-    layout_strips: Query<(&LayoutStrip, &ChildOf), Without<PendingSpaceDestruction>>,
-    displays: Query<(&Display, Option<&DockPosition>)>,
-    config: Res<Config>,
-    settling: Res<super::window_geometry::WindowGeometrySettling>,
-    mut commands: Commands,
+#[derive(SystemParam)]
+pub(super) struct WindowFrameCommitCtx<'w, 's> {
+    windows: PendingWindowFrames<'w, 's>,
+    layout_strips:
+        Query<'w, 's, (&'static LayoutStrip, &'static ChildOf), Without<PendingSpaceDestruction>>,
+    displays: Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>,
+    config: Res<'w, Config>,
+    settling: ResMut<'w, super::window_geometry::WindowGeometrySettling>,
+    sync: ResMut<'w, WindowStateSync>,
+    time: Res<'w, Time>,
+    commands: Commands<'w, 's>,
+}
+
+fn write_presented_frame(
+    window: &mut Window,
+    target: IRect,
+    observed: Option<IRect>,
+    complete_frame: bool,
+) -> crate::errors::Result<IRect> {
+    if complete_frame {
+        return window.set_frame(target);
+    }
+    if observed == Some(target) {
+        return Ok(target);
+    }
+    let height_only = observed.is_some_and(|frame| {
+        frame.min == target.min
+            && frame.width() == target.width()
+            && frame.height() != target.height()
+    });
+    if height_only {
+        // Dock/menu-bar changes need only a height write unless AX moves the origin.
+        window.resize_preserving_origin(target)
+    } else if observed.is_none_or(|frame| frame.size() != target.size()) {
+        // Resizing can move the origin, so commit the complete presentation.
+        window.set_frame(target)
+    } else {
+        window.reposition(target.min)
+    }
+}
+
+fn suspend_failed_frame_commit(
+    entity: Entity,
+    window: &mut Window,
+    desired: IRect,
+    commands: &mut Commands,
 ) {
-    for (entity, mut window, presented, desired, mut width_ratio, observed, floating) in
-        &mut windows
+    // AX can partially mutate a frame before returning an error. Publish only
+    // readback and leave retries to the bounded correction policy.
+    let readback = window.update_frame();
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<WindowFrameMotion>();
+        entity_commands.try_insert(WindowFrameCommitSuspended::new(desired));
+        match readback {
+            Ok(frame) => {
+                entity_commands.try_insert(ObservedWindowFrame(frame));
+            }
+            Err(error) => {
+                warn!(window_id = window.id(), %error, "unable to read back failed window frame write");
+                entity_commands.try_remove::<ObservedWindowFrame>();
+            }
+        }
+    }
+}
+
+#[instrument(level = Level::TRACE, skip_all)]
+pub(super) fn commit_window_frame(ctx: WindowFrameCommitCtx) {
+    commit_window_frames(ctx, false);
+}
+
+pub(super) fn commit_default_window_frames(ctx: WindowFrameCommitCtx) {
+    commit_window_frames(ctx, true);
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "serialize default, interactive, and corrective writes with their common readback policy"
+)]
+fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
+    let WindowFrameCommitCtx {
+        mut windows,
+        layout_strips,
+        displays,
+        config,
+        mut settling,
+        mut sync,
+        time,
+        mut commands,
+    } = ctx;
+    for (
+        entity,
+        mut window,
+        mut presented,
+        mut desired,
+        mut width_ratio,
+        observed,
+        (mut position, mut bounds),
+        (default_frame, defaults_pending),
+        (floating, correction, interactive, suspended, moving, unavailable, reassigning),
+    ) in &mut windows
     {
+        if defaults_phase != default_frame.is_some() {
+            continue;
+        }
+        if default_frame.is_some() {
+            commands.entity(entity).remove::<DefaultWindowFrame>();
+        }
+        if correction.is_some() {
+            commands.entity(entity).remove::<WindowFrameCorrection>();
+        }
+        if interactive.is_some() {
+            commands.entity(entity).remove::<InteractiveWindowFrame>();
+        }
+        if unavailable || reassigning || (default_frame.is_none() && defaults_pending) {
+            continue;
+        }
+        if default_frame.is_some_and(|request| request.incarnation != window.incarnation()) {
+            continue;
+        }
+        // Current pointer intent supersedes animation and audit correction;
+        // all three still share the same native ownership checks below.
+        let interactive = interactive.filter(|request| request.incarnation == window.incarnation());
+        let correcting = default_frame.is_none()
+            && interactive.is_none()
+            && correction.is_some_and(|request| request.0 == desired.0)
+            && !floating
+            && !moving;
+        if default_frame.is_none()
+            && interactive.is_none()
+            && !correcting
+            && (suspended || !presented.is_changed())
+        {
+            continue;
+        }
         let native_fullscreen = layout_strips
             .iter()
             .any(|(strip, _)| strip.is_fullscreen() && strip.contains(entity));
         if native_fullscreen || window.try_is_full_screen().unwrap_or(true) {
             continue;
         }
-        if settling.contains(entity) {
+        if default_frame.is_none() && interactive.is_none() && settling.contains(entity) {
             continue;
         }
-        let target = presented.0;
+        let target = if let Some(request) = default_frame {
+            presented.bypass_change_detection().0 = request.target;
+            request.target
+        } else if let Some(request) = interactive {
+            presented.bypass_change_detection().0 = request.target;
+            request.target
+        } else if correcting {
+            let Some(observed) = observed.as_ref() else {
+                continue;
+            };
+            if !sync.admit_frame_correction(
+                entity,
+                window.id(),
+                observed.0,
+                desired.0,
+                time.elapsed(),
+            ) {
+                continue;
+            }
+            presented.bypass_change_detection().0 = desired.0;
+            desired.0
+        } else {
+            presented.0
+        };
         if !floating
+            && default_frame.is_none()
+            && interactive.is_none()
             && let Some(display_width) = layout_strips
                 .iter()
                 .find_map(|(strip, child)| strip.contains(entity).then_some(child.parent()))
@@ -1386,29 +1530,59 @@ pub(super) fn commit_window_frame(
                 width_ratio.0 = desired_ratio;
             }
         }
-        let observed_frame = observed.as_ref().map(|observed| observed.0);
-        let needs_size_write =
-            observed_frame.is_none_or(|observed| observed.size() != target.size());
-        let height_only_resize = observed_frame.is_some_and(|observed| {
-            observed.min == target.min
-                && observed.width() == target.width()
-                && observed.height() != target.height()
-        });
-        let result = if height_only_resize {
-            // Dock/menu-bar changes commonly alter only the usable height.
-            // Avoid the complete frame sequence (size/read/position/size/read)
-            // unless AX unexpectedly moves the origin or the width also changes.
-            window.resize_preserving_origin(target)
-        } else if needs_size_write {
-            // A size write may move the window. Supply the complete presented
-            // frame so position and size remain one atomic projection.
-            window.set_frame(target)
-        } else {
-            window.reposition(target.min)
-        };
+        let result = write_presented_frame(
+            &mut window,
+            target,
+            observed.as_ref().map(|frame| frame.0),
+            correcting || interactive.is_some() || default_frame.is_some(),
+        );
 
         match result {
             Ok(frame) => {
+                if default_frame.is_some() {
+                    if position.0 != frame.min {
+                        position.0 = frame.min;
+                    }
+                    if bounds.0 != frame.size() {
+                        bounds.0 = frame.size();
+                    }
+                    desired.set_if_neq(DesiredWindowFrame(frame));
+                    presented.bypass_change_detection().0 = frame;
+                    commands
+                        .entity(entity)
+                        .remove::<(WindowFrameMotion, WindowFrameCommitSuspended)>()
+                        .insert(super::WindowDefaultsApplied);
+                }
+                if let Some(request) = interactive {
+                    presented.bypass_change_detection().0 = frame;
+                    commands
+                        .entity(entity)
+                        .remove::<(WindowFrameMotion, WindowFrameCommitSuspended)>();
+                    if floating {
+                        if position.0 != frame.min {
+                            position.0 = frame.min;
+                        }
+                        if bounds.0 != frame.size() {
+                            bounds.0 = frame.size();
+                        }
+                        desired.set_if_neq(DesiredWindowFrame(frame));
+                    } else {
+                        settling.record(entity, &window, request.start, frame, time.elapsed());
+                    }
+                }
+                if correcting {
+                    // Physical readback is not a new presentation request.
+                    presented.bypass_change_detection().0 = frame;
+                    if sync.confirm_frame_convergence(entity, frame, target) {
+                        commands
+                            .entity(entity)
+                            .remove::<WindowFrameCommitSuspended>();
+                    } else {
+                        commands
+                            .entity(entity)
+                            .insert(WindowFrameCommitSuspended::new(desired.0));
+                    }
+                }
                 if let Some(mut observed) = observed {
                     if observed.0 != frame {
                         observed.0 = frame;
@@ -1419,25 +1593,7 @@ pub(super) fn commit_window_frame(
             }
             Err(error) => {
                 warn!(window_id = window.id(), %error, "unable to commit window frame");
-                // AX frame writes are not transactional: a failed size write
-                // may still have moved or partially resized the physical
-                // window. Stop the per-frame presentation loop immediately
-                // and refresh physical truth. The central reconciler owns the
-                // subsequent bounded retry budget.
-                let readback = window.update_frame();
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_remove::<WindowFrameMotion>();
-                    entity_commands.try_insert(WindowFrameCommitSuspended::new(desired.0));
-                    match readback {
-                        Ok(frame) => {
-                            entity_commands.try_insert(ObservedWindowFrame(frame));
-                        }
-                        Err(read_error) => {
-                            warn!(window_id = window.id(), %read_error, "unable to read back failed window frame write");
-                            entity_commands.try_remove::<ObservedWindowFrame>();
-                        }
-                    }
-                }
+                suspend_failed_frame_commit(entity, &mut window, desired.0, &mut commands);
             }
         }
     }
@@ -1448,18 +1604,13 @@ pub(super) fn verify_window_position(
     mut windows: PositionVerificationWindows,
     mut commands: Commands,
 ) {
-    for (entity, mut window, desired, mut verification, mut observed) in &mut windows {
-        let mut confirmed_frame = window.update_frame().ok();
-        let already_positioned = confirmed_frame.is_some_and(|frame| frame.min == desired.0.min);
-
-        if !already_positioned {
-            match window.reposition(desired.0.min) {
-                Ok(frame) => confirmed_frame = Some(frame),
-                Err(error) => {
-                    warn!(window_id = window.id(), %error, "unable to retry window position");
-                    confirmed_frame = None;
-                }
-            }
+    for (entity, mut window, mut presented, mut verification, mut observed) in &mut windows {
+        let confirmed_frame = window.update_frame().ok();
+        let positioned = confirmed_frame.is_some_and(|frame| frame.min == presented.0.min);
+        // Retry through the normal committer, never bypass presentation or its
+        // AX-failure suspension policy with a second geometry writer.
+        if !positioned {
+            presented.set_changed();
         }
 
         if let Some(frame) = confirmed_frame {
@@ -1474,7 +1625,6 @@ pub(super) fn verify_window_position(
             entity_commands.try_remove::<ObservedWindowFrame>();
         }
 
-        let positioned = confirmed_frame.is_some_and(|frame| frame.min == desired.0.min);
         if (positioned || verification.tick())
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {

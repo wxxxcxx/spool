@@ -282,6 +282,11 @@ fn changed_display_geometry_clamps_the_startup_frame_without_resizing_it() {
         window.frame = startup_frame;
     });
     harness.pump_frames(10);
+    harness.mock_state.add_display(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, 800, 600),
+        vec![TEST_WORKSPACE_ID],
+    );
 
     let display_entity = {
         let world = harness.world();
@@ -315,6 +320,17 @@ fn missing_launch_display_leaves_the_window_on_its_current_display() {
         window.frame = IRect::new(100, 80, 600, 480);
     });
     harness.pump_frames(10);
+    harness.mock_state.remove_display(TEST_DISPLAY_ID);
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(
+            TEST_DISPLAY_WIDTH,
+            0,
+            TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+            EXT_DISPLAY_HEIGHT,
+        ),
+        vec![TEST_WORKSPACE_ID],
+    );
 
     let display_entity = {
         let world = harness.world();

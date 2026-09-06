@@ -10,11 +10,26 @@ use crate::{
     config::Config,
     ecs::DockPosition,
     errors::{Error, Result},
+    platform::WorkspaceId,
 };
+
+/// Physical presence is independent of whether native Space topology can be
+/// read during a display reconfiguration.
+#[derive(Clone, Debug)]
+pub struct DisplayObservation {
+    pub display: Display,
+    pub spaces: Result<Vec<WorkspaceId>>,
+}
+
+impl DisplayObservation {
+    pub fn into_known_topology(self) -> Option<(Display, Vec<WorkspaceId>)> {
+        self.spaces.ok().map(|spaces| (self.display, spaces))
+    }
+}
 
 /// `Display` represents a physical monitor and manages its associated workspaces and window panes.
 /// Each display has a unique ID, bounds, and a collection of `LayoutStrip`s for different spaces.
-#[derive(Component, Debug)]
+#[derive(Clone, Component, Debug, PartialEq, Eq)]
 pub struct Display {
     /// The unique identifier for this display provided by Core Graphics.
     id: CGDirectDisplayID,
@@ -100,6 +115,16 @@ impl Display {
     /// The `CGDirectDisplayID` of the display.
     pub fn id(&self) -> CGDirectDisplayID {
         self.id
+    }
+
+    /// Refresh OS-owned geometry without discarding configured menu/notch
+    /// properties or dirtying unchanged displays on every heartbeat.
+    pub fn update_geometry(&mut self, observed: &Self) -> bool {
+        let changed =
+            self.bounds != observed.bounds || self.menubar_height != observed.menubar_height;
+        self.bounds = observed.bounds;
+        self.menubar_height = observed.menubar_height;
+        changed
     }
 
     pub fn locate_dock(&self, visible_frame: &IRect) -> DockPosition {

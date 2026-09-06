@@ -52,6 +52,7 @@ use crate::manager::{
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
+pub(crate) mod defaults;
 pub mod display;
 pub(crate) mod exit_restore;
 pub mod focus;
@@ -67,6 +68,7 @@ pub mod script_state;
 pub mod scroll;
 pub mod state;
 pub(crate) mod systems;
+pub(crate) mod topology;
 mod triggers;
 pub mod window_frame;
 pub(crate) mod window_geometry;
@@ -94,6 +96,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
 
     app.init_resource::<reconcile::WindowStateSync>();
     app.init_resource::<window_geometry::WindowGeometrySettling>();
+    app.init_resource::<topology::NativeTopology>();
+    app.init_resource::<defaults::DefaultRetries>();
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
@@ -171,7 +175,13 @@ pub fn register_systems(app: &mut bevy::app::App) {
 
     app.add_systems(
         Startup,
-        (systems::gather_displays, systems::gather_initial_processes).chain(),
+        (
+            topology::gather_initial_topology,
+            systems::gather_displays,
+            native_space::reconcile_native_spaces,
+            systems::gather_initial_processes,
+        )
+            .chain(),
     );
     // Registered with `add_message`, not `init_resource`, so the buffer is
     // double-buffered and dropped after a frame like any other message stream.
@@ -189,7 +199,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
         Update,
         (
             (
+                defaults::refresh_default_retries.after(native_space::reconcile_native_spaces),
                 triggers::apply_window_defaults,
+                systems::commit_default_window_frames,
                 systems::detect_tabbed_windows.run_if(native_tabs_enabled),
                 triggers::apply_window_positions,
             )
@@ -245,7 +257,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(not(resource_exists::<Initializing>))
                 .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             systems::verify_window_position
-                .after(systems::commit_window_frame)
+                .after(window_frame::animate_presented_window_frames)
+                .before(systems::commit_window_frame)
                 .run_if(not(resource_exists::<Initializing>))
                 .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             (

@@ -14,13 +14,12 @@ use stdext::function_name;
 use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
-use crate::ecs::native_space::VisibleNativeSpaceMarker;
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, EnsureVisibleMarker,
-    Initializing, LayoutPosition, Position, PresentedWindowFrame, ReshuffleAroundMarker, Scrolling,
-    SpawnCommandsExt,
+    Initializing, LayoutPosition, Position, PresentedWindowFrame, RepositionMarker,
+    ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -50,17 +49,21 @@ type StripPlacements<'w, 's> = Query<
 /// raw bounds into the usable viewport.
 type DisplayViewports<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
 
-type ChangedDisplayViewports<'w, 's> =
-    Query<'w, 's, Entity, Or<(Changed<Display>, Changed<DockPosition>)>>;
+#[derive(Component)]
+struct LayoutViewport(IRect);
 
-type VisibleLayoutStrips<'w, 's> = Query<
+type LayoutViewports<'w, 's> = Query<
     'w,
     's,
-    (&'static ChildOf, &'static mut LayoutStrip),
     (
-        With<VisibleNativeSpaceMarker>,
-        Without<PendingSpaceDestruction>,
+        Entity,
+        &'static ChildOf,
+        &'static mut LayoutStrip,
+        &'static mut Position,
+        Option<&'static mut RepositionMarker>,
+        Option<&'static mut LayoutViewport>,
     ),
+    Without<PendingSpaceDestruction>,
 >;
 
 /// Windows whose logical size changed this tick. Presentation and observed
@@ -194,23 +197,45 @@ impl Plugin for LayoutEventsPlugin {
                 )
                     .chain()
                     .after(super::systems::finish_setup)
+                    .after(super::display::reconcile_displays)
+                    .after(super::native_space::reconcile_native_spaces)
+                    .after(super::workspace::reconcile_fullscreen_spaces)
                     .run_if(not(resource_exists::<Initializing>)),
             ),
         );
     }
 }
 
-/// Invalidates the currently visible strip when its display's usable viewport
-/// changes. Display properties are discovered through deferred startup
-/// commands, so the strip may not exist yet when `DockPosition` is inserted;
-/// change detection carries that observation into the first layout pass.
+/// Keep the strip's scroll offset local to its display, including while a
+/// strip animation is running. Relative window sizes need not change when a
+/// monitor moves, so viewport translation must invalidate global positions.
 fn display_viewport_changed(
-    changed_displays: ChangedDisplayViewports,
-    mut strips: VisibleLayoutStrips,
+    displays: DisplayViewports,
+    mut strips: LayoutViewports,
+    config: Res<Config>,
+    mut commands: Commands,
 ) {
-    let changed_displays = changed_displays.iter().collect::<EntityHashSet>();
-    for (child, mut strip) in &mut strips {
-        if changed_displays.contains(&child.parent()) && !strip.is_fullscreen() {
+    for (entity, child, mut strip, mut position, pending, previous) in &mut strips {
+        let Ok((display, dock)) = displays.get(child.parent()) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, &config);
+        if let Some(mut previous) = previous {
+            if previous.0 == viewport {
+                continue;
+            }
+            let translation = viewport.min - previous.0.min;
+            if translation != Origin::ZERO {
+                position.0 += translation;
+                if let Some(mut pending) = pending {
+                    pending.0 += translation;
+                }
+            }
+            previous.0 = viewport;
+        } else {
+            commands.entity(entity).insert(LayoutViewport(viewport));
+        }
+        if !strip.is_fullscreen() {
             strip.set_changed();
         }
     }

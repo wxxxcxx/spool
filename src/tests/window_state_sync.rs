@@ -14,6 +14,119 @@ use crate::manager::{Application, Window};
 
 use super::*;
 
+#[test]
+fn frame_audit_leaves_physical_writes_to_the_presentation_committer() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(30);
+    let entity = find_window_entity(0, harness.world());
+    let target = harness
+        .world()
+        .get::<crate::ecs::DesiredWindowFrame>(entity)
+        .unwrap()
+        .0;
+    let drift = IRect::from_corners(
+        target.min + IVec2::new(80, 50),
+        target.max + IVec2::new(180, 150),
+    );
+    harness.mock_state.os_set_window_frame_silently(0, drift);
+    let state = harness.mock_state.clone();
+    harness.app.add_systems(
+        PostUpdate,
+        (move || {
+            assert_eq!(
+                state.actual_window_frame(0),
+                Some(drift),
+                "audit must observe without writing before presentation"
+            );
+        })
+        .before(crate::ecs::window_frame::animate_presented_window_frames),
+    );
+    harness
+        .world()
+        .write_message(crate::events::Event::ReconcileWindows {
+            scope: crate::events::ReconcileScope::All,
+        });
+    harness.pump_frames(1);
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(target));
+}
+
+#[test]
+fn frame_correction_yields_to_new_intent_before_commit() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(30);
+    let entity = find_window_entity(0, harness.world());
+    let target = harness
+        .world()
+        .get::<crate::ecs::DesiredWindowFrame>(entity)
+        .unwrap()
+        .0;
+    let drift = IRect::from_corners(
+        target.min + IVec2::splat(80),
+        target.max + IVec2::splat(180),
+    );
+    let replacement = IRect::from_corners(
+        target.min + IVec2::splat(20),
+        target.max + IVec2::splat(220),
+    );
+    harness.mock_state.os_set_window_frame_silently(0, drift);
+    let attempts = harness.mock_state.frame_write_attempts(0);
+    harness.app.add_systems(
+        PostUpdate,
+        (move |mut commands: Commands| {
+            commands.entity(entity).insert((
+                crate::ecs::DesiredWindowFrame(replacement),
+                PresentedWindowFrame(replacement),
+            ));
+        })
+        .before(crate::ecs::window_frame::animate_presented_window_frames),
+    );
+    harness
+        .world()
+        .write_message(crate::events::Event::ReconcileWindows {
+            scope: crate::events::ReconcileScope::All,
+        });
+    harness.pump_frames(1);
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(replacement));
+    assert_eq!(
+        harness.mock_state.frame_write_attempts(0) - attempts,
+        1,
+        "one commit must apply current intent without first writing the stale audit target"
+    );
+}
+
+#[test]
+fn frame_correction_yields_to_space_reassignment_before_commit() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(30);
+    let entity = find_window_entity(0, harness.world());
+    let target = harness
+        .world()
+        .get::<crate::ecs::DesiredWindowFrame>(entity)
+        .unwrap()
+        .0;
+    let drift = IRect::from_corners(
+        target.min + IVec2::splat(80),
+        target.max + IVec2::splat(180),
+    );
+    harness.mock_state.os_set_window_frame_silently(0, drift);
+    let attempts = harness.mock_state.frame_write_attempts(0);
+    harness.app.add_systems(
+        PostUpdate,
+        (move |mut commands: Commands| {
+            crate::ecs::workspace::freeze_window_for_space_reassignment(entity, 0, &mut commands);
+        })
+        .before(crate::ecs::window_frame::animate_presented_window_frames),
+    );
+    harness
+        .world()
+        .write_message(crate::events::Event::ReconcileWindows {
+            scope: crate::events::ReconcileScope::All,
+        });
+    harness.pump_frames(1);
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(drift));
+    assert_eq!(harness.mock_state.frame_write_attempts(0), attempts);
+}
+
 fn assert_stale_geometry_callbacks_are_ignored(
     harness: &mut TestHarness,
     replacement: Entity,
@@ -1205,6 +1318,258 @@ fn paused_mouse_drag_does_not_settle_until_the_button_is_released() {
 }
 
 #[test]
+fn mouse_resize_gesture_does_not_cross_a_reused_window_id() {
+    let config: Config = (
+        MainOptions {
+            mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            animation_speed: Some(10000.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(1);
+    harness.pump_frames(30);
+    let original = find_window_entity(0, harness.world());
+    for x in [300.0, 310.0] {
+        harness
+            .world()
+            .write_message(crate::events::Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint::new(x, 200.0),
+                modifiers: crate::platform::Modifiers::CMD,
+            });
+        harness.pump_frames(1);
+    }
+    drop(harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::new(0, 20, 400, 600),
+    ));
+    harness.pump_frames(20);
+    let replacement = find_window_entity(0, harness.world());
+    assert_ne!(replacement, original);
+    let frame = harness.mock_state.actual_window_frame(0).unwrap();
+    let writes = harness.mock_state.frame_write_attempts(0);
+    harness
+        .world()
+        .write_message(crate::events::Event::MouseMoved {
+            point: objc2_core_foundation::CGPoint::new(320.0, 200.0),
+            modifiers: crate::platform::Modifiers::CMD,
+        });
+    harness.pump_frames(1);
+    assert_eq!(harness.mock_state.frame_write_attempts(0), writes);
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(frame));
+    for (x, modifiers) in [
+        (330.0, crate::platform::Modifiers::empty()),
+        (340.0, crate::platform::Modifiers::CMD),
+        (350.0, crate::platform::Modifiers::CMD),
+    ] {
+        harness
+            .world()
+            .write_message(crate::events::Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint::new(x, 200.0),
+                modifiers,
+            });
+        harness.pump_frames(1);
+    }
+    assert_eq!(harness.mock_state.frame_write_attempts(0), writes + 1);
+    assert_eq!(
+        harness.mock_state.actual_window_frame(0).unwrap().width(),
+        frame.width() + 50
+    );
+}
+
+#[test]
+fn mouse_resize_coalesces_one_frame_of_input_into_one_commit() {
+    let config: Config = (
+        MainOptions {
+            mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.pump_frames(30);
+    let initial = harness.mock_state.actual_window_frame(0).unwrap();
+    let writes = harness.mock_state.frame_write_attempts(0);
+    for x in [300.0, 310.0, 320.0] {
+        harness
+            .world()
+            .write_message(crate::events::Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint::new(x, 200.0),
+                modifiers: crate::platform::Modifiers::CMD,
+            });
+    }
+    harness.pump_frames(1);
+    assert_eq!(
+        harness.mock_state.actual_window_frame(0).unwrap().width(),
+        initial.width() + 100
+    );
+    assert_eq!(
+        harness.mock_state.frame_write_attempts(0) - writes,
+        1,
+        "one input burst must produce one physical frame commit"
+    );
+}
+
+#[test]
+fn mouse_resize_request_is_discarded_if_space_migration_starts_before_commit() {
+    let config: Config = (
+        MainOptions {
+            mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(1);
+    harness.pump_frames(30);
+    let entity = find_window_entity(0, harness.world());
+    let initial = harness.mock_state.actual_window_frame(0).unwrap();
+    let writes = harness.mock_state.frame_write_attempts(0);
+    harness.app.add_systems(
+        PostUpdate,
+        (move |mut commands: Commands| {
+            crate::ecs::workspace::freeze_window_for_space_reassignment(entity, 0, &mut commands);
+        })
+        .before(crate::ecs::window_frame::animate_presented_window_frames),
+    );
+    for x in [300.0, 310.0] {
+        harness
+            .world()
+            .write_message(crate::events::Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint::new(x, 200.0),
+                modifiers: crate::platform::Modifiers::CMD,
+            });
+    }
+    harness.pump_frames(1);
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(initial));
+    assert_eq!(harness.mock_state.frame_write_attempts(0), writes);
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::window_frame::InteractiveWindowFrame>(entity)
+            .is_none(),
+        "a blocked gesture must not replay when membership later resumes"
+    );
+}
+
+#[test]
+fn mouse_resize_failed_readback_preserves_physical_truth_without_settling_intent() {
+    let config: Config = (
+        MainOptions {
+            mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(1);
+    harness.pump_frames(30);
+    let entity = find_window_entity(0, harness.world());
+    let initial = harness.mock_state.actual_window_frame(0).unwrap();
+    harness.mock_state.fail_frame_write_readbacks(0, 1);
+    for x in [300.0, 310.0] {
+        harness
+            .world()
+            .write_message(crate::events::Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint::new(x, 200.0),
+                modifiers: crate::platform::Modifiers::CMD,
+            });
+    }
+    harness.pump_frames(1);
+    let physical = harness.mock_state.actual_window_frame(0).unwrap();
+    assert_ne!(
+        physical, initial,
+        "the mock must simulate a partial successful setter"
+    );
+    assert_eq!(
+        harness
+            .world()
+            .get::<ObservedWindowFrame>(entity)
+            .unwrap()
+            .0,
+        physical
+    );
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::DesiredWindowFrame>(entity)
+            .unwrap()
+            .0,
+        initial
+    );
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::WindowFrameCommitSuspended>(entity)
+            .is_some()
+    );
+    assert!(
+        !harness
+            .world()
+            .resource::<crate::ecs::window_geometry::WindowGeometrySettling>()
+            .contains(entity)
+    );
+}
+
+#[test]
+fn floating_mouse_resize_commits_confirmed_intent_without_replaying_it() {
+    let config: Config = (
+        MainOptions {
+            mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(1);
+    harness.pump_frames(30);
+    harness
+        .world()
+        .write_message(crate::events::Event::ActionRequested {
+            action: Action::Window(Operation::ToggleFloating),
+        });
+    harness.pump_frames(30);
+    let entity = find_window_entity(0, harness.world());
+    assert!(harness.world().get::<Floating>(entity).is_some());
+    let initial = harness.mock_state.actual_window_frame(0).unwrap();
+    let writes = harness.mock_state.frame_write_attempts(0);
+    for x in [300.0, 310.0] {
+        harness
+            .world()
+            .write_message(crate::events::Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint::new(x, 200.0),
+                modifiers: crate::platform::Modifiers::CMD,
+            });
+    }
+    harness.pump_frames(1);
+    let confirmed = harness.mock_state.actual_window_frame(0).unwrap();
+    assert_eq!(confirmed.width(), initial.width() + 50);
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::DesiredWindowFrame>(entity)
+            .unwrap()
+            .0,
+        confirmed
+    );
+    assert_eq!(
+        harness
+            .world()
+            .get::<PresentedWindowFrame>(entity)
+            .unwrap()
+            .0,
+        confirmed
+    );
+    harness.pump_frames(30);
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(confirmed));
+    assert_eq!(harness.mock_state.frame_write_attempts(0) - writes, 1);
+}
+
+#[test]
 fn configured_mouse_resize_updates_the_dragged_window_live_but_defers_its_neighbour() {
     let config: Config = (
         MainOptions {
@@ -2071,6 +2436,324 @@ fn window_state_sync_retries_partial_window_observer_registration() {
 }
 
 #[test]
+fn grid_defaults_use_the_owning_display_origin_and_extent() {
+    let mut params = WindowParams::new(".*", None);
+    params.floating = Some(true);
+    params.grid = Some("1:1:0:0:1:1".to_string());
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config).with_display(
+        EXT_DISPLAY_ID,
+        IRect::new(1200, 200, 2800, 1100),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.pump_frames(30);
+    let expected = {
+        let world = harness.world();
+        let config = world.resource::<Config>().clone();
+        world
+            .query::<(&crate::manager::Display, Option<&crate::ecs::DockPosition>)>()
+            .iter(world)
+            .find(|(display, _)| display.id() == EXT_DISPLAY_ID)
+            .map(|(display, dock)| display.actual_display_bounds(dock, &config))
+            .unwrap()
+    };
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_WORKSPACE_ID,
+        9,
+        IRect::new(1300, 300, 1700, 700),
+    );
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger::new(vec![window]));
+    harness.pump_frames(3);
+    assert_eq!(harness.mock_state.actual_window_frame(9), Some(expected));
+    assert_eq!(harness.mock_state.frame_write_attempts(9), 1);
+}
+
+#[test]
+fn configured_width_uses_the_owning_display_during_startup() {
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(0.5);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(1200, 200, 2800, 1100),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_workspace_window(9, EXT_WORKSPACE_ID, |_| {});
+    harness.pump_frames(30);
+    let entity = find_window_entity(9, harness.world());
+    assert_eq!(harness.world().get::<Bounds>(entity).unwrap().0.x, 800);
+}
+
+#[test]
+fn grid_defaults_wait_for_unambiguous_membership_then_retry() {
+    for ambiguous in [false, true] {
+        let mut params = WindowParams::new(".*", None);
+        params.floating = Some(true);
+        params.grid = Some("1:1:0:0:1:1".to_string());
+        let config: Config = (MainOptions::default(), vec![params]).into();
+        let mut harness = TestHarness::new().with_config(config).with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(1200, 200, 2800, 1100),
+            vec![EXT_WORKSPACE_ID],
+        );
+        harness.pump_frames(30);
+        let initial = IRect::new(1300, 300, 1700, 700);
+        let window = harness
+            .mock_state
+            .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 9, initial);
+        harness
+            .world()
+            .trigger(SpawnWindowTrigger::new(vec![window]));
+        harness.mock_state.script_workspace_membership_queries(
+            TEST_WORKSPACE_ID,
+            std::iter::repeat_n(if ambiguous { Ok(vec![9]) } else { Err(()) }, 100),
+        );
+        harness.pump_frames(2);
+        let entity = find_window_entity(9, harness.world());
+        assert_eq!(harness.mock_state.frame_write_attempts(9), 0);
+        assert_eq!(harness.mock_state.actual_window_frame(9), Some(initial));
+        assert!(
+            harness
+                .world()
+                .get::<WindowDefaultsPending>(entity)
+                .is_some()
+        );
+        harness
+            .mock_state
+            .script_workspace_membership_queries(TEST_WORKSPACE_ID, []);
+        harness.pump_frames(3);
+        assert!(
+            harness
+                .world()
+                .get::<WindowDefaultsPending>(entity)
+                .is_none()
+        );
+        assert_eq!(harness.mock_state.frame_write_attempts(9), 1);
+    }
+}
+
+#[test]
+fn default_failures_are_bounded_across_heartbeats_and_recover_after_cooldown() {
+    let mut params = WindowParams::new(".*", None);
+    params.floating = Some(true);
+    params.grid = Some("1:1:0:0:1:1".to_string());
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config);
+    harness.pump_frames(30);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        9,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger::new(vec![window]));
+    harness.mock_state.reject_frame_writes(9, true);
+    for _ in 0..40 {
+        harness
+            .world()
+            .write_message(crate::events::Event::ReconcileWindows {
+                scope: crate::events::ReconcileScope::All,
+            });
+        harness.pump_frames(1);
+    }
+    assert_eq!(
+        harness.mock_state.frame_write_attempts(9),
+        3,
+        "event and topology heartbeats must not restart failed initialization every frame"
+    );
+    let entity = find_window_entity(9, harness.world());
+    assert!(
+        harness
+            .world()
+            .get::<WindowDefaultsPending>(entity)
+            .is_some()
+    );
+    harness.mock_state.reject_frame_writes(9, false);
+    harness.pump_frames(30);
+    assert!(
+        harness
+            .world()
+            .get::<WindowDefaultsPending>(entity)
+            .is_none()
+    );
+    assert_eq!(harness.mock_state.frame_write_attempts(9), 4);
+}
+
+#[test]
+fn changed_default_context_restarts_a_cooling_transaction() {
+    for change_config in [true, false] {
+        let mut params = WindowParams::new(".*", None);
+        params.floating = Some(true);
+        params.grid = Some("1:1:0:0:1:1".to_string());
+        let config: Config = (MainOptions::default(), vec![params.clone()]).into();
+        let mut harness = TestHarness::new().with_config(config);
+        harness.pump_frames(30);
+        let window = harness.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            TEST_WORKSPACE_ID,
+            9,
+            IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+        );
+        harness
+            .world()
+            .trigger(SpawnWindowTrigger::new(vec![window]));
+        harness.mock_state.reject_frame_writes(9, true);
+        harness.pump_frames(4);
+        assert_eq!(harness.mock_state.frame_write_attempts(9), 3);
+        harness.mock_state.reject_frame_writes(9, false);
+        let expected_width = if change_config {
+            params.grid = Some("2:1:0:0:1:1".to_string());
+            let config: Config = (MainOptions::default(), vec![params]).into();
+            harness.world().insert_resource(config);
+            TEST_DISPLAY_WIDTH / 2
+        } else {
+            harness.mock_state.add_display(
+                TEST_DISPLAY_ID,
+                IRect::new(500, 0, 1900, 900),
+                vec![TEST_WORKSPACE_ID],
+            );
+            harness
+                .world()
+                .write_message(crate::events::Event::DisplayConfigured {
+                    display_id: TEST_DISPLAY_ID,
+                });
+            1400
+        };
+        harness.pump_frames(2);
+        let entity = find_window_entity(9, harness.world());
+        assert!(
+            harness
+                .world()
+                .get::<WindowDefaultsPending>(entity)
+                .is_none()
+        );
+        assert_eq!(harness.mock_state.frame_write_attempts(9), 4);
+        assert_eq!(
+            harness.mock_state.actual_window_frame(9).unwrap().width(),
+            expected_width
+        );
+    }
+}
+
+#[test]
+fn default_read_failures_also_obey_the_retry_budget() {
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(0.5);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config);
+    harness.pump_frames(30);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        9,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger::new(vec![window]));
+    harness.mock_state.fail_frame_updates(9, 4);
+    harness.pump_frames(40);
+    let entity = find_window_entity(9, harness.world());
+    assert!(
+        harness
+            .world()
+            .get::<WindowDefaultsPending>(entity)
+            .is_some()
+    );
+    assert_eq!(harness.mock_state.frame_write_attempts(9), 0);
+    harness.pump_frames(30);
+    assert!(
+        harness
+            .world()
+            .get::<WindowDefaultsPending>(entity)
+            .is_none()
+    );
+    assert!(harness.mock_state.frame_write_attempts(9) > 0);
+}
+
+#[test]
+fn changing_partial_default_writes_do_not_restart_the_budget() {
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(0.5);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config);
+    harness.pump_frames(30);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        9,
+        IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+    );
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger::new(vec![window]));
+    harness.mock_state.fail_frame_write_readbacks(9, 100);
+    for offset in 0..20 {
+        harness
+            .mock_state
+            .os_set_window_frame_silently(9, IRect::new(offset, 20, offset + 400, 500));
+        harness.pump_frames(1);
+    }
+    assert_eq!(
+        harness.mock_state.frame_write_attempts(9),
+        3,
+        "changing physical origins must not create fresh initialization budgets"
+    );
+}
+
+#[test]
+fn resuming_one_default_transaction_preserves_another_windows_cooldown() {
+    let mut params = WindowParams::new(".*", None);
+    params.floating = Some(true);
+    params.grid = Some("1:1:0:0:1:1".to_string());
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let mut harness = TestHarness::new().with_config(config);
+    harness.pump_frames(30);
+    for id in [9, 10] {
+        let window = harness.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            TEST_WORKSPACE_ID,
+            id,
+            IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT),
+        );
+        harness
+            .world()
+            .trigger(SpawnWindowTrigger::new(vec![window]));
+        harness.mock_state.reject_frame_writes(id, true);
+    }
+    harness.pump_frames(4);
+    assert_eq!(harness.mock_state.frame_write_attempts(9), 3);
+    assert_eq!(harness.mock_state.frame_write_attempts(10), 3);
+    harness.mock_state.os_withdraw_window(9);
+    harness.pump_frames(15);
+    let entity = find_window_entity(9, harness.world());
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::reconcile::WindowUnavailable>(entity)
+            .is_some()
+    );
+    harness.mock_state.reject_frame_writes(9, false);
+    harness.mock_state.os_restore_withdrawn_window(9);
+    harness.pump_frames(15);
+    assert!(
+        harness
+            .world()
+            .get::<WindowDefaultsPending>(entity)
+            .is_none()
+    );
+    assert_eq!(harness.mock_state.frame_write_attempts(9), 4);
+    assert_eq!(harness.mock_state.frame_write_attempts(10), 3);
+}
+
+#[test]
 fn window_defaults_retry_after_a_transient_geometry_failure() {
     let mut params = WindowParams::new(".*", None);
     params.floating = Some(true);
@@ -2409,6 +3092,54 @@ fn suspended_animation_commit_recovers_through_bounded_reconciliation() {
             .is_none(),
         "successful bounded reconciliation must resume normal projection"
     );
+}
+
+#[test]
+fn external_frame_recovery_resumes_presentation_without_another_write() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(30);
+    let entity = find_window_entity(0, harness.world());
+    let target = harness
+        .world()
+        .get::<crate::ecs::DesiredWindowFrame>(entity)
+        .unwrap()
+        .0;
+    let drift = IRect::from_corners(
+        target.min + IVec2::splat(80),
+        target.max + IVec2::splat(180),
+    );
+    harness.mock_state.os_set_window_frame_silently(0, drift);
+    harness.mock_state.constrain_frame_writes(0, true);
+    harness.pump_frames(40);
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::WindowFrameCommitSuspended>(entity)
+            .is_some()
+    );
+    let attempts = harness.mock_state.frame_write_attempts(0);
+    harness.mock_state.os_set_window_frame_silently(0, target);
+    harness
+        .world()
+        .write_message(crate::events::Event::ReconcileWindows {
+            scope: crate::events::ReconcileScope::All,
+        });
+    harness.pump_frames(1);
+    assert_eq!(
+        harness
+            .world()
+            .get::<PresentedWindowFrame>(entity)
+            .unwrap()
+            .0,
+        target
+    );
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::WindowFrameCommitSuspended>(entity)
+            .is_none()
+    );
+    assert_eq!(harness.mock_state.frame_write_attempts(0), attempts);
 }
 
 #[test]

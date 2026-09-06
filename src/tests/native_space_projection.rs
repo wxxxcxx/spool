@@ -92,9 +92,9 @@ fn topology_heartbeat_projects_a_target_when_space_created_is_lost() {
     );
 
     let layers = world
-        .query::<(&FloatingLayer, &ChildOf)>()
+        .query_filtered::<(&LayoutStrip, &ChildOf), With<FloatingLayer>>()
         .iter(world)
-        .filter(|(layer, _)| layer.workspace_id == TARGET_SPACE_ID)
+        .filter(|(strip, _)| strip.id() == TARGET_SPACE_ID)
         .collect::<Vec<_>>();
     assert_eq!(layers.len(), 1);
     assert_eq!(layers[0].1.parent(), target_parent);
@@ -188,9 +188,9 @@ fn topology_projection_places_a_created_space_on_its_own_inactive_display() {
     assert_eq!(active_ids, vec![TEST_WORKSPACE_ID]);
 
     let layers = world
-        .query::<(&FloatingLayer, &ChildOf)>()
+        .query_filtered::<(&LayoutStrip, &ChildOf), With<FloatingLayer>>()
         .iter(world)
-        .filter(|(layer, _)| layer.workspace_id == TARGET_SPACE_ID)
+        .filter(|(strip, _)| strip.id() == TARGET_SPACE_ID)
         .collect::<Vec<_>>();
     assert_eq!(layers.len(), 1);
     assert_eq!(layers[0].1.parent(), second_display);

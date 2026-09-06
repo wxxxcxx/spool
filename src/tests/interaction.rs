@@ -6,6 +6,236 @@ use crate::config::{Config, MainOptions, WindowParams, parse_action};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::native_space::VisibleNativeSpaceMarker;
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
+
+#[test]
+fn native_space_move_suspends_source_frame_until_membership_confirmation() {
+    use crate::ecs::{DesiredWindowFrame, PresentedWindowFrame, WindowFrameMotion};
+    use bevy::ecs::system::RunSystemOnce as _;
+    let target_space = TEST_WORKSPACE_ID + 1;
+    let config: Config = (
+        MainOptions {
+            experimental_space_control: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(
+            TEST_DISPLAY_ID + 1,
+            IRect::new(
+                TEST_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH * 2,
+                TEST_DISPLAY_HEIGHT,
+            ),
+            vec![target_space],
+        );
+    harness.mock_state.enable_native_space_control();
+    harness.pump_frames(30);
+    let entity = find_window_entity(0, harness.world());
+    let source = harness
+        .world()
+        .get::<DesiredWindowFrame>(entity)
+        .expect("source")
+        .0;
+    let mut next = source;
+    next.max.x += 100;
+    harness.world().entity_mut(entity).insert((
+        DesiredWindowFrame(next),
+        PresentedWindowFrame(source),
+        WindowFrameMotion,
+    ));
+    harness.world().write_message(Event::ActionRequested {
+        action: Action::MoveWindowToSpace {
+            window_id: 0,
+            space_id: target_space,
+            move_focus: MoveFocus::Stay,
+        },
+    });
+    harness
+        .world()
+        .run_system_once(crate::ecs::native_space::handle_native_space_commands)
+        .expect("submit move");
+    let offset = IVec2::new(TEST_DISPLAY_WIDTH, 0);
+    let destination = IRect::from_corners(source.min + offset, source.max + offset);
+    harness
+        .mock_state
+        .os_set_window_frame_silently(0, destination);
+    let writes = harness.mock_state.frame_write_attempts(0);
+    harness.world().run_schedule(PostUpdate);
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(destination));
+    assert_eq!(harness.mock_state.frame_write_attempts(0), writes);
+    harness.world().resource_mut::<Messages<Event>>().clear();
+    harness.pump_frames(40);
+    assert!(
+        harness
+            .world()
+            .get::<WindowSpaceReassignmentPending>(entity)
+            .is_none()
+    );
+    assert_eq!(harness.mock_state.window_workspace(0), Some(target_space));
+    assert_eq!(
+        harness
+            .mock_state
+            .actual_window_frame(0)
+            .expect("frame")
+            .min,
+        destination.min
+    );
+}
+
+#[test]
+fn native_space_move_timeout_keeps_geometry_frozen_until_membership_recovers() {
+    use bevy::ecs::system::RunSystemOnce as _;
+    let target = TEST_WORKSPACE_ID + 1;
+    let config: Config = (
+        MainOptions {
+            experimental_space_control: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(
+            TEST_DISPLAY_ID + 1,
+            IRect::new(
+                TEST_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH * 2,
+                TEST_DISPLAY_HEIGHT,
+            ),
+            vec![target],
+        );
+    harness.mock_state.enable_native_space_control();
+    harness.pump_frames(30);
+    let entity = find_window_entity(0, harness.world());
+    harness.world().write_message(Event::ActionRequested {
+        action: Action::MoveWindowToSpace {
+            window_id: 0,
+            space_id: target,
+            move_focus: MoveFocus::Stay,
+        },
+    });
+    harness
+        .world()
+        .run_system_once(crate::ecs::native_space::handle_native_space_commands)
+        .expect("submit move");
+    harness.world().resource_mut::<Messages<Event>>().clear();
+    harness
+        .mock_state
+        .script_workspace_membership_queries(target, std::iter::repeat_n(Err(()), 1000));
+    let destination = IRect::new(
+        TEST_DISPLAY_WIDTH,
+        TEST_MENUBAR_HEIGHT,
+        TEST_DISPLAY_WIDTH + 400,
+        TEST_DISPLAY_HEIGHT,
+    );
+    harness
+        .mock_state
+        .os_set_window_frame_silently(0, destination);
+    let writes = harness.mock_state.frame_write_attempts(0);
+    harness.pump_frames(35);
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::native_space::NativeMoveOwner>(entity)
+            .is_none()
+    );
+    assert!(
+        harness
+            .world()
+            .get::<WindowSpaceReassignmentPending>(entity)
+            .is_some()
+    );
+    assert_eq!(harness.mock_state.frame_write_attempts(0), writes);
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(destination));
+    harness
+        .mock_state
+        .script_workspace_membership_queries(target, []);
+    harness.pump_frames(50);
+    assert!(
+        harness
+            .world()
+            .get::<WindowSpaceReassignmentPending>(entity)
+            .is_none()
+    );
+    let world = harness.world();
+    assert_eq!(
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .filter(|strip| strip.contains(entity))
+            .map(LayoutStrip::id)
+            .collect::<Vec<_>>(),
+        vec![target]
+    );
+}
+
+#[test]
+fn reappearing_native_space_resumes_its_retained_layout() {
+    let omitted_space = TEST_WORKSPACE_ID + 1;
+    let mut harness = TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, omitted_space],
+        )
+        .with_windows(1)
+        .with_workspace_window(1, omitted_space, |_| {});
+    harness.pump_frames(30);
+    let window = find_window_entity(1, harness.world());
+    let source = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &LayoutStrip)>()
+            .iter(world)
+            .find_map(|(entity, strip)| (strip.id() == omitted_space).then_some(entity))
+            .expect("inactive Space")
+    };
+    harness
+        .mock_state
+        .destroy_workspace(TEST_DISPLAY_ID, omitted_space);
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: TEST_DISPLAY_ID,
+    });
+    harness.pump_frames(1);
+    assert!(
+        harness
+            .world()
+            .get::<PendingSpaceDestruction>(source)
+            .is_some()
+    );
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, omitted_space, false);
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, false);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(40);
+    let world = harness.world();
+    assert!(
+        world
+            .get::<LayoutStrip>(source)
+            .is_some_and(|strip| strip.contains(window))
+    );
+    assert!(
+        world.get::<PendingSpaceDestruction>(source).is_none(),
+        "recovered Space must not remain tombstoned"
+    );
+    assert!(
+        world
+            .get::<WindowSpaceReassignmentPending>(window)
+            .is_none(),
+        "recovered member must resume"
+    );
+}
 use crate::ecs::{
     ActiveWorkspaceMarker, Floating, FocusedMarker, NativeFullscreenMarker, Position,
     PreviousTiledStrip, WindowVisibility, layout::LayoutStrip,
@@ -17,6 +247,152 @@ use crate::platform::Modifiers;
 use crate::{assert_focused, assert_window_at, assert_window_size};
 
 use super::*;
+
+#[test]
+fn fullscreen_membership_failure_retries_without_losing_the_source_index() {
+    const FULLSCREEN: WorkspaceId = TEST_WORKSPACE_ID + 100;
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.pump_frames(30);
+    let window = find_window_entity(1, harness.world());
+    let (source, index) = {
+        let world = harness.world();
+        let (entity, strip) = world
+            .query::<(Entity, &LayoutStrip)>()
+            .iter(world)
+            .find(|(_, strip)| strip.contains(window))
+            .unwrap();
+        (entity, strip.index_of(window).unwrap())
+    };
+    harness.mock_state.update_window(1, |window| {
+        window.workspace_id = FULLSCREEN;
+        window.is_full_screen = true;
+    });
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, FULLSCREEN, true);
+    harness
+        .mock_state
+        .script_workspace_membership_queries(FULLSCREEN, std::iter::repeat_n(Err(()), 100));
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(1);
+    assert!(
+        harness
+            .world()
+            .get::<LayoutStrip>(source)
+            .unwrap()
+            .contains(window),
+        "a failed fullscreen read must preserve the original layout for retry"
+    );
+    harness
+        .mock_state
+        .script_workspace_membership_queries(FULLSCREEN, []);
+    harness.pump_frames(20);
+    {
+        let world = harness.world();
+        let (strip, marker) = world
+            .query::<(&LayoutStrip, &NativeFullscreenMarker)>()
+            .iter(world)
+            .find(|(strip, _)| strip.id() == FULLSCREEN)
+            .expect("heartbeat completes fullscreen migration");
+        assert!(strip.contains(window));
+        assert_eq!(marker.layout_strip, source);
+        assert_eq!(marker.index, index);
+    }
+    harness.mock_state.update_window(1, |window| {
+        window.workspace_id = TEST_WORKSPACE_ID;
+        window.is_full_screen = false;
+    });
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, false);
+    harness
+        .mock_state
+        .destroy_workspace(TEST_DISPLAY_ID, FULLSCREEN);
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: FULLSCREEN,
+    });
+    harness.pump_frames(20);
+    assert_eq!(
+        harness
+            .world()
+            .get::<LayoutStrip>(source)
+            .unwrap()
+            .index_of(window)
+            .unwrap(),
+        index
+    );
+}
+
+#[test]
+fn fullscreen_transition_recovers_when_the_space_changed_event_is_lost() {
+    const FULLSCREEN: WorkspaceId = TEST_WORKSPACE_ID + 100;
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(30);
+    let window = find_window_entity(0, harness.world());
+    harness.mock_state.update_window(0, |window| {
+        window.workspace_id = FULLSCREEN;
+        window.is_full_screen = true;
+    });
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, FULLSCREEN, true);
+    harness.pump_frames(20);
+    let world = harness.world();
+    assert!(
+        world
+            .query::<(&LayoutStrip, &NativeFullscreenMarker)>()
+            .iter(world)
+            .any(|(strip, _)| strip.id() == FULLSCREEN && strip.contains(window))
+    );
+}
+
+#[test]
+fn ambiguous_fullscreen_membership_preserves_sources_until_a_unique_read() {
+    const FULLSCREEN: WorkspaceId = TEST_WORKSPACE_ID + 100;
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(30);
+    let window = find_window_entity(0, harness.world());
+    let sibling = find_window_entity(1, harness.world());
+    let source = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &LayoutStrip)>()
+            .iter(world)
+            .find(|(_, strip)| strip.contains(window))
+            .unwrap()
+            .0
+    };
+    harness.mock_state.update_window(0, |window| {
+        window.workspace_id = FULLSCREEN;
+        window.is_full_screen = true;
+    });
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, FULLSCREEN, true);
+    harness
+        .mock_state
+        .script_workspace_membership_queries(FULLSCREEN, std::iter::repeat_n(Ok(vec![0, 1]), 100));
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(1);
+    let strip = harness.world().get::<LayoutStrip>(source).unwrap();
+    assert!(strip.contains(window) && strip.contains(sibling));
+    harness
+        .mock_state
+        .script_workspace_membership_queries(FULLSCREEN, []);
+    harness.pump_frames(20);
+    let world = harness.world();
+    assert!(
+        world
+            .query::<(&LayoutStrip, &NativeFullscreenMarker)>()
+            .iter(world)
+            .any(|(strip, marker)| strip.id() == FULLSCREEN
+                && strip.contains(window)
+                && marker.layout_strip == source)
+    );
+    let strip = world.get::<LayoutStrip>(source).unwrap();
+    assert!(strip.contains(sibling));
+    assert!(!strip.contains(window));
+}
 
 #[test]
 fn native_fullscreen_transition_removes_window_from_original_strip_without_focus_marker() {
@@ -462,17 +838,11 @@ fn repeated_space_destruction_preserves_pending_active_state() {
     harness
         .mock_state
         .destroy_workspace(TEST_DISPLAY_ID, FULLSCREEN_WORKSPACE_ID);
-    // Each destruction frame reads the active Space once during topology
-    // reconciliation and once while reconciling pending membership.
-    harness.mock_state.script_active_space_queries(
-        TEST_DISPLAY_ID,
-        [
-            Ok(TEST_WORKSPACE_ID),
-            Err(()),
-            Ok(TEST_WORKSPACE_ID),
-            Ok(TEST_WORKSPACE_ID),
-        ],
-    );
+    // One shared visibility observation fails; the next destruction epoch
+    // succeeds. Both projection and membership recovery see the same result.
+    harness
+        .mock_state
+        .script_active_space_queries(TEST_DISPLAY_ID, [Err(()), Ok(TEST_WORKSPACE_ID)]);
     harness.world().write_message(Event::SpaceDestroyed {
         space_id: FULLSCREEN_WORKSPACE_ID,
     });
@@ -743,10 +1113,15 @@ fn destroyed_space_tombstone_waits_for_source_display_topology_after_transient_o
         .mock_state
         .script_present_display_topology_queries(SECOND_DISPLAY_ID, [Err(())]);
 
-    // The first frame consumes the reconciliation backoff. On the second, the
-    // source display's one failed topology query must not look like proof that
-    // its Space disappeared.
+    // Force one observation epoch with a failed source-display query.
+    harness.world().write_message(Event::SpaceChanged);
     harness.pump_frames(2);
+    assert!(
+        !harness
+            .world()
+            .resource::<crate::ecs::topology::NativeTopology>()
+            .is_complete()
+    );
     let mut pending = harness
         .world()
         .query::<(&LayoutStrip, Has<PendingSpaceDestruction>)>();
@@ -759,7 +1134,7 @@ fn destroyed_space_tombstone_waits_for_source_display_topology_after_transient_o
 
     // Once the next successful observation confirms that the source display no
     // longer contains the Space, the empty tombstone can be removed.
-    harness.pump_frames(4);
+    harness.pump_frames(30);
     let mut strips = harness.world().query::<&LayoutStrip>();
     assert!(
         strips
@@ -2892,12 +3267,13 @@ fn mouse_outside_corner_still_changes_focus() {
 #[test]
 fn focus_other_layer_tracks_the_focused_tier() {
     fn current_layer(world: &mut World) -> FloatingLayer {
-        let mut query = world.query::<&FloatingLayer>();
+        let mut query = world.query::<(&LayoutStrip, &FloatingLayer)>();
         *query
             .query(world)
             .iter()
-            .find(|layer| layer.workspace_id == TEST_WORKSPACE_ID)
+            .find(|(strip, _)| strip.id() == TEST_WORKSPACE_ID)
             .expect("active workspace has FloatingLayer")
+            .1
     }
 
     let commands = vec![

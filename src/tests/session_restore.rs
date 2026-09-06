@@ -22,6 +22,100 @@ use crate::tests::{
 use spool_shared_types::state::SpaceKind;
 
 #[test]
+fn restore_changes_columns_without_replacing_the_native_space_entity() {
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(30);
+    let (entity, native, parent) = {
+        let world = harness.world();
+        let (entity, _, native, parent) = world
+            .query::<(Entity, &LayoutStrip, &NativeSpace, &ChildOf)>()
+            .iter(world)
+            .find(|(_, strip, _, _)| strip.id() == TEST_WORKSPACE_ID)
+            .expect("Space");
+        (entity, *native, parent.parent())
+    };
+    let mut state = target_restore_state(TEST_WORKSPACE_ID);
+    state.spaces[0].columns = vec![
+        SavedColumn::Single(saved_window(1)),
+        SavedColumn::Single(saved_window(0)),
+    ];
+    harness.world().insert_resource(state);
+    harness.world().trigger(RestoreWindowState);
+    harness.pump_frames(20);
+    let expected = [
+        crate::tests::harness::find_window_entity(1, harness.world()),
+        crate::tests::harness::find_window_entity(0, harness.world()),
+    ];
+    assert_eq!(
+        harness
+            .world()
+            .get::<LayoutStrip>(entity)
+            .expect("restore must retain the native Space entity")
+            .all_windows(),
+        expected
+    );
+    assert_eq!(harness.world().get::<NativeSpace>(entity), Some(&native));
+    assert_eq!(
+        harness
+            .world()
+            .get::<ChildOf>(entity)
+            .expect("parent")
+            .parent(),
+        parent
+    );
+}
+
+#[test]
+fn restore_obeys_current_inactive_space_membership() {
+    let actual_space = TEST_WORKSPACE_ID + 1;
+    let mut harness = TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, actual_space],
+        )
+        .with_workspace_window(0, actual_space, |_| {})
+        .with_state(target_restore_state(TEST_WORKSPACE_ID));
+    harness.pump_frames(50);
+    assert_eq!(harness.mock_state.window_workspace(0), Some(actual_space));
+    let window = crate::tests::harness::find_window_entity(0, harness.world());
+    let world = harness.world();
+    let owners = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.contains(window))
+        .map(LayoutStrip::id)
+        .collect::<Vec<_>>();
+    assert_eq!(owners, vec![actual_space]);
+}
+
+#[test]
+fn restore_retries_transient_membership_failure_without_another_notification() {
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(30);
+    let mut saved = target_restore_state(TEST_WORKSPACE_ID);
+    saved.spaces[0].columns = vec![
+        SavedColumn::Single(saved_window(1)),
+        SavedColumn::Single(saved_window(0)),
+    ];
+    harness.world().insert_resource(saved);
+    harness
+        .mock_state
+        .script_workspace_membership_queries(TEST_WORKSPACE_ID, [Err(())]);
+    harness.world().trigger(RestoreWindowState);
+    harness.pump_frames(40);
+    let first = crate::tests::harness::find_window_entity(1, harness.world());
+    let second = crate::tests::harness::find_window_entity(0, harness.world());
+    let world = harness.world();
+    let strip = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .expect("strip");
+    assert_eq!(strip.all_windows(), vec![first, second]);
+}
+
+#[test]
 fn suspended_windows_remain_in_the_persisted_layout() {
     let mut harness = TestHarness::new().with_windows(3);
     harness.pump_frames(15);
@@ -294,6 +388,26 @@ fn late_restore_cannot_despawn_pending_source_still_present_in_topology() {
     harness
         .world()
         .insert_resource(target_restore_state(TEST_WORKSPACE_ID));
+    harness.world().trigger(RestoreWindowState);
+    harness.pump_frames(4);
+
+    let source = {
+        let world = harness.world();
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .find(|strip| strip.id() == FULLSCREEN_SPACE_ID)
+            .expect("retained source")
+            .contains(window)
+    };
+    assert!(
+        source,
+        "restore must wait for native membership before consuming the source"
+    );
+    harness.mock_state.update_window(0, |window| {
+        window.workspace_id = TEST_WORKSPACE_ID;
+        window.is_full_screen = false;
+    });
     harness.world().trigger(RestoreWindowState);
     harness.pump_frames(4);
 

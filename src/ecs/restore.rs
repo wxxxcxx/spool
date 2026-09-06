@@ -4,11 +4,10 @@ use std::time::Duration;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::observer::On;
-use bevy::ecs::query::Has;
+use bevy::ecs::query::With;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, Query, Res, ResMut, SystemParam};
 use bevy::time::{Time, Timer, TimerMode, Virtual};
-use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{Level, info, instrument, warn};
 
 use crate::config::{Config, MissingWindowBehavior};
@@ -16,10 +15,7 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{SavedColumn, SavedSpace, SavedStackItem, SavedWindow, SpoolState};
 use crate::ecs::workspace::PendingSpaceDestruction;
-use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Floating, RefreshWindowSizes, RestoreWindowState,
-    SpawnCommandsExt,
-};
+use crate::ecs::{Floating, RefreshWindowSizes, RestoreWindowState};
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
 
@@ -38,9 +34,25 @@ impl SessionRestore {
     }
 }
 
+#[derive(Resource)]
+pub(super) struct RestoreRetry(Timer);
+
+fn defer_restore(commands: &mut Commands) {
+    commands.queue(|world: &mut bevy::prelude::World| {
+        world
+            .resource_mut::<super::topology::NativeTopology>()
+            .request_refresh();
+    });
+    commands.insert_resource(RestoreRetry(Timer::new(
+        Duration::from_millis(250),
+        TimerMode::Once,
+    )));
+}
+
 pub(super) fn tick_restore_grace(
     time: Res<Time<Virtual>>,
     mut session: Option<ResMut<SessionRestore>>,
+    mut retry: Option<ResMut<RestoreRetry>>,
     mut commands: Commands,
 ) {
     let Some(session) = session.as_mut() else {
@@ -52,6 +64,13 @@ pub(super) fn tick_restore_grace(
         info!("Session restore grace period ended");
         commands.remove_resource::<SessionRestore>();
         commands.remove_resource::<SpoolState>();
+        commands.remove_resource::<RestoreRetry>();
+    } else if let Some(retry) = retry.as_mut() {
+        retry.0.tick(time.delta());
+        if retry.0.is_finished() {
+            commands.remove_resource::<RestoreRetry>();
+            commands.trigger(RestoreWindowState);
+        }
     }
 }
 
@@ -107,14 +126,12 @@ pub(crate) enum PlannedStackItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedStrip {
     pub workspace_id: WorkspaceId,
-    pub display_id: Option<CGDirectDisplayID>,
     pub columns: Vec<PlannedColumn>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RestorePlan {
     pub strips: Vec<PlannedStrip>,
-    pub active_workspaces: HashSet<WorkspaceId>,
     pub consumed_entities: HashSet<Entity>,
     pub ignored_missing_windows: usize,
     pub skipped_ambiguous_matches: usize,
@@ -155,14 +172,20 @@ impl<'a> RestorePlanner<'a> {
         self.saved_windows().any(|window| !window.title.is_empty())
     }
 
-    pub(crate) fn plan(&self, current: &[CurrentWindowIdentity]) -> RestorePlan {
+    pub(crate) fn plan(
+        &self,
+        current: &[CurrentWindowIdentity],
+        memberships: &HashMap<WinID, Option<WorkspaceId>>,
+    ) -> RestorePlan {
         let mut plan = RestorePlan::default();
 
         for space in self.saved_spaces() {
-            let surviving_strips = self.plan_space(space, current, &mut plan);
-            if !surviving_strips.is_empty() {
-                plan.active_workspaces.insert(space.space_id);
-            }
+            let eligible = current
+                .iter()
+                .filter(|window| memberships.get(&window.window_id) == Some(&Some(space.space_id)))
+                .cloned()
+                .collect::<Vec<_>>();
+            let surviving_strips = self.plan_space(space, &eligible, &mut plan);
             plan.strips.extend(surviving_strips);
         }
 
@@ -185,7 +208,6 @@ impl<'a> RestorePlanner<'a> {
         } else {
             vec![PlannedStrip {
                 workspace_id: space.space_id,
-                display_id: space.display_id,
                 columns,
             }]
         }
@@ -329,13 +351,12 @@ fn saved_hard_match_keys_for_spaces(
 }
 
 pub(crate) fn eligible_restore_space_ids(
-    topology: &[(Display, Vec<WorkspaceId>)],
+    present_spaces: impl IntoIterator<Item = WorkspaceId>,
     pending_space_ids: impl IntoIterator<Item = WorkspaceId>,
 ) -> HashSet<WorkspaceId> {
     let pending = pending_space_ids.into_iter().collect::<HashSet<_>>();
-    topology
-        .iter()
-        .flat_map(|(_, spaces)| spaces.iter().copied())
+    present_spaces
+        .into_iter()
         .filter(|workspace_id| !pending.contains(workspace_id))
         .collect()
 }
@@ -373,19 +394,16 @@ pub(super) struct RestoreWindowStateCtx<'w, 's> {
     workspaces: Query<
         'w,
         's,
-        (
-            Entity,
-            &'static mut LayoutStrip,
-            Option<&'static ChildOf>,
-            Has<ActiveWorkspaceMarker>,
-        ),
+        (Entity, &'static mut LayoutStrip, Option<&'static ChildOf>),
+        With<super::native_space::NativeSpace>,
     >,
-    displays: Query<'w, 's, (Entity, &'static Display, Has<ActiveDisplayMarker>)>,
+    displays: Query<'w, 's, &'static Display>,
     apps: Query<'w, 's, &'static Application>,
     pending_spaces: Query<'w, 's, &'static PendingSpaceDestruction>,
     session: Option<Res<'w, SessionRestore>>,
     restoration: Option<Res<'w, SpoolState>>,
     window_manager: Res<'w, WindowManager>,
+    topology: Res<'w, super::topology::NativeTopology>,
     window: WindowCtx<'w, 's>,
 }
 
@@ -400,6 +418,7 @@ pub(super) fn restore_window_state(_: On<RestoreWindowState>, restore: RestoreWi
         session,
         restoration,
         window_manager,
+        topology,
         window: mut ctx,
     } = restore;
     let restoration = if let Some(session) = session.as_deref() {
@@ -423,20 +442,49 @@ pub(super) fn restore_window_state(_: On<RestoreWindowState>, restore: RestoreWi
         restoration
     };
 
-    let topology = window_manager.present_displays();
+    if !topology.is_complete() {
+        warn!("Session restore deferred: display topology unavailable");
+        defer_restore(&mut ctx.commands);
+        return;
+    }
+    let topology = topology.known_displays().collect::<Vec<_>>();
+    let mut memberships = HashMap::new();
+    for space_id in topology.iter().flat_map(|(_, spaces)| spaces.iter()) {
+        let Ok(window_ids) = window_manager.windows_in_workspace(*space_id) else {
+            warn!(
+                space_id,
+                "Session restore deferred: Space membership unavailable"
+            );
+            defer_restore(&mut ctx.commands);
+            return;
+        };
+        for window_id in window_ids {
+            memberships
+                .entry(window_id)
+                .and_modify(|space| {
+                    if *space != Some(*space_id) {
+                        *space = None;
+                    }
+                })
+                .or_insert(Some(*space_id));
+        }
+    }
     let mut live_space_displays = HashMap::new();
     for (display, spaces) in &topology {
-        for workspace_id in spaces {
+        for workspace_id in *spaces {
             live_space_displays.insert(*workspace_id, display.id());
         }
     }
     let present_spaces = eligible_restore_space_ids(
-        &topology,
+        topology
+            .iter()
+            .flat_map(|(_, spaces)| spaces.iter().copied()),
         pending_spaces.iter().map(|pending| pending.workspace_id),
     );
     let planner = RestorePlanner::for_present_spaces(restoration, &present_spaces);
     let current = current_window_identities(&ctx.windows, &apps, &planner);
-    let plan = planner.plan(&current);
+    let plan = planner.plan(&current, &memberships);
+    ctx.commands.remove_resource::<RestoreRetry>();
 
     if plan.consumed_entities.is_empty() {
         info!(
@@ -446,40 +494,41 @@ pub(super) fn restore_window_state(_: On<RestoreWindowState>, restore: RestoreWi
         return;
     }
 
-    let mut existing_workspace_parents = HashMap::new();
-    let mut active_workspace_ids = HashSet::new();
-    let mut emptied_existing_strips = HashSet::new();
-    for (entity, mut strip, child, active) in &mut workspaces {
-        if active {
-            active_workspace_ids.insert(strip.id());
-        }
-        if let Some(child) = child {
-            existing_workspace_parents
-                .entry(strip.id())
-                .or_insert_with(|| child.parent());
-        }
-
-        let had_consumed_window = plan
-            .consumed_entities
-            .iter()
-            .any(|entity| strip.contains(*entity));
-        for entity in &plan.consumed_entities {
-            strip.remove(*entity);
-        }
-
-        // A pending strip is a topology tombstone. Restore may empty it, but
-        // only destroyed-Space reconciliation may decide that it can die.
-        if had_consumed_window
-            && strip.all_windows().is_empty()
-            && pending_spaces.get(entity).is_err()
+    let targets = plan
+        .strips
+        .iter()
+        .filter_map(|planned| {
+            workspaces.iter().find_map(|(entity, strip, child)| {
+                let display = child.and_then(|child| displays.get(child.parent()).ok())?;
+                (strip.id() == planned.workspace_id
+                    && !pending_spaces.contains(entity)
+                    && live_space_displays.get(&planned.workspace_id) == Some(&display.id()))
+                .then_some((planned.workspace_id, entity))
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    if targets.len() != plan.strips.len() {
+        defer_restore(&mut ctx.commands);
+        return;
+    }
+    for planned in &plan.strips {
+        if matches!(planned.columns.as_slice(), [PlannedColumn::Fullscreen(_)])
+            && workspaces
+                .get(targets[&planned.workspace_id])
+                .is_ok_and(|(_, strip, _)| {
+                    strip
+                        .all_windows()
+                        .iter()
+                        .any(|entity| !plan.consumed_entities.contains(entity))
+                })
         {
-            emptied_existing_strips.insert(entity);
+            warn!("Skipping fullscreen restore that would discard unmatched live members");
+            return;
         }
     }
-
-    for entity in &emptied_existing_strips {
-        if let Ok(mut entity_commands) = ctx.commands.get_entity(*entity) {
-            entity_commands.try_despawn();
+    for (_, mut strip, _) in &mut workspaces {
+        for entity in &plan.consumed_entities {
+            strip.remove(*entity);
         }
     }
 
@@ -491,63 +540,18 @@ pub(super) fn restore_window_state(_: On<RestoreWindowState>, restore: RestoreWi
 
     let mut restored_strips = 0;
     for planned in &plan.strips {
-        let Some((display_entity, display)) = select_display(
-            planned.workspace_id,
-            live_space_displays.get(&planned.workspace_id).copied(),
-            planned.display_id,
-            &existing_workspace_parents,
-            &displays,
-        ) else {
-            warn!(
-                "Skipping restore for Space {} because no display exists",
-                planned.workspace_id
-            );
+        let mut strip = layout_strip_from_plan(planned);
+        let entity = targets[&planned.workspace_id];
+        let Ok((_, mut existing, _)) = workspaces.get_mut(entity) else {
             continue;
         };
-
-        let mut strip = layout_strip_from_plan(planned);
-        if strip.all_windows().is_empty() {
-            continue;
-        }
-
-        // Keep unmatched startup windows on the same normal row. Fullscreen
-        // strips must remain single-column, so leave those rows separate.
-        if !strip.is_fullscreen()
-            && let Some((entity, mut existing, _, _)) =
-                workspaces.iter_mut().find(|(entity, existing, _, _)| {
-                    !emptied_existing_strips.contains(entity)
-                        && existing.id() == planned.workspace_id
-                        && !existing.is_fullscreen()
-                })
-        {
+        if !strip.is_fullscreen() {
             strip.append_strip(&mut existing);
-            emptied_existing_strips.insert(entity);
-            if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-                entity_commands.try_despawn();
-            }
         }
-
-        let is_active = plan.active_workspaces.contains(&planned.workspace_id);
-        let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
-        if is_active {
-            for (entity, strip, _, _) in &mut workspaces {
-                if strip.id() == planned.workspace_id
-                    && !emptied_existing_strips.contains(&entity)
-                    && is_global_active
-                    && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
-                {
-                    entity_commands.try_remove::<ActiveWorkspaceMarker>();
-                }
-            }
-        }
-
-        let mut spawned = ctx.commands.spawn_layout_strip(
-            strip,
-            display.bounds().min,
-            display_entity,
-            is_global_active,
-        );
-        spawned.try_insert(RefreshWindowSizes::default());
+        *existing = strip;
+        ctx.commands
+            .entity(entity)
+            .insert(RefreshWindowSizes::default());
         restored_strips += 1;
     }
 
@@ -619,60 +623,6 @@ fn hydrate_fallback_identities(
         identity.role = window.role().unwrap_or_default();
         identity.subrole = window.subrole().unwrap_or_default();
     }
-}
-
-fn select_display<'a>(
-    workspace_id: WorkspaceId,
-    live_display_id: Option<CGDirectDisplayID>,
-    planned_display_id: Option<CGDirectDisplayID>,
-    existing_workspace_parents: &HashMap<WorkspaceId, Entity>,
-    displays: &'a Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
-) -> Option<(Entity, &'a Display)> {
-    if let Some(display_id) = live_display_id
-        && let Some((entity, display, _)) = displays
-            .iter()
-            .find(|(_, display, _)| display.id() == display_id)
-    {
-        return Some((entity, display));
-    }
-
-    if let Some(display_entity) = existing_workspace_parents.get(&workspace_id)
-        && let Ok((entity, display, _)) = displays.get(*display_entity)
-    {
-        let current_display_id = display.id();
-        if planned_display_id.is_some_and(|display_id| display_id != current_display_id) {
-            info!(
-                "Session restore remapping workspace {} from saved display {:?} to current display {}",
-                workspace_id, planned_display_id, current_display_id
-            );
-            return Some((entity, display));
-        }
-    }
-
-    if let Some(display_id) = planned_display_id {
-        if let Some((entity, display, _)) = displays
-            .iter()
-            .find(|(_, display, _)| display.id() == display_id)
-        {
-            return Some((entity, display));
-        }
-        info!(
-            "Session restore remapping workspace {} from missing display {}",
-            workspace_id, display_id
-        );
-    }
-
-    if let Some(display_entity) = existing_workspace_parents.get(&workspace_id)
-        && let Ok((entity, display, _)) = displays.get(*display_entity)
-    {
-        return Some((entity, display));
-    }
-
-    displays
-        .iter()
-        .find(|(_, _, active)| *active)
-        .or_else(|| displays.iter().min_by_key(|(_, display, _)| display.id()))
-        .map(|(entity, display, _)| (entity, display))
 }
 
 fn apply_planned_columns(strip: &mut LayoutStrip, columns: &[PlannedColumn]) {

@@ -38,11 +38,32 @@ pub struct PresentedWindowFrame(pub IRect);
 #[derive(bevy::ecs::component::Component, Clone, Copy, Debug, Default)]
 pub struct WindowFrameMotion;
 
-/// Suspends frame-by-frame macOS commits after an AX write fails.
+/// An audit request, revalidated against current intent at commit time.
+#[derive(bevy::ecs::component::Component, Clone, Copy, Debug)]
+pub(crate) struct WindowFrameCorrection(pub IRect);
+
+/// Prepared initialization geometry; success, not enqueueing, completes defaults.
+#[derive(bevy::ecs::component::Component, Clone, Copy, Debug)]
+pub(crate) struct DefaultWindowFrame {
+    pub(crate) target: IRect,
+    pub(crate) incarnation: crate::platform::WindowIncarnation,
+}
+
+/// Coalesced pointer intent. Only confirmed commit readback enters settling.
+#[derive(bevy::ecs::component::Component, Clone, Copy, Debug)]
+pub(crate) struct InteractiveWindowFrame {
+    pub(crate) target: IRect,
+    pub(crate) start: IRect,
+    pub(crate) incarnation: crate::platform::WindowIncarnation,
+}
+
+/// Suspends frame-by-frame commits after an AX failure or constrained correction.
 ///
 /// The declarative desired frame remains intact; the central reconciler owns
-/// bounded retries. A genuinely new desired frame clears this suspension and
+/// bounded retry admission; the presentation committer executes the retries.
+/// A genuinely new desired frame clears this suspension and
 /// starts a fresh presentation attempt.
+/// New pointer input also gets one attempt; failed input is never replayed.
 #[derive(bevy::ecs::component::Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowFrameCommitSuspended {
     desired: IRect,

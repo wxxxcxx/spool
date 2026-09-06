@@ -690,15 +690,15 @@ fn command_focus_other_layer(
         return;
     };
 
-    if let Some(mut layer) = floating_layers
-        .iter_mut()
-        .find(|layer| layer.workspace_id == workspace_id)
-    {
+    if let Ok(mut layer) = floating_layers.get_mut(active_display.active_strip_entity()) {
         layer.front = focus_floating;
     } else {
-        let mut layer = FloatingLayer::new(workspace_id);
-        layer.front = focus_floating;
-        commands.spawn((layer, ChildOf(active_display.entity())));
+        let layer = FloatingLayer {
+            front: focus_floating,
+        };
+        commands
+            .entity(active_display.active_strip_entity())
+            .insert(layer);
     }
 
     if focus_floating {

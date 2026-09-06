@@ -24,6 +24,7 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::reconcile::{WindowStateSync, WindowUnavailable};
 use crate::ecs::state::SpoolState;
+use crate::ecs::window_frame::DefaultWindowFrame;
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, FullscreenDefaultsDeferred,
@@ -75,6 +76,7 @@ type DefaultableWindows<'w, 's> = Populated<
     (
         With<WindowDefaultsPending>,
         Without<WindowDefaultsApplied>,
+        Without<DefaultWindowFrame>,
         Without<FullscreenDefaultsDeferred>,
         Without<WindowUnavailable>,
         Without<WindowSpaceReassignmentPending>,
@@ -756,6 +758,7 @@ pub(super) fn dispatch_application_messages(
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_floating_trigger(
     trigger: On<Add, Floating>,
+    pending_defaults: Query<(), With<WindowDefaultsPending>>,
     apps: Query<(Entity, &Application)>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     // `Option<Single>` rather than `Single`: an unresolvable display would skip the
@@ -827,6 +830,12 @@ pub(super) fn window_floating_trigger(
         if strip.contains(entity) {
             strip.remove(entity);
         }
+    }
+
+    // Default geometry is already owned by the initialization transaction.
+    // Adding its classification must not schedule a second active-screen grid.
+    if pending_defaults.contains(entity) {
+        return;
     }
 
     let Some((display, dock)) = active_display.map(|display| *display) else {
@@ -1487,6 +1496,40 @@ fn mark_window_defaults_applied(entity: Entity, commands: &mut Commands) {
     }
 }
 
+#[derive(SystemParam)]
+pub(super) struct DefaultGeometry<'w, 's> {
+    topology: Res<'w, super::topology::NativeTopology>,
+    displays: Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>,
+    manager: Res<'w, WindowManager>,
+    retries: ResMut<'w, super::defaults::DefaultRetries>,
+    time: Res<'w, bevy::time::Time>,
+}
+
+impl DefaultGeometry<'_, '_> {
+    fn viewport(&self, window_id: WinID, config: &Config) -> Option<IRect> {
+        if !self.topology.is_complete() {
+            return None;
+        }
+        let mut owner = None;
+        for (display, spaces) in self.topology.known_displays() {
+            for space in spaces {
+                let members = self.manager.windows_in_workspace(*space).ok()?;
+                if members.contains(&window_id) {
+                    if owner.is_some() {
+                        return None;
+                    }
+                    owner = Some(display.id());
+                }
+            }
+        }
+        let owner = owner?;
+        self.displays
+            .iter()
+            .find(|(display, _)| display.id() == owner)
+            .map(|(display, dock)| display.actual_display_bounds(dock, config))
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "default application is one retryable transaction across floating and tiled rules"
@@ -1494,7 +1537,7 @@ fn mark_window_defaults_applied(entity: Entity, commands: &mut Commands) {
 pub(super) fn apply_window_defaults(
     added: DefaultableWindows,
     apps: Query<(Entity, &Application)>,
-    active_display: ActiveDisplay,
+    mut geometry: DefaultGeometry,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
     mut commands: Commands,
@@ -1513,6 +1556,11 @@ pub(super) fn apply_window_defaults(
         let Ok((_, app)) = apps.get(child.parent()) else {
             continue;
         };
+
+        let now = geometry.time.elapsed();
+        if !geometry.retries.admit(entity, window.incarnation(), now) {
+            continue;
+        }
 
         // A startup fullscreen frame is physical state owned by macOS, not a
         // sensible tiling size. Keep the defaults transaction pending until
@@ -1549,34 +1597,19 @@ pub(super) fn apply_window_defaults(
             // Skip grid_ratios during init: we don't know this window's display.
             let applied = if !initializing && let Some((rx, ry, rw, rh)) = properties.grid_ratios()
             {
-                let viewport = active_display.actual_bounds(&config);
+                let Some(viewport) = geometry.viewport(window.id(), &config) else {
+                    continue;
+                };
                 let x = viewport.min.x + round_px(f64::from(viewport.width()) * rx);
                 let y = viewport.min.y + round_px(f64::from(viewport.height()) * ry);
                 let w = round_px(f64::from(viewport.width()) * rw);
                 let h = round_px(f64::from(viewport.height()) * rh);
-                let target = IRect::new(x, y, w, h);
-                match window.set_frame(target) {
-                    Ok(frame) => {
-                        commit_default_frame(
-                            entity,
-                            frame,
-                            (
-                                &mut position,
-                                &mut bounds,
-                                &mut desired,
-                                &mut presented,
-                                observed.as_deref_mut(),
-                            ),
-                            &mut commands,
-                        );
-                        true
-                    }
-                    Err(error) => {
-                        warn!(window_id = window.id(), %error, "unable to apply window grid defaults");
-                        invalidate_default_frame(entity, &mut commands);
-                        false
-                    }
-                }
+                let target = IRect::from_corners(Origin::new(x, y), Origin::new(x + w, y + h));
+                commands.entity(entity).insert(DefaultWindowFrame {
+                    target,
+                    incarnation: window.incarnation(),
+                });
+                false
             } else if observed.is_none() {
                 match window.update_frame() {
                     Ok(frame) => {
@@ -1634,7 +1667,9 @@ pub(super) fn apply_window_defaults(
         // Safe during init: this only resizes, it doesn't reposition, so a
         // window on an inactive display stays put.
         if let Some(width) = properties.width_ratio() {
-            let viewport = active_display.actual_bounds(&config);
+            let Some(viewport) = geometry.viewport(window.id(), &config) else {
+                continue;
+            };
             let (_, pad_right, _, pad_left) = config.edge_padding();
             let padded_width = viewport.width() - pad_left - pad_right;
             let new_width = round_px(f64::from(padded_width) * width);
@@ -1643,25 +1678,11 @@ pub(super) fn apply_window_defaults(
                 window.frame().min,
                 window.frame().min + Size::new(new_width, height),
             );
-            match window.set_frame(target) {
-                Ok(frame) => commit_default_frame(
-                    entity,
-                    frame,
-                    (
-                        &mut position,
-                        &mut bounds,
-                        &mut desired,
-                        &mut presented,
-                        observed.as_deref_mut(),
-                    ),
-                    &mut commands,
-                ),
-                Err(error) => {
-                    warn!(window_id = window.id(), %error, "unable to apply configured window width");
-                    invalidate_default_frame(entity, &mut commands);
-                    continue;
-                }
-            }
+            commands.entity(entity).insert(DefaultWindowFrame {
+                target,
+                incarnation: window.incarnation(),
+            });
+            continue;
         }
         mark_window_defaults_applied(entity, &mut commands);
     }
@@ -1670,16 +1691,17 @@ pub(super) fn apply_window_defaults(
 #[derive(SystemParam)]
 pub(super) struct ApplyWindowPositionsCtx<'w, 's> {
     focus: Res<'w, FocusCoordinator>,
-    window_manager: Res<'w, WindowManager>,
+    topology: Res<'w, super::topology::NativeTopology>,
     pending_spaces: Query<'w, 's, &'static PendingSpaceDestruction>,
     window: WindowCtx<'w, 's>,
 }
 
 impl ApplyWindowPositionsCtx<'_, '_> {
     fn eligible_restore_spaces(&self) -> HashSet<WorkspaceId> {
-        let topology = self.window_manager.present_displays();
         crate::ecs::restore::eligible_restore_space_ids(
-            &topology,
+            self.topology
+                .known_displays()
+                .flat_map(|(_, spaces)| spaces.iter().copied()),
             self.pending_spaces
                 .iter()
                 .map(|pending| pending.workspace_id),
@@ -1723,7 +1745,7 @@ pub(super) fn apply_window_positions(
     };
     let ApplyWindowPositionsCtx {
         focus,
-        window_manager: _,
+        topology: _,
         pending_spaces: _,
         window: mut ctx,
     } = ctx;

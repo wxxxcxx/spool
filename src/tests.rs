@@ -3,6 +3,7 @@ mod exit_restore;
 mod harness;
 mod interaction;
 mod mocks;
+mod native_move;
 mod native_space_projection;
 mod session_restore;
 mod state;

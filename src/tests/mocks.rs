@@ -10,8 +10,8 @@ use crate::errors::Error;
 use crate::events::{DestroySource, Event};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
-    Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
-    Window, WindowPadding, origin_from, origin_to,
+    Application, Display, DisplayObservation, MockProcessApi, MockWindowApi, MockWindowManagerApi,
+    Origin, Size, Window, WindowPadding, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 
@@ -78,7 +78,6 @@ impl Default for MockWindowData {
 
 /// Data for a mocked display.
 struct MockDisplayData {
-    id: u32,
     bounds: IRect,
     workspaces: Vec<WorkspaceId>,
 }
@@ -92,6 +91,8 @@ struct MockStateInner {
     /// lost move/resize notification and a stale optimistic cache.
     cached_frames: HashMap<WinID, IRect>,
     displays: HashMap<u32, MockDisplayData>,
+    display_observation_count: usize,
+    display_inventory_available: bool,
     fullscreen_spaces: HashSet<WorkspaceId>,
     active_display_id: u32,
     cursor_position: Origin,
@@ -156,6 +157,8 @@ impl MockState {
                 windows: HashMap::new(),
                 cached_frames: HashMap::new(),
                 displays: HashMap::new(),
+                display_observation_count: 0,
+                display_inventory_available: true,
                 fullscreen_spaces: HashSet::new(),
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
@@ -322,14 +325,9 @@ impl MockState {
         if inner.displays.is_empty() {
             inner.active_display_id = id;
         }
-        inner.displays.insert(
-            id,
-            MockDisplayData {
-                id,
-                bounds,
-                workspaces,
-            },
-        );
+        inner
+            .displays
+            .insert(id, MockDisplayData { bounds, workspaces });
     }
 
     #[allow(unused)]
@@ -408,6 +406,40 @@ impl MockState {
             .force_write()
             .present_display_topology_scripts
             .insert(display_id, responses.into_iter().collect());
+    }
+
+    fn observe_displays(&self) -> crate::errors::Result<Vec<DisplayObservation>> {
+        let mut inner = self.inner.force_write();
+        inner.display_observation_count += 1;
+        if !inner.display_inventory_available {
+            return Err(Error::Generic("display inventory unavailable".into()));
+        }
+        let ids = inner.displays.keys().copied().collect::<Vec<_>>();
+        Ok(ids
+            .into_iter()
+            .map(|id| {
+                let available = inner
+                    .present_display_topology_scripts
+                    .get_mut(&id)
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or(Ok(()));
+                let display = &inner.displays[&id];
+                DisplayObservation {
+                    display: Display::new(id, display.bounds, TEST_MENUBAR_HEIGHT),
+                    spaces: available
+                        .map(|()| display.workspaces.clone())
+                        .map_err(|()| Error::Generic(format!("display {id} topology unavailable"))),
+                }
+            })
+            .collect())
+    }
+
+    pub(crate) fn set_display_inventory_available(&self, available: bool) {
+        self.inner.force_write().display_inventory_available = available;
+    }
+
+    pub(crate) fn display_observation_count(&self) -> usize {
+        self.inner.force_read().display_observation_count
     }
 
     fn query_workspace_windows(
@@ -1513,38 +1545,14 @@ impl MockState {
         self.mock_native_space_queries(&mut wm);
 
         let s = self.clone();
-        wm.expect_is_fullscreen_space()
-            .returning(move |display_id| {
-                let inner = s.inner.force_read();
-                inner
-                    .displays
-                    .get(&display_id)
-                    .and_then(|display| display.workspaces.first())
-                    .is_some_and(|workspace_id| inner.fullscreen_spaces.contains(workspace_id))
-            });
-
+        wm.expect_observe_displays()
+            .returning(move || s.observe_displays());
         let s = self.clone();
         wm.expect_present_displays().returning(move || {
-            let mut inner = s.inner.force_write();
-            let display_ids = inner.displays.keys().copied().collect::<Vec<_>>();
-            display_ids
+            s.observe_displays()
+                .unwrap_or_default()
                 .into_iter()
-                .filter_map(|display_id| {
-                    let topology_available = inner
-                        .present_display_topology_scripts
-                        .get_mut(&display_id)
-                        .and_then(VecDeque::pop_front)
-                        .unwrap_or(Ok(()))
-                        .is_ok();
-                    if !topology_available {
-                        return None;
-                    }
-                    let display = inner.displays.get(&display_id)?;
-                    Some((
-                        Display::new(display.id, display.bounds, TEST_MENUBAR_HEIGHT),
-                        display.workspaces.clone(),
-                    ))
-                })
+                .filter_map(DisplayObservation::into_known_topology)
                 .collect()
         });
 

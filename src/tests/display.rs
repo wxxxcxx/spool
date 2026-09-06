@@ -7,17 +7,385 @@ use bevy::time::TimeUpdateStrategy;
 
 use crate::commands::{Action, MouseMove, MoveFocus, Operation};
 use crate::config::Config;
+use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Floating, ObservedWindowFrame,
-    ReadDisplayProperties, RefreshWindowSizes, Timeout,
+    ReadDisplayProperties, RefreshWindowSizes,
 };
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::{assert_not_on_workspace, assert_on_workspace, assert_window_at, assert_window_size};
 
 use super::*;
+use crate::ecs::native_space::DetachedSpace;
+
+#[test]
+fn long_display_disconnect_preserves_strip_identity_and_window_order() {
+    let mut harness = TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(
+                TEST_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+                EXT_DISPLAY_HEIGHT,
+            ),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(101, EXT_WORKSPACE_ID, |_| {});
+    harness.pump_frames(30);
+    let (source, order) = {
+        let world = harness.world();
+        let (entity, strip) = world
+            .query::<(Entity, &LayoutStrip)>()
+            .iter(world)
+            .find(|(_, strip)| strip.id() == EXT_WORKSPACE_ID)
+            .expect("external strip");
+        (entity, strip.all_windows())
+    };
+    {
+        let world = harness.world();
+        world
+            .get_mut::<FloatingLayer>(source)
+            .expect("external floating layer")
+            .front = true;
+    }
+    harness.mock_state.remove_display(EXT_DISPLAY_ID);
+    harness.world().write_message(Event::DisplayRemoved {
+        display_id: EXT_DISPLAY_ID,
+    });
+    harness.pump_frames(350);
+    assert_eq!(
+        harness
+            .world()
+            .get::<LayoutStrip>(source)
+            .expect("detached strip must outlive a timeout")
+            .all_windows(),
+        order
+    );
+    assert!(
+        harness
+            .world()
+            .get::<FloatingLayer>(source)
+            .expect("floating layer must share the retained Space lifetime")
+            .front
+    );
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(
+            TEST_DISPLAY_WIDTH,
+            0,
+            TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+            EXT_DISPLAY_HEIGHT,
+        ),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.world().write_message(Event::DisplayAdded {
+        display_id: EXT_DISPLAY_ID,
+    });
+    harness.pump_frames(30);
+    assert_eq!(
+        harness
+            .world()
+            .get::<LayoutStrip>(source)
+            .expect("same strip must reattach")
+            .all_windows(),
+        order
+    );
+    let parent = harness
+        .world()
+        .get::<ChildOf>(source)
+        .expect("reattached")
+        .parent();
+    assert_eq!(
+        harness
+            .world()
+            .get::<Display>(parent)
+            .expect("display")
+            .id(),
+        EXT_DISPLAY_ID
+    );
+    assert!(
+        harness
+            .world()
+            .get::<FloatingLayer>(source)
+            .expect("reattached floating layer")
+            .front
+    );
+    for entity in order {
+        assert!(harness.world().get::<Floating>(entity).is_none());
+    }
+}
+
+#[test]
+fn lifecycle_consumers_share_one_topology_observation_per_invalidation() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(30);
+    let before = harness.mock_state.display_observation_count();
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: TEST_DISPLAY_ID,
+    });
+    harness.pump_frames(1);
+    assert_eq!(
+        harness.mock_state.display_observation_count() - before,
+        1,
+        "display and Space lifecycle consumers must share the same observation"
+    );
+}
+
+#[test]
+fn failed_topology_epoch_preserves_projection_but_is_not_membership_evidence() {
+    use crate::ecs::topology::NativeTopology;
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(30);
+    let generation = harness.world().resource::<NativeTopology>().generation();
+    let display = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &Display)>()
+            .iter(world)
+            .next()
+            .expect("display")
+            .0
+    };
+    harness.mock_state.set_display_inventory_available(false);
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: TEST_DISPLAY_ID,
+    });
+    harness.pump_frames(1);
+    assert!(harness.world().get::<Display>(display).is_some());
+    let snapshot = harness.world().resource::<NativeTopology>();
+    assert!(snapshot.generation() > generation);
+    assert!(!snapshot.is_complete());
+    assert_eq!(snapshot.known_displays().count(), 0);
+    harness.mock_state.set_display_inventory_available(true);
+    harness.pump_frames(30);
+    assert!(harness.world().resource::<NativeTopology>().is_complete());
+    assert!(harness.world().get::<Display>(display).is_some());
+}
+
+#[test]
+fn partial_topology_is_shared_without_another_consumer_retrying_in_the_same_frame() {
+    use crate::ecs::topology::NativeTopology;
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(30);
+    harness
+        .mock_state
+        .script_present_display_topology_queries(TEST_DISPLAY_ID, [Err(()), Ok(())]);
+    let before = harness.mock_state.display_observation_count();
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: TEST_DISPLAY_ID,
+    });
+    harness.pump_frames(1);
+    assert_eq!(harness.mock_state.display_observation_count() - before, 1);
+    assert!(!harness.world().resource::<NativeTopology>().is_complete());
+    let world = harness.world();
+    assert_eq!(world.query::<&Display>().iter(world).count(), 1);
+    assert_eq!(world.query::<&LayoutStrip>().iter(world).count(), 1);
+    harness.pump_frames(30);
+    assert!(harness.world().resource::<NativeTopology>().is_complete());
+}
+
+#[test]
+fn position_verifier_does_not_overwrite_the_presented_frame() {
+    use crate::ecs::{
+        DesiredWindowFrame, PresentedWindowFrame, VerifyWindowPosition, WindowFrameMotion,
+    };
+    let config: Config = (
+        crate::config::MainOptions {
+            animation_speed: Some(2.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(1);
+    harness.pump_frames(40);
+    let entity = find_window_entity(0, harness.world());
+    let current = harness
+        .world()
+        .get::<DesiredWindowFrame>(entity)
+        .expect("desired")
+        .0;
+    let target = IRect::from_corners(
+        current.min + IVec2::new(200, 0),
+        current.max + IVec2::new(200, 0),
+    );
+    harness.world().entity_mut(entity).insert((
+        DesiredWindowFrame(target),
+        PresentedWindowFrame(current),
+        WindowFrameMotion,
+        VerifyWindowPosition::default(),
+    ));
+    harness.world().run_schedule(PostUpdate);
+    let presented = harness
+        .world()
+        .get::<PresentedWindowFrame>(entity)
+        .expect("presented")
+        .0;
+    assert_ne!(presented, target, "fixture must still be animating");
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(presented));
+}
+
+#[test]
+fn wake_preserves_valid_floating_window_position() {
+    let config = Config::try_from(r#"{"windows": {"test": {"title": ".*", "floating": true}}}"#)
+        .expect("floating config");
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_window(0, |window| {
+            window.frame = IRect::new(220, 160, 620, 460);
+        });
+    harness.pump_frames(20);
+    harness.mock_state.os_move_window(0, Origin::new(220, 160));
+    harness.mock_state.os_resize_window(0, Size::new(400, 300));
+    harness.pump_frames(10);
+    let entity = find_window_entity(0, harness.world());
+    let before = harness
+        .world()
+        .get::<Window>(entity)
+        .expect("window")
+        .frame();
+    assert_eq!(before, IRect::new(220, 160, 620, 460));
+    harness.world().write_message(Event::SystemWoke {
+        msg: "same topology".into(),
+    });
+    harness.pump_frames(2);
+    {
+        let world = harness.world();
+        for mut refresh in world.query::<&mut RefreshWindowSizes>().iter_mut(world) {
+            refresh.0 = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(6))
+                .expect("six seconds before now");
+        }
+    }
+    harness.pump_frames(40);
+    let after = harness
+        .world()
+        .get::<Window>(entity)
+        .expect("window")
+        .frame();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn display_heartbeat_discovers_a_connection_without_an_os_notification() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(20);
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(
+            TEST_DISPLAY_WIDTH,
+            0,
+            TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+            EXT_DISPLAY_HEIGHT,
+        ),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.pump_frames(30);
+    let world = harness.world();
+    assert_eq!(world.query::<&Display>().iter(world).count(), 2);
+    assert_eq!(
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .filter(|strip| strip.id() == EXT_WORKSPACE_ID)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn partial_display_topology_does_not_remove_a_connected_display() {
+    use bevy::ecs::system::RunSystemOnce as _;
+    let mut harness = TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {});
+    harness.pump_frames(20);
+    let original_display = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &Display)>()
+            .iter(world)
+            .find_map(|(entity, display)| (display.id() == EXT_DISPLAY_ID).then_some(entity))
+            .expect("external display")
+    };
+    harness
+        .mock_state
+        .script_present_display_topology_queries(EXT_DISPLAY_ID, [Err(())]);
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: EXT_DISPLAY_ID,
+    });
+    harness
+        .world()
+        .run_system_once(crate::ecs::topology::refresh_topology)
+        .expect("sample partial display topology");
+    harness
+        .world()
+        .run_system_once(crate::ecs::display::reconcile_displays)
+        .expect("reconcile partial display topology");
+    assert!(
+        harness.world().get::<Display>(original_display).is_some(),
+        "one failed Space read is not evidence that its physical display was removed"
+    );
+    harness.world().resource_mut::<Messages<Event>>().clear();
+    harness.pump_frames(50);
+    let world = harness.world();
+    assert_eq!(world.query::<&Display>().iter(world).count(), 2);
+}
+
+#[test]
+fn same_display_origin_changes_rebase_frames_without_losing_strip_offset() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(20);
+    let window = find_window_entity(0, harness.world());
+    let initial = harness
+        .world()
+        .get::<crate::ecs::DesiredWindowFrame>(window)
+        .expect("initial desired frame")
+        .0;
+    for offset in [
+        IVec2::new(0, -TEST_DISPLAY_HEIGHT),
+        IVec2::new(TEST_DISPLAY_WIDTH, -TEST_DISPLAY_HEIGHT),
+        IVec2::new(-TEST_DISPLAY_WIDTH, 0),
+        IVec2::ZERO,
+    ] {
+        harness.mock_state.add_display(
+            TEST_DISPLAY_ID,
+            IRect::from_corners(
+                offset,
+                offset + IVec2::new(TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            ),
+            vec![TEST_WORKSPACE_ID],
+        );
+        let expected = IRect::from_corners(initial.min + offset, initial.max + offset);
+        harness.mock_state.os_set_window_frame_silently(0, expected);
+        harness.world().write_message(Event::DisplayMoved {
+            display_id: TEST_DISPLAY_ID,
+        });
+        harness.pump_frames(30);
+
+        assert_eq!(
+            harness
+                .world()
+                .get::<crate::ecs::DesiredWindowFrame>(window)
+                .expect("desired")
+                .0,
+            expected,
+            "display translation must rebase the layout at {offset:?}"
+        );
+        assert_eq!(harness.mock_state.actual_window_frame(0), Some(expected));
+    }
+}
 
 fn discover_bottom_dock(displays: Query<Entity, Added<Display>>, mut commands: Commands) {
     for entity in &displays {
@@ -83,8 +451,8 @@ fn test_multi_display_lifecycle() {
             };
             let workspace = world.entity(workspace_entity);
             assert!(
-                workspace.get::<Timeout>().is_some(),
-                "orphaned workspace should have a timeout"
+                workspace.get::<DetachedSpace>().is_some(),
+                "orphaned workspace should retain its source display"
             );
             assert!(
                 workspace.get::<ChildOf>().is_none(),
@@ -108,8 +476,8 @@ fn test_multi_display_lifecycle() {
             };
             let workspace = world.entity(workspace_entity);
             assert!(
-                workspace.get::<Timeout>().is_none(),
-                "re-parented workspace should no longer have a timeout"
+                workspace.get::<DetachedSpace>().is_none(),
+                "re-parented workspace should no longer be detached"
             );
             let child_of: &ChildOf = workspace
                 .get::<ChildOf>()
@@ -171,7 +539,7 @@ fn test_multi_workspace_orphaning() {
             for &ws in &workspace_entities {
                 let entity: EntityRef = world.entity(ws);
                 assert!(
-                    entity.get::<Timeout>().is_some(),
+                    entity.get::<DetachedSpace>().is_some(),
                     "each workspace should have a timeout"
                 );
                 assert!(
@@ -506,14 +874,17 @@ fn test_wake_reconciles_unplugged_display() {
 
             // The external display's workspace must be orphaned, not lost.
             let orphan = world
-                .query::<(&LayoutStrip, Option<&ChildOf>, Has<Timeout>)>()
+                .query::<(&LayoutStrip, Option<&ChildOf>, Has<DetachedSpace>)>()
                 .iter(world)
                 .find(|(strip, _, _)| strip.id() == EXT_WORKSPACE_ID)
                 .map(|(_, child, timeout)| (child.is_some(), timeout));
-            let (has_parent, has_timeout) =
+            let (has_parent, detached) =
                 orphan.expect("external workspace strip should still exist");
             assert!(!has_parent, "orphaned workspace should have no parent");
-            assert!(has_timeout, "orphaned workspace should carry a timeout");
+            assert!(
+                detached,
+                "orphaned workspace should retain its source display"
+            );
         })
         .run(commands);
 }

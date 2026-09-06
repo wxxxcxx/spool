@@ -10,11 +10,10 @@ use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single, SystemParam};
-use bevy::time::Time;
 use bevy::time::common_conditions::on_timer;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use tracing::{Level, debug, error, instrument, warn};
+use tracing::{Level, debug, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
 use crate::config::Config;
@@ -25,9 +24,9 @@ use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::reconcile::WindowUnavailable;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Floating,
-    FullscreenDefaultsDeferred, Initializing, NativeFullscreenMarker, Position, PreviousTiledStrip,
+    FullscreenDefaultsDeferred, Initializing, NativeFullscreenMarker, PreviousTiledStrip,
     RefreshWindowSizes, RepositionMarker, ReshuffleAroundMarker, ResizeMarker, SpawnCommandsExt,
-    Timeout, VerifyWindowPosition, WindowFrameMotion, WindowVisibility,
+    VerifyWindowPosition, WindowFrameMotion, WindowVisibility,
 };
 use crate::errors::Result;
 use crate::events::Event;
@@ -44,9 +43,10 @@ pub(crate) struct PendingSpaceDestruction {
     pub(crate) workspace_id: WorkspaceId,
     source_display_id: u32,
     was_active: bool,
+    explicit: bool,
 }
 
-/// Freezes a window while macOS is moving it away from a disappearing Space.
+/// Freezes geometry while native Space membership is changing.
 /// The `WindowServer` membership snapshot, rather than notification order, ends
 /// this state.
 #[derive(Component, Debug)]
@@ -57,36 +57,38 @@ pub(crate) struct WindowSpaceReassignmentPending {
 impl Plugin for WorkspaceEventsPlugin {
     fn build(&self, app: &mut App) {
         const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
-        const DISPLAY_CHANGE_CHECK_FREQ_MS: u64 = 1000;
 
         app.init_resource::<native_space::NativeSpaceTransactions>();
         app.add_systems(
             PreUpdate,
             (
                 native_space::handle_focus_window_commands,
-                native_space::handle_native_space_commands,
-                invalidate_missing_workspaces.after(super::systems::pump_events),
+                (
+                    native_space::handle_native_space_commands,
+                    super::topology::refresh_topology,
+                    invalidate_missing_workspaces,
+                )
+                    .chain()
+                    .after(super::systems::pump_events),
             ),
         );
         app.add_systems(
             Update,
             (
-                workspace_change_handler,
+                native_space::reconcile_native_spaces
+                    .after(super::display::reconcile_displays)
+                    .before(reconcile_fullscreen_spaces)
+                    .before(super::systems::finish_setup),
+                reconcile_fullscreen_spaces.before(detect_moved_windows),
                 detect_moved_windows.run_if(not(resource_exists::<Initializing>)),
                 refresh_workspace_window_sizes.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
                 ))),
-                find_orphaned_workspaces
-                    .after(crate::ecs::display::reconcile_displays)
-                    .run_if(on_timer(Duration::from_millis(
-                        DISPLAY_CHANGE_CHECK_FREQ_MS,
-                    ))),
             ),
         );
         app.add_systems(
             Last,
             (
-                native_space::reconcile_native_spaces,
                 reconcile_destroyed_workspace_membership,
                 native_space::reconcile_native_space_transactions,
             )
@@ -97,131 +99,86 @@ impl Plugin for WorkspaceEventsPlugin {
     }
 }
 
-fn fullscreen_window_in_strip(
-    workspace_id: WorkspaceId,
-    strip: &LayoutStrip,
-    windows: &Windows,
-    window_manager: &WindowManager,
-) -> Option<Entity> {
-    window_manager
-        .windows_in_workspace(workspace_id)
-        .ok()
-        .and_then(|window_ids| {
-            window_ids.into_iter().find_map(|window_id| {
-                windows
-                    .find_tiled(window_id)
-                    .map(|(_, entity)| entity)
-                    .filter(|entity| strip.contains(*entity))
-            })
-        })
-        .or_else(|| {
-            windows.tiled_iter().find_map(|(window, entity, _)| {
-                (strip.contains(entity) && window.is_full_screen()).then_some(entity)
-            })
-        })
-        .or_else(|| {
-            windows
-                .focused()
-                .map(|(_, entity)| entity)
-                .filter(|entity| strip.contains(*entity))
-        })
-}
-
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn workspace_change_handler(
+pub(super) fn reconcile_fullscreen_spaces(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    mut workspaces: Query<(&mut LayoutStrip, Entity, Has<ActiveWorkspaceMarker>)>,
-    active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
+    mut workspaces: Query<(&mut LayoutStrip, Entity, Has<NativeFullscreenMarker>)>,
+    topology: Res<super::topology::NativeTopology>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
+    mut generation: Local<u64>,
 ) {
-    if !messages
+    let signaled = messages
         .read()
-        .any(|event| matches!(event, Event::SpaceChanged))
-    {
+        .any(|event| matches!(event, Event::SpaceChanged));
+    if !signaled && *generation == topology.generation() {
         return;
     }
-    let (active_display, display_entity) = *active_display;
-
-    let Ok(workspace_id) = window_manager.active_display_space(active_display.id()) else {
-        error!("Unable to get active workspace id!");
-        return;
-    };
-
-    let mut remove_from = None;
-    let mut insert_into = None;
-    for (strip, entity, active) in &workspaces {
-        if active && strip.id() == workspace_id {
-            debug!("Workspace id {} already active", strip.id());
-            return;
-        }
-        if active && strip.id() != workspace_id {
-            debug!("Workspace id {} no longer active", strip.id());
-            remove_from = Some(entity);
-        }
-        if !active && strip.id() == workspace_id {
-            debug!("Workspace id {} is active", strip.id());
-            insert_into = Some(entity);
-        }
-    }
-
-    if insert_into.is_none() {
-        // The Space may have been observed before its display association was
-        // updated; find its sole strip by stable ID.
-        insert_into = workspaces
-            .iter()
-            .find(|(strip, _, _)| strip.id() == workspace_id)
-            .map(|(_, entity, _)| entity);
-    }
-
-    if insert_into.is_none()
-        && let Some(old_space) = remove_from
-        && window_manager.is_fullscreen_space(active_display.id())
-        && let Ok((mut old_strip, old_strip_entity, _)) = workspaces.get_mut(old_space)
-        && let Some(fullscreen_window) =
-            fullscreen_window_in_strip(workspace_id, &old_strip, &windows, &window_manager)
-        && let Ok(original_index) = old_strip.index_of(fullscreen_window)
-    {
-        debug!("workspace_change: space={workspace_id} fullscreen");
-
-        let fullscreen_marker = NativeFullscreenMarker {
-            layout_strip: old_strip_entity,
-            workspace_id: old_strip.id(),
-            index: original_index,
+    *generation = topology.generation();
+    let targets = workspaces
+        .iter()
+        .filter_map(|(strip, entity, marked)| {
+            (topology.is_fullscreen(strip.id()) && !marked).then_some((entity, strip.id()))
+        })
+        .collect::<Vec<_>>();
+    for (target, workspace_id) in targets {
+        let Ok(members) = window_manager.windows_in_workspace(workspace_id) else {
+            continue;
         };
-        old_strip.remove(fullscreen_window);
-        if let Ok(mut entity_commands) = commands.get_entity(fullscreen_window) {
-            entity_commands.remove::<(
-                RepositionMarker,
-                ResizeMarker,
-                WindowFrameMotion,
-                VerifyWindowPosition,
-            )>();
+        let mut sources = members
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter_map(|id| windows.find_tiled(id).map(|(_, entity)| entity))
+            .filter_map(|window| {
+                workspaces.iter().find_map(|(strip, entity, _)| {
+                    (entity != target)
+                        .then(|| {
+                            strip
+                                .index_of(window)
+                                .ok()
+                                .map(|index| (entity, strip.id(), index, window))
+                        })
+                        .flatten()
+                })
+            });
+        let Some((source, source_id, index, window)) = sources.next() else {
+            continue;
+        };
+        if sources.next().is_some() {
+            warn!(
+                workspace_id,
+                "fullscreen membership has multiple tracked source windows; deferring migration"
+            );
+            continue;
         }
-
-        let fullscreen_strip = LayoutStrip::fullscreen(workspace_id, fullscreen_window);
-        let entity = commands
-            .spawn((
-                Position(active_display.bounds().min),
-                fullscreen_marker,
-                fullscreen_strip,
-                ChildOf(display_entity),
-            ))
-            .id();
-        insert_into = Some(entity);
-    }
-
-    if let Some(into) = insert_into
-        && let Ok(mut entity_commands) = commands.get_entity(into)
-    {
-        entity_commands.try_insert(ActiveWorkspaceMarker);
+        if let Ok((mut strip, _, _)) = workspaces.get_mut(source) {
+            strip.remove(window);
+        }
+        if let Ok((mut strip, _, _)) = workspaces.get_mut(target) {
+            *strip = LayoutStrip::fullscreen(workspace_id, window);
+        }
+        commands.entity(target).insert(NativeFullscreenMarker {
+            layout_strip: source,
+            workspace_id: source_id,
+            index,
+        });
+        commands.entity(window).remove::<(
+            RepositionMarker,
+            ResizeMarker,
+            WindowFrameMotion,
+            VerifyWindowPosition,
+        )>();
     }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn detect_moved_windows(
-    activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,
+    activated_workspace: Single<
+        (Entity, Option<&native_space::NativeSpace>),
+        Added<ActiveWorkspaceMarker>,
+    >,
     mut workspaces: Query<(&mut LayoutStrip, Entity, Has<NativeFullscreenMarker>)>,
     pending_windows: Query<(), With<WindowSpaceReassignmentPending>>,
     apps: Query<&mut Application>,
@@ -229,8 +186,14 @@ fn detect_moved_windows(
     mut ignored_windows: Local<HashSet<WinID>>,
     mut ctx: WindowCtx,
 ) {
+    let (activated_workspace, native) = *activated_workspace;
+    if native.is_some_and(|space| space.kind == native_space::SpaceKind::Fullscreen) {
+        // Fullscreen ownership and source-index capture belong to its reconciler,
+        // including while its membership read is temporarily unavailable.
+        return;
+    }
     let Ok(workspace_id) = workspaces
-        .get(*activated_workspace)
+        .get(activated_workspace)
         .map(|strip| strip.0.id())
     else {
         return;
@@ -308,7 +271,7 @@ fn detect_moved_windows(
             .find_map(|(strip, _, _)| strip.tab_group(entity))
             .unwrap_or_else(|| vec![entity]);
         for (mut strip, strip_entity, _) in &mut workspaces {
-            if strip_entity == *activated_workspace {
+            if strip_entity == activated_workspace {
                 strip.append_tab_group(&moving_entities);
             } else {
                 for moving_entity in &moving_entities {
@@ -319,52 +282,47 @@ fn detect_moved_windows(
     }
 }
 
-fn topology_event(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::SpaceChanged
-            | Event::SpaceCreated { .. }
-            | Event::SpaceDestroyed { .. }
-            | Event::SystemWoke { .. }
-            | Event::DisplayAdded { .. }
-            | Event::DisplayRemoved { .. }
-            | Event::DisplayMoved { .. }
-            | Event::DisplayResized { .. }
-            | Event::DisplayConfigured { .. }
-    )
-}
-
 type InvalidatedWorkspaces<'w, 's> = Populated<
     'w,
     's,
     (
         &'static LayoutStrip,
         Entity,
-        &'static ChildOf,
+        Option<&'static ChildOf>,
         Option<&'static PendingSpaceDestruction>,
         Option<&'static NativeFullscreenMarker>,
         Has<ActiveWorkspaceMarker>,
+        Option<&'static native_space::DetachedSpace>,
     ),
 >;
 
 type DetachedPreviousWindows<'w, 's> = Query<
     'w,
     's,
-    (Entity, &'static PreviousTiledStrip),
-    (With<Window>, Without<WindowSpaceReassignmentPending>),
+    (
+        Entity,
+        &'static PreviousTiledStrip,
+        Has<WindowSpaceReassignmentPending>,
+    ),
+    With<Window>,
 >;
 
 #[derive(SystemParam)]
 struct MissingWorkspaceCtx<'w, 's> {
     workspaces: InvalidatedWorkspaces<'w, 's>,
     detached_windows: DetachedPreviousWindows<'w, 's>,
+    native_moves: Query<'w, 's, (), With<native_space::NativeMoveOwner>>,
     displays: Query<'w, 's, &'static Display>,
-    window_manager: Res<'w, WindowManager>,
+    topology: Res<'w, super::topology::NativeTopology>,
     focus: ResMut<'w, FocusCoordinator>,
     commands: Commands<'w, 's>,
 }
 
-fn freeze_window_for_space_reassignment(window: Entity, index: usize, commands: &mut Commands) {
+pub(crate) fn freeze_window_for_space_reassignment(
+    window: Entity,
+    index: usize,
+    commands: &mut Commands,
+) {
     if let Ok(mut entity_commands) = commands.get_entity(window) {
         entity_commands
             .try_insert(WindowSpaceReassignmentPending { index })
@@ -372,10 +330,65 @@ fn freeze_window_for_space_reassignment(window: Entity, index: usize, commands: 
                 RepositionMarker,
                 ResizeMarker,
                 WindowFrameMotion,
+                super::window_frame::WindowFrameCorrection,
                 VerifyWindowPosition,
                 ReshuffleAroundMarker,
                 EnsureVisibleMarker,
             )>();
+    }
+}
+
+fn resume_reappearing_workspace(
+    entity: Entity,
+    strip: &LayoutStrip,
+    detached_windows: &DetachedPreviousWindows,
+    attached_windows: &HashSet<Entity>,
+    native_moves: &Query<(), With<native_space::NativeMoveOwner>>,
+    commands: &mut Commands,
+) {
+    commands.entity(entity).remove::<PendingSpaceDestruction>();
+    let retained = strip
+        .all_windows()
+        .into_iter()
+        .chain(
+            detached_windows
+                .iter()
+                .filter_map(|(window, previous, pending)| {
+                    (pending
+                        && previous.workspace_id == strip.id()
+                        && !attached_windows.contains(&window))
+                    .then_some(window)
+                }),
+        );
+    for window in retained {
+        if !native_moves.contains(window) {
+            commands
+                .entity(window)
+                .remove::<WindowSpaceReassignmentPending>();
+        }
+    }
+}
+
+fn freeze_workspace_windows(
+    strip: &LayoutStrip,
+    fullscreen: Option<&NativeFullscreenMarker>,
+    detached_windows: &DetachedPreviousWindows,
+    attached_windows: &HashSet<Entity>,
+    commands: &mut Commands,
+) {
+    for window in strip.all_windows() {
+        let index = fullscreen
+            .filter(|_| strip.first().ok().and_then(|column| column.top()) == Some(window))
+            .map_or_else(
+                || strip.index_of(window).unwrap_or(strip.len()),
+                |marker| marker.index,
+            );
+        freeze_window_for_space_reassignment(window, index, commands);
+    }
+    for (window, previous, pending) in detached_windows {
+        if !pending && previous.workspace_id == strip.id() && !attached_windows.contains(&window) {
+            freeze_window_for_space_reassignment(window, previous.index, commands);
+        }
     }
 }
 
@@ -386,36 +399,30 @@ fn freeze_window_for_space_reassignment(window: Entity, index: usize, commands: 
 #[instrument(level = Level::DEBUG, skip_all)]
 fn invalidate_missing_workspaces(
     mut messages: MessageReader<Event>,
-    time: Res<Time>,
-    mut since_audit: Local<Duration>,
+    mut generation: Local<u64>,
     ctx: MissingWorkspaceCtx,
 ) {
     let MissingWorkspaceCtx {
         workspaces,
         detached_windows,
+        native_moves,
         displays,
-        window_manager,
+        topology,
         mut focus,
         mut commands,
     } = ctx;
-    const TOPOLOGY_HEARTBEAT: Duration = Duration::from_secs(1);
-
     let mut destroyed = HashSet::new();
-    let mut topology_changed = false;
     for event in messages.read() {
-        topology_changed |= topology_event(event);
         if let Event::SpaceDestroyed { space_id } = event {
             destroyed.insert(*space_id);
         }
     }
-    *since_audit = since_audit.saturating_add(time.delta());
-    let heartbeat = *since_audit >= TOPOLOGY_HEARTBEAT;
-    if !topology_changed && !heartbeat {
+    if destroyed.is_empty() && *generation == topology.generation() {
         return;
     }
-    *since_audit = Duration::ZERO;
-
-    let topology = window_manager.present_displays();
+    *generation = topology.generation();
+    let complete = topology.is_complete();
+    let topology = topology.known_displays().collect::<Vec<_>>();
     let present_spaces = topology
         .iter()
         .flat_map(|(_, spaces)| spaces.iter().copied())
@@ -429,15 +436,28 @@ fn invalidate_missing_workspaces(
         .flat_map(|(strip, ..)| strip.all_windows())
         .collect::<HashSet<_>>();
 
-    for (strip, entity, child, pending, fullscreen, active) in &workspaces {
+    for (strip, entity, child, pending, fullscreen, active, detached) in &workspaces {
         let source_display_id = pending
             .map(|pending| pending.source_display_id)
-            .or_else(|| displays.get(child.parent()).ok().map(Display::id));
+            .or_else(|| detached.map(|detached| detached.source_display_id))
+            .or_else(|| child.and_then(|child| displays.get(child.parent()).ok().map(Display::id)));
         let display_topology_available =
             source_display_id.is_some_and(|id| observed_displays.contains(&id));
         let missing = destroyed.contains(&strip.id())
-            || (display_topology_available && !present_spaces.contains(&strip.id()));
+            || ((display_topology_available || complete) && !present_spaces.contains(&strip.id()));
         if !missing {
+            if pending.is_some_and(|pending| !pending.explicit)
+                && present_spaces.contains(&strip.id())
+            {
+                resume_reappearing_workspace(
+                    entity,
+                    strip,
+                    &detached_windows,
+                    &attached_windows,
+                    &native_moves,
+                    &mut commands,
+                );
+            }
             continue;
         }
         let Some(source_display_id) = source_display_id else {
@@ -463,23 +483,17 @@ fn invalidate_missing_workspaces(
                     workspace_id: strip.id(),
                     source_display_id,
                     was_active,
+                    explicit: destroyed.contains(&strip.id())
+                        || pending.is_some_and(|pending| pending.explicit),
                 });
         }
-        for window in strip.all_windows() {
-            let index = fullscreen
-                .filter(|_| strip.first().ok().and_then(|column| column.top()) == Some(window))
-                .map_or_else(
-                    || strip.index_of(window).unwrap_or(strip.len()),
-                    |marker| marker.index,
-                );
-            freeze_window_for_space_reassignment(window, index, &mut commands);
-        }
-        for (window, previous) in &detached_windows {
-            if previous.workspace_id != strip.id() || attached_windows.contains(&window) {
-                continue;
-            }
-            freeze_window_for_space_reassignment(window, previous.index, &mut commands);
-        }
+        freeze_workspace_windows(
+            strip,
+            fullscreen,
+            &detached_windows,
+            &attached_windows,
+            &mut commands,
+        );
     }
 }
 
@@ -548,12 +562,13 @@ fn live_space_snapshot(
     workspaces: &DestructionWorkspaces,
     window_manager: &WindowManager,
     active_workspace_id: Option<WorkspaceId>,
+    observation: &super::topology::NativeTopology,
 ) -> LiveSpaceSnapshot {
     let destroyed_spaces = workspaces
         .iter()
         .filter_map(|(_, _, _, pending, _, _)| pending.map(|pending| pending.workspace_id))
         .collect::<HashSet<_>>();
-    let topology = window_manager.present_displays();
+    let topology = observation.known_displays().collect::<Vec<_>>();
     let observed_display_ids = topology
         .iter()
         .map(|(display, _)| display.id())
@@ -565,6 +580,7 @@ fn live_space_snapshot(
     let present_spaces = topology
         .into_iter()
         .flat_map(|(_, spaces)| spaces)
+        .copied()
         .collect::<HashSet<_>>();
     let mut candidates = workspaces
         .iter()
@@ -572,7 +588,7 @@ fn live_space_snapshot(
             (pending.is_none()
                 && !destroyed_spaces.contains(&strip.id())
                 && present_spaces.contains(&strip.id())
-                && !window_manager.workspace_is_fullscreen(strip.id()))
+                && !observation.is_fullscreen(strip.id()))
             .then_some((
                 SurvivingWorkspace {
                     entity,
@@ -601,13 +617,12 @@ fn live_space_snapshot(
         .iter()
         .copied()
         .filter(|workspace_id| {
-            !destroyed_spaces.contains(workspace_id)
-                && !window_manager.workspace_is_fullscreen(*workspace_id)
+            !destroyed_spaces.contains(workspace_id) && !observation.is_fullscreen(*workspace_id)
         })
         .collect::<Vec<_>>();
     membership_spaces.sort_unstable();
     let mut memberships = HashMap::new();
-    let mut complete = true;
+    let mut complete = observation.is_complete();
     for workspace_id in membership_spaces {
         match window_manager.windows_in_workspace(workspace_id) {
             Ok(window_ids) => {
@@ -649,7 +664,10 @@ type ReassignmentWindows<'w, 's> = Query<
         Option<&'static WindowVisibility>,
         &'static WindowSpaceReassignmentPending,
     ),
-    Without<WindowUnavailable>,
+    (
+        Without<WindowUnavailable>,
+        Without<native_space::NativeMoveOwner>,
+    ),
 >;
 
 fn unique_membership(snapshot: &LiveSpaceSnapshot, window_id: WinID) -> Option<WorkspaceId> {
@@ -916,6 +934,7 @@ fn reconcile_destroyed_workspace_membership(
     windows: ReassignmentWindows,
     active_display: Query<&Display, With<ActiveDisplayMarker>>,
     window_manager: Res<WindowManager>,
+    topology: Res<super::topology::NativeTopology>,
     mut backoff: Local<SpaceReconciliationBackoff>,
     mut commands: Commands,
 ) {
@@ -934,8 +953,9 @@ fn reconcile_destroyed_workspace_membership(
     let active_workspace_id = active_display
         .single()
         .ok()
-        .and_then(|display| window_manager.active_display_space(display.id()).ok());
-    let snapshot = live_space_snapshot(&workspaces, &window_manager, active_workspace_id);
+        .and_then(|display| topology.visible_space(display.id()));
+    let snapshot =
+        live_space_snapshot(&workspaces, &window_manager, active_workspace_id, &topology);
     if pending.iter().any(|workspace| workspace.was_active)
         && let Some(active_target) = snapshot.active_target
         && let Ok(mut entity_commands) = commands.get_entity(active_target.entity)
@@ -1010,81 +1030,27 @@ fn windows_not_in_strips<F: Fn(WinID) -> Option<Entity>>(
         })
 }
 
-#[instrument(level = Level::DEBUG, skip_all)]
-fn find_orphaned_workspaces(
-    orphans: Populated<(&LayoutStrip, Entity, &Timeout, Option<&ChildOf>), With<Timeout>>,
-    displays: Populated<(&Display, Entity)>,
-    window_manager: Res<WindowManager>,
-    mut commands: Commands,
-) {
-    let present = window_manager.present_displays();
-
-    for (orphan, orphan_entity, timeout, child) in orphans {
-        if orphan.len() == 0 {
-            if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
-                cmd.try_despawn();
-            }
-            debug!("despawning empty orphan workspace {}", orphan.id());
-            continue;
-        }
-        if child.is_some() {
-            // Was reparented, remove timer.
-            if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
-                cmd.try_remove::<Timeout>();
-                cmd.insert(RefreshWindowSizes::default());
-            }
-            debug!(
-                "layout strip {} was re-parented, removing timeout.",
-                orphan.id()
-            );
-            continue;
-        }
-
-        if timeout.timer.is_finished() {
-            // Rescue windows from orphaned strips before despawning by floating them.
-            debug!("Rescue windows from timed out orphan {}.", orphan.id());
-            for lost_window in orphan.all_windows() {
-                if let Ok(mut cmd) = commands.get_entity(lost_window) {
-                    cmd.try_insert(Floating);
-                }
-            }
-            continue;
-        }
-
-        // Find which display now owns this space ID.
-        let target = present.iter().find_map(|(present_display, spaces)| {
-            if spaces.iter().any(|&id| id == orphan.id()) {
-                displays
-                    .iter()
-                    .find(|(d, _)| d.id() == present_display.id())
-            } else {
-                None
-            }
-        });
-        let Some((target_display, target_entity)) = target else {
-            continue; // No display owns this space yet; wait for next tick.
-        };
-
-        debug!(
-            "Re-parenting orphaned strip {} to display {}",
-            orphan.id(),
-            target_display.id(),
-        );
-
-        if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
-            cmd.try_remove::<Timeout>()
-                .insert(ChildOf(target_entity))
-                .insert(RefreshWindowSizes::default());
-        }
-    }
-}
+type RefreshableWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut Window,
+        &'static mut Bounds,
+        Has<Floating>,
+    ),
+    (
+        Without<WindowUnavailable>,
+        Without<WindowSpaceReassignmentPending>,
+    ),
+>;
 
 fn refresh_workspace_window_sizes(
     layout_strip: Populated<
         (&RefreshWindowSizes, &LayoutStrip, Entity, &ChildOf),
         Without<PendingSpaceDestruction>,
     >,
-    mut windows: Query<(Entity, &mut Window, &mut Bounds, Has<Floating>)>,
+    mut windows: RefreshableWindows,
     displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
@@ -1099,12 +1065,15 @@ fn refresh_workspace_window_sizes(
         };
         let viewport = display.actual_display_bounds(dock, &config);
 
-        let mut in_workspace = window_manager
-            .windows_in_workspace(strip.id())
-            .inspect_err(|err| {
-                warn!("getting windows in workspace: {err}");
-            })
-            .unwrap_or_default();
+        let Ok(mut in_workspace) =
+            window_manager
+                .windows_in_workspace(strip.id())
+                .inspect_err(|err| {
+                    warn!("getting windows in workspace: {err}");
+                })
+        else {
+            continue;
+        };
 
         // Resize windows for the new display dimensions.
         for entity in strip.all_windows() {
@@ -1124,14 +1093,26 @@ fn refresh_workspace_window_sizes(
         }
 
         // Find remaining windows which are outside of the strip.                                                  ...
-        let floating = in_workspace.into_iter().filter_map(|window_id| {
-            windows.iter().find_map(|(entity, window, _, floating)| {
-                (window_id == window.id() && floating).then_some(entity)
+        let floating = in_workspace
+            .into_iter()
+            .filter_map(|window_id| {
+                windows.iter().find_map(|(entity, window, _, floating)| {
+                    (window_id == window.id() && floating).then_some(entity)
+                })
             })
-        });
+            .collect::<Vec<_>>();
         for window_entity in floating {
-            debug!("repositioning floating window {window_entity}");
-            commands.reposition_entity(window_entity, viewport.min);
+            let Ok((_, mut window, _, _)) = windows.get_mut(window_entity) else {
+                continue;
+            };
+            let Ok(frame) = window.update_frame() else {
+                continue;
+            };
+            let last_origin = (viewport.max - frame.size()).max(viewport.min);
+            let origin = frame.min.clamp(viewport.min, last_origin);
+            if origin != frame.min {
+                commands.reposition_entity(window_entity, origin);
+            }
         }
 
         if let Ok(mut cmds) = commands.get_entity(strip_entity) {

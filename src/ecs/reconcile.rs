@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 use crate::config::Config;
 use crate::ecs::focus::{FocusCoordinator, FocusSignal, FocusSnapshot};
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::window_frame::WindowFrameCorrection;
 use crate::ecs::window_geometry::WindowGeometrySettling;
 use crate::ecs::workspace::WindowSpaceReassignmentPending;
 use crate::ecs::{
@@ -114,18 +115,29 @@ impl WindowStateSync {
         true
     }
 
-    fn converge_tiled_frame(
+    pub(crate) fn confirm_frame_convergence(
+        &mut self,
+        entity: Entity,
+        frame: IRect,
+        target: IRect,
+    ) -> bool {
+        if !frames_equivalent(frame, target) {
+            return false;
+        }
+        self.frame_convergence.remove(&entity);
+        true
+    }
+
+    pub(crate) fn admit_frame_correction(
         &mut self,
         entity: Entity,
         window_id: WinID,
-        window: &mut Window,
-        mut frame: IRect,
+        frame: IRect,
         target: IRect,
         now: Duration,
-    ) -> Option<IRect> {
-        if frames_equivalent(frame, target) {
-            self.frame_convergence.remove(&entity);
-            return Some(frame);
+    ) -> bool {
+        if self.confirm_frame_convergence(entity, frame, target) {
+            return false;
         }
 
         let convergence = self
@@ -159,33 +171,15 @@ impl WindowStateSync {
                     ?retry_after,
                     "window frame remains constrained during retry cooldown"
                 );
-                return Some(frame);
+                return false;
             }
         }
 
         convergence.attempts += 1;
-        match window.set_frame(target) {
-            Ok(confirmed_frame) => {
-                frame = confirmed_frame;
-                if frames_equivalent(frame, target) {
-                    self.frame_convergence.remove(&entity);
-                } else if let Some(convergence) = self.frame_convergence.get_mut(&entity)
-                    && convergence.attempts >= MAX_FRAME_ATTEMPTS
-                {
-                    convergence.retry_after = Some(now.saturating_add(FRAME_RETRY_COOLDOWN));
-                }
-            }
-            Err(error) => {
-                warn!(
-                    window_id,
-                    attempt = convergence.attempts,
-                    %error,
-                    "unable to converge tiled window frame"
-                );
-                return None;
-            }
+        if convergence.attempts >= MAX_FRAME_ATTEMPTS {
+            convergence.retry_after = Some(now.saturating_add(FRAME_RETRY_COOLDOWN));
         }
-        Some(frame)
+        true
     }
 }
 
@@ -679,7 +673,7 @@ impl ReconcileState<'_, '_> {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "one audit pass keeps each window's observe, converge, and publish transaction contiguous"
+        reason = "one audit pass keeps each window's observation, correction request, and publication contiguous"
     )]
     fn reconcile_frames(
         &mut self,
@@ -687,7 +681,6 @@ impl ReconcileState<'_, '_> {
         audit: &LifecycleAudit,
         sync: &mut WindowStateSync,
         commands: &mut Commands,
-        now: Duration,
     ) {
         let native_fullscreen_windows = self
             .workspaces
@@ -753,7 +746,7 @@ impl ReconcileState<'_, '_> {
                 continue;
             }
 
-            let Ok(mut frame) = window.update_frame().inspect_err(|error| {
+            let Ok(frame) = window.update_frame().inspect_err(|error| {
                 warn!(window_id, %error, "unable to observe window frame");
             }) else {
                 remove_observed_frame(entity, commands);
@@ -773,38 +766,13 @@ impl ReconcileState<'_, '_> {
                 && !self.settling.contains(entity);
             if !floating && can_adopt_frame {
                 let target = desired.0;
-                let Some(confirmed) =
-                    sync.converge_tiled_frame(entity, window_id, &mut window, frame, target, now)
-                else {
-                    // The AX setter may have partially succeeded even though
-                    // it returned an error. Keep a fresh physical readback so
-                    // overlays and diagnostics never fall back to stale or
-                    // missing geometry while the bounded retry is pending.
-                    match window.update_frame() {
-                        Ok(readback) => {
-                            if let Some(mut observed) = observed {
-                                if observed.0 != readback {
-                                    observed.0 = readback;
-                                }
-                            } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                                entity_commands.try_insert(ObservedWindowFrame(readback));
-                            }
-                        }
-                        Err(error) => {
-                            warn!(window_id, %error, "unable to read back constrained tiled window frame");
-                            remove_observed_frame(entity, commands);
-                        }
+                if sync.confirm_frame_convergence(entity, frame, target) {
+                    presented.bypass_change_detection().0 = frame;
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_remove::<WindowFrameCommitSuspended>();
                     }
-                    continue;
-                };
-                frame = confirmed;
-                if presented.0 != frame {
-                    presented.0 = frame;
-                }
-                if frames_equivalent(frame, target)
-                    && let Ok(mut entity_commands) = commands.get_entity(entity)
-                {
-                    entity_commands.try_remove::<WindowFrameCommitSuspended>();
+                } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(WindowFrameCorrection(target));
                 }
             } else if floating {
                 sync.frame_convergence.remove(&entity);
@@ -860,7 +828,7 @@ pub(super) fn reconcile_windows(
     if (heartbeat || !request.pids.is_empty()) && focus_audit_enabled {
         state.audit_frontmost_focus(&request, &mut sync, &mut commands);
     }
-    state.reconcile_frames(&request, &audit, &mut sync, &mut commands, time.elapsed());
+    state.reconcile_frames(&request, &audit, &mut sync, &mut commands);
 }
 
 fn refresh_application_observer(entity: Entity, app: &mut Application, sync: &mut WindowStateSync) {
