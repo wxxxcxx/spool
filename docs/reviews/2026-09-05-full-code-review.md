@@ -7,7 +7,7 @@
 - 用户明确选择当前代码全量审查，不使用历史提交 diff。Standards 与 Spec 由独立审查者检查，再由主审查者核实关键发现和补充测试；两轴分别报告，不合并评分。
 - 深入检查：显示器事件、Display/Native Space 拓扑、窗口 membership、布局坐标、Desired/Presented/Observed、普通提交与重试、启动恢复及相关测试。
 - 辅助检查：Lua worker/查询缓存/热重载、Bar 状态与生命周期、IPC、持久化。辅助检查深度低于窗口管理主路径，不能据此宣称这些模块没有其他缺陷。
-- 规范来源：`AGENTS.md`、`ARCHITECTURE.md`、`CONTEXT.md`、ADR 0001；功能契约补充 `SCRIPTING.md`、`CONFIGURATION.md`、`BAR.md`。没有提供单一 issue/PRD，缺少 `docs/agents/issue-tracker.md`；本次不擅自初始化 issue tracker，按当前仓库契约审查。
+- 规范来源：`AGENTS.md`、`docs/ARCHITECTURE.md`、`docs/CONTEXT.md`、ADR 0001；功能契约补充 `docs/SCRIPTING.md`、`docs/CONFIGURATION.md`、`docs/BAR.md`。没有提供单一 issue/PRD，缺少 `docs/agents/issue-tracker.md`；本次不擅自初始化 issue tracker，按当前仓库契约审查。
 - 原工作区生产代码与既有测试未修改。审查期间出现的未跟踪 `docs/research/` 不属于本次工作，未改动。回归探针位于独立的 `/tmp/spool-review-495c2ff` 源码快照。
 - 以下 mock 重现证明具体代码路径存在缺陷，不等于已确认用户真实桌面上每一次错位都由它们引起。未重启 daemon、操作用户窗口或进行实体显示器插拔。
 
@@ -17,7 +17,7 @@
 
 ### S1 [P2] 后台 AX discovery 违反仓库线程约束
 
-规范：`ARCHITECTURE.md:105` 要求与 Accessibility 的交互发生在主线程。
+规范：`docs/ARCHITECTURE.md:105` 要求与 Accessibility 的交互发生在主线程。
 
 `src/ecs/systems.rs:283` 将 `bruteforce_windows` 放入 `AsyncComputeTaskPool`；`src/manager.rs:1151` 在该任务内创建 AX element，随后构造窗口包装对象并返回到 ECS。这与当前声明的线程封闭模型不一致。尚未证明它导致真实崩溃，不能把它当成已复现的插拔根因。
 
@@ -25,7 +25,7 @@
 
 ### S2 [P1] 普通窗口几何存在竞争写入者
 
-规范：`ARCHITECTURE.md:107-108` / ADR 0001 声明单向投影，普通提交只消费 Presented。
+规范：`docs/ARCHITECTURE.md:107-108` / ADR 0001 声明单向投影，普通提交只消费 Presented。
 
 `src/ecs.rs:247` 把位置 verifier 放在普通 commit 之后；`src/ecs/systems.rs:1456` 却直接写 Desired 的 origin。正常 retile 在 `src/ecs/triggers.rs:1080` 安装该 verifier，因此这不是仅限退出恢复的特殊写入。另有 defaults 直接写 frame（`src/ecs/triggers.rs:1646`）。
 
@@ -43,7 +43,7 @@
 
 ### S4 [P2] 旧 Lua callback 可以覆盖新 runtime 的 handler 状态
 
-契约：`SCRIPTING.md:112-118` 描述成功热重载替换当前配置/runtime。
+契约：`docs/SCRIPTING.md:112-118` 描述成功热重载替换当前配置/runtime。
 
 `src/lua/worker.rs:443-447` 发布新 runtime 的 handler 状态，但 reload 前已经挂起的 task 仍持有旧 runtime；它结束时 `src/lua/worker.rs:478-479` 再次向共享 `has_handlers` 写入旧值。旧脚本只有 bind、新脚本新增 on handler 时，旧 bind 的迟到完成可把新值改回 false。`src/lua.rs:90` 会据此停止转发事件。
 
@@ -53,7 +53,7 @@
 
 ### S5 [P2] Lua 查询缓存的寿命由所有重叠 callback 决定
 
-契约：`SCRIPTING.md:206` 表述为按 callback 按需获取状态；`CONTEXT.md` 定义 State Snapshot 为当前状态的时点投影。
+契约：`docs/SCRIPTING.md:206` 表述为按 callback 按需获取状态；`docs/CONTEXT.md` 定义 State Snapshot 为当前状态的时点投影。
 
 `src/lua/world.rs:138` 直接返回已有缓存，直到 `src/lua/world.rs:272` 的全局 `in_flight` 归零才清除。callback A 持有一次读取并持续挂起时，之后其他帧的 callback B/C 仍可能拿到 A 的旧布局；连续重叠任务可以让缓存长期不失效。reload 也共享同一个 DispatchWorld。
 
@@ -75,7 +75,7 @@
 
 ### B1 [P1] 短暂缺失的 Space 回来后仍被冻结
 
-需求：`ARCHITECTURE.md:106`，macOS 是 topology/membership 的事实来源；当前观测恢复后应能够恢复投影。
+需求：`docs/ARCHITECTURE.md:106`，macOS 是 topology/membership 的事实来源；当前观测恢复后应能够恢复投影。
 
 路径：`src/ecs/workspace.rs:438` 把一次 Space 缺失认定为待销毁，冻结窗口；随后 ID 再次出现时，`src/ecs/native_space.rs:429` 跳过 pending strip，`src/ecs/workspace.rs:604` 又把该 Space 排除在 membership 恢复候选外。不存在“撤销误判”的路径。
 
@@ -85,7 +85,7 @@
 
 ### B2 [P1] 原生跨 Space 移动尚未确认时仍写源显示器坐标
 
-需求：`ARCHITECTURE.md:108` 明确要求 Space reassignment 暂停或取代普通几何写入。
+需求：`docs/ARCHITECTURE.md:108` 明确要求 Space reassignment 暂停或取代普通几何写入。
 
 路径：`src/ecs/native_space.rs:231-241` 先提交 native move，只记录 PendingMove，没有取得窗口 geometry ownership 或暂停 motion。命令在 PreUpdate 处理，普通 commit 在 PostUpdate，membership transaction 在 Last 才确认（`src/ecs/workspace.rs:87-93`）。
 
@@ -95,7 +95,7 @@
 
 ### B3 [P2] 启动恢复用保存的 Space 覆盖真实 membership
 
-需求：`ARCHITECTURE.md:106` 的 split ownership，保存状态只能恢复 Spool 布局，不能凭空宣布原生 membership 已改变。
+需求：`docs/ARCHITECTURE.md:106` 的 split ownership，保存状态只能恢复 Spool 布局，不能凭空宣布原生 membership 已改变。
 
 路径：`src/ecs/restore.rs:186` 直接使用 saved Space；`src/ecs/restore.rs:426-439` 校验 Space 是否存在及 display 映射，却没有按当前每个窗口的 membership 过滤。`finish_setup` 虽做一次真实 membership 对齐，但在其结束时才触发 RestoreWindowState（`src/ecs/systems.rs:384-385`），恢复又会覆盖刚对齐的结果。平时 detect_moved_windows 依赖新激活 Space，未覆盖长期 inactive 目的地。
 
@@ -105,7 +105,7 @@
 
 ### B4 [P1] 显示器 ID 不变、原点改变时布局仍使用旧全局坐标
 
-需求：每显示器独立布局（`README.md:22-24`）及 `CONTEXT.md` 的 Desired Window Frame 定义。
+需求：每显示器独立布局（`README.md:22-24`）及 `docs/CONTEXT.md` 的 Desired Window Frame 定义。
 
 路径：`src/ecs/display.rs:344` 更新 Display bounds，但 `src/ecs/display.rs:369` 只在 parent 不同时修复 strip；`src/ecs/native_space.rs:444` 同样如此。`src/ecs/layout.rs:207-215` 只标记 strip 改变。纯 origin 平移、尺寸不变时，relative_positions 没变，Bounds/LayoutPosition 不会因此触发新的全局坐标投影；strip Position 仍在旧位置。
 
@@ -115,7 +115,7 @@
 
 ### B5 [P1] 一块屏幕的 Space 查询失败会被当作拔屏，且不会自动补回
 
-需求：`ARCHITECTURE.md:106` 的 OS-authoritative reconciliation。查询失败不是物理 removal 证据。
+需求：`docs/ARCHITECTURE.md:106` 的 OS-authoritative reconciliation。查询失败不是物理 removal 证据。
 
 路径：`src/manager.rs:612-619` 用 filter_map 丢弃 Space 查询失败的显示器；`src/ecs/display.rs:175` 只保护“结果全空”，非空但不完整的结果进入 `src/ecs/display.rs:210-215`，删除缺失的 Display。扫描恢复后，native-space heartbeat 只遍历已有 ECS displays（`src/ecs/native_space.rs:545`），而 display reconciliation 没有普通 heartbeat，只由列出的 OS 事件触发。orphan 修复也要求目标 Display entity 已存在。
 
@@ -125,7 +125,7 @@
 
 ### B6 [P2] 唤醒刷新把合法 floating 窗口强行移到左上角
 
-需求：`CONTEXT.md` 定义 Floating Window 不占平铺 strip；显示器恢复应保留仍合法的用户几何，而非无条件重置位置。
+需求：`docs/CONTEXT.md` 定义 Floating Window 不占平铺 strip；显示器恢复应保留仍合法的用户几何，而非无条件重置位置。
 
 路径：`src/ecs/display.rs:241-243` 在唤醒后安排 RefreshWindowSizes；`src/ecs/workspace.rs:1126-1134` 将该 Space 内所有 floating 窗口 reposition 到 viewport.min，没有检查窗口是否已经可见。
 

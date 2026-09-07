@@ -1,8 +1,8 @@
 use accessibility_sys::{
     AXUIElementCreateApplication, AXUIElementIsAttributeSettable, AXUIElementRef, AXValueCreate,
-    AXValueGetValue, kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction,
-    kAXSizeAttribute, kAXStandardWindowSubrole, kAXUnknownSubrole, kAXValueTypeCGPoint,
-    kAXValueTypeCGSize, kAXWindowRole,
+    AXValueGetValue, kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXParentAttribute,
+    kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute, kAXValueTypeCGPoint,
+    kAXValueTypeCGSize,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -14,7 +14,6 @@ use objc2_core_foundation::{
     kCFBooleanFalse, kCFBooleanTrue,
 };
 use std::collections::HashMap;
-use std::ptr::null_mut;
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -23,15 +22,15 @@ use stdext::sync::rw_lock::RwLockExt;
 use tracing::{Level, debug, instrument, trace, warn};
 
 use super::skylight::{
-    _AXUIElementGetWindow, _SLPSSetFrontProcessWithOptions, AXUIElementCopyAttributeValue,
-    AXUIElementPerformAction, AXUIElementSetAttributeValue, SLPSPostEventRecordTo,
-    SLSWindowIteratorAdvance,
+    _AXUIElementGetWindow, _SLPSSetFrontProcessWithOptions, AXUIElementPerformAction,
+    AXUIElementSetAttributeValue, SLPSPostEventRecordTo, SLSWindowIteratorAdvance,
 };
 use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::manager::{Origin, Size, irect_from};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WindowIncarnation, macos_major_version};
 use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
+use crate::window_policy::{self, Admission, LayoutDecision};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct EnhancedUiKey {
@@ -180,6 +179,7 @@ pub trait WindowApi: Send + Sync {
     /// Reads the native fullscreen attribute without collapsing an AX failure
     /// into `false`.
     fn try_is_full_screen(&self) -> Result<bool>;
+    fn is_movable(&self) -> Result<bool>;
     fn is_resizable(&self) -> Result<bool>;
     fn is_full_screen(&self) -> bool;
     /// Requests a new origin and returns the frame read back from AX.
@@ -216,6 +216,13 @@ impl Window {
     pub fn new(window: Box<dyn WindowApi>) -> Self {
         Window(window)
     }
+
+    pub(crate) fn layout_decision(&self, floating: bool) -> LayoutDecision {
+        if floating {
+            return window_policy::layout(None, None, true);
+        }
+        window_policy::layout(self.is_movable().ok(), self.is_resizable().ok(), false)
+    }
 }
 
 /// Retrieves the window ID (`WinID`) from an `AXUIElementRef`.
@@ -238,9 +245,8 @@ pub fn ax_window_id(element_ref: AXUIElementRef) -> Result<WinID> {
 
 /// Allocation-free variant of [`ax_window_id`].
 ///
-/// [`crate::manager::bruteforce_windows`] calls this tens of thousands of times in
-/// a row and discards nearly every result, so the error path must not format a
-/// message it will only drop.
+/// Incremental remote-token discovery discards nearly every result, so the
+/// error path must not format a message it will only drop.
 pub fn try_ax_window_id(element_ref: AXUIElementRef) -> Option<WinID> {
     let ptr = NonNull::new(element_ref)?;
     let mut window_id: WinID = 0;
@@ -281,6 +287,36 @@ pub struct WindowOS {
     title: RwLock<Option<String>>,
 }
 
+#[derive(Default)]
+pub(super) struct WindowEvidence {
+    pub role: Option<String>,
+    pub subrole: Option<String>,
+    pub title: Option<String>,
+    pub parent_role: Option<String>,
+}
+
+impl WindowEvidence {
+    pub(super) fn admission(&self, config: &Config, bundle_id: Option<&str>) -> Admission {
+        let rules = config.match_window_rules(
+            self.title.as_deref(),
+            Some(bundle_id.unwrap_or_default()),
+            self.role.as_deref(),
+            self.subrole.as_deref(),
+        );
+        // An unsupported AXParent is not proof of an attached child window.
+        if rules.pending {
+            Admission::Defer
+        } else {
+            window_policy::admission(
+                self.role.as_deref(),
+                self.subrole.as_deref(),
+                self.parent_role.as_deref(),
+                rules.params.iter().find_map(|rule| rule.track),
+            )
+        }
+    }
+}
+
 impl WindowOS {
     /// Creates a new `Window` instance using an empty configuration.
     /// Non-standard windows are rejected unless they match a `track = true` rule.
@@ -315,7 +351,22 @@ impl WindowOS {
         bundle_id: Option<&str>,
     ) -> Result<Self> {
         let id = ax_window_id(element.as_ptr())?;
-        let window = Self {
+        let window = Self::from_element(id, element);
+        let evidence = WindowEvidence {
+            role: window.role().ok(),
+            subrole: window.subrole().ok(),
+            title: window.title().ok(),
+            parent_role: window
+                .parent_element()
+                .and_then(|parent| parent.role())
+                .ok(),
+        };
+        window.admit(evidence, config, bundle_id)
+    }
+
+    /// Construction without AX reads; discovery gathers evidence across ticks.
+    pub(super) fn from_element(id: WinID, element: &CFRetained<AXUIWrapper>) -> Self {
+        Self {
             id,
             ax_element: element.clone(),
             frame: IRect::default(),
@@ -325,73 +376,60 @@ impl WindowOS {
             pid: OnceLock::new(),
             app_reference: OnceLock::new(),
             title: RwLock::new(None),
-        };
-
-        let forced = window.is_forced_track(config, bundle_id);
-
-        if window.is_unknown() && !forced {
-            return Err(Error::invalid_window(&format!(
-                "Ignoring AXUnknown window, id: {}, role {}, subrole {}",
-                window.id(),
-                window.role().unwrap_or_default(),
-                window.subrole().unwrap_or_default(),
-            )));
         }
+    }
 
-        if !window.is_real() && !forced {
+    pub(super) fn parent_element(&self) -> Result<CFRetained<AXUIWrapper>> {
+        self.ax_element
+            .get_attribute(&CFString::from_static_str(kAXParentAttribute))
+    }
+
+    /// Pure admission shared by `AXWindows` inventory and staged discovery.
+    pub(super) fn admit(
+        self,
+        evidence: WindowEvidence,
+        config: &Config,
+        bundle_id: Option<&str>,
+    ) -> Result<Self> {
+        let decision = evidence.admission(config, bundle_id);
+        let WindowEvidence {
+            role,
+            subrole,
+            title,
+            ..
+        } = evidence;
+        if decision != Admission::Track {
             return Err(Error::invalid_window(&format!(
-                "Ignoring non-real window, id: {}, role {}, subrole {}",
-                window.id(),
-                window.role().unwrap_or_default(),
-                window.subrole().unwrap_or_default(),
+                "Window admission {decision:?}, id: {}, role {role:?}, subrole {subrole:?}",
+                self.id()
             )));
         }
 
         trace!(
             "created {} title: {} role: {} subrole: {}",
-            window.id(),
-            window.title().unwrap_or_default(),
-            window.role().unwrap_or_default(),
-            window.subrole().unwrap_or_default(),
+            self.id(),
+            title.unwrap_or_default(),
+            role.unwrap_or_default(),
+            subrole.unwrap_or_default(),
         );
-        Ok(window)
+        Ok(self)
     }
 
-    /// Checks whether a configured window rule forces this window to be tracked
-    /// despite having a non-standard role/subrole.
-    fn is_forced_track(&self, config: &Config, bundle_id: Option<&str>) -> bool {
-        let Ok(title) = self.title() else {
-            return false;
+    fn attribute_is_settable(&self, attribute: &'static str) -> Result<bool> {
+        let mut settable = 0;
+        let attribute = CFString::from_static_str(attribute);
+        let status = unsafe {
+            AXUIElementIsAttributeSettable(
+                self.ax_element.as_ptr(),
+                CFRetained::as_ptr(&attribute).as_ptr().cast(),
+                &raw mut settable,
+            )
         };
-        config
-            .find_window_properties(&title, bundle_id.unwrap_or_default())
-            .iter()
-            .any(|params| params.track.is_some_and(|track| track))
-    }
-
-    /// Checks if the window's subrole is "`AXUnknownSubrole`".
-    ///
-    /// # Returns
-    ///
-    /// `true` if the subrole is unknown, `false` otherwise.
-    fn is_unknown(&self) -> bool {
-        self.subrole()
-            .is_ok_and(|subrole| subrole.eq(kAXUnknownSubrole))
-    }
-
-    /// Checks if the window is a "real" window based on its role and subrole.
-    /// It considers standard and floating window subroles as real.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the window is real, `false` otherwise.
-    fn is_real(&self) -> bool {
-        let role = self.role().ok();
-        let subrole = self.subrole().ok();
-
-        subrole.as_deref() == Some(kAXStandardWindowSubrole)
-            || (role.as_deref() == Some(kAXWindowRole)
-                && subrole.as_deref() == Some(kAXFloatingWindowSubrole))
+        if status == kAXErrorAttributeUnsupported {
+            return Ok(false);
+        }
+        status.to_result(function_name!())?;
+        Ok(settable != 0)
     }
 
     fn app_reference(&self) -> Option<CFRetained<AXUIWrapper>> {
@@ -474,7 +512,7 @@ impl WindowOS {
                 NonNull::from(&mut point).as_ptr().cast(),
             )
         };
-        let position = AXUIWrapper::retain(position_ref)?;
+        let position = AXUIWrapper::from_retained(position_ref)?;
         unsafe {
             AXUIElementSetAttributeValue(
                 self.ax_element.as_ptr(),
@@ -503,7 +541,7 @@ impl WindowOS {
                 NonNull::from(&mut cgsize).as_ptr().cast(),
             )
         };
-        let size_value = AXUIWrapper::retain(size_ref)?;
+        let size_value = AXUIWrapper::from_retained(size_ref)?;
         unsafe {
             AXUIElementSetAttributeValue(
                 self.ax_element.as_ptr(),
@@ -643,7 +681,7 @@ impl WindowApi for WindowOS {
         if let Some(cached) = self.title.force_read().clone() {
             return Ok(cached);
         }
-        let title = self.ax_element.title()?;
+        let title = known_window_title(self.ax_element.title())?;
         *self.title.force_write() = Some(title.clone());
         Ok(title)
     }
@@ -695,18 +733,12 @@ impl WindowApi for WindowOS {
         self.ax_element.full_screen()
     }
 
+    fn is_movable(&self) -> Result<bool> {
+        self.attribute_is_settable(kAXPositionAttribute)
+    }
+
     fn is_resizable(&self) -> Result<bool> {
-        let mut settable = 0;
-        let attribute = CFString::from_static_str(kAXSizeAttribute);
-        unsafe {
-            AXUIElementIsAttributeSettable(
-                self.ax_element.as_ptr(),
-                CFRetained::as_ptr(&attribute).as_ptr().cast(),
-                &raw mut settable,
-            )
-        }
-        .to_result(function_name!())?;
-        Ok(settable != 0)
+        self.attribute_is_settable(kAXSizeAttribute)
     }
 
     #[instrument(level = Level::TRACE)]
@@ -757,28 +789,12 @@ impl WindowApi for WindowOS {
     ///
     /// `Ok(())` if the frame is updated successfully, otherwise `Err(Error)`.
     fn update_frame(&mut self) -> Result<IRect> {
-        let window_ref = self.ax_element.as_ptr();
-
-        let position = unsafe {
-            let mut position_ref: *mut CFType = null_mut();
-            AXUIElementCopyAttributeValue(
-                window_ref,
-                CFString::from_static_str(kAXPositionAttribute).as_ref(),
-                &mut position_ref,
-            )
-            .to_result(function_name!())?;
-            AXUIWrapper::retain(position_ref)?
-        };
-        let size = unsafe {
-            let mut size_ref: *mut CFType = null_mut();
-            AXUIElementCopyAttributeValue(
-                window_ref,
-                CFString::from_static_str(kAXSizeAttribute).as_ref(),
-                &mut size_ref,
-            )
-            .to_result(function_name!())?;
-            AXUIWrapper::retain(size_ref)?
-        };
+        let position = self
+            .ax_element
+            .get_attribute::<AXUIWrapper>(&CFString::from_static_str(kAXPositionAttribute))?;
+        let size = self
+            .ax_element
+            .get_attribute::<AXUIWrapper>(&CFString::from_static_str(kAXSizeAttribute))?;
 
         let mut frame = CGRect::default();
         let (position_ok, size_ok) = unsafe {
@@ -939,6 +955,19 @@ impl WindowApi for WindowOS {
     }
 }
 
+fn known_window_title(result: Result<String>) -> Result<String> {
+    match result {
+        Err(error)
+            if error.macos_code().is_some_and(|code| {
+                code == kAXErrorNoValue || code == kAXErrorAttributeUnsupported
+            }) =>
+        {
+            Ok(String::new())
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,6 +975,21 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn window_policy_distinguishes_absent_titles_from_failed_title_reads() {
+        for code in [kAXErrorNoValue, kAXErrorAttributeUnsupported] {
+            assert_eq!(
+                known_window_title(Err(Error::macos("AXTitle", code))).unwrap(),
+                ""
+            );
+        }
+        assert!(known_window_title(Err(Error::InvalidWindow)).is_err());
+        assert_eq!(
+            known_window_title(Ok("Settings".into())).unwrap(),
+            "Settings"
+        );
+    }
 
     #[test]
     fn enhanced_ui_first_acquire_and_final_restore_are_atomic() {

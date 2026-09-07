@@ -14,6 +14,8 @@
 use std::cell::RefCell;
 use std::process::Command as ProcessCommand;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use mlua::{IntoLua, Lua, LuaSerdeExt, Table, Value};
 use tracing::{error, info};
@@ -113,11 +115,11 @@ pub(super) fn install(
     // spool.flash(message[, duration]) — show an on-screen toast.
     let flash = {
         let outbox = Rc::clone(outbox);
-        lua.create_function(move |_, (message, duration): (String, Option<f32>)| {
-            outbox
-                .borrow_mut()
-                .flashes
-                .push((message, duration.unwrap_or(2.0)));
+        lua.create_function(move |_, (message, duration): (String, Option<f64>)| {
+            let duration = Duration::try_from_secs_f64(duration.unwrap_or(2.0)).map_err(|err| {
+                mlua::Error::RuntimeError(format!("spool.flash: invalid duration: {err}"))
+            })?;
+            outbox.borrow_mut().flashes.push((message, duration));
             Ok(())
         })?
     };
@@ -303,6 +305,8 @@ fn register_bind(
     chord: &str,
     handler: Value,
 ) -> mlua::Result<()> {
+    static NEXT_BIND_ID: AtomicU32 = AtomicU32::new(1);
+
     let handler = match handler {
         Value::Function(function) => shared::action_for_function(lua, &function)?
             .map_or(BindHandler::Function(function), BindHandler::Action),
@@ -317,9 +321,12 @@ fn register_bind(
         .map_err(|err| mlua::Error::RuntimeError(format!("spool.bind: {err}")))?;
 
     let mut registry = registry.borrow_mut();
-    registry.binds.push(handler);
-    let id = u32::try_from(registry.binds.len())
-        .map_err(|_| mlua::Error::RuntimeError("spool.bind: too many binds".into()))?;
+    // Queued event-tap actions can outlive a reload. Never reuse an id for
+    // a different callback, including after a failed script load.
+    let id = NEXT_BIND_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| mlua::Error::RuntimeError("spool.bind: callback ids exhausted".into()))?;
+    registry.binds.insert(id, handler);
     registry.keybinds.push((code, modifiers, id));
     Ok(())
 }
@@ -341,13 +348,12 @@ fn chord_strings(value: &Value) -> mlua::Result<Vec<String>> {
 /// Installs the state-query half of the API, matching the client module's
 /// naming: `spool.query(kind)` hands back the raw JSON string,
 /// `spool.query_json(kind)` the decoded table, and `query_state` /
-/// `query_active` / `query_workspaces` / `query_on_screen` are fixed-kind
+/// `query_active` / `query_spaces` / `query_on_screen` are fixed-kind
 /// shorthands.
 ///
-/// The world itself is only reachable while a dispatch is on the stack
-/// (`super::LuaRuntime::with_query` installs the provider for exactly that
-/// long), so calling one of these at script top level fails with an
-/// explanation rather than returning stale data.
+/// The world is reachable only while the runtime polls a callback with its
+/// input batch installed, so calling one of these at script top level fails
+/// with an explanation rather than returning stale data.
 fn install_query(lua: &Lua, spool: &mlua::Table, world: &Rc<DispatchWorld>) -> mlua::Result<()> {
     let raw = query_function(lua, world, None, true)?;
     spool.set("query", raw)?;

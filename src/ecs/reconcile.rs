@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use accessibility_sys::kAXErrorNoValue;
+use accessibility_sys::{kAXErrorAPIDisabled, kAXErrorCannotComplete, kAXErrorNoValue};
 use bevy::ecs::change_detection::DetectChangesMut as _;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
@@ -28,13 +28,21 @@ use crate::ecs::{
 };
 use crate::errors::Error;
 use crate::events::{Event, FocusSource, ReconcileScope};
-use crate::manager::{Application, Window, WindowManager};
+use crate::manager::{Application, Window, WindowManager, app::ApplicationWindowInventory};
 use crate::platform::{Pid, WinID, WindowIncarnation};
 
 const CONFIRMATION_DELAY: Duration = Duration::from_millis(250);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const FRAME_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 const MAX_FRAME_ATTEMPTS: u8 = 3;
+const MAX_APPLICATION_AX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct ApplicationAxRetry {
+    code: i32,
+    delay: Duration,
+    retry_after: Duration,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct FrameConvergence {
@@ -48,9 +56,11 @@ struct FrameConvergence {
 /// gaps when AX, SLS, or `WindowServer` drops an event.
 #[derive(Resource, Debug, Default)]
 pub(crate) struct WindowStateSync {
+    elapsed: Duration,
     since_heartbeat: Duration,
     frame_convergence: HashMap<Entity, FrameConvergence>,
     application_observers: HashSet<Entity>,
+    application_ax_retries: HashMap<Entity, ApplicationAxRetry>,
     window_observers: HashSet<Entity>,
     focus_absent: HashMap<Entity, FocusSnapshot>,
     retired_window_incarnations: HashSet<(Entity, WindowKey)>,
@@ -101,18 +111,84 @@ impl WindowStateSync {
     fn forget_application(&mut self, application: Entity) {
         self.ax_observed_windows.remove(&application);
         self.application_observers.remove(&application);
+        self.application_ax_retries.remove(&application);
         self.focus_absent.remove(&application);
         self.retired_window_incarnations
             .retain(|(owner, _)| *owner != application);
     }
 
+    fn retain_applications(&mut self, live: &HashSet<Entity>) {
+        self.application_observers
+            .retain(|entity| live.contains(entity));
+        self.application_ax_retries
+            .retain(|entity, _| live.contains(entity));
+        self.focus_absent.retain(|entity, _| live.contains(entity));
+        self.retired_window_incarnations
+            .retain(|(entity, _)| live.contains(entity));
+        self.ax_observed_windows
+            .retain(|entity, _| live.contains(entity));
+    }
+
     fn tick(&mut self, delta: Duration) -> bool {
+        self.elapsed = self.elapsed.saturating_add(delta);
         self.since_heartbeat = self.since_heartbeat.saturating_add(delta);
         if self.since_heartbeat < HEARTBEAT_INTERVAL {
             return false;
         }
         self.since_heartbeat = Duration::ZERO;
         true
+    }
+
+    fn application_ax_ready(&self, entity: Entity) -> bool {
+        self.application_ax_retries
+            .get(&entity)
+            .is_none_or(|retry| self.elapsed >= retry.retry_after)
+    }
+
+    fn defer_application_ax(&mut self, entity: Entity, app: &Application, error: &Error) -> bool {
+        let Some(code) = error
+            .macos_code()
+            .filter(|code| *code == kAXErrorCannotComplete || *code == kAXErrorAPIDisabled)
+        else {
+            return false;
+        };
+        let previous = self.application_ax_retries.get(&entity);
+        let changed = previous.is_none_or(|retry| retry.code != code);
+        let delay = previous.map_or(HEARTBEAT_INTERVAL, |retry| {
+            retry
+                .delay
+                .saturating_mul(2)
+                .min(MAX_APPLICATION_AX_RETRY_DELAY)
+        });
+        let retry_after = self.elapsed.saturating_add(delay);
+        self.application_ax_retries.insert(
+            entity,
+            ApplicationAxRetry {
+                code,
+                delay,
+                retry_after,
+            },
+        );
+        if changed {
+            warn!(
+                pid = app.pid(), app = app.name(), bundle_id = ?app.bundle_id(),
+                %error, ?delay,
+                "application AX endpoint unavailable; backing off probes"
+            );
+        } else {
+            debug!(pid = app.pid(), %error, ?delay, "application AX retry deferred");
+        }
+        true
+    }
+
+    fn application_ax_recovered(&mut self, entity: Entity, app: &Application) {
+        if self.application_ax_retries.remove(&entity).is_some() {
+            debug!(
+                pid = app.pid(),
+                app = app.name(),
+                "application AX endpoint recovered"
+            );
+        }
     }
 
     pub(crate) fn confirm_frame_convergence(
@@ -456,13 +532,15 @@ impl ReconcileState<'_, '_> {
                     warn!(pid, %error, "application liveness audit failed open");
                 }
             }
-            refresh_application_observer(app_entity, &mut app, sync);
+            let can_probe = sync.application_ax_ready(app_entity)
+                && refresh_application_observer(app_entity, &mut app, sync);
             let Some(owners) = &audit.window_server else {
                 continue;
             };
-            let Ok(inventory) = app.window_inventory(config).inspect_err(|error| {
-                warn!(pid, %error, "window reconciliation skipped application");
-            }) else {
+            let inventory = can_probe
+                .then(|| refresh_application_inventory(app_entity, &app, config, sync))
+                .flatten();
+            let Some(inventory) = inventory else {
                 suspend_windows_missing_from_window_server(
                     app_entity,
                     pid,
@@ -508,14 +586,7 @@ impl ReconcileState<'_, '_> {
                 .iter()
                 .map(|(entity, _)| entity)
                 .collect::<HashSet<_>>();
-            sync.application_observers
-                .retain(|entity| live_applications.contains(entity));
-            sync.focus_absent
-                .retain(|entity, _| live_applications.contains(entity));
-            sync.retired_window_incarnations
-                .retain(|(entity, _)| live_applications.contains(entity));
-            sync.ax_observed_windows
-                .retain(|entity, _| live_applications.contains(entity));
+            sync.retain_applications(&live_applications);
             let live_windows = self
                 .windows
                 .iter()
@@ -603,7 +674,10 @@ impl ReconcileState<'_, '_> {
         let mut selected = None;
         for (app_entity, app) in &mut self.applications {
             let pid = app.pid();
-            if !request.includes_application(pid) || !app.is_frontmost() {
+            if !request.includes_application(pid)
+                || sync.application_ax_retries.contains_key(&app_entity)
+                || !app.is_frontmost()
+            {
                 continue;
             }
             let candidate = (app_entity, pid, app.focused_window_id());
@@ -693,7 +767,7 @@ impl ReconcileState<'_, '_> {
         for (
             entity,
             mut window,
-            _,
+            parent,
             unavailable,
             mut position,
             mut bounds,
@@ -706,6 +780,9 @@ impl ReconcileState<'_, '_> {
         ) in &mut self.windows
         {
             let window_id = window.id();
+            if sync.application_ax_retries.contains_key(&parent.parent()) {
+                continue;
+            }
             if defaults_pending {
                 sync.frame_convergence.remove(&entity);
                 continue;
@@ -831,10 +908,14 @@ pub(super) fn reconcile_windows(
     state.reconcile_frames(&request, &audit, &mut sync, &mut commands);
 }
 
-fn refresh_application_observer(entity: Entity, app: &mut Application, sync: &mut WindowStateSync) {
+fn refresh_application_observer(
+    entity: Entity,
+    app: &mut Application,
+    sync: &mut WindowStateSync,
+) -> bool {
     let pid = app.pid();
     if sync.application_observers.contains(&entity) {
-        return;
+        return true;
     }
     match app.observe() {
         Ok(true) => {
@@ -844,7 +925,31 @@ fn refresh_application_observer(entity: Entity, app: &mut Application, sync: &mu
             debug!(pid, "application observer registration remains incomplete");
         }
         Err(error) => {
+            if sync.defer_application_ax(entity, app, &error) {
+                return false;
+            }
             warn!(pid, %error, "unable to refresh application observers");
+        }
+    }
+    true
+}
+
+fn refresh_application_inventory(
+    entity: Entity,
+    app: &Application,
+    config: &Config,
+    sync: &mut WindowStateSync,
+) -> Option<ApplicationWindowInventory> {
+    match app.window_inventory(config) {
+        Ok(inventory) => {
+            sync.application_ax_recovered(entity, app);
+            Some(inventory)
+        }
+        Err(error) => {
+            if !sync.defer_application_ax(entity, app, &error) {
+                warn!(pid = app.pid(), %error, "window reconciliation skipped application");
+            }
+            None
         }
     }
 }
@@ -1140,5 +1245,77 @@ pub(super) fn confirm_unavailable_windows(
         commands.trigger(SendMessageTrigger(Event::ReconcileWindows {
             scope: ReconcileScope::Application(pid),
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use bevy::prelude::World;
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    use super::*;
+    use crate::manager::app::MockApplicationApi;
+
+    #[derive(Clone, Default)]
+    struct LogLevels(Arc<Mutex<Vec<tracing::Level>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for LogLevels {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+    }
+
+    #[test]
+    fn application_ax_retry_is_bounded_scoped_and_reports_changed_errors() {
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let other = world.spawn_empty().id();
+        let mut mock = MockApplicationApi::new();
+        mock.expect_pid().return_const(1);
+        mock.expect_name().return_const("Test".to_owned());
+        mock.expect_bundle_id().return_const(None);
+        let app = Application::new(Box::new(mock));
+        let mut sync = WindowStateSync::default();
+        let error = Error::macos("AXCreated", kAXErrorCannotComplete);
+        let logs = LogLevels::default();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(logs.clone()),
+            || {
+                for seconds in [1, 2, 4, 8, 16, 30, 30] {
+                    let delay = Duration::from_secs(seconds);
+                    assert!(sync.defer_application_ax(entity, &app, &error));
+                    assert_eq!(sync.application_ax_retries[&entity].delay, delay);
+                    assert!(!sync.application_ax_ready(entity));
+                    assert!(sync.application_ax_ready(other));
+                    sync.tick(delay.checked_sub(Duration::from_millis(1)).unwrap());
+                    assert!(!sync.application_ax_ready(entity));
+                    sync.tick(Duration::from_millis(1));
+                    assert!(sync.application_ax_ready(entity));
+                }
+                let permission_error = Error::macos("AXCreated", kAXErrorAPIDisabled);
+                assert!(sync.defer_application_ax(entity, &app, &permission_error));
+                sync.application_ax_recovered(entity, &app);
+                assert!(sync.application_ax_ready(entity));
+                assert!(sync.defer_application_ax(entity, &app, &error));
+                assert_eq!(
+                    sync.application_ax_retries[&entity].delay,
+                    HEARTBEAT_INTERVAL
+                );
+                sync.forget_application(entity);
+                assert!(sync.application_ax_ready(entity));
+                assert!(!sync.defer_application_ax(entity, &app, &Error::InvalidWindow));
+            },
+        );
+        let levels = logs.0.lock().unwrap();
+        assert_eq!(
+            levels
+                .iter()
+                .filter(|&&level| level == tracing::Level::WARN)
+                .count(),
+            3
+        );
+        assert!(!levels.contains(&tracing::Level::ERROR));
     }
 }

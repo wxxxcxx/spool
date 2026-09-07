@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
 use mlua::prelude::{FromLua, IntoLua};
 use mlua::{AnyUserData, Function, Lua, Table, Value};
@@ -22,7 +23,7 @@ use spool_shared_types::windowset::WindowSet;
 use tracing::{error, warn};
 
 use super::api;
-use super::world::DispatchWorld;
+use super::world::{DispatchBatch, DispatchWorld};
 use crate::commands::Action;
 use crate::config::Config;
 use crate::platform::Modifiers;
@@ -102,9 +103,9 @@ pub(super) enum BindHandler {
 pub(super) struct Registry {
     /// `spool.on` handlers, in registration order per event name.
     pub(super) handlers: HashMap<String, Vec<HandlerEntry>>,
-    /// `spool.bind` action functions and callbacks indexed by `id - 1`.
-    pub(super) binds: Vec<BindHandler>,
-    /// Chords parallel to `binds`, for publishing to the event-tap registry.
+    /// `spool.bind` callbacks keyed by process-unique ids, never reused on reload.
+    pub(super) binds: HashMap<u32, BindHandler>,
+    /// Chords in registration order, for publishing to the event-tap registry.
     pub(super) keybinds: Vec<LuaKeybind>,
 }
 
@@ -117,8 +118,8 @@ pub(super) type SharedRegistry = Rc<RefCell<Registry>>;
 pub(super) struct Outbox {
     /// Actions queued via `spool.run` / `spool.action` / compatibility aliases.
     pub(super) actions: Vec<Action>,
-    /// Flash messages queued via `spool.flash` as `(message, duration_secs)`.
-    pub(super) flashes: Vec<(String, f32)>,
+    /// Flash messages queued via `spool.flash` with validated durations.
+    pub(super) flashes: Vec<(String, Duration)>,
 }
 
 /// The side effects one dispatch produced: actions to put on the bus and
@@ -127,16 +128,15 @@ pub(super) struct Outbox {
 /// Script state writes are not among them: they are the one thing a handler
 /// has to see the result of, so they go and come back while the handler
 /// waits rather than being queued for later.
-pub(super) type Effects = (Vec<Action>, Vec<(String, f32)>);
+pub(super) type Effects = (Vec<Action>, Vec<(String, Duration)>);
 
 /// The embedded Lua runtime and its shared registration state.
 pub struct LuaRuntime {
     lua: Lua,
     outbox: Rc<RefCell<Outbox>>,
     registry: SharedRegistry,
-    /// World access for the dispatches in flight, shared with the `spool.*`
-    /// functions that read through it. Outlives a reload: the caches behind it
-    /// are keyed by batch and revision, not by interpreter.
+    /// World access shared with the `spool.*` functions. Each dispatch supplies
+    /// its input batch; only the revision-keyed script store spans batches.
     world: Rc<DispatchWorld>,
     /// The `Config` a script declared via `spool.setup{...}`, if it called it.
     /// `None` means the script uses built-in defaults.
@@ -217,40 +217,50 @@ impl LuaRuntime {
     /// `call_async`, so a handler that reads the world suspends here instead of
     /// holding the interpreter — which is what lets the next handler run rather
     /// than queue behind this one.
-    pub(super) async fn dispatch_event(&self, name: &str, event: &Table, handler: &Function) {
+    pub(super) async fn dispatch_event(
+        &self,
+        name: &str,
+        event: &Table,
+        handler: &Function,
+        batch: &Rc<DispatchBatch>,
+    ) {
         let context = format!("event handler '{name}'");
-        let _dispatch = self.world.enter();
-        let Some(window_set) = self.window_set_arg(&context).await else {
-            return;
-        };
-        match handler
-            .call_async::<Value>((event.clone(), window_set))
-            .await
-        {
-            Ok(returned) => self.commit(&returned, &context),
-            Err(err) => error!("lua {context}: {err}"),
-        }
+        self.world
+            .with_batch(batch, async {
+                let Some(window_set) = self.window_set_arg(&context).await else {
+                    return;
+                };
+                match handler
+                    .call_async::<Value>((event.clone(), window_set))
+                    .await
+                {
+                    Ok(returned) => self.commit(&returned, &context),
+                    Err(err) => error!("lua {context}: {err}"),
+                }
+            })
+            .await;
     }
 
     /// Runs the action function or callback bound to keybind `id`.
-    pub(super) async fn dispatch_bind(&self, id: u32) {
-        let handler = id
-            .checked_sub(1)
-            .and_then(|index| self.registry.borrow().binds.get(index as usize).cloned());
+    pub(super) async fn dispatch_bind(&self, id: u32, batch: &Rc<DispatchBatch>) {
+        let handler = self.registry.borrow().binds.get(&id).cloned();
         match handler {
             Some(BindHandler::Action(action)) => {
                 self.outbox.borrow_mut().actions.push(action);
             }
             Some(BindHandler::Function(handler)) => {
                 let context = format!("keybind handler {id}");
-                let _dispatch = self.world.enter();
-                let Some(window_set) = self.window_set_arg(&context).await else {
-                    return;
-                };
-                match handler.call_async::<Value>(window_set).await {
-                    Ok(returned) => self.commit(&returned, &context),
-                    Err(err) => error!("lua {context}: {err}"),
-                }
+                self.world
+                    .with_batch(batch, async {
+                        let Some(window_set) = self.window_set_arg(&context).await else {
+                            return;
+                        };
+                        match handler.call_async::<Value>(window_set).await {
+                            Ok(returned) => self.commit(&returned, &context),
+                            Err(err) => error!("lua {context}: {err}"),
+                        }
+                    })
+                    .await;
             }
             None => warn!("lua keybind {id} has no handler"),
         }
@@ -472,6 +482,10 @@ mod tests {
         runtime.outbox.borrow_mut().actions.drain(..).collect()
     }
 
+    fn bind_id(runtime: &LuaRuntime, position: usize) -> u32 {
+        runtime.published_keybinds()[position - 1].2
+    }
+
     #[test]
     fn bind_registers_keybind_and_stores_handler() {
         let world = TestWorld::default();
@@ -482,7 +496,34 @@ mod tests {
         assert_eq!(binds.len(), 1);
         let (_, modifiers, id) = binds[0];
         assert_eq!(modifiers, Modifiers::ALT);
-        assert_eq!(id, 1);
+        assert_ne!(id, 0);
+    }
+
+    #[test]
+    fn a_runtime_rejects_binding_ids_from_another_runtime() {
+        let world = TestWorld::default();
+        let old = world
+            .runtime(r#"spool.bind("alt+a", spool.action.window.focus_west)"#)
+            .unwrap();
+        let current = world
+            .runtime(r#"spool.bind("alt+b", spool.action.window.balance)"#)
+            .unwrap();
+        let extract = || Err("action bindings must not query the world".to_string());
+        for stale in [0, bind_id(&old, 1), u32::MAX] {
+            world.drive(
+                &extract,
+                current.dispatch_bind(stale, &DispatchBatch::new()),
+            );
+        }
+        assert!(drained_commands(&current).is_empty());
+        world.drive(
+            &extract,
+            current.dispatch_bind(bind_id(&current, 1), &DispatchBatch::new()),
+        );
+        assert!(matches!(
+            drained_commands(&current).as_slice(),
+            [Action::Window(crate::commands::Operation::Balance)]
+        ));
     }
 
     #[test]
@@ -494,13 +535,18 @@ mod tests {
         let binds = runtime.published_keybinds();
         assert_eq!(binds.len(), 2);
         assert_eq!(binds[0].1, Modifiers::ALT);
-        assert_eq!(binds[0].2, 1);
         assert_eq!(binds[1].1, Modifiers::ALT);
-        assert_eq!(binds[1].2, 2);
+        assert_ne!(binds[0].2, binds[1].2);
 
         let extract = || Err("action functions must not query the window set".to_string());
-        world.drive(&extract, runtime.dispatch_bind(1));
-        world.drive(&extract, runtime.dispatch_bind(2));
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 2), &DispatchBatch::new()),
+        );
         let actions = drained_commands(&runtime);
         assert_eq!(actions.len(), 2);
         assert!(actions.iter().all(|action| matches!(
@@ -542,7 +588,10 @@ mod tests {
             .runtime(r#"spool.bind("alt+b", spool.action.window.balance)"#)
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
         let commands = drained_commands(&runtime);
         assert!(
             matches!(
@@ -560,7 +609,10 @@ mod tests {
             .runtime(r#"spool.bind("alt+j", function(state) spool.run("window focus east") end)"#)
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
         assert_eq!(drained_commands(&runtime).len(), 1);
     }
 
@@ -575,7 +627,7 @@ mod tests {
         for handler in runtime.event_handlers(&name) {
             world.drive(
                 &extract,
-                runtime.dispatch_event(&name, &table, &handler.handler),
+                runtime.dispatch_event(&name, &table, &handler.handler, &DispatchBatch::new()),
             );
         }
         assert_eq!(drained_commands(&runtime).len(), 1);
@@ -648,7 +700,10 @@ mod tests {
             )
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
 
         let flashes: Vec<String> = runtime
             .outbox
@@ -664,6 +719,67 @@ mod tests {
             flashes[2].starts_with('{') && flashes[2].contains("\"focused_app_name\":\"Test App\""),
             "spool.query should return raw JSON, got {}",
             flashes[2]
+        );
+    }
+
+    #[test]
+    fn overlapping_callbacks_read_their_own_state_snapshots() {
+        let world = TestWorld::default();
+        let runtime = world
+            .runtime(
+                r#"
+                spool.bind("alt+a", function()
+                    before = spool.query_active().focused_app_name
+                    spool.state.get("pause")
+                    after = spool.query_active().focused_app_name
+                end)
+                spool.bind("alt+b", function()
+                    later = spool.query_active().focused_app_name
+                end)
+                "#,
+            )
+            .unwrap();
+        let older_batch = DispatchBatch::new();
+        let mut older = Box::pin(runtime.dispatch_bind(bind_id(&runtime, 1), &older_batch));
+
+        assert!(block_on(poll_once(older.as_mut())).is_none());
+        let WorldRequest::WindowSet { reply } = world.world_queries.try_recv().unwrap() else {
+            panic!("expected the older callback's layout");
+        };
+        reply.try_send(Ok(Arc::new(WindowSet::default()))).unwrap();
+        assert!(block_on(poll_once(older.as_mut())).is_none());
+        let WorldRequest::State { reply } = world.world_queries.try_recv().unwrap() else {
+            panic!("expected the older callback's state");
+        };
+        reply.try_send(Ok(Arc::new(test_state()))).unwrap();
+        assert!(block_on(poll_once(older.as_mut())).is_none());
+        let StoreRequest::Read { reply: paused } = world.store_queries.try_recv().unwrap() else {
+            panic!("expected a store read to park the older callback");
+        };
+
+        let fresh = || {
+            let mut state = test_state();
+            state.active.focused_app_name = Some("New App".to_string());
+            Ok(Arc::new(state))
+        };
+        world.drive(
+            &fresh,
+            runtime.dispatch_bind(bind_id(&runtime, 2), &DispatchBatch::new()),
+        );
+        assert_eq!(
+            runtime.lua().globals().get::<String>("later").unwrap(),
+            "New App",
+            "a later callback must not inherit a suspended callback's snapshot"
+        );
+
+        paused.try_send(world.read()).unwrap();
+        world.drive(&fresh, older);
+        let globals = runtime.lua().globals();
+        assert_eq!(globals.get::<String>("before").unwrap(), "Test App");
+        assert_eq!(
+            globals.get::<String>("after").unwrap(),
+            "Test App",
+            "resuming an older callback must preserve its original snapshot"
         );
     }
 
@@ -687,14 +803,20 @@ mod tests {
             *extractions.borrow_mut() += 1;
             Ok(Arc::new(test_state()))
         };
-        world.drive(&extract, runtime.dispatch_bind(2));
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 2), &DispatchBatch::new()),
+        );
         assert_eq!(
             *extractions.borrow(),
             0,
             "a handler that never queries pays nothing"
         );
 
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
         assert_eq!(*extractions.borrow(), 1, "two queries share one extraction");
     }
 
@@ -720,7 +842,10 @@ mod tests {
             )
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
         assert!(
             runtime.lua().load("escaped()").exec().is_err(),
             "a query captured during dispatch should not answer afterwards"
@@ -784,12 +909,41 @@ mod tests {
             )
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
         let (commands, flashes) = runtime.drain_outbox();
         assert_eq!(commands.len(), 1);
-        assert_eq!(flashes, vec![("done".to_string(), 3.0)]);
+        assert_eq!(flashes, vec![("done".to_string(), Duration::from_secs(3))]);
         // ...and the outbox is empty afterwards, so nothing is delivered twice.
         assert!(runtime.drain_outbox().0.is_empty());
+    }
+
+    #[test]
+    fn flash_reports_invalid_durations_and_preserves_valid_seconds() {
+        let world = TestWorld::default();
+        let runtime = world
+            .runtime(
+                r#"
+                for _, duration in ipairs({ -1, 0/0, math.huge, -math.huge, 1e30 }) do
+                    local ok, err = pcall(spool.flash, "invalid", duration)
+                    assert(not ok and tostring(err):find("spool.flash: invalid duration", 1, true))
+                end
+                spool.flash("default")
+                spool.flash("fractional", 0.125)
+                spool.flash("zero", 0)
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.drain_outbox().1,
+            vec![
+                ("default".to_string(), Duration::from_secs(2)),
+                ("fractional".to_string(), Duration::from_millis(125)),
+                ("zero".to_string(), Duration::ZERO),
+            ]
+        );
     }
 
     /// Runs `source` as a keybind handler against `world`'s store.
@@ -798,7 +952,10 @@ mod tests {
             .runtime(&format!(r#"spool.bind("alt+z", function() {source} end)"#))
             .expect("script should load");
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
     }
 
     #[test]
@@ -921,7 +1078,10 @@ mod tests {
             .expect("script should load");
 
         let extract = || Ok(Arc::new(test_state()));
-        world.drive_patiently(&extract, runtime.dispatch_bind(1));
+        world.drive_patiently(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
 
         let globals = runtime.lua().globals();
         assert_eq!(globals.get::<i32>("code").expect("an exit code"), 0);
@@ -949,7 +1109,10 @@ mod tests {
             .expect("script should load");
 
         let extract = || Ok(Arc::new(test_state()));
-        world.drive_patiently(&extract, runtime.dispatch_bind(1));
+        world.drive_patiently(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
 
         let globals = runtime.lua().globals();
         assert!(
@@ -1010,7 +1173,10 @@ mod tests {
             )
             .expect("script should load");
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive(
+            &extract,
+            runtime.dispatch_bind(bind_id(&runtime, 1), &DispatchBatch::new()),
+        );
 
         assert!(
             runtime.lua.globals().get::<bool>("errored").unwrap(),

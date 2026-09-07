@@ -46,7 +46,7 @@ Configuration discovery checks these locations in order:
 2. `$HOME/.spool.lua`
 3. `$XDG_CONFIG_HOME/spool/init.lua` (normally `~/.config/spool/init.lua`)
 
-If none exists, Spool creates the [default init.lua](config/default.lua) in the
+If none exists, Spool creates the [default init.lua](../config/default.lua) in the
 XDG config directory without overwriting an existing script. TOML configuration
 (`spool.toml`, `bar.toml`, `~/.spool`, and `SPOOL_CONFIG`) is no longer supported.
 Existing TOML files are left untouched but are not read, created, or watched.
@@ -54,6 +54,8 @@ Existing TOML files are left untouched but are not read, created, or watched.
 Save the active script to reload settings, Bar appearance, and keybindings.
 A failed reload keeps the last working configuration. Omitted settings use
 built-in defaults; removing `bar` or `spool.setup` also restores their defaults.
+Keypresses captured under a retired configuration are discarded if they reach
+the worker after a successful reload; they cannot invoke a replacement binding.
 Builds without the `lua` feature use built-in defaults only.
 
 ```lua
@@ -116,7 +118,7 @@ and configuration. Missing sections use defaults; no TOML fallback exists.
 **Notes:**
 - Float-valued options (`animation_speed`, border `width`/`opacity`, window `width`, …) should be written with a decimal point (`12.0`, not `12`).
 - A successful reload that removes a previous `spool.setup` call restores built-in defaults. Removing only `bar` restores default Bar styling.
-- With Nix modules, set `services.spool.config` to this `init.lua` (Lua source or a path). See [`nix/README.md`](nix/README.md).
+- With Nix modules, set `services.spool.config` to this `init.lua` (Lua source or a path). See [`docs/NIX.md`](NIX.md).
 
 ---
 
@@ -201,9 +203,21 @@ end)
 | `spool.query_spaces()` | native macOS Spaces and their tracked windows |
 | `spool.query_on_screen()` | the windows currently visible |
 
-These are spelled exactly as in the loadable client module (`require("spool")`, see [`crates/lua`](crates/lua)), so a helper that reads state works unchanged in either host. The payloads are documented in [`QUERY_AND_SUBSCRIBE_FORMAT.md`](QUERY_AND_SUBSCRIBE_FORMAT.md).
+These are spelled exactly as in the loadable client module (`require("spool")`, see [`crates/lua`](../crates/lua)), so a helper that reads state works unchanged in either host. The payloads are documented in [`docs/QUERY_AND_SUBSCRIBE_FORMAT.md`](QUERY_AND_SUBSCRIBE_FORMAT.md).
 
 State is gathered on demand and at most once per callback, so handlers that never query cost nothing extra. Outside a callback there is no window-manager state to read, so calling one of these at script top level raises an error; call them inside a handler or keybinding callback.
+
+Handlers from the same input batch share an extraction. A later input batch
+gets its own snapshot even if an earlier callback is still waiting on a query,
+script-state write, or external command. A resumed callback keeps its original
+snapshot; a long-running callback does not freeze state for later inputs.
+
+After a successful reload, callbacks already in flight may finish their queued
+actions, but only the installed runtime can update event-handler availability.
+
+`spool.flash(message[, seconds])` defaults to two seconds. Its duration must be
+finite, non-negative, and representable by the host timer; invalid values raise
+a Lua error before any message is queued. Zero is accepted as an immediate expiry.
 
 ---
 

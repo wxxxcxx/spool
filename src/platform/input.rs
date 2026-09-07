@@ -89,10 +89,15 @@ static LUA_KEYBINDS: LazyLock<ArcSwap<Vec<(u8, Modifiers, u32)>>> =
     LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
 /// Replace the Lua keybind set that the event tap checks on every key-down.
-/// Called from the main thread on script load and hot reload.
+/// Called from the Lua worker on script load and hot reload.
 #[cfg(feature = "lua")]
 pub fn set_lua_keybinds(keys: Vec<(u8, Modifiers, u32)>) {
     LUA_KEYBINDS.store(Arc::new(keys));
+}
+
+#[cfg(all(test, feature = "lua"))]
+pub(crate) fn lua_keybinds() -> Vec<(u8, Modifiers, u32)> {
+    LUA_KEYBINDS.load().as_ref().clone()
 }
 
 const SWIPE_THRESHOLD: f64 = 0.001;

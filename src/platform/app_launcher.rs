@@ -91,8 +91,21 @@ impl AppLauncher {
 }
 
 fn ensure_owned_bundle(app_path: &Path) -> Result<()> {
-    let plist = fs::read_to_string(app_path.join("Contents/Info.plist"))?;
-    if plist.contains(&format!("<string>{APP_BUNDLE_ID}</string>")) {
+    let output = Command::new("/usr/bin/plutil")
+        .args([
+            "-extract",
+            "CFBundleIdentifier",
+            "raw",
+            "-expect",
+            "string",
+            "-n",
+            "-o",
+            "-",
+            "--",
+        ])
+        .arg(app_path.join("Contents/Info.plist"))
+        .output()?;
+    if output.status.success() && output.stdout == APP_BUNDLE_ID.as_bytes() {
         return Ok(());
     }
 
@@ -196,6 +209,29 @@ mod tests {
         let script = launcher_script(PathBuf::from("/tmp/Spool's bin").as_path());
         assert_eq!(script, "#!/bin/sh\nexec '/tmp/Spool'\"'\"'s bin' start\n");
         assert_eq!(shell_quote("spool"), "'spool'");
+    }
+
+    #[test]
+    fn bundle_ownership_checks_the_identifier_not_an_unrelated_string() {
+        let root = test_directory();
+        let contents = root.join("Spool.app/Contents");
+        fs::create_dir_all(&contents).unwrap();
+        fs::write(
+            contents.join("Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                <plist version="1.0"><dict>
+                  <key>CFBundleIdentifier</key><string>com.example.other</string>
+                  <key>Comment</key><string>{APP_BUNDLE_ID}</string>
+                </dict></plist>"#
+            ),
+        )
+        .unwrap();
+        assert!(
+            ensure_owned_bundle(&root.join("Spool.app")).is_err(),
+            "mentioning Spool's identifier does not make a foreign bundle replaceable"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

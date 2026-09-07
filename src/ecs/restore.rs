@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::observer::On;
@@ -10,14 +11,20 @@ use bevy::ecs::system::{Commands, Query, Res, ResMut, SystemParam};
 use bevy::time::{Time, Timer, TimerMode, Virtual};
 use tracing::{Level, info, instrument, warn};
 
-use crate::config::{Config, MissingWindowBehavior};
+use crate::config::MissingWindowBehavior;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{SavedColumn, SavedSpace, SavedStackItem, SavedWindow, SpoolState};
+use crate::ecs::topology::WindowMemberships;
 use crate::ecs::workspace::PendingSpaceDestruction;
 use crate::ecs::{Floating, RefreshWindowSizes, RestoreWindowState};
-use crate::manager::{Application, Display, Window, WindowManager};
-use crate::platform::{Pid, WinID, WorkspaceId};
+use crate::manager::{Application, Display, WindowManager};
+use crate::platform::{Pid, WinID, WindowIncarnation, WorkspaceId};
+
+#[derive(Component)]
+pub(super) struct RestoredWindowPlacement {
+    pub(super) incarnation: WindowIncarnation,
+}
 
 #[derive(Debug, Resource)]
 pub(crate) struct SessionRestore {
@@ -35,18 +42,45 @@ impl SessionRestore {
 }
 
 #[derive(Resource)]
-pub(super) struct RestoreRetry(Timer);
+pub(super) struct RestoreRetry {
+    timer: Timer,
+    pending_defaults: HashMap<Entity, WindowIncarnation>,
+}
 
-fn defer_restore(commands: &mut Commands) {
-    commands.queue(|world: &mut bevy::prelude::World| {
+impl RestoreRetry {
+    pub(super) fn preserves_defaults(
+        &self,
+        entity: Entity,
+        incarnation: WindowIncarnation,
+    ) -> bool {
+        self.pending_defaults.get(&entity) == Some(&incarnation)
+    }
+}
+
+fn defer_restore(ctx: &mut WindowCtx, apps: &Query<&Application>, state: &SpoolState) {
+    // Saved Spaces retain candidate eligibility during incomplete observation;
+    // only the complete live membership scan below can authorize placement.
+    let saved_spaces = state.spaces.iter().map(|space| space.space_id).collect();
+    let planner = RestorePlanner::for_present_spaces(state, &saved_spaces);
+    let pending_defaults = current_window_identities(&ctx.windows, apps, &planner)
+        .into_iter()
+        .filter(|window| planner.has_saved_candidate(window))
+        .filter_map(|identity| {
+            ctx.windows
+                .get(identity.entity)
+                .map(|window| (identity.entity, window.incarnation()))
+        })
+        .collect();
+
+    ctx.commands.queue(|world: &mut bevy::prelude::World| {
         world
             .resource_mut::<super::topology::NativeTopology>()
             .request_refresh();
     });
-    commands.insert_resource(RestoreRetry(Timer::new(
-        Duration::from_millis(250),
-        TimerMode::Once,
-    )));
+    ctx.commands.insert_resource(RestoreRetry {
+        timer: Timer::new(Duration::from_millis(250), TimerMode::Once),
+        pending_defaults,
+    });
 }
 
 pub(super) fn tick_restore_grace(
@@ -66,8 +100,8 @@ pub(super) fn tick_restore_grace(
         commands.remove_resource::<SpoolState>();
         commands.remove_resource::<RestoreRetry>();
     } else if let Some(retry) = retry.as_mut() {
-        retry.0.tick(time.delta());
-        if retry.0.is_finished() {
+        retry.timer.tick(time.delta());
+        if retry.timer.is_finished() {
             commands.remove_resource::<RestoreRetry>();
             commands.trigger(RestoreWindowState);
         }
@@ -172,17 +206,34 @@ impl<'a> RestorePlanner<'a> {
         self.saved_windows().any(|window| !window.title.is_empty())
     }
 
+    fn has_saved_candidate(&self, current: &CurrentWindowIdentity) -> bool {
+        self.current_window_has_saved_hard_match(current)
+            || self
+                .saved_windows()
+                .any(|saved| saved.fallback_match(current))
+    }
+
+    fn has_unresolved_membership(
+        &self,
+        current: &[CurrentWindowIdentity],
+        memberships: &WindowMemberships,
+    ) -> bool {
+        current.iter().any(|window| {
+            memberships.unique_space(window.window_id).is_none() && self.has_saved_candidate(window)
+        })
+    }
+
     pub(crate) fn plan(
         &self,
         current: &[CurrentWindowIdentity],
-        memberships: &HashMap<WinID, Option<WorkspaceId>>,
+        memberships: &WindowMemberships,
     ) -> RestorePlan {
         let mut plan = RestorePlan::default();
 
         for space in self.saved_spaces() {
             let eligible = current
                 .iter()
-                .filter(|window| memberships.get(&window.window_id) == Some(&Some(space.space_id)))
+                .filter(|window| memberships.unique_space(window.window_id) == Some(space.space_id))
                 .cloned()
                 .collect::<Vec<_>>();
             let surviving_strips = self.plan_space(space, &eligible, &mut plan);
@@ -361,34 +412,6 @@ pub(crate) fn eligible_restore_space_ids(
         .collect()
 }
 
-pub(crate) fn matches_startup_restore_state(
-    window: &Window,
-    app: &Application,
-    session: Option<&SessionRestore>,
-    restoration: Option<&SpoolState>,
-    config: &Config,
-    present_spaces: &HashSet<WorkspaceId>,
-) -> bool {
-    if !config.restore_enabled() {
-        return false;
-    }
-
-    let Ok(pid) = window.pid() else {
-        return false;
-    };
-    let bundle_id = app.bundle_id().unwrap_or_default().clone();
-    let state = if let Some(session) = session {
-        &session.state
-    } else if let Some(state) = restoration {
-        state
-    } else {
-        return false;
-    };
-    RestorePlanner::for_present_spaces(state, present_spaces)
-        .saved_windows()
-        .any(|saved| saved.hard_match(window.id(), pid, &bundle_id))
-}
-
 #[derive(SystemParam)]
 pub(super) struct RestoreWindowStateCtx<'w, 's> {
     workspaces: Query<
@@ -442,33 +465,16 @@ pub(super) fn restore_window_state(_: On<RestoreWindowState>, restore: RestoreWi
         restoration
     };
 
-    if !topology.is_complete() {
-        warn!("Session restore deferred: display topology unavailable");
-        defer_restore(&mut ctx.commands);
+    let Ok(memberships) = topology
+        .observe_memberships(&window_manager)
+        .inspect_err(|error| {
+            warn!(%error, "Session restore deferred: native membership unavailable");
+        })
+    else {
+        defer_restore(&mut ctx, &apps, restoration);
         return;
-    }
+    };
     let topology = topology.known_displays().collect::<Vec<_>>();
-    let mut memberships = HashMap::new();
-    for space_id in topology.iter().flat_map(|(_, spaces)| spaces.iter()) {
-        let Ok(window_ids) = window_manager.windows_in_workspace(*space_id) else {
-            warn!(
-                space_id,
-                "Session restore deferred: Space membership unavailable"
-            );
-            defer_restore(&mut ctx.commands);
-            return;
-        };
-        for window_id in window_ids {
-            memberships
-                .entry(window_id)
-                .and_modify(|space| {
-                    if *space != Some(*space_id) {
-                        *space = None;
-                    }
-                })
-                .or_insert(Some(*space_id));
-        }
-    }
     let mut live_space_displays = HashMap::new();
     for (display, spaces) in &topology {
         for workspace_id in *spaces {
@@ -483,6 +489,10 @@ pub(super) fn restore_window_state(_: On<RestoreWindowState>, restore: RestoreWi
     );
     let planner = RestorePlanner::for_present_spaces(restoration, &present_spaces);
     let current = current_window_identities(&ctx.windows, &apps, &planner);
+    if planner.has_unresolved_membership(&current, &memberships) {
+        defer_restore(&mut ctx, &apps, restoration);
+        return;
+    }
     let plan = planner.plan(&current, &memberships);
     ctx.commands.remove_resource::<RestoreRetry>();
 
@@ -508,7 +518,7 @@ pub(super) fn restore_window_state(_: On<RestoreWindowState>, restore: RestoreWi
         })
         .collect::<HashMap<_, _>>();
     if targets.len() != plan.strips.len() {
-        defer_restore(&mut ctx.commands);
+        defer_restore(&mut ctx, &apps, restoration);
         return;
     }
     for planned in &plan.strips {
@@ -533,7 +543,12 @@ pub(super) fn restore_window_state(_: On<RestoreWindowState>, restore: RestoreWi
     }
 
     for entity in &plan.consumed_entities {
-        if let Ok(mut entity_commands) = ctx.commands.get_entity(*entity) {
+        if let Some(window) = ctx.windows.get(*entity)
+            && let Ok(mut entity_commands) = ctx.commands.get_entity(*entity)
+        {
+            entity_commands.try_insert(RestoredWindowPlacement {
+                incarnation: window.incarnation(),
+            });
             entity_commands.try_remove::<Floating>();
         }
     }

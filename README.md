@@ -119,7 +119,7 @@ Note that you will need to grant accessibility privileges to the binary.
 
 ### Installing with Nix
 
-See [`nix/README.md`](/nix/README.md).
+See [`docs/NIX.md`](docs/NIX.md).
 
 ### Configuration
 
@@ -140,8 +140,8 @@ A failed reload keeps the last working configuration. Omitted settings use
 built-in defaults; removing `bar` or `spool.setup` also restores their defaults.
 Builds without the `lua` feature use built-in defaults only.
 
-See the **[Configuration Guide](./CONFIGURATION.md)** and
-**[Lua Scripting Guide](./SCRIPTING.md)** for options and actions.
+See the **[Configuration Guide](docs/CONFIGURATION.md)** and
+**[Lua Scripting Guide](docs/SCRIPTING.md)** for options and actions.
 
 ```lua
 -- init.lua
@@ -175,7 +175,7 @@ or unmatched windows follow the normal configuration and window-rule behavior.
 Saved windows that are not present are ignored by default and the restored
 layout is compacted around the windows that were found. The behavior is
 configured with `spool.setup { restore = { ... } }`; see the
-**[Session Restore](./CONFIGURATION.md#session-restore)** section in the
+**[Session Restore](docs/CONFIGURATION.md#session-restore)** section in the
 configuration guide.
 
 When upgrading a v2 state file, inspect the safe fold first, then apply it:
@@ -342,7 +342,7 @@ $ spool subscribe --json --raw
 
 Events cover focus changes, Space changes, window-list changes, visible-set
 changes, title changes, and display changes. See
-[`QUERY_AND_SUBSCRIBE_FORMAT.md`](./QUERY_AND_SUBSCRIBE_FORMAT.md) for the
+[`docs/QUERY_AND_SUBSCRIBE_FORMAT.md`](docs/QUERY_AND_SUBSCRIBE_FORMAT.md) for the
 full payload contract.
 
 ### Running Client Scripts
@@ -402,7 +402,7 @@ scripts, `cron` jobs, or other automation tools:
 - More actions for manipulating windows: finegrained size adjustments, touchpad resizing, etc.
 - Deeper scriptability building on the embedded Lua runtime, which already
   supports full configuration (`spool.setup`), event hooks (`spool.on`),
-  keybindings (`spool.bind`), and state queries — see the **[Lua Scripting Guide](./SCRIPTING.md)**.
+  keybindings (`spool.bind`), and state queries — see the **[Lua Scripting Guide](docs/SCRIPTING.md)**.
 
 ## Communication
 
@@ -412,8 +412,10 @@ specific to Spool should be reported in this repository.
 
 ## Architecture Overview
 
+All project guides, research, and reviews are indexed in **[Documentation](docs/README.md)**.
+
 For a detailed high-level overview of Spool's internal design, data flow, and
-ECS patterns, please refer to the **[Architecture Guide](./ARCHITECTURE.md)**.
+ECS patterns, please refer to the **[Architecture Guide](docs/ARCHITECTURE.md)**.
 
 Spool's architecture is built around the **Bevy ECS (Entity Component
 System)**, which manages the window manager's state as a collection of entities

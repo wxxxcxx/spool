@@ -1,0 +1,143 @@
+# 窗口准入与平铺规则
+
+决策日期：2026-09-06。本次重构的行为契约，不代表已部署或完成真实桌面验收。
+
+## 路线
+
+保留现有 AX 操作和 WindowServer/Native Spaces 观察后端，统一策略，不增加注入、SIP 调整或另一套私有控制后端。
+
+- 参考 AltTab/DockDoor 的“发现、身份、视图过滤分离”，不照搬切换器的最终显示列表。
+- 参考 yabai 等项目区分 tracked 与 tiled；当前 strip 需要移动和双轴缩放，不采用“大固定窗口也平铺”的尺寸阈值。
+- **窗口用途不是核心分类依据。** “设置页、工具窗通常浮动”属于可编辑用户规则；可写的设置窗不因名称或用途被核心禁止平铺。
+- 结构事实与能力限制不能通过偏好覆盖。菜单不是独立窗口；`floating=false` 不会让不可写的 AX 属性变得可写。
+
+研究依据见[准入比较](research/window-exclusion-policy.md)和[平铺比较](research/window-tiling-policy.md)。研究保留重构前快照，当前实现以本文为准。
+
+## 独立决策
+
+| 问题 | 当前处理 | 不应混淆 |
+| --- | --- | --- |
+| 应用是否可能有窗口 | Regular、Accessory；明确 bundle 的 `track=true` 可扩大进程观察范围 | Accessory 不等于默认 float |
+| 是否跟踪具体窗口 | 有效 AX 窗口 ID、role/subrole、已知父关系、准入规则 | 无截图、不能 resize、不可见不等于应忽略 |
+| 默认布局意图 | 既有恢复语义、用户规则；无偏好时尝试 tile | Settings 标题不是核心用途分类 |
+| 此刻能否执行 | backend 能力，加已有可用性、全屏、可见性和 Space 迁移保护 | AX 报错不等于永久不支持 |
+
+Floating Window 仍是 Tracked Window，参与现有查询和聚焦流程，不占 strip 栏位。窗口身份与导航视图应否显示它仍是两个问题。
+
+## 准入契约
+
+1. AX 必须给出有效窗口 ID。物理 surface 本身不自动产生可控制窗口。
+2. `track=false` 排除匹配窗口。`track=true` 可放行非标准 subrole，但不能放行非 `AXWindow` 元素或已确认附属于另一个窗口的条目。
+3. 默认接收 `AXWindow` 下的 `AXStandardWindow`、`AXFloatingWindow`、`AXDialog`、`AXSystemDialog`。独立 dialog 不再仅因 subrole 被排除，也不因此在核心里默认 float。
+4. 已确认 AXParent role 为 `AXWindow`、`AXSheet`、`AXDrawer` 时，不另建独立跟踪项。父属性不可用不等于已证明是子窗口：以 AX 窗口列表为基础，不把缺失父属性作为全局否决条件。
+5. role/subrole 读取失败与实际返回非标准值不同。元数据或必要规则匹配尚未确定时暂缓准入；应用 inventory 保留原始身份供核对，不把它当作窗口销毁。
+
+AX 列表和私有 WindowServer 列表提供互补发现证据。后者为空或失败不再否决前者；补找窗口按 ID 差集计算，不用数量相同代替身份相同。已启动但暂时无窗口的应用保留观察，后续由通知和 inventory reconciliation 发现窗口，不再因五秒内没有窗口而清理应用。
+
+**应用可观察不等于已经就绪。** 初始扫描和后续启动统一经过 `Process::ready()`：等待 `isFinishedLaunching`，再检查可观察策略或显式强制规则。初始扫描中未就绪的进程转为待启动状态，保持观察就绪变化，但不提前创建 AX Application。不会按辅助进程名字建立隐藏黑名单，也不会因此排除已就绪的菜单栏应用。
+
+## 能力契约
+
+| 输入 | 无显式 float 时的结果 |
+| --- | --- |
+| AXPosition、AXSize 均明确 settable | 可以尝试 tile |
+| AXPosition 明确不可写 | float，原因 `NotMovable` |
+| AXSize 明确不可写 | float，原因 `NotResizable`，不区分大小窗口 |
+| 没有明确不支持，但至少一个能力读取失败 | defer，保留身份并有界重试 |
+| 用户规则 `floating=true` | float，无须证明 tile 能力 |
+
+settable 不保证任意尺寸可达。明确返回 attribute unsupported 也归为当前 backend 不支持，而非通信失败。写入继续经过现有几何事务和读回机制，处理应用钳制、部分成功与有界重试；不会为了分类偷偷试改尺寸。
+
+初始未知状态复用 `WindowDefaultsPending`：暂以 Floating 投影留在 strip 外，快速尝试后冷却重试，不把未知结果提交成永久默认浮动。手动 tile 时未知则保留 `RetilePending`，五秒后重试；再次切换会取消待完成的请求。明确不支持时拒绝本次 tile，保持 float，用户可在应用状态改变后重试。
+
+创建、默认布局、重新平铺使用同一能力函数。浮动切换命令不再直接插入 strip，取消最小化等既有重新平铺入口也经过检查。手动 tile 可覆盖默认浮动偏好，不能绕过物理能力。
+
+浮动 `grid` 需要完整几何操作：能力未知时等待，明确受限时不执行 grid，保留当前 frame。固定窗口也不执行浮动切换时的装饰性缩放。
+
+## 用户规则
+
+`windows` 保持命名表。四个可选匹配条件是 AND：`title` 正则、`bundle_id`、`role`、`subrole` 精确匹配。省略条件表示不限制该属性，不再要求 `title=".*"`。真实空标题可以匹配 `^$`；暂时读取失败不能冒充空标题。其他条件已经确定不匹配时，不必等待无关元数据。
+
+Adapter 把明确不存在的 bundle ID、AXTitle 的 no-value/unsupported 转为空值；真正的 AX 通信错误仍是未知。无 bundle 的应用不会因为系统设置的 bundle 规则而永久等待。
+
+规则按 `priority` 降序排列，默认 `0`，同级按规则名的 Rust 字符串顺序升序。**每个字段取第一个明确值**，包括 `false`；不是整条规则覆盖，也没有隐含的“更具体者优先”。`bindings_passthrough` 沿用累积行为。
+
+```lua
+spool.setup { windows = {
+  default_dialog = {
+    subrole = "AXDialog", floating = true, priority = -100,
+  },
+  my_dialog = {
+    bundle_id = "example.editor", title = "^Settings$",
+    floating = false, priority = 10,
+  },
+  ignore_overlay = {
+    bundle_id = "example.editor", title = "^Overlay$",
+    track = false, priority = 20,
+  },
+} }
+```
+
+[default.lua](../config/default.lua) 提供低优先级浮动偏好：三个 dialog/floating subrole，以及 System Settings、KeepingYouAwake 两个明确 bundle。没有通用 Settings 标题猜测，也没有 Accessory 全局浮动规则。用户可删除、修改或覆盖。
+
+`Config::default()` 不注入这些用途偏好。已有 `init.lua` 不被升级重写，也不自动合并新模板，已有用户按需采用。因此，没有采用模板偏好且能力可用的设置窗口可以正常 tile。
+
+## 生效与迁移
+
+- 准入规则作用于新发现、尚未跟踪的窗口。新加 `track=false` 不会即时撤销已有身份或伪造销毁事件，需重新创建窗口或下次启动才按新准入规则处理。
+- `floating/index/width/grid` 保留初始默认值语义；待完成事务使用新配置，不因每次元数据刷新覆盖手动选择或重排桌面。其他动态配置沿用原有更新机制。
+- 手动 tile 不把默认 `floating=true` 当作永久禁令。已完成的选择不被普通重采样重置。
+- 延迟手动 tile 以完整、唯一的原生 Space 归属为准；切换当前 Space 不改变目标。几何使用目标 Space 所属显示器的可用区域，没有活动显示器时也可恢复到已知目标。
+- 启动恢复保留既有优先级：可匹配的已保存平铺布局优先于初始偏好，但不绕过已知移动/缩放限制。未知能力可能延迟到恢复宽限期之后，不能保证恢复旧位置。
+- 恢复期间临时无法确认归属时，匹配候选按窗口 incarnation 保留初始默认事务，避免浮动偏好提前消耗恢复资格；用户随后明确选择浮动仍然有效。超过恢复宽限期后不继续保留这一阻塞。
+- 旧冲突规则没有可靠顺序；现在顺序确定。若此前依赖偶然结果，需要显式设置 `priority`。
+- 旧 `track=true` 可把非窗口 role 强行包装成窗口；现在收紧该绕过。真正使用非 AXWindow 根元素的应用需要经证据验证的 adapter 兼容路径，不能依靠全局强制开关。
+
+## AX 通知能力（2026-09-07）
+
+通知支持与窗口准入、移动/缩放能力独立。`AXObserverAddNotification` 返回 `-25207`（`kAXErrorNotificationUnsupported`）表示目标 AX 元素不支持该通知，不是辅助功能未授权，也不意味着窗口必须被排除。
+
+注册策略见 [app.rs](../src/manager/app.rs)：
+
+| 返回结果 | 处理 |
+| --- | --- |
+| 成功、already registered | 记录已完成，不重复注册 |
+| notification unsupported (`-25207`) | 记录该目标不支持；仅首次输出 DEBUG，不进入错误重试列表 |
+| cannot complete (`-25204`)、API disabled (`-25211`) | 立即停止本批注册，保留已完成项与真实错误码，由调用方处理应用级退避 |
+| 其他失败 | 保留真实错误码和重试机会，不伪装成统一的 PermissionDenied |
+
+按应用观察器/具体窗口 incarnation 和通知名称保存结果；一项失败不能导致已成功或明确不支持的其他项整批重试。取消观察时清理对应记录，窗口 ID 复用不会继承旧实例的结论。`observe() == Ok(true)` 表示没有待重试项，不保证所有请求的通知都可用；即使全不支持，也继续依靠 inventory 和状态 reconciliation 跟踪窗口。
+
+此次错误的原因是旧注册逻辑把所有非成功结果都当成可重试失败；扩大 Accessory 观察范围后会涉及更多不支持这些通知的目标。测试覆盖全不支持、部分失败恢复、实例隔离、取消后重注册及 ERROR 日志不再刷屏。该修正不新增权限、不移除跟踪资格，也不自动部署或重启 daemon。
+
+### 应用级通信故障与退避
+
+`-25204`（`kAXErrorCannotComplete`）表示消息通信失败或目标忙碌、无响应，不能据此认定缺少授权，也不能缓存成永久不支持。与 `-25207` 的通知能力结论分开处理。
+
+- 注册发生通信/权限失败时中止剩余通知，包含“已有部分通知成功”的情况；错误交给上层，避免每项 ERROR 再叠加一次应用 WARN。
+- `WindowStateSync` 按 Application Entity 保存失败状态。注册或 AXWindows inventory 返回 `-25204` / `-25211` 后，等待 **1、2、4、8、16、30 秒**，持续失败时最多每 30 秒探测一次。实际探测发生在到期后的下一次对账，事件风暴不绕过冷却。
+- 当轮注册通信失败，不继续读取同一应用的 AXWindows。冷却期间跳过该应用在 reconciliation 中的注册、inventory、焦点和 frame AX 查询。其他应用保持正常频率；这不是所有用户命令和平台调用的全局熔断器。
+- 对账中的同一连续故障、同一错误码只首次 WARN，带 PID、应用名、bundle ID 和真实错误。后续失败记 DEBUG，错误码变化重新 WARN。成功读取 inventory 后清除退避并记恢复 DEBUG，下次故障从一秒开始。启动路径的一次性诊断不属于这项日志去重范围。
+- 进程存活与 WindowServer 观察继续执行。AX 失败或冷却不能当成窗口销毁证据，保留既有身份和布局；物理 surface 缺失仍按原有暂不可用流程处理。明确进程退出可立即清理，不必等待冷却结束。退避随 Entity 清理，复用 PID 的新应用不继承旧故障。
+
+2026-09-07 的只读现场样本：日志 PID `80780` 对应 `com.apple.WebKit.Networking`，应用名为“飞牛同步 Networking”，`activationPolicy=Accessory`、`isFinishedLaunching=false`。原有进程初始化路径只检查可观察策略，没有经过后续启动路径的 `ready()`；随后通知批次继续访问失败端点，心跳又立即重试，形成持续错误。这个样本说明 Accessory 不是 AX 可用性的保证，不代表所有 WebKit helper 或所有 Accessory 应用都应排除。
+
+错误定义核对自本机 Xcode SDK 的 `HIServices.framework/Headers/AXError.h`（`kAXErrorCannotComplete`、`kAXErrorNotificationUnsupported`、`kAXErrorAPIDisabled`）。Apple 网页本次未返回可用正文；真实桌面修复效果仍须重建并经授权部署后验证。
+
+## 边界与验收
+
+- 不是完整重写 AltTab 目录，没有增加截图权限、注入、私有 AX token 遍历或新私有 API。
+- 扩大应用观察范围和增加父关系读取会增加 AX 工作量；本次未做大量应用并行运行的真实开销测量。
+- 不新增 sheet/modal 聚焦代理或完整父子模型；父属性缺失的兼容性需真实应用验证。
+- 不支持固定尺寸 item、单轴约束布局求解，也不把视觉缩放当作真实 resize。
+- 未实现 sticky 多 Space 布局归属、实时撤销已跟踪窗口的准入规则，或所有动作的能力菜单。
+- 原因用于内部决策和日志，未扩展公开 query schema。待定初始窗口的 `floating` 投影不等于已完成默认决策。
+- 本次仅代码、mock 与静态验证；KeepingYouAwake、System Settings、第三方 dialog、多显示器与真实全屏切换需授权后的桌面验收。禁用 zoom 按钮不是 fixed-size 证据。
+
+## 实现入口
+
+- [window_policy.rs](../src/window_policy.rs)：不依赖 AppKit/ECS 的准入与能力决策。
+- [config.rs](../src/config.rs)：匹配、未知值和确定顺序。
+- [windows.rs](../src/manager/windows.rs)、[process.rs](../src/manager/process.rs)：平台属性和应用观察。
+- [triggers.rs](../src/ecs/triggers.rs)、[defaults.rs](../src/ecs/defaults.rs)：初始事务、浮动和重试。
+- [策略回归测试](../src/tests/window_policy.rs)：用途无关、规则覆盖、能力拒绝、失败恢复和无窗口应用生命周期。

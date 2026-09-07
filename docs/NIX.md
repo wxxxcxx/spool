@@ -99,7 +99,7 @@ services.spool = {
 
 To make extra Lua modules available to `init.lua` (e.g. to call SketchyBar's
 Lua bridge directly from a `spool.on` handler, see
-[`CONFIGURATION.md`](/CONFIGURATION.md#8-lua-scripting)):
+[`docs/CONFIGURATION.md`](CONFIGURATION.md#8-lua-scripting)):
 
 ```nix
 services.spool.extraLuaPackages = luaPs: [ (luaPs.callPackage ./sbarlua.nix { }) ];
@@ -123,7 +123,7 @@ If neither nix-darwin nor Home Manager suits your use case, the flake provides t
 #### Run without installing
 
 > [!NOTE]
-> Running spool requires a configuration to be present (See [`CONFIGURATION.md`](/CONFIGURATION.md))
+> Running spool requires a configuration to be present (See [`docs/CONFIGURATION.md`](CONFIGURATION.md))
 
 ```shell
 nix run github:wxxxcxx/spool

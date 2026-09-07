@@ -28,7 +28,7 @@ use tracing::{error, info, warn};
 
 use super::convert::{self, LuaEvent};
 use super::runtime::LuaRuntime;
-use super::world::{DispatchWorld, WorldAccess};
+use super::world::{DispatchBatch, DispatchWorld, WorldAccess};
 use crate::commands::Action;
 use crate::config::Config;
 use crate::ecs::state::SpoolQueryState;
@@ -69,7 +69,7 @@ pub(super) enum FromLua {
     Action(Action),
     Flash {
         message: String,
-        duration: f32,
+        duration: Duration,
     },
     /// A reload installed a script that calls `spool.setup{...}`; tells the
     /// main thread to re-apply the config in [`LuaWorker::built_config`].
@@ -328,12 +328,16 @@ fn reload(
             );
             let _ = to_main.try_send(FromLua::ConfigChanged);
             info!("Reloaded Lua script {}", path.display());
-            flash(to_main, "Lua reloaded".to_string(), 1.5);
+            flash(
+                to_main,
+                "Lua reloaded".to_string(),
+                Duration::from_millis(1500),
+            );
             Some(runtime)
         }
         Err(err) => {
             error!("Reloading Lua script '{}': {err}", path.display());
-            flash(to_main, format!("Lua error: {err}"), 4.0);
+            flash(to_main, format!("Lua error: {err}"), Duration::from_secs(4));
             None
         }
     }
@@ -347,7 +351,7 @@ fn publish_config(slot: &Mutex<Option<Config>>, config: &Config) {
 }
 
 /// Queues an on-screen message for the main thread to show.
-fn flash(to_main: &Sender<FromLua>, message: String, duration: f32) {
+fn flash(to_main: &Sender<FromLua>, message: String, duration: Duration) {
     let _ = to_main.try_send(FromLua::Flash { message, duration });
 }
 
@@ -393,6 +397,7 @@ fn run(
             match message {
                 ToLua::Events(events) => {
                     let runtime = Rc::clone(&current.borrow());
+                    let batch = DispatchBatch::new();
                     for event in &events {
                         let Some((name, table)) = convert::event_table(runtime.lua(), event) else {
                             continue;
@@ -410,6 +415,8 @@ fn run(
                             }
                             let task = Task {
                                 runtime: Rc::clone(&runtime),
+                                current: &current,
+                                batch: Rc::clone(&batch),
                                 to_main: to_main.clone(),
                                 has_handlers,
                             };
@@ -417,7 +424,9 @@ fn run(
                                 (name.clone(), table.clone(), entry.handler.clone());
                             executor
                                 .spawn(async move {
-                                    task.runtime.dispatch_event(&name, &table, &handler).await;
+                                    task.runtime
+                                        .dispatch_event(&name, &table, &handler, &task.batch)
+                                        .await;
                                     task.finish();
                                 })
                                 .detach();
@@ -426,15 +435,18 @@ fn run(
                 }
                 ToLua::Binds { ids } => {
                     let runtime = Rc::clone(&current.borrow());
+                    let batch = DispatchBatch::new();
                     for id in ids {
                         let task = Task {
                             runtime: Rc::clone(&runtime),
+                            current: &current,
+                            batch: Rc::clone(&batch),
                             to_main: to_main.clone(),
                             has_handlers,
                         };
                         executor
                             .spawn(async move {
-                                task.runtime.dispatch_bind(id).await;
+                                task.runtime.dispatch_bind(id, &task.batch).await;
                                 task.finish();
                             })
                             .detach();
@@ -456,6 +468,8 @@ fn run(
 /// way back to the main thread once it is done.
 struct Task<'a> {
     runtime: Rc<LuaRuntime>,
+    current: &'a RefCell<Rc<LuaRuntime>>,
+    batch: Rc<DispatchBatch>,
     to_main: Sender<FromLua>,
     has_handlers: &'a AtomicBool,
 }
@@ -468,6 +482,12 @@ impl Task<'_> {
     /// action still reaches the bus exactly once, in order, just not
     /// necessarily via the dispatch that queued it.
     fn finish(&self) {
+        // Retired callbacks may finish their actions, but only the installed
+        // interpreter can publish the event fast path's registration state.
+        if Rc::ptr_eq(&self.runtime, &self.current.borrow()) {
+            self.has_handlers
+                .store(self.runtime.has_event_handlers(), Ordering::Relaxed);
+        }
         let (actions, flashes) = self.runtime.drain_outbox();
         for action in actions {
             let _ = self.to_main.try_send(FromLua::Action(action));
@@ -475,8 +495,6 @@ impl Task<'_> {
         for (message, duration) in flashes {
             flash(&self.to_main, message, duration);
         }
-        self.has_handlers
-            .store(self.runtime.has_event_handlers(), Ordering::Relaxed);
     }
 }
 
@@ -500,6 +518,16 @@ mod tests {
 
     fn worker(source: &str) -> LuaWorker {
         spawn_with_store(LuaSource::Inline(source.to_string()))
+    }
+
+    fn send_binds(worker: &LuaWorker, positions: &[usize]) {
+        let published = crate::platform::input::lua_keybinds();
+        worker.send_binds(
+            positions
+                .iter()
+                .map(|position| published[position - 1].2)
+                .collect(),
+        );
     }
 
     #[test]
@@ -734,7 +762,7 @@ mod tests {
     #[test]
     fn bind_dispatch_reaches_the_outbox() {
         let worker = worker(r#"spool.bind("alt+b", spool.action.window.balance)"#);
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
         let FromLua::Action(action) = next_effect(&worker, "the bound action") else {
             panic!("expected an action");
         };
@@ -742,6 +770,36 @@ mod tests {
             matches!(action, Action::Window(crate::commands::Operation::Balance)),
             "expected a balance action, got {action:?}"
         );
+    }
+
+    #[test]
+    fn invalid_flash_durations_cannot_panic_the_main_thread() {
+        use crate::ecs::{FlashMessage, SpawnCommandsExt, Timeout};
+
+        let worker = worker(
+            r#"
+            spool.bind("alt+f", function()
+                for _, duration in ipairs({ -1, 0/0, math.huge, -math.huge, 1e30 }) do
+                    pcall(spool.flash, "invalid", duration)
+                end
+                spool.flash("valid", 0)
+            end)
+            "#,
+        );
+        send_binds(&worker, &[1]);
+        let FromLua::Flash { message, duration } = next_effect(&worker, "the valid flash") else {
+            panic!("expected a flash");
+        };
+        let mut world = bevy::ecs::world::World::new();
+        world.commands().flash_message(message, duration);
+        world.flush();
+        let (message, timeout) = world
+            .query::<(&FlashMessage, &Timeout)>()
+            .single(&world)
+            .unwrap();
+        assert_eq!(message.0, "valid");
+        assert_eq!(timeout.timer.duration(), Duration::ZERO);
+        assert!(worker.outbox.try_recv().is_err());
     }
 
     #[test]
@@ -761,7 +819,7 @@ mod tests {
             end)
             "#,
         );
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
 
         // Every dispatch is handed a window set before the handler runs, so that
         // is the first thing to arrive whether or not the handler wants one.
@@ -783,7 +841,7 @@ mod tests {
             end)
             "#,
         );
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
 
         serve_window_set(&worker);
         next_world_request(&worker, "the first query").answer(Ok(Arc::new(test_state())));
@@ -802,12 +860,12 @@ mod tests {
             spool.bind("alt+b", spool.action.window.balance)
             "#,
         );
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
         // Drop the request without answering, as a shutdown would.
         drop(next_world_request(&worker, "the world"));
 
         // The handler's error is not the worker's: it is still dispatching.
-        worker.send_binds(vec![2]);
+        send_binds(&worker, &[2]);
         let FromLua::Action(action) = next_effect(&worker, "the next bind") else {
             panic!("expected an action");
         };
@@ -829,21 +887,74 @@ mod tests {
         .unwrap();
 
         let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision());
-        std::fs::write(&script, "this is not lua ===").unwrap();
+        let published = crate::platform::input::lua_keybinds();
+        std::fs::write(
+            &script,
+            r#"spool.bind("alt+b", spool.action.quit); error("broken reload")"#,
+        )
+        .unwrap();
         worker.send_reload(script.clone());
         assert!(
             next_flash(&worker, "the reload error").starts_with("Lua error:"),
             "a broken script should be reported"
         );
 
+        assert_eq!(crate::platform::input::lua_keybinds(), published);
         // ...and the bind registered by the working script still dispatches.
-        worker.send_binds(vec![1]);
+        worker.send_binds(vec![published[0].2]);
         assert!(matches!(
             next_effect(&worker, "the surviving bind"),
             FromLua::Action(Action::Window(crate::commands::Operation::Balance))
         ));
 
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_keypress_queued_before_reload_cannot_run_a_replacement_binding() {
+        let directory = std::env::temp_dir().join(format!(
+            "spool-lua-worker-stale-bind-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let _cleanup = scopeguard::guard(directory.clone(), |path| {
+            let _ = std::fs::remove_dir_all(path);
+        });
+        let script = directory.join("init.lua");
+        let worker = worker(r#"spool.bind("alt+a", spool.action.window.focus_west)"#);
+        let old_id = crate::platform::input::lua_keybinds()[0].2;
+
+        std::fs::write(
+            &script,
+            r#"
+            spool.bind("alt+b", spool.action.window.balance)
+            spool.bind("alt+c", spool.action.window.focus_east)
+            "#,
+        )
+        .unwrap();
+        worker.send_reload(script);
+        assert!(matches!(
+            next_effect(&worker, "the configuration reset"),
+            FromLua::ConfigChanged
+        ));
+        assert_eq!(next_flash(&worker, "the reload notice"), "Lua reloaded");
+
+        let new_id = crate::platform::input::lua_keybinds()[1].2;
+        // The event tap captured old_id before the reload, but the main
+        // thread only forwarded that queued event after the reload committed.
+        worker.send_binds(vec![old_id, new_id]);
+        let FromLua::Action(action) = next_effect(&worker, "the current binding") else {
+            panic!("expected the current binding's action");
+        };
+        assert!(
+            matches!(
+                action,
+                Action::Window(crate::commands::Operation::Focus(
+                    crate::commands::Direction::East
+                ))
+            ),
+            "a stale keypress must not dispatch a replacement callback: {action:?}"
+        );
     }
 
     #[test]
@@ -880,6 +991,67 @@ mod tests {
         assert_eq!(next_flash(&worker, "the new handler"), "reloaded");
 
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn retired_callback_cannot_replace_reloaded_handler_availability() {
+        for new_has_handlers in [true, false] {
+            let directory = std::env::temp_dir().join(format!(
+                "spool-retired-callback-{}-{new_has_handlers}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let script = directory.join("init.lua");
+            let old_handler = if new_has_handlers {
+                ""
+            } else {
+                r#"spool.on("space_changed", function() end)"#
+            };
+            let worker = worker(&format!(
+                r#"
+                {old_handler}
+                spool.bind("alt+a", function()
+                    spool.query_active()
+                    spool.flash("retired callback finished")
+                end)
+                "#
+            ));
+            send_binds(&worker, &[1]);
+            serve_window_set(&worker);
+            let parked = next_world_request(&worker, "the old callback's query");
+
+            std::fs::write(
+                &script,
+                if new_has_handlers {
+                    r#"spool.on("space_changed", function() end)"#
+                } else {
+                    "-- no event handlers"
+                },
+            )
+            .unwrap();
+            worker.send_reload(script);
+            assert!(matches!(
+                next_effect(&worker, "the configuration reset"),
+                FromLua::ConfigChanged
+            ));
+            assert_eq!(next_flash(&worker, "the reload notice"), "Lua reloaded");
+
+            parked.answer(Ok(Arc::new(test_state())));
+            assert_eq!(
+                next_flash(&worker, "the old callback"),
+                "retired callback finished"
+            );
+            // Joining the worker waits for the whole completion, including
+            // publication after the flash, without a timing-dependent sleep.
+            let availability = Arc::clone(&worker.has_handlers);
+            drop(worker);
+            assert_eq!(
+                availability.load(Ordering::Relaxed),
+                new_has_handlers,
+                "only the installed runtime owns event-handler availability"
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     /// The canned layout with its window on one Space.
@@ -944,7 +1116,7 @@ mod tests {
 
         let worker = spawn_with_store(LuaSource::Path(script.clone()));
 
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
         // Serving is what lets the write land; the flash is how we know the
         // handler got that far.
         std::fs::write(
@@ -967,7 +1139,7 @@ mod tests {
         };
         assert_eq!(message, "Lua reloaded");
 
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
         let FromLua::Flash { message, .. } = serve_until_effect(&worker, "the value read back")
         else {
             panic!("expected the flash the reloaded script sends");
@@ -984,7 +1156,7 @@ mod tests {
     fn a_returned_window_set_commits_its_operations() {
         let worker =
             worker(r#"spool.bind("alt+f", function(ws) return ws:focus(ws:focused()) end)"#);
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
         serve_window_set(&worker);
 
         let FromLua::Action(action) = next_effect(&worker, "the layout action") else {
@@ -1006,7 +1178,7 @@ mod tests {
             end)
             "#,
         );
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
         serve_window_set(&worker);
 
         assert_eq!(next_flash(&worker, "the handler to finish"), "discarded");
@@ -1027,11 +1199,11 @@ mod tests {
             spool.bind("alt+b", spool.action.window.balance)
             "#,
         );
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
         serve_window_set(&worker);
 
         // Nothing from the failed handler; the worker is still dispatching.
-        worker.send_binds(vec![2]);
+        send_binds(&worker, &[2]);
         assert!(matches!(
             next_effect(&worker, "the next bind"),
             FromLua::Action(Action::Window(crate::commands::Operation::Balance))
@@ -1047,7 +1219,7 @@ mod tests {
             end)
             "#,
         );
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
         serve_window_set(&worker);
 
         let FromLua::Action(Action::Layout(ops)) = next_effect(&worker, "the layout action") else {
@@ -1075,7 +1247,7 @@ mod tests {
         // Laziness is what keeps the window set affordable on hot events: it
         // costs a round-trip and reads every window title over the AX API.
         let worker = worker(r#"spool.bind("alt+b", spool.action.window.balance)"#);
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
 
         assert!(matches!(
             next_effect(&worker, "the bound action"),
@@ -1095,7 +1267,7 @@ mod tests {
             spool.bind("alt+b", function(ws) spool.flash(tostring(ws:focused())) end)
             "#,
         );
-        worker.send_binds(vec![1, 2]);
+        send_binds(&worker, &[1, 2]);
         serve_window_set(&worker);
 
         assert_eq!(next_flash(&worker, "the first handler"), "7");
@@ -1118,7 +1290,7 @@ mod tests {
             spool.bind("alt+b", function() spool.flash("second") end)
             "#,
         );
-        worker.send_binds(vec![1, 2]);
+        send_binds(&worker, &[1, 2]);
         serve_window_set(&worker);
 
         // Taken but deliberately not answered: the first handler stays parked.
@@ -1132,6 +1304,33 @@ mod tests {
 
         parked.answer(Ok(Arc::new(test_state())));
         assert_eq!(next_flash(&worker, "the first handler"), "Test App");
+    }
+
+    #[test]
+    fn a_later_input_batch_does_not_join_an_older_pending_read() {
+        let worker = worker(
+            r#"
+            spool.bind("alt+a", function()
+                spool.flash("old:" .. spool.query_active().focused_app_name)
+            end)
+            spool.bind("alt+b", function()
+                spool.flash("new:" .. spool.query_active().focused_app_name)
+            end)
+            "#,
+        );
+        send_binds(&worker, &[1]);
+        serve_window_set(&worker);
+        let parked = next_world_request(&worker, "the older batch's state");
+
+        send_binds(&worker, &[2]);
+        serve_window_set(&worker);
+        let mut fresh = test_state();
+        fresh.active.focused_app_name = Some("New App".to_string());
+        next_world_request(&worker, "the newer batch's state").answer(Ok(Arc::new(fresh)));
+        assert_eq!(next_flash(&worker, "the newer callback"), "new:New App");
+
+        parked.answer(Ok(Arc::new(test_state())));
+        assert_eq!(next_flash(&worker, "the older callback"), "old:Test App");
     }
 
     #[test]
@@ -1162,11 +1361,11 @@ mod tests {
             spool.bind("alt+b", function() spool.flash(tostring(escaped:focused())) end)
             "#,
         );
-        worker.send_binds(vec![1]);
+        send_binds(&worker, &[1]);
         serve_window_set(&worker);
         assert_eq!(next_flash(&worker, "the first handler"), "7");
 
-        worker.send_binds(vec![2]);
+        send_binds(&worker, &[2]);
         assert_eq!(next_flash(&worker, "the captured set"), "7");
         assert!(
             worker.world_queries.try_recv().is_err(),

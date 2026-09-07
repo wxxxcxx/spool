@@ -20,8 +20,8 @@ use crate::ecs::native_space::VisibleNativeSpaceMarker;
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, Floating, FocusedMarker,
-    FullWidthMarker, NativeFullscreenMarker, RaiseWindow, SendMessageTrigger, SpawnCommandsExt,
-    Timeout,
+    FullWidthMarker, NativeFullscreenMarker, RaiseWindow, RetilePending, RetileWindow,
+    SendMessageTrigger, SpawnCommandsExt, Timeout,
 };
 use crate::events::{Event, ReconcileScope};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -1147,7 +1147,7 @@ fn maximize_window(
 fn toggle_floating_window(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    pending_retiles: Query<(), With<RetilePending>>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::ToggleFloating))
@@ -1173,28 +1173,14 @@ fn toggle_floating_window(
     }
     let was_floating = state.is_floating();
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        if was_floating {
-            entity_commands.try_remove::<Floating>();
+        if pending_retiles.contains(entity) {
+            // A second toggle cancels the outstanding tile intent.
+            entity_commands.try_remove::<RetilePending>();
+        } else if was_floating {
+            commands.trigger(RetileWindow(entity));
         } else {
             entity_commands.try_insert(Floating);
         }
-    }
-
-    // Going floating -> tiled only flips the component. Nothing else in
-    // the pipeline reinserts the window into a strip, so if it had been
-    // stripped of membership (spawn-floating path in window_floating_trigger
-    // strip.removes; orphan rescue in find_orphaned_workspaces despawns the
-    // strip) the toggle is invisible — the window stays where it floated
-    // and the user thinks the keybind is broken. Append to the active
-    // strip and reshuffle so the layout pipeline tiles it.
-    if was_floating
-        && !workspaces.iter().any(|(strip, _)| strip.contains(entity))
-        && let Some(mut strip) = workspaces
-            .iter_mut()
-            .find_map(|(strip, active)| active.then_some(strip))
-    {
-        strip.append(entity);
-        commands.reshuffle_around(entity);
     }
 }
 

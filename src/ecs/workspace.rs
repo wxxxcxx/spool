@@ -1,5 +1,5 @@
 use bevy::app::{App, Last, Plugin, PreUpdate, Update};
-use bevy::ecs::change_detection::{DetectChanges, Ref};
+use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut as _, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -22,6 +22,7 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_space::{self, VisibleNativeSpaceMarker};
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::reconcile::WindowUnavailable;
+use crate::ecs::topology::WindowMemberships;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Floating,
     FullscreenDefaultsDeferred, Initializing, NativeFullscreenMarker, PreviousTiledStrip,
@@ -79,7 +80,9 @@ impl Plugin for WorkspaceEventsPlugin {
                     .after(super::display::reconcile_displays)
                     .before(reconcile_fullscreen_spaces)
                     .before(super::systems::finish_setup),
-                reconcile_fullscreen_spaces.before(detect_moved_windows),
+                reconcile_fullscreen_spaces
+                    .after(super::reconcile::reconcile_windows)
+                    .before(detect_moved_windows),
                 detect_moved_windows.run_if(not(resource_exists::<Initializing>)),
                 refresh_workspace_window_sizes.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
@@ -99,10 +102,16 @@ impl Plugin for WorkspaceEventsPlugin {
     }
 }
 
+type FullscreenWindows<'w, 's> = (
+    Windows<'w, 's>,
+    Query<'w, 's, (), Added<Window>>,
+    Query<'w, 's, Entity, With<FullscreenDefaultsDeferred>>,
+);
+
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn reconcile_fullscreen_spaces(
     mut messages: MessageReader<Event>,
-    windows: Windows,
+    (windows, discovered, deferred): FullscreenWindows,
     mut workspaces: Query<(&mut LayoutStrip, Entity, Has<NativeFullscreenMarker>)>,
     topology: Res<super::topology::NativeTopology>,
     window_manager: Res<WindowManager>,
@@ -112,10 +121,32 @@ pub(super) fn reconcile_fullscreen_spaces(
     let signaled = messages
         .read()
         .any(|event| matches!(event, Event::SpaceChanged));
-    if !signaled && *generation == topology.generation() {
+    if !signaled && discovered.is_empty() && *generation == topology.generation() {
         return;
     }
     *generation = topology.generation();
+    let detached = deferred
+        .iter()
+        .filter(|entity| !workspaces.iter().any(|(strip, ..)| strip.contains(*entity)))
+        .collect::<Vec<_>>();
+    // Unknown capabilities can keep a startup fullscreen window outside every
+    // strip. Such a window has no source-strip destruction to resume its defaults.
+    if !detached.is_empty()
+        && let Ok(memberships) = topology.observe_memberships(&window_manager)
+    {
+        for entity in detached {
+            if let Some(window) = windows.get(entity)
+                && memberships
+                    .unique_space(window.id())
+                    .is_some_and(|space| !topology.is_fullscreen(space))
+                && matches!(window.try_is_full_screen(), Ok(false))
+            {
+                commands
+                    .entity(entity)
+                    .remove::<FullscreenDefaultsDeferred>();
+            }
+        }
+    }
     let targets = workspaces
         .iter()
         .filter_map(|(strip, entity, marked)| {
@@ -126,44 +157,48 @@ pub(super) fn reconcile_fullscreen_spaces(
         let Ok(members) = window_manager.windows_in_workspace(workspace_id) else {
             continue;
         };
-        let mut sources = members
+        let mut candidates = members
             .into_iter()
             .collect::<HashSet<_>>()
             .into_iter()
-            .filter_map(|id| windows.find_tiled(id).map(|(_, entity)| entity))
-            .filter_map(|window| {
-                workspaces.iter().find_map(|(strip, entity, _)| {
-                    (entity != target)
-                        .then(|| {
-                            strip
-                                .index_of(window)
-                                .ok()
-                                .map(|index| (entity, strip.id(), index, window))
-                        })
-                        .flatten()
-                })
-            });
-        let Some((source, source_id, index, window)) = sources.next() else {
+            .filter_map(|id| windows.find_tiled(id).map(|(_, entity)| entity));
+        let Some(window) = candidates.next() else {
             continue;
         };
-        if sources.next().is_some() {
+        if candidates.next().is_some() {
             warn!(
                 workspace_id,
-                "fullscreen membership has multiple tracked source windows; deferring migration"
+                "fullscreen membership has multiple tracked windows; deferring migration"
             );
             continue;
         }
-        if let Ok((mut strip, _, _)) = workspaces.get_mut(source) {
-            strip.remove(window);
+        let source = workspaces.iter().find_map(|(strip, entity, _)| {
+            (entity != target)
+                .then(|| {
+                    strip
+                        .index_of(window)
+                        .ok()
+                        .map(|index| (entity, strip.id(), index))
+                })
+                .flatten()
+        });
+        // AX may first expose an inactive fullscreen window after startup.
+        // It needs a native strip even when there is no previous tiled slot.
+        if let Some((source, source_id, index)) = source {
+            if let Ok((mut strip, _, _)) = workspaces.get_mut(source) {
+                strip.remove(window);
+            }
+            commands.entity(target).insert(NativeFullscreenMarker {
+                layout_strip: source,
+                workspace_id: source_id,
+                index,
+            });
         }
-        if let Ok((mut strip, _, _)) = workspaces.get_mut(target) {
+        if let Ok((mut strip, _, _)) = workspaces.get_mut(target)
+            && (!strip.is_fullscreen() || !strip.contains(window))
+        {
             *strip = LayoutStrip::fullscreen(workspace_id, window);
         }
-        commands.entity(target).insert(NativeFullscreenMarker {
-            layout_strip: source,
-            workspace_id: source_id,
-            index,
-        });
         commands.entity(window).remove::<(
             RepositionMarker,
             ResizeMarker,
@@ -311,7 +346,6 @@ type DetachedPreviousWindows<'w, 's> = Query<
 struct MissingWorkspaceCtx<'w, 's> {
     workspaces: InvalidatedWorkspaces<'w, 's>,
     detached_windows: DetachedPreviousWindows<'w, 's>,
-    native_moves: Query<'w, 's, (), With<native_space::NativeMoveOwner>>,
     displays: Query<'w, 's, &'static Display>,
     topology: Res<'w, super::topology::NativeTopology>,
     focus: ResMut<'w, FocusCoordinator>,
@@ -335,37 +369,6 @@ pub(crate) fn freeze_window_for_space_reassignment(
                 ReshuffleAroundMarker,
                 EnsureVisibleMarker,
             )>();
-    }
-}
-
-fn resume_reappearing_workspace(
-    entity: Entity,
-    strip: &LayoutStrip,
-    detached_windows: &DetachedPreviousWindows,
-    attached_windows: &HashSet<Entity>,
-    native_moves: &Query<(), With<native_space::NativeMoveOwner>>,
-    commands: &mut Commands,
-) {
-    commands.entity(entity).remove::<PendingSpaceDestruction>();
-    let retained = strip
-        .all_windows()
-        .into_iter()
-        .chain(
-            detached_windows
-                .iter()
-                .filter_map(|(window, previous, pending)| {
-                    (pending
-                        && previous.workspace_id == strip.id()
-                        && !attached_windows.contains(&window))
-                    .then_some(window)
-                }),
-        );
-    for window in retained {
-        if !native_moves.contains(window) {
-            commands
-                .entity(window)
-                .remove::<WindowSpaceReassignmentPending>();
-        }
     }
 }
 
@@ -405,7 +408,6 @@ fn invalidate_missing_workspaces(
     let MissingWorkspaceCtx {
         workspaces,
         detached_windows,
-        native_moves,
         displays,
         topology,
         mut focus,
@@ -449,14 +451,9 @@ fn invalidate_missing_workspaces(
             if pending.is_some_and(|pending| !pending.explicit)
                 && present_spaces.contains(&strip.id())
             {
-                resume_reappearing_workspace(
-                    entity,
-                    strip,
-                    &detached_windows,
-                    &attached_windows,
-                    &native_moves,
-                    &mut commands,
-                );
+                // Space presence cannot confirm where its former windows went.
+                // Their barriers remain owned by membership reconciliation.
+                commands.entity(entity).remove::<PendingSpaceDestruction>();
             }
             continue;
         }
@@ -515,11 +512,10 @@ struct PendingWorkspaceSnapshot {
 
 struct LiveSpaceSnapshot {
     surviving: Vec<SurvivingWorkspace>,
-    memberships: HashMap<WorkspaceId, Vec<WinID>>,
+    memberships: Option<WindowMemberships>,
     active_target: Option<SurvivingWorkspace>,
     observed_display_ids: HashSet<u32>,
     topology_by_display: HashMap<u32, HashSet<WorkspaceId>>,
-    complete: bool,
 }
 
 #[derive(Default)]
@@ -613,31 +609,10 @@ fn live_space_snapshot(
         .map(|(workspace, _, _)| workspace)
         .collect::<Vec<_>>();
 
-    let mut membership_spaces = present_spaces
-        .iter()
-        .copied()
-        .filter(|workspace_id| {
-            !destroyed_spaces.contains(workspace_id) && !observation.is_fullscreen(*workspace_id)
-        })
-        .collect::<Vec<_>>();
-    membership_spaces.sort_unstable();
-    let mut memberships = HashMap::new();
-    let mut complete = observation.is_complete();
-    for workspace_id in membership_spaces {
-        match window_manager.windows_in_workspace(workspace_id) {
-            Ok(window_ids) => {
-                memberships.insert(workspace_id, window_ids);
-            }
-            Err(error) => {
-                complete = false;
-                debug!(
-                    workspace_id,
-                    %error,
-                    "destroyed Space membership snapshot incomplete"
-                );
-            }
-        }
-    }
+    let memberships = observation
+        .observe_memberships(window_manager)
+        .inspect_err(|error| debug!(%error, "Space membership snapshot incomplete"))
+        .ok();
     let active_target = active_workspace_id.and_then(|workspace_id| {
         surviving
             .iter()
@@ -650,7 +625,6 @@ fn live_space_snapshot(
         active_target,
         observed_display_ids,
         topology_by_display,
-        complete,
     }
 }
 
@@ -671,12 +645,7 @@ type ReassignmentWindows<'w, 's> = Query<
 >;
 
 fn unique_membership(snapshot: &LiveSpaceSnapshot, window_id: WinID) -> Option<WorkspaceId> {
-    let mut matches = snapshot
-        .memberships
-        .iter()
-        .filter_map(|(workspace_id, ids)| ids.contains(&window_id).then_some(*workspace_id));
-    let target = matches.next()?;
-    matches.next().is_none().then_some(target)
+    snapshot.memberships.as_ref()?.unique_space(window_id)
 }
 
 fn target_workspace(
@@ -760,13 +729,17 @@ fn move_layout_group(
     moved
 }
 
-fn finish_rehomed_windows(windows: &[Entity], commands: &mut Commands) {
+fn release_reassignment_barriers(windows: &[Entity], commands: &mut Commands) {
     for entity in windows {
         if let Ok(mut entity_commands) = commands.get_entity(*entity) {
             entity_commands
                 .try_remove::<(WindowSpaceReassignmentPending, FullscreenDefaultsDeferred)>();
         }
     }
+}
+
+fn finish_rehomed_windows(windows: &[Entity], commands: &mut Commands) {
+    release_reassignment_barriers(windows, commands);
     if let Some(entity) = windows.first() {
         commands.reshuffle_around(*entity);
     }
@@ -859,11 +832,16 @@ fn rehome_detached_pending_windows(
     commands: &mut Commands,
 ) -> bool {
     let mut unresolved = false;
+    let mut tiled_by_route: HashMap<(Entity, WorkspaceId), Vec<Entity>> = HashMap::new();
     for (entity, window, floating, visibility, pending) in windows {
-        let still_in_source = workspaces
+        let source = workspaces
             .iter()
-            .any(|(strip, _, _, source, _, _)| source.is_some() && strip.contains(entity));
-        if still_in_source {
+            .find_map(|(strip, source, _, retiring, _, _)| {
+                strip
+                    .contains(entity)
+                    .then_some((source, retiring.is_some()))
+            });
+        if source.is_some_and(|(_, retiring)| retiring) {
             continue;
         }
         let Some(workspace_id) = unique_membership(snapshot, window.id()) else {
@@ -875,6 +853,16 @@ fn rehome_detached_pending_windows(
             continue;
         };
 
+        if !floating
+            && visibility.is_none()
+            && let Some((source, _)) = source
+        {
+            tiled_by_route
+                .entry((source, workspace_id))
+                .or_default()
+                .push(entity);
+            continue;
+        }
         remove_windows_from_strips(&[entity], workspaces);
         if floating {
             finish_rehomed_windows(&[entity], commands);
@@ -899,6 +887,23 @@ fn rehome_detached_pending_windows(
             finish_rehomed_windows(&[entity], commands);
         } else {
             unresolved = true;
+        }
+    }
+    for ((source, workspace_id), entities) in tiled_by_route {
+        let Some(target) = target_workspace(snapshot, workspace_id) else {
+            unresolved = true;
+            continue;
+        };
+        if source == target.entity {
+            // An unchanged membership must preserve columns, tabs and scrolling.
+            if let Ok((mut strip, ..)) = workspaces.get_mut(source) {
+                strip.set_changed();
+            }
+            release_reassignment_barriers(&entities, commands);
+        } else {
+            let moved = move_layout_group(source, target, &entities, workspaces);
+            unresolved |= moved.len() != entities.len();
+            finish_rehomed_windows(&moved, commands);
         }
     }
     unresolved
@@ -963,7 +968,7 @@ fn reconcile_destroyed_workspace_membership(
         entity_commands.try_insert(ActiveWorkspaceMarker);
     }
 
-    if !snapshot.complete {
+    if snapshot.memberships.is_none() {
         defer_reconciliation(&mut backoff, "membership snapshot incomplete");
         return;
     }

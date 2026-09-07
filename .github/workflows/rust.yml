@@ -2,37 +2,45 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: "1.95.0"
 
 jobs:
   validate:
-    runs-on: macos-latest
+    name: Validate (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
     steps:
-    - uses: actions/checkout@v4
-    - run: rustup update
-    - run: rustup component add rustfmt clippy
-    - name: Formatting
-      run: cargo fmt --all -- --check
-    - name: Clippy
-      run: cargo clippy --workspace --all-targets --locked -- -D warnings
-    - name: Tests (serial macOS FFI)
-      run: cargo test --workspace --locked -- --test-threads=1
-    - name: Build without Lua
-      run: cargo check -p spool --no-default-features --locked
-
-  build:
-    needs: validate
-    runs-on: macos-latest
-    steps:
-    - uses: actions/checkout@v4
-    - run: rustup update
-    - run: cargo build --release --locked --verbose
-    - uses: actions/upload-artifact@v4
-      with:
-        name: spool-macos
-        path: target/release/spool
+      - uses: actions/checkout@v4
+      - name: Install declared Rust version
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+      - name: Verify host architecture
+        run: |
+          rustc --version --verbose | grep -Fx 'host: ${{ matrix.target }}'
+      - name: Verify release candidate
+        run: bash scripts/verify-release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spool-${{ matrix.target }}
+          path: target/release-check/${{ matrix.target }}/
+          if-no-files-found: error

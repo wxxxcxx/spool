@@ -1,5 +1,6 @@
 use accessibility_sys::{
-    AXIsProcessTrusted, AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt,
+    AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXUIElementCreateSystemWide,
+    AXUIElementSetMessagingTimeout, kAXTrustedCheckOptionPrompt,
 };
 use bevy::ecs::resource::Resource;
 use bevy::math::{IRect, IVec2};
@@ -9,10 +10,10 @@ use mockall::automock;
 #[cfg(feature = "lua")]
 use notify::{RecursiveMode, Watcher};
 use objc2::runtime::{AnyClass, AnyObject};
-use objc2::{msg_send, sel};
+use objc2::{MainThreadMarker, msg_send, sel};
 use objc2_core_foundation::{
-    CFArray, CFDictionary, CFMutableData, CFNumber, CFNumberType, CFRetained, CFString, CFType,
-    CGPoint, CGRect, CGSize, kCFBooleanTrue,
+    CFArray, CFDictionary, CFNumber, CFNumberType, CFRetained, CFString, CFType, CGPoint, CGRect,
+    CGSize, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGEvent,
@@ -24,10 +25,10 @@ use std::collections::HashMap;
 #[cfg(feature = "lua")]
 use std::path::Path;
 use std::ptr::null_mut;
-use std::slice::from_raw_parts_mut;
-use std::time::{Duration, Instant};
+#[cfg(feature = "lua")]
+use std::time::Duration;
 use stdext::function_name;
-use tracing::{Level, debug, error, instrument, trace, warn};
+use tracing::{Level, debug, instrument, trace, warn};
 
 use crate::config::Config;
 use crate::errors::{Error, Result};
@@ -43,16 +44,15 @@ pub use display::{Display, DisplayObservation};
 pub use process::{Process, ProcessApi};
 pub use skylight::AXUIElementCopyAttributeValue;
 use skylight::{
-    _AXUIElementCreateWithRemoteToken, SLSCopyActiveMenuBarDisplayIdentifier,
-    SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
-    SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
-    SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSMoveWindowsToManagedSpace,
+    SLSCopyActiveMenuBarDisplayIdentifier, SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces,
+    SLSCopyWindowsWithOptionsAndTags, SLSFindWindowAndOwner, SLSGetConnectionIDForPSN,
+    SLSGetCurrentCursorLocation, SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode,
+    SLSMainConnectionID, SLSManagedDisplayGetCurrentSpace, SLSMoveWindowsToManagedSpace,
     SLSRequestNotificationsForWindows, SLSSpaceGetType, SLSWindowIteratorAdvance,
     SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags,
     SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
 };
-pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
+pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id};
 
 #[cfg(test)]
 pub use process::MockProcessApi;
@@ -60,6 +60,7 @@ pub use process::MockProcessApi;
 pub use windows::MockWindowApi;
 
 pub(crate) mod app;
+pub(crate) mod discovery;
 mod display;
 mod process;
 mod skylight;
@@ -392,6 +393,17 @@ pub struct WindowManagerOS {
     event_sender: EventSender,
 }
 
+const AX_MESSAGING_TIMEOUT_SEC: f32 = 0.25;
+
+fn initialize_ax_timeout_with<T>(
+    system_wide: impl FnOnce() -> Result<T>,
+    set_timeout: impl FnOnce(&T, f32) -> i32,
+) -> Result<()> {
+    let element = system_wide()?;
+    set_timeout(&element, AX_MESSAGING_TIMEOUT_SEC)
+        .to_result("AXUIElementSetMessagingTimeout(system-wide)")
+}
+
 impl WindowManagerOS {
     /// Creates a new `WindowManagerOS` instance.
     /// It initializes the main connection ID to the macOS `SkyLight` API.
@@ -402,15 +414,25 @@ impl WindowManagerOS {
     ///
     /// # Returns
     ///
-    /// A new `WindowManagerOS` instance.
-    pub fn new(event_sender: EventSender) -> Self {
+    /// A new `WindowManagerOS`, or an error before platform setup can proceed.
+    pub fn new(event_sender: EventSender) -> Result<Self> {
+        let _main_thread = MainThreadMarker::new().ok_or_else(|| {
+            Error::Generic("window manager initialization requires the main thread".to_string())
+        })?;
+        // AXUIElement.h: the system-wide object sets the default for this
+        // process only. An application object's timeout does not propagate to
+        // its windows, parents, or remote-token elements.
+        initialize_ax_timeout_with(
+            || AXUIWrapper::from_retained(unsafe { AXUIElementCreateSystemWide() }),
+            |element, timeout| unsafe { AXUIElementSetMessagingTimeout(element.as_ptr(), timeout) },
+        )?;
         let main_cid = unsafe { SLSMainConnectionID() };
         debug!("My connection id: {main_cid}");
 
-        Self {
+        Ok(Self {
             main_cid,
             event_sender,
-        }
+        })
     }
 
     /// Retrieves a list of space IDs for a given display UUID.
@@ -689,17 +711,11 @@ impl WindowManagerApi for WindowManagerOS {
         spaces: &[WorkspaceId],
         config: &Config,
     ) -> Result<(Vec<Window>, Vec<WinID>)> {
-        let global_window_list = existing_application_window_list(self.main_cid, app, spaces)?;
-        if global_window_list.is_empty() {
-            return Err(Error::InvalidInput(format!("No windows found for {app}")));
-        }
-        debug!("{app} has global windows: {global_window_list:?}");
-
         let found_windows = app.window_list(config);
-        if found_windows.len() == global_window_list.len() {
-            debug!("All windows for {:?} are now resolved", app.psn());
-            return Ok((found_windows, vec![]));
-        }
+        let global_window_list = existing_application_window_list(self.main_cid, app, spaces)
+            .inspect_err(|error| debug!(%error, "supplementary WindowServer inventory unavailable"))
+            .unwrap_or_default();
+        debug!("{app} has global windows: {global_window_list:?}");
 
         let find_window = |window_id| found_windows.iter().find(|window| window.id() == window_id);
         let offscreen_windows = global_window_list
@@ -1073,101 +1089,6 @@ fn existing_application_window_list(
     space_window_list_for_connection(cid, spaces, app.connection(), true)
 }
 
-/// Wall-clock ceiling on a single application's brute-force scan: generous
-/// next to a healthy scan, but short enough that an app which never resolves
-/// cannot hold up initialisation, which waits on these tasks.
-const BRUTEFORCE_BUDGET: Duration = Duration::from_millis(250);
-
-/// Attempts to find and add unresolved windows for a given application by brute-forcing `element_id` values.
-/// This is a workaround for macOS API limitations that do not return `AXUIElementRef` for windows on inactive spaces.
-///
-/// # Arguments
-///
-/// * `pid` - The process ID of the application whose windows are to be brute-forced.
-/// * `bundle_id` - The bundle identifier of the application, if known.
-/// * `window_list` - A mutable vector of `WinID`s representing the expected global window list; found windows are removed from this list.
-/// * `config` - The current Spool configuration, used to evaluate window rules.
-pub fn bruteforce_windows(
-    pid: Pid,
-    bundle_id: Option<&str>,
-    mut window_list: Vec<WinID>,
-    config: &Config,
-) -> Vec<Window> {
-    const MAGIC: u32 = 0x636f_636f;
-    const BUFSIZE: isize = 0x14;
-    let mut found_windows = Vec::new();
-    debug!("{pid} has unresolved window on other desktops, bruteforcing them.");
-
-    //
-    // NOTE: MacOS API does not return AXUIElementRef of windows on inactive spaces. However,
-    // we can just brute-force the element_id and create the AXUIElementRef ourselves.
-    //  https://github.com/decodism
-    //  https://github.com/lwouis/alt-tab-macos/issues/1324#issuecomment-2631035482
-    //
-
-    let Some(data_ref) = CFMutableData::new(None, BUFSIZE) else {
-        error!("error creating mutable data");
-        return found_windows;
-    };
-    CFMutableData::increase_length(data_ref.deref().into(), BUFSIZE);
-
-    let data = unsafe {
-        from_raw_parts_mut(
-            CFMutableData::mutable_byte_ptr(data_ref.deref().into()),
-            BUFSIZE as usize,
-        )
-    };
-    let bytes = pid.to_ne_bytes();
-    data[0x0..bytes.len()].copy_from_slice(&bytes);
-    let bytes = MAGIC.to_ne_bytes();
-    data[0x8..0x8 + bytes.len()].copy_from_slice(&bytes);
-
-    // A window SkyLight lists but that never resolves to an AX element (a
-    // panel, helper, anything non-AX) never clears from `window_list`, so
-    // without this deadline the scan would run all 0x7fff round trips every
-    // time that app starts.
-    let deadline = Instant::now() + BRUTEFORCE_BUDGET;
-
-    for element_id in 0..0x7fffu64 {
-        // Every iteration is a synchronous cross-process AX round trip.
-        if window_list.is_empty() {
-            break;
-        }
-        // Checked periodically only: `Instant::now` can itself be a syscall.
-        if element_id.is_multiple_of(256) && Instant::now() >= deadline {
-            warn!(
-                "{pid}: giving up the brute-force scan at element {element_id} with {} window(s) \
-                 unresolved: {window_list:?}",
-                window_list.len()
-            );
-            break;
-        }
-
-        let bytes = element_id.to_ne_bytes();
-        data[0xc..0xc + bytes.len()].copy_from_slice(&bytes);
-
-        let Ok(element_ref) =
-            AXUIWrapper::retain(unsafe { _AXUIElementCreateWithRemoteToken(data_ref.as_ref()) })
-        else {
-            continue;
-        };
-        let Some(window_id) = try_ax_window_id(element_ref.as_ptr()) else {
-            continue;
-        };
-
-        if let Some(index) = window_list.iter().position(|&id| id == window_id) {
-            window_list.remove(index);
-            debug!("Found window {window_id:?}");
-            if let Ok(window) = WindowOS::new_with_config(&element_ref, config, bundle_id)
-                .inspect_err(|err| warn!("{err}"))
-            {
-                found_windows.push(Window::new(Box::new(window)));
-            }
-        }
-    }
-    found_windows
-}
-
 /// Checks if the application has Accessibility privileges without showing UI.
 ///
 /// # Returns
@@ -1348,5 +1269,40 @@ mod native_space_runtime_tests {
         assert_eq!(native_space_gesture_delta(&spaces, 20, 20).unwrap(), 0);
         assert!(native_space_gesture_delta(&spaces, 99, 20).is_err());
         assert!(native_space_gesture_delta(&spaces, 20, 99).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ax_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn ax_timeout_initialization_must_not_ignore_setter_failure() {
+        let result = initialize_ax_timeout_with(
+            || Ok("system-wide"),
+            |element, timeout| {
+                assert_eq!(*element, "system-wide");
+                assert!((timeout - 0.25).abs() < f32::EPSILON);
+                accessibility_sys::kAXErrorInvalidUIElement
+            },
+        );
+        assert_eq!(
+            result.unwrap_err().macos_code(),
+            Some(accessibility_sys::kAXErrorInvalidUIElement)
+        );
+    }
+
+    #[test]
+    fn ax_timeout_initialization_stops_before_setter_when_creation_fails() {
+        let result = initialize_ax_timeout_with::<()>(
+            || Err(Error::Generic("creation failed".to_string())),
+            |(), _| panic!("no element was created"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ax_timeout_initialization_accepts_a_successful_setter() {
+        assert!(initialize_ax_timeout_with(|| Ok(()), |(), _| 0).is_ok());
     }
 }

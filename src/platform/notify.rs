@@ -1,13 +1,12 @@
-use core::ptr::NonNull;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use scopeguard::ScopeGuard;
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::marker::PhantomPinned;
-use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use stdext::function_name;
 use tracing::{Level, debug, error, instrument};
 
-use crate::errors::Result;
+use crate::errors::{Error, Result};
 use crate::events::{DestroySource, Event, EventSender};
 use crate::platform::{ConnID, OSStatus, WinID, WorkspaceId, macos_major_version};
 use crate::util::MacResult;
@@ -21,31 +20,118 @@ unsafe extern "C" {
         event: u32,
         data: *mut c_void,
     ) -> OSStatus;
+    fn SLSRemoveConnectionNotifyProc(
+        cid: ConnID,
+        callback: extern "C-unwind" fn(u32, *mut c_void, usize, *mut c_void, ConnID),
+        event: u32,
+        data: *mut c_void,
+    ) -> OSStatus;
 }
+
+trait NotifyApi {
+    fn register(&self, cid: ConnID, event: u32, context: *mut c_void) -> Result<()>;
+    fn unregister(&self, cid: ConnID, event: u32, context: *mut c_void) -> Result<()>;
+}
+
+struct SystemNotifyApi;
+
+impl NotifyApi for SystemNotifyApi {
+    fn register(&self, cid: ConnID, event: u32, context: *mut c_void) -> Result<()> {
+        unsafe { SLSRegisterConnectionNotifyProc(cid, NotifyHandler::callback, event, context) }
+            .to_result(function_name!())
+    }
+
+    fn unregister(&self, cid: ConnID, event: u32, context: *mut c_void) -> Result<()> {
+        unsafe { SLSRemoveConnectionNotifyProc(cid, NotifyHandler::callback, event, context) }
+            .to_result(function_name!())
+    }
+}
+
+static NEXT_CALLBACK_TOKEN: AtomicUsize = AtomicUsize::new(1);
+
+/// Opaque refcons are never dereferenced or reused. A callback takes its own
+/// lease before teardown removes the lookup, independent of native queue drain.
+#[derive(Debug)]
+pub(crate) struct CallbackRegistry<T> {
+    contexts: Mutex<HashMap<usize, Arc<T>>>,
+}
+
+impl<T> CallbackRegistry<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            contexts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn insert(&self, context: T) -> Option<usize> {
+        let token = NEXT_CALLBACK_TOKEN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .ok()?;
+        self.contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(token, Arc::new(context));
+        Some(token)
+    }
+
+    pub(crate) fn get(&self, token: usize) -> Option<Arc<T>> {
+        self.contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&token)
+            .cloned()
+    }
+
+    pub(crate) fn remove(&self, token: usize) {
+        self.contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&token);
+    }
+}
+
+static NOTIFY_CONTEXTS: LazyLock<CallbackRegistry<NotifyHandler>> =
+    LazyLock::new(CallbackRegistry::new);
 
 pub(super) struct NotifyHandler {
     events: EventSender,
     conn: ConnID,
-    _pin: PhantomPinned,
 }
 
-pub(super) type PinnedNotifyHandler =
-    ScopeGuard<Pin<Box<NotifyHandler>>, Box<dyn FnOnce(Pin<Box<NotifyHandler>>)>>;
+pub(super) type PinnedNotifyHandler = NotifyRegistration;
+
+pub(super) struct NotifyRegistration {
+    conn: ConnID,
+    token: usize,
+    registered: Vec<u32>,
+    api: Box<dyn NotifyApi>,
+}
+
+impl Drop for NotifyRegistration {
+    fn drop(&mut self) {
+        // Close delivery first. Even failed unregisters can only carry an inert
+        // token afterwards; callbacks already holding an Arc remain memory-safe.
+        NOTIFY_CONTEXTS.remove(self.token);
+        for event in self.registered.drain(..).rev() {
+            if let Err(error) = self
+                .api
+                .unregister(self.conn, event, self.token as *mut c_void)
+            {
+                error!(event, %error, "unable to unregister WindowServer notification");
+            }
+        }
+    }
+}
 
 impl NotifyHandler {
     pub(super) fn new(events: EventSender) -> Self {
         Self {
             events,
             conn: unsafe { SLSMainConnectionID() },
-            _pin: PhantomPinned,
         }
     }
 
     pub(super) fn start(self) -> Result<PinnedNotifyHandler> {
-        debug!("Registering notify handler");
-        let cid = self.conn;
-        let mut pinned = Box::pin(self);
-        let this = unsafe { NonNull::new_unchecked(pinned.as_mut().get_unchecked_mut()) }.as_ptr();
         let mut events = vec![
             KnownCGSEvent::SpaceCreated,
             KnownCGSEvent::SpaceCurrentChanged,
@@ -55,19 +141,36 @@ impl NotifyHandler {
         if macos_major_version() >= 15 {
             events.push(KnownCGSEvent::WindowClosed);
         }
-        for event in events {
-            unsafe {
-                SLSRegisterConnectionNotifyProc(cid, Self::callback, event.into(), this.cast())
-            }
-            .to_result(function_name!())?;
-        }
+        self.start_with_api(Box::new(SystemNotifyApi), &events)
+    }
 
-        Ok(scopeguard::guard(
-            pinned,
-            Box::new(|_pin: Pin<Box<Self>>| {
-                debug!("Unregistering notify handler");
-            }),
-        ))
+    fn start_with_api(
+        self,
+        api: Box<dyn NotifyApi>,
+        events: &[KnownCGSEvent],
+    ) -> Result<PinnedNotifyHandler> {
+        debug!("Registering notify handler");
+        let cid = self.conn;
+        let token = NOTIFY_CONTEXTS
+            .insert(self)
+            .ok_or_else(|| Error::InvalidInput("callback token space exhausted".to_owned()))?;
+        let mut registration = NotifyRegistration {
+            conn: cid,
+            token,
+            registered: Vec::new(),
+            api,
+        };
+        for &event in events {
+            let event = event.into();
+            if registration.registered.contains(&event) {
+                continue;
+            }
+            registration
+                .api
+                .register(cid, event, token as *mut c_void)?;
+            registration.registered.push(event);
+        }
+        Ok(registration)
     }
 
     extern "C-unwind" fn callback(
@@ -77,12 +180,8 @@ impl NotifyHandler {
         context: *mut c_void,
         cid: ConnID,
     ) {
-        if let Some(this) =
-            NonNull::new(context).map(|this| unsafe { this.cast::<NotifyHandler>().as_mut() })
-        {
+        if let Some(this) = NOTIFY_CONTEXTS.get(context.addr()) {
             this.notify_handler(event_id, data, len, cid);
-        } else {
-            error!("Zero passed to Notify Handler.");
         }
     }
 
@@ -155,17 +254,19 @@ impl NotifyHandler {
 
             _ => {
                 let bytes = (!data.is_null() && len > 0)
-                    .then_some(unsafe { std::slice::from_raw_parts(data as *const u8, len) });
+                    .then(|| unsafe { std::slice::from_raw_parts(data as *const u8, len) });
                 debug!("Unhandled event {event}: {bytes:?}");
             }
         }
     }
 }
 
-fn from_bytes<T>(data: *const c_void, len: usize) -> Option<T> {
+fn from_bytes<T: Copy>(data: *const c_void, len: usize) -> Option<T> {
     let size = std::mem::size_of::<T>();
-    (!data.is_null() && len >= size)
-        .then_some(unsafe { std::ptr::read_unaligned(data.cast::<T>()) })
+    if data.is_null() || len < size {
+        return None;
+    }
+    Some(unsafe { std::ptr::read_unaligned(data.cast::<T>()) })
 }
 
 // credits
@@ -282,19 +383,218 @@ impl std::fmt::Display for CGSEventType {
 
 #[cfg(test)]
 mod tests {
-    use std::marker::PhantomPinned;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
-    use super::{KnownCGSEvent, NotifyHandler};
+    use super::{KnownCGSEvent, NOTIFY_CONTEXTS, NotifyApi, NotifyHandler, from_bytes};
+    use crate::errors::{Error, Result};
     use crate::events::{DestroySource, Event, EventSender};
+    use crate::platform::ConnID;
+
+    #[derive(Default)]
+    struct RegistrationLog {
+        registered: Vec<u32>,
+        removed: Vec<u32>,
+        context: usize,
+        live_during_unregister: bool,
+    }
+
+    struct FakeNotifyApi {
+        log: Rc<RefCell<RegistrationLog>>,
+        fail: Option<u32>,
+        fail_unregister: bool,
+    }
+
+    impl NotifyApi for FakeNotifyApi {
+        fn register(&self, _: ConnID, event: u32, context: *mut std::ffi::c_void) -> Result<()> {
+            if self.fail == Some(event) {
+                return Err(Error::macos("injected registration failure", -1));
+            }
+            let mut log = self.log.borrow_mut();
+            log.registered.push(event);
+            log.context = context.addr();
+            Ok(())
+        }
+
+        fn unregister(&self, _: ConnID, event: u32, context: *mut std::ffi::c_void) -> Result<()> {
+            let mut log = self.log.borrow_mut();
+            log.removed.push(event);
+            log.live_during_unregister |= NOTIFY_CONTEXTS.get(context.addr()).is_some();
+            if self.fail_unregister {
+                return Err(Error::macos("injected unregister failure", -1));
+            }
+            Ok(())
+        }
+    }
+
+    fn notification_fixture() -> NotifyHandler {
+        let (events, _receiver) = EventSender::new();
+        NotifyHandler { events, conn: 0 }
+    }
+
+    #[test]
+    fn notification_registration_failure_rolls_back_successful_registrations() {
+        let log = Rc::new(RefCell::new(RegistrationLog::default()));
+        let result = notification_fixture().start_with_api(
+            Box::new(FakeNotifyApi {
+                log: log.clone(),
+                fail: Some(KnownCGSEvent::SpaceDestroyed as u32),
+                fail_unregister: false,
+            }),
+            &[
+                KnownCGSEvent::SpaceCreated,
+                KnownCGSEvent::SpaceCurrentChanged,
+                KnownCGSEvent::SpaceDestroyed,
+            ],
+        );
+        assert!(result.is_err());
+        assert_eq!(log.borrow().removed, vec![1329, 1327]);
+        assert!(!log.borrow().live_during_unregister);
+    }
+
+    #[test]
+    fn notification_registration_drop_unregisters_every_success_once() {
+        let log = Rc::new(RefCell::new(RegistrationLog::default()));
+        let registration = notification_fixture()
+            .start_with_api(
+                Box::new(FakeNotifyApi {
+                    log: log.clone(),
+                    fail: None,
+                    fail_unregister: false,
+                }),
+                &[
+                    KnownCGSEvent::SpaceCreated,
+                    KnownCGSEvent::WindowClosed,
+                    KnownCGSEvent::SpaceCreated,
+                ],
+            )
+            .unwrap();
+        drop(registration);
+        assert_eq!(
+            log.borrow().removed,
+            vec![KnownCGSEvent::WindowClosed as u32, 1327]
+        );
+        assert!(!log.borrow().live_during_unregister);
+        assert_eq!(log.borrow().registered, vec![1327, 804]);
+    }
+
+    #[test]
+    fn notification_retirement_ignores_late_tokens_and_keeps_in_flight_context_alive() {
+        let (events, receiver) = EventSender::new();
+        let log = Rc::new(RefCell::new(RegistrationLog::default()));
+        let registration = NotifyHandler { events, conn: 0 }
+            .start_with_api(
+                Box::new(FakeNotifyApi {
+                    log: log.clone(),
+                    fail: None,
+                    fail_unregister: false,
+                }),
+                &[KnownCGSEvent::WindowClosed],
+            )
+            .unwrap();
+        let token = log.borrow().context;
+        let in_flight = NOTIFY_CONTEXTS.get(token).unwrap();
+        let weak = std::sync::Arc::downgrade(&in_flight);
+        drop(registration);
+        assert!(NOTIFY_CONTEXTS.get(token).is_none());
+        assert!(weak.upgrade().is_some());
+        // A retired callback must not even inspect this intentionally invalid payload.
+        NotifyHandler::callback(804, std::ptr::null_mut(), usize::MAX, token as *mut _, 0);
+        assert!(receiver.try_recv().is_err());
+        drop(in_flight);
+        assert!(weak.upgrade().is_none());
+
+        let next = notification_fixture()
+            .start_with_api(
+                Box::new(FakeNotifyApi {
+                    log: log.clone(),
+                    fail: None,
+                    fail_unregister: false,
+                }),
+                &[KnownCGSEvent::WindowClosed],
+            )
+            .unwrap();
+        assert_ne!(log.borrow().context, token);
+        drop(next);
+    }
+
+    #[test]
+    fn notification_unregister_failure_still_retires_context_and_attempts_every_removal() {
+        let log = Rc::new(RefCell::new(RegistrationLog::default()));
+        let registration = notification_fixture()
+            .start_with_api(
+                Box::new(FakeNotifyApi {
+                    log: log.clone(),
+                    fail: None,
+                    fail_unregister: true,
+                }),
+                &[KnownCGSEvent::SpaceCreated, KnownCGSEvent::WindowClosed],
+            )
+            .unwrap();
+        let token = log.borrow().context;
+        drop(registration);
+        assert_eq!(log.borrow().removed, vec![804, 1327]);
+        assert!(NOTIFY_CONTEXTS.get(token).is_none());
+        NotifyHandler::callback(804, std::ptr::null_mut(), usize::MAX, token as *mut _, 0);
+    }
+
+    #[test]
+    fn short_notification_payload_never_reads_beyond_its_length() {
+        const PROBE: &str = "SPOOL_SHORT_NOTIFICATION_PROBE";
+        if let Ok(case) = std::env::var(PROBE) {
+            if case == "null" {
+                assert_eq!(from_bytes::<u64>(std::ptr::null(), 0), None);
+                return;
+            }
+            let len: usize = case.parse().unwrap();
+            unsafe {
+                let page = usize::try_from(libc::sysconf(libc::_SC_PAGESIZE)).unwrap();
+                let allocation = libc::mmap(
+                    std::ptr::null_mut(),
+                    2 * page,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                assert_ne!(allocation, libc::MAP_FAILED);
+                assert_eq!(
+                    libc::mprotect(allocation.byte_add(page), page, libc::PROT_NONE),
+                    0
+                );
+                // Only `len` readable bytes remain before the guard page.
+                let payload = allocation.byte_add(page - len);
+                assert_eq!(from_bytes::<u64>(payload, len), None);
+                assert_eq!(libc::munmap(allocation, 2 * page), 0);
+            }
+            return;
+        }
+
+        // Isolate an invalid read so a regression fails this test, not the suite.
+        for case in ["1", "7", "0", "2", "3", "4", "5", "6", "null"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::notify::tests::short_notification_payload_never_reads_beyond_its_length",
+                    "--test-threads=1",
+                ])
+                .env(PROBE, case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "payload {case}: {}; stdout: {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
 
     #[test]
     fn window_server_close_notification_reports_definitive_destruction() {
         let (events, receiver) = EventSender::new();
-        let handler = NotifyHandler {
-            events,
-            conn: 0,
-            _pin: PhantomPinned,
-        };
+        let handler = NotifyHandler { events, conn: 0 };
         let window_id = 42;
 
         handler.notify_handler(

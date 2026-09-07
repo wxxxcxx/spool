@@ -1,6 +1,16 @@
 -- Spool configuration. Changes are hot-reloaded on save.
 spool.setup {
   options = {},
+  -- Editable preferences, not built-in window classification. Higher priority
+  -- wins per field; equal priorities use rule-name order. Omit a matcher to
+  -- match every value. Existing init.lua files are never rewritten on upgrade.
+  windows = {
+    default_dialog = { subrole = "AXDialog", floating = true, priority = -100 },
+    default_system_dialog = { subrole = "AXSystemDialog", floating = true, priority = -100 },
+    default_floating = { subrole = "AXFloatingWindow", floating = true, priority = -100 },
+    default_system_settings = { bundle_id = "com.apple.systempreferences", floating = true, priority = -100 },
+    default_keeping_you_awake = { bundle_id = "info.marcel-dierkes.KeepingYouAwake", floating = true, priority = -100 },
+  },
   bar = {
     embed_in_menu_bar = true,
     height = 0, -- 0 follows each screen's menu-bar height.

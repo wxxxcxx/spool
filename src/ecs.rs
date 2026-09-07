@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
-use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
+use bevy::app::{First, Last, PostStartup, PostUpdate, PreStartup, PreUpdate, Startup};
 use bevy::ecs::change_detection::DetectChanges as _;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
@@ -13,7 +13,6 @@ use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor, SystemCondition as _};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
-use bevy::tasks::Task;
 use bevy::time::Timer;
 use bevy::time::common_conditions::on_timer;
 use bevy::time::{Time, Virtual};
@@ -45,6 +44,7 @@ use crate::errors::Result;
 use crate::events::{Event, EventSender, FocusObservation, InputEvent};
 #[cfg(feature = "lua")]
 use crate::lua;
+use crate::manager::discovery::WindowDiscovery;
 use crate::manager::{
     Application, Display, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi,
     WindowManagerOS,
@@ -204,13 +204,15 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::commit_default_window_frames,
                 systems::detect_tabbed_windows.run_if(native_tabs_enabled),
                 triggers::apply_window_positions,
+                triggers::retry_pending_retiles,
             )
                 .chain()
                 .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             (
                 systems::add_existing_process,
                 systems::add_existing_application,
-                systems::finish_setup,
+                systems::advance_window_discovery,
+                systems::finish_setup.run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             )
                 .chain()
                 .run_if(resource_exists::<Initializing>),
@@ -230,6 +232,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::cleanup_on_exit,
             reconcile::reconcile_windows
                 .after(window_geometry::settle_external_window_geometry)
+                // Audit the confirmed focus, not an older application between
+                // direct focus resolution and its resulting observation.
+                .after(triggers::window_focused_trigger)
                 .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             reconcile::confirm_unavailable_windows,
             systems::refresh_window_notifications,
@@ -450,6 +455,10 @@ pub enum WindowVisibility {
 #[derive(BevyEvent)]
 pub struct RetileWindow(pub Entity);
 
+/// A tile request waiting for trustworthy capability or native state reads.
+#[derive(Component)]
+pub(crate) struct RetilePending(pub Duration);
+
 #[derive(Clone, Component, Copy, Debug)]
 pub struct PreviousTiledStrip {
     pub workspace_id: WorkspaceId,
@@ -482,7 +491,7 @@ impl Timeout {
     ///
     /// A new `Timeout` instance.
     pub fn new(duration: Duration, message: Option<String>, commands: &mut Commands) -> Self {
-        let timer = Timer::from_seconds(duration.as_secs_f32(), bevy::time::TimerMode::Once);
+        let timer = Timer::new(duration, bevy::time::TimerMode::Once);
         if let Some(message) = message {
             let callback = move || {
                 tracing::debug!("{message}");
@@ -500,7 +509,7 @@ impl Timeout {
 
     /// Creates an action timeout, which oneshots a provided system id.
     pub fn callback(duration: Duration, system_id: SystemId, commands: &mut Commands) {
-        let timer = Timer::from_seconds(duration.as_secs_f32(), bevy::time::TimerMode::Once);
+        let timer = Timer::new(duration, bevy::time::TimerMode::Once);
         commands.spawn(Self {
             timer,
             system_id: Some(system_id),
@@ -532,9 +541,6 @@ impl RetryFrontSwitch {
         }
     }
 }
-
-#[derive(Component)]
-pub struct BruteforceWindows(Task<Vec<Window>>);
 
 #[derive(Clone, Component, Copy, Debug, Eq, PartialEq)]
 pub enum DockPosition {
@@ -656,7 +662,7 @@ pub trait SpawnCommandsExt {
     fn focus_entity(&mut self, entity: Entity, raise: bool);
 
     #[cfg(feature = "lua")]
-    fn flash_message(&mut self, message: String, duration: f32);
+    fn flash_message(&mut self, message: String, duration: Duration);
 
     // Spawns a layout strip in a single place, to properly insert all components.
     fn spawn_layout_strip(
@@ -709,8 +715,8 @@ impl SpawnCommandsExt for Commands<'_, '_> {
 
     #[cfg(feature = "lua")]
     #[instrument(level = Level::TRACE, skip(self))]
-    fn flash_message(&mut self, message: String, duration: f32) {
-        let timeout = Timeout::new(Duration::from_secs_f32(duration), None, self);
+    fn flash_message(&mut self, message: String, duration: Duration) {
+        let timeout = Timeout::new(duration, None, self);
         self.spawn((timeout, FlashMessage(message)));
     }
 
@@ -743,7 +749,7 @@ pub(crate) fn rewatch_configs(
 }
 
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
-    let window_manager: Box<dyn WindowManagerApi> = Box::new(WindowManagerOS::new(sender.clone()));
+    let window_manager: Box<dyn WindowManagerApi> = Box::new(WindowManagerOS::new(sender.clone())?);
 
     #[cfg(feature = "lua")]
     let lua_path = crate::config::ensure_lua_file()?;
@@ -784,21 +790,9 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     // pool: the task-pool handoff measured ~45% of main-thread time against
     // ~16% actually spent on accessibility calls, dropping to ~10% once
     // inlined. The expensive systems here all take `&mut Window` and are
-    // already mutually exclusive, so the fan-out bought little; genuine
-    // parallelism (`par_iter_mut`) still goes through `ComputeTaskPool`
-    // directly. `First`/`Last` are included even though unused because an
-    // empty schedule still costs a task-pool scope per frame.
-    for label in [
-        First.intern(),
-        PreUpdate.intern(),
-        Update.intern(),
-        PostUpdate.intern(),
-        Last.intern(),
-    ] {
-        app.edit_schedule(label, |schedule| {
-            schedule.set_executor(SingleThreadedExecutor::new());
-        });
-    }
+    // already mutually exclusive, so the fan-out bought little. Startup must
+    // also remain inline: inventory touches AppKit, CoreGraphics, and AX.
+    configure_main_thread_schedules(&mut app);
 
     let bar_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
@@ -808,6 +802,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     let flash_message_manager = FlashMessageManager::new(mtm);
     let bar_manager = BarManager::new(mtm, bar_events);
     app.insert_non_send(platform_callbacks)
+        .insert_non_send(WindowDiscovery::new(mtm))
         .insert_non_send(overlay_manager)
         .insert_non_send(flash_message_manager)
         .insert_non_send(bar_manager)
@@ -859,16 +854,52 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     Ok(app)
 }
 
+fn configure_main_thread_schedules(app: &mut BevyApp) {
+    for label in [
+        PreStartup.intern(),
+        Startup.intern(),
+        PostStartup.intern(),
+        First.intern(),
+        PreUpdate.intern(),
+        Update.intern(),
+        PostUpdate.intern(),
+        Last.intern(),
+    ] {
+        app.edit_schedule(label, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+    }
+}
+
 struct WindowProperties {
     params: Vec<WindowParams>,
+    pending: bool,
 }
 
 impl WindowProperties {
     pub fn new(app: &Application, window: &Window, config: &Config) -> Self {
         let bundle_id = app.bundle_id().unwrap_or_default();
-        let title = window.title().unwrap_or_default();
-        let params = config.find_window_properties(&title, &bundle_id);
-        Self { params }
+        let title = window.title().ok();
+        let role = window.role().ok();
+        let subrole = window.subrole().ok();
+        let matched = config.match_window_rules(
+            title.as_deref(),
+            Some(&bundle_id),
+            role.as_deref(),
+            subrole.as_deref(),
+        );
+        Self {
+            params: matched.params,
+            pending: matched.pending,
+        }
+    }
+
+    pub fn layout_decision(&self, window: &Window) -> crate::window_policy::LayoutDecision {
+        if self.pending {
+            crate::window_policy::LayoutDecision::Defer
+        } else {
+            window.layout_decision(self.floating())
+        }
     }
 
     pub fn floating(&self) -> bool {
@@ -920,5 +951,54 @@ impl WindowProperties {
             .iter()
             .find_map(|props| props.horizontal_padding)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod main_thread_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[test]
+    fn timeouts_preserve_duration_boundaries_without_float_round_trips() {
+        let mut world = bevy::ecs::world::World::new();
+        for duration in [Duration::ZERO, Duration::from_nanos(1), Duration::MAX] {
+            let timeout = Timeout::new(duration, None, &mut world.commands());
+            assert_eq!(timeout.timer.duration(), duration);
+
+            let system = world.register_system(|| {});
+            Timeout::callback(duration, system, &mut world.commands());
+            world.flush();
+            assert!(world.query::<&Timeout>().iter(&world).any(|timeout| {
+                timeout.system_id == Some(system) && timeout.timer.duration() == duration
+            }));
+        }
+    }
+
+    #[test]
+    fn startup_schedules_execute_on_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let mut app = BevyApp::new();
+        app.add_plugins(MinimalPlugins);
+        configure_main_thread_schedules(&mut app);
+
+        for label in [PreStartup.intern(), Startup.intern(), PostStartup.intern()] {
+            let threads = Arc::new(Mutex::new(Vec::new()));
+            for _ in 0..32 {
+                let threads = threads.clone();
+                app.add_systems(label, move || {
+                    threads.lock().unwrap().push(std::thread::current().id());
+                    std::thread::sleep(Duration::from_millis(1));
+                });
+            }
+            app.world_mut().run_schedule(label);
+            let threads = threads.lock().unwrap();
+            assert_eq!(threads.len(), 32);
+            assert!(
+                threads.iter().all(|thread| *thread == caller),
+                "{label:?} dispatched platform-capable startup work off its caller: {threads:?}"
+            );
+        }
     }
 }

@@ -73,6 +73,68 @@ fn reconcile(harness: &mut TestHarness) {
 }
 
 #[test]
+fn native_move_keeps_floating_windows_outside_layout_strips() {
+    for resizable in [true, false] {
+        let config = Config::try_from(
+            r#"{"options":{"experimental_space_control":true},
+                "windows":{"float":{"title":"Floating","floating":true}}}"#,
+        )
+        .unwrap();
+        let mut harness = TestHarness::new()
+            .with_config(config)
+            .with_display(
+                TEST_DISPLAY_ID,
+                IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+                vec![TEST_WORKSPACE_ID, TARGET],
+            )
+            .with_window(0, |window| {
+                window.title = "Floating".into();
+                window.resizable = resizable;
+            })
+            .with_workspace_window(1, TARGET, |_| {});
+        harness.mock_state.enable_native_space_control();
+        harness.pump_frames(30);
+        let entity = find_window_entity(0, harness.world());
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::Floating>(entity)
+                .is_some()
+        );
+        let frame = harness.mock_state.actual_window_frame(0);
+        let writes = harness.mock_state.frame_write_attempts(0);
+
+        harness.world().write_message(Event::ActionRequested {
+            action: Action::MoveWindowToSpace {
+                window_id: 0,
+                space_id: TARGET,
+                move_focus: MoveFocus::Stay,
+            },
+        });
+        harness.pump_frames(20);
+
+        assert_eq!(harness.mock_state.window_workspace(0), Some(TARGET));
+        let world = harness.world();
+        assert!(world.get::<crate::ecs::Floating>(entity).is_some());
+        assert!(world.get::<NativeMoveOwner>(entity).is_none());
+        assert!(
+            world
+                .get::<WindowSpaceReassignmentPending>(entity)
+                .is_none()
+        );
+        assert!(
+            world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .all(|strip| !strip.contains(entity)),
+            "native movement cannot give a floating window a tiled slot"
+        );
+        assert_eq!(harness.mock_state.actual_window_frame(0), frame);
+        assert_eq!(harness.mock_state.frame_write_attempts(0), writes);
+    }
+}
+
+#[test]
 fn native_move_waits_for_unique_membership_before_committing_a_column() {
     let (mut harness, source, members) = column_harness();
     submit(&mut harness, MoveFocus::Stay);
@@ -196,6 +258,86 @@ fn partial_column_move_times_out_into_membership_recovery_without_os_rollback() 
     );
     for entity in members {
         assert!(world.get::<NativeMoveOwner>(entity).is_none());
+        assert!(
+            world
+                .get::<WindowSpaceReassignmentPending>(entity)
+                .is_none()
+        );
+    }
+    assert_eq!(harness.mock_state.native_space_intents().len(), 1);
+}
+
+#[test]
+fn native_move_recovery_preserves_source_stack_after_timeout() {
+    let (mut harness, source, members) = column_harness();
+    let Some(Column::Stack(before)) = harness
+        .world()
+        .get::<LayoutStrip>(source)
+        .unwrap()
+        .column_containing(members[0])
+    else {
+        panic!("source stack")
+    };
+    submit(&mut harness, MoveFocus::Stay);
+    for id in 0..2 {
+        harness.mock_state.update_window(id, |window| {
+            window.workspace_id = TEST_WORKSPACE_ID;
+        });
+    }
+    harness.pump_frames(45);
+    for entity in members {
+        assert!(
+            harness
+                .world()
+                .get::<WindowSpaceReassignmentPending>(entity)
+                .is_none()
+        );
+        assert!(harness.world().get::<NativeMoveOwner>(entity).is_none());
+    }
+    let strip = harness.world().get::<LayoutStrip>(source).unwrap();
+    let Some(Column::Stack(after)) = strip.column_containing(members[0]) else {
+        panic!("the unchanged source column must remain a stack: {strip:?}");
+    };
+    assert_eq!(after, before);
+    assert_eq!(harness.mock_state.native_space_intents().len(), 1);
+}
+
+#[test]
+fn native_move_recovery_preserves_column_at_an_unrequested_destination() {
+    const ACTUAL: WorkspaceId = TARGET + 1;
+    let (mut harness, _, members) = column_harness();
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, ACTUAL, false);
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, false);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(3);
+    submit(&mut harness, MoveFocus::Follow);
+    for id in 0..2 {
+        harness
+            .mock_state
+            .update_window(id, |window| window.workspace_id = ACTUAL);
+    }
+    harness.pump_frames(45);
+    let world = harness.world();
+    let target = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find(|strip| strip.id() == ACTUAL)
+        .unwrap();
+    let Some(Column::Stack(items)) = target.column_containing(members[0]) else {
+        panic!("members sharing an actual destination must retain their column");
+    };
+    assert_eq!(
+        items,
+        members
+            .into_iter()
+            .map(StackItem::Single)
+            .collect::<Vec<_>>()
+    );
+    for entity in members {
         assert!(
             world
                 .get::<WindowSpaceReassignmentPending>(entity)

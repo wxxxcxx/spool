@@ -10,6 +10,7 @@ mod state;
 mod tabs;
 mod tiling;
 mod window_frame_architecture;
+mod window_policy;
 mod window_state_sync;
 
 pub(crate) use harness::*;

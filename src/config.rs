@@ -178,34 +178,55 @@ impl Config {
             .max(0.0)
     }
 
-    /// Finds window properties for a given `title` and `bundle_id`.
-    /// It iterates through configured window parameters and returns all matching rules.
-    /// A rule matches when its bundle ID (if any) and title regex match.
-    ///
-    /// # Arguments
-    ///
-    /// * `title` - The title of the window to match.
-    /// * `bundle_id` - The bundle identifier of the application owning the window.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec<WindowParams>` containing all matching window rules.
+    #[cfg(test)]
     pub fn find_window_properties(&self, title: &str, bundle_id: &str) -> Vec<WindowParams> {
-        self.inner()
-            .windows
-            .as_ref()
-            .map(|windows| {
-                windows
-                    .values()
-                    .filter(|params| {
-                        let bundle_match =
-                            params.bundle_id.as_ref().map(|id| id.as_str() == bundle_id);
-                        bundle_match.is_none_or(|m| m) && params.title.is_match(title)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
+        self.match_window_rules(Some(title), Some(bundle_id), None, None)
+            .params
+    }
+
+    /// Higher priority wins per field; equal priorities use ascending rule names.
+    /// Unknown metadata defers potentially matching rules, never matches an empty string.
+    pub(crate) fn match_window_rules(
+        &self,
+        title: Option<&str>,
+        bundle_id: Option<&str>,
+        role: Option<&str>,
+        subrole: Option<&str>,
+    ) -> MatchedWindowRules {
+        let inner = self.inner();
+        let Some(windows) = &inner.windows else {
+            return MatchedWindowRules::default();
+        };
+        let mut ordered = windows.iter().collect::<Vec<_>>();
+        ordered.sort_by(|(a_name, a), (b_name, b)| {
+            b.priority.cmp(&a.priority).then_with(|| a_name.cmp(b_name))
+        });
+        let mut matched = MatchedWindowRules::default();
+        for (_, rule) in ordered {
+            let predicates = [
+                rule.title
+                    .as_ref()
+                    .map(|regex| title.map(|value| regex.is_match(value))),
+                rule.bundle_id
+                    .as_deref()
+                    .map(|expected| bundle_id.map(|value| value == expected)),
+                rule.role
+                    .as_deref()
+                    .map(|expected| role.map(|value| value == expected)),
+                rule.subrole
+                    .as_deref()
+                    .map(|expected| subrole.map(|value| value == expected)),
+            ];
+            if predicates.contains(&Some(Some(false))) {
+                continue;
+            }
+            if predicates.contains(&Some(None)) {
+                matched.pending = true;
+            } else {
+                matched.params.push(rule.clone());
+            }
+        }
+        matched
     }
 
     /// Returns `true` if any window rule for the given bundle ID requests that the
@@ -619,7 +640,7 @@ impl From<(MainOptions, Vec<WindowParams>)> for Config {
                 windows: params
                     .into_iter()
                     .enumerate()
-                    .map(|(nr, param)| Some((format!("param{nr}"), param)))
+                    .map(|(nr, param)| Some((format!("param{nr:020}"), param)))
                     .collect(),
                 ..Default::default()
             })),
@@ -797,14 +818,18 @@ pub fn default_preset_column_widths() -> Vec<f64> {
 #[derive(Clone, Debug, Deserialize)]
 pub struct WindowParams {
     /// A regular expression to match against the window's title.
-    #[serde(deserialize_with = "deserialize_title")]
-    title: Regex,
+    #[serde(default, deserialize_with = "deserialize_title")]
+    title: Option<Regex>,
     /// An optional bundle identifier to match against the application's bundle ID.
     bundle_id: Option<String>,
+    role: Option<String>,
+    subrole: Option<String>,
+    #[serde(default)]
+    priority: i32,
     /// If `true`, the tracked window starts floating instead of tiled.
     pub floating: Option<bool>,
-    /// If `true`, force the process/window to be tracked even if macOS reports it as
-    /// unobservable or the window does not look like a standard window.
+    /// Explicit admission override. False excludes; true permits nonstandard
+    /// independent windows, but cannot turn a menu/control/child into a window.
     pub track: Option<bool>,
     /// An optional preferred index for the window's position in the window strip.
     pub index: Option<usize>,
@@ -835,8 +860,11 @@ impl WindowParams {
     #![allow(unused)]
     pub fn new(title: &str, bundle_id: Option<String>) -> Self {
         Self {
-            title: Regex::new(title).unwrap(),
+            title: Some(Regex::new(title).unwrap()),
             bundle_id,
+            role: None,
+            subrole: None,
+            priority: 0,
             floating: None,
             track: None,
             index: None,
@@ -877,12 +905,132 @@ impl WindowParams {
 }
 
 /// Deserializes a regular expression from a string for window titles.
-fn deserialize_title<'de, D>(deserializer: D) -> std::result::Result<Regex, D::Error>
+fn deserialize_title<'de, D>(deserializer: D) -> std::result::Result<Option<Regex>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    Regex::new(&s).map_err(de::Error::custom)
+    Regex::new(&s).map(Some).map_err(de::Error::custom)
+}
+
+#[derive(Default)]
+pub(crate) struct MatchedWindowRules {
+    pub(crate) params: Vec<WindowParams>,
+    pub(crate) pending: bool,
+}
+
+#[cfg(test)]
+mod window_rule_tests {
+    use super::*;
+
+    #[test]
+    fn window_rules_resolve_fields_by_priority_then_name() {
+        let config = Config::try_from(
+            r#"{"windows": {
+            "z_default": {"floating": true, "track": true, "width": 0.4, "priority": -100},
+            "b_tie": {"title": ".*", "floating": true, "priority": 10},
+            "a_override": {"bundle_id": "test", "floating": false, "track": false, "priority": 10}
+        }}"#,
+        )
+        .unwrap();
+        for _ in 0..20 {
+            let matched = config.match_window_rules(Some("Settings"), Some("test"), None, None);
+            assert!(!matched.pending);
+            assert_eq!(matched.params.iter().find_map(|p| p.floating), Some(false));
+            assert_eq!(matched.params.iter().find_map(|p| p.track), Some(false));
+            assert!(
+                matched
+                    .params
+                    .iter()
+                    .find_map(|p| p.width)
+                    .is_some_and(|width| (width - 0.4).abs() < f64::EPSILON)
+            );
+        }
+    }
+
+    #[test]
+    fn window_rules_match_roles_without_requiring_a_title() {
+        let config = Config::try_from(
+            r#"{"windows": {
+            "dialog": {"role": "AXWindow", "subrole": "AXDialog", "floating": true},
+            "other_app": {"title": ".*", "bundle_id": "other", "track": false}
+        }}"#,
+        )
+        .unwrap();
+        let matched =
+            config.match_window_rules(None, Some("test"), Some("AXWindow"), Some("AXDialog"));
+        assert!(
+            !matched.pending,
+            "a definite bundle mismatch must beat an unknown title"
+        );
+        assert_eq!(matched.params.len(), 1);
+        assert_eq!(matched.params[0].floating, Some(true));
+    }
+
+    #[test]
+    fn window_rules_do_not_turn_failed_reads_into_empty_strings() {
+        let config = Config::try_from(
+            r#"{"windows": {
+            "untitled": {"title": "^$", "floating": true}
+        }}"#,
+        )
+        .unwrap();
+        let unknown = config.match_window_rules(None, None, None, None);
+        assert!(unknown.pending);
+        assert!(unknown.params.is_empty());
+        let empty = config.match_window_rules(Some(""), None, None, None);
+        assert!(!empty.pending);
+        assert_eq!(empty.params.len(), 1);
+    }
+
+    #[test]
+    fn window_rules_absent_bundle_does_not_defer_unrelated_preferences() {
+        let config = Config::try_from(
+            r#"{"windows": {
+            "settings": {"bundle_id": "com.apple.systempreferences", "floating": true}
+        }}"#,
+        )
+        .unwrap();
+        let matched = config.match_window_rules(
+            Some("Untitled"),
+            Some(""),
+            Some("AXWindow"),
+            Some("AXStandardWindow"),
+        );
+        assert!(!matched.pending);
+        assert!(matched.params.is_empty());
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn window_rules_shipped_preferences_are_editable_lua_not_core_defaults() {
+        let lua = mlua::Lua::new();
+        let source = format!(
+            "local config; spool = {{setup = function(c) config = c end}}; {}\nreturn config",
+            include_str!("../config/default.lua")
+        );
+        let value = lua.load(source).eval().unwrap();
+        let shipped = config_from_lua(&lua, value).unwrap();
+        let rules = shipped.match_window_rules(
+            None,
+            Some("com.apple.systempreferences"),
+            Some("AXWindow"),
+            Some("AXStandardWindow"),
+        );
+        assert!(!rules.pending);
+        assert_eq!(rules.params.iter().find_map(|p| p.floating), Some(true));
+        assert!(
+            Config::default()
+                .match_window_rules(
+                    None,
+                    Some("com.apple.systempreferences"),
+                    Some("AXWindow"),
+                    Some("AXStandardWindow")
+                )
+                .params
+                .is_empty()
+        );
+    }
 }
 
 fn deserialize_modifier<'de, D>(deserializer: D) -> std::result::Result<Option<Modifiers>, D::Error>
@@ -1426,8 +1574,11 @@ fn test_grid_ratios() {
     use regex::Regex;
 
     let make = |grid: Option<&str>| WindowParams {
-        title: Regex::new(".*").unwrap(),
+        title: Some(Regex::new(".*").unwrap()),
         bundle_id: None,
+        role: None,
+        subrole: None,
+        priority: 0,
         floating: None,
         track: None,
         index: None,
@@ -1594,15 +1745,21 @@ mod lua_setup_tests {
     }
 
     #[test]
-    fn default_lua_matches_builtin_configuration() {
+    fn default_lua_adds_preferences_without_changing_other_builtin_defaults() {
         let source = format!(
             "local configured; spool = {{ setup = function(value) configured = value end }};\n{DEFAULT_LUA_SCRIPT}\nreturn configured"
         );
-        let generated = config_from_source(&source);
+        let lua = Lua::new();
+        let table: mlua::Table = lua.load(&source).eval().unwrap();
+        let generated = config_from_lua(&lua, mlua::Value::Table(table.clone())).unwrap();
         let defaults = Config::default();
         assert_eq!(generated.bar_preferences(), defaults.bar_preferences());
+        assert!(generated.inner().windows.is_some());
+        assert!(defaults.inner().windows.is_none());
+        table.set("windows", mlua::Nil).unwrap();
+        let without_preferences = config_from_lua(&lua, mlua::Value::Table(table)).unwrap();
         assert_eq!(
-            format!("{:?}", generated.inner()),
+            format!("{:?}", without_preferences.inner()),
             format!("{:?}", defaults.inner()),
         );
         let omitted = config_from_source("return {}");

@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_and_interrupted_expansion_never_move_icons_vertically() {
+    fn collapse_and_interrupted_expansion_preserve_single_window_vertical_geometry() {
         let now = Instant::now();
         let mut display = crate::bar::layout::tests::display();
         let mut extra = display.spaces[1].columns[1].clone();
@@ -533,6 +533,9 @@ mod tests {
                     .iter()
                     .find(|item| item.key() == visual.key())
                     .unwrap();
+                if matches!(before.item.kind, ItemKind::Window { stacked: true, .. }) {
+                    continue;
+                }
                 assert!((visual.item.rect.y - before.item.rect.y).abs() < 0.001);
                 assert!((visual.item.rect.height - before.item.rect.height).abs() < 0.001);
             }
@@ -540,6 +543,79 @@ mod tests {
                 motion.retarget(&initial, now + Duration::from_millis(millis));
             }
         }
+    }
+
+    #[test]
+    fn stack_collapse_and_interrupted_expansion_converge_to_target_geometry() {
+        let now = Instant::now();
+        let mut display = crate::bar::layout::tests::display();
+        let expanded = BarLayout::resolve(&display, 1200.0, 0.0);
+        let mut motion = BarMotion::new(&expanded, now);
+        let original = motion.presented.clone();
+        display.spaces[1].visible = false;
+        let collapsed = BarLayout::resolve(&display, 1200.0, 0.0);
+        let target = Presentation::from_layout(&collapsed);
+        motion.retarget(&collapsed, now);
+        for millis in [0, 30, 70, 120, 240] {
+            motion.advance(now + Duration::from_millis(millis));
+            for visual in &motion.presented.items {
+                if !matches!(visual.item.kind, ItemKind::Window { space_id: 11, .. }) {
+                    continue;
+                }
+                let before = original
+                    .items
+                    .iter()
+                    .find(|item| item.key() == visual.key())
+                    .unwrap();
+                let after = target
+                    .items
+                    .iter()
+                    .find(|item| item.key() == visual.key())
+                    .unwrap();
+                for (value, from, to) in [
+                    (visual.item.rect.y, before.item.rect.y, after.item.rect.y),
+                    (
+                        visual.item.rect.width,
+                        before.item.rect.width,
+                        after.item.rect.width,
+                    ),
+                    (
+                        visual.item.rect.height,
+                        before.item.rect.height,
+                        after.item.rect.height,
+                    ),
+                ] {
+                    assert!(value >= from.min(to) - 0.001 && value <= from.max(to) + 0.001);
+                }
+            }
+        }
+        assert_eq!(motion.presented, target);
+        for visual in &motion.presented.items {
+            if matches!(visual.item.kind, ItemKind::Window { space_id: 11, .. }) {
+                assert!((visual.item.rect.y - 6.0).abs() < f64::EPSILON);
+                assert!((visual.item.rect.width - 22.0).abs() < f64::EPSILON);
+                assert!((visual.item.rect.height - 22.0).abs() < f64::EPSILON);
+            }
+        }
+
+        motion.retarget(&expanded, now + Duration::from_millis(300));
+        motion.advance(now + Duration::from_millis(370));
+        let interrupted = motion.presented.clone();
+        motion.retarget(&collapsed, now + Duration::from_millis(370));
+        motion.advance(now + Duration::from_millis(370));
+        for visual in &motion.presented.items {
+            let before = interrupted
+                .items
+                .iter()
+                .find(|item| item.key() == visual.key())
+                .unwrap();
+            assert_eq!(visual.item.rect, before.item.rect);
+        }
+        motion.advance(now + Duration::from_millis(610));
+        assert_eq!(motion.presented, target);
+        motion.retarget(&expanded, now + Duration::from_millis(700));
+        motion.advance(now + Duration::from_millis(940));
+        assert_eq!(motion.presented, original);
     }
 
     #[test]

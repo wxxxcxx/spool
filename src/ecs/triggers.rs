@@ -23,15 +23,16 @@ use crate::ecs::focus::{FocusCoordinator, FocusSignal};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::reconcile::{WindowStateSync, WindowUnavailable};
-use crate::ecs::state::SpoolState;
+use crate::ecs::restore::{RestoreRetry, RestoredWindowPlacement};
 use crate::ecs::window_frame::DefaultWindowFrame;
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, FullscreenDefaultsDeferred,
     InitialWindowMarker, Initializing, LayoutPosition, ObservedWindowFrame, Position,
-    PresentedWindowFrame, RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio, WindowDefaultsApplied,
-    WindowDefaultsPending, WindowFrameMotion, WindowOwnershipChanged, WindowProperties,
+    PresentedWindowFrame, RepositionMarker, ResizeMarker, RestoreWindowState, RetilePending,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio,
+    WindowDefaultsApplied, WindowDefaultsPending, WindowFrameMotion, WindowOwnershipChanged,
+    WindowProperties,
 };
 use crate::events::{DestroySource, Event, FocusObservation, FocusSource};
 use crate::manager::{
@@ -39,6 +40,7 @@ use crate::manager::{
 };
 use crate::platform::{WinID, WindowIncarnation, WorkspaceId};
 use crate::util::round_px;
+use crate::window_policy::LayoutDecision;
 
 /// The display currently in front, paired with the Dock's edge — together they
 /// give the usable viewport a window has to be fitted into.
@@ -106,6 +108,7 @@ pub(super) struct SpawnWindowCtx<'w, 's> {
     initializing: Option<Res<'w, Initializing>>,
     restore: Option<Res<'w, crate::ecs::restore::SessionRestore>>,
     sync: ResMut<'w, WindowStateSync>,
+    config: Res<'w, Config>,
     commands: Commands<'w, 's>,
 }
 
@@ -114,10 +117,6 @@ pub(super) struct SpawnWindowCtx<'w, 's> {
 fn update_passthrough(window: &Window, app: &Application, config: &Config) {
     let properties = WindowProperties::new(app, window, config);
     crate::platform::input::set_focused_passthrough(properties.passthrough_keys());
-}
-
-fn window_is_fixed_size(window: &Window) -> bool {
-    window.is_resizable().is_ok_and(|resizable| !resizable)
 }
 
 fn focus_query_failure_level(error: &crate::errors::Error) -> Level {
@@ -755,10 +754,55 @@ pub(super) fn dispatch_application_messages(
     }
 }
 
+fn clamp_origin_to_bounds(origin: IRect, size: Size, bounds: IRect) -> IRect {
+    let max = (bounds.max - size).max(bounds.min);
+    let min = origin.min.clamp(bounds.min, max);
+    IRect::from_corners(min, min + size)
+}
+
+type PendingFloating<'w, 's> = Query<
+    'w,
+    's,
+    Has<RetilePending>,
+    bevy::ecs::query::Or<(With<WindowDefaultsPending>, With<RetilePending>)>,
+>;
+
+#[derive(SystemParam)]
+pub(super) struct FloatingTransactions<'w, 's> {
+    pending: PendingFloating<'w, 's>,
+    restore_retry: Option<Res<'w, RestoreRetry>>,
+}
+
+impl FloatingTransactions<'_, '_> {
+    fn handles_transition(
+        &self,
+        entity: Entity,
+        incarnation: WindowIncarnation,
+        commands: &mut Commands,
+    ) -> bool {
+        let Ok(retile_pending) = self.pending.get(entity) else {
+            return false;
+        };
+        // Held defaults cannot add Floating. A transition without a pending
+        // tile request is explicit and ends this window's initial transaction.
+        if !retile_pending
+            && self
+                .restore_retry
+                .as_ref()
+                .is_some_and(|retry| retry.preserves_defaults(entity, incarnation))
+        {
+            finish_pending_window_defaults(entity, commands);
+        }
+        // Initial placement and retile own geometry; neither can race a
+        // second cosmetic active-display grid or pop-out resize here.
+        true
+    }
+}
+
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_floating_trigger(
     trigger: On<Add, Floating>,
-    pending_defaults: Query<(), With<WindowDefaultsPending>>,
+    pending_defaults: FloatingTransactions,
     apps: Query<(Entity, &Application)>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     // `Option<Single>` rather than `Single`: an unresolvable display would skip the
@@ -770,12 +814,6 @@ pub(super) fn window_floating_trigger(
     const FLOATING_MAX_SCREEN_RATIO_NUM: i32 = 4;
     const FLOATING_MAX_SCREEN_RATIO_DEN: i32 = 5;
     const FLOATING_POP_OFFSET: i32 = 32;
-
-    fn clamp_origin_to_bounds(origin: IRect, size: Size, bounds: IRect) -> IRect {
-        let max = (bounds.max - size).max(bounds.min);
-        let min = origin.min.clamp(bounds.min, max);
-        IRect::from_corners(min, min + size)
-    }
 
     fn offset_frame_within_bounds(frame: IRect, bounds: IRect, offset: i32) -> IRect {
         let candidates = [
@@ -807,7 +845,7 @@ pub(super) fn window_floating_trigger(
     }
 
     let entity = trigger.event().entity;
-    let Some((_, _, state)) = ctx.windows.get_tracked(entity) else {
+    let Some((window, _, state)) = ctx.windows.get_tracked(entity) else {
         return;
     };
     if !state.is_floating() {
@@ -832,9 +870,7 @@ pub(super) fn window_floating_trigger(
         }
     }
 
-    // Default geometry is already owned by the initialization transaction.
-    // Adding its classification must not schedule a second active-screen grid.
-    if pending_defaults.contains(entity) {
+    if pending_defaults.handles_transition(entity, window.incarnation(), &mut ctx.commands) {
         return;
     }
 
@@ -846,6 +882,11 @@ pub(super) fn window_floating_trigger(
     let Some((window, _, parent)) = ctx.windows.get_parent(entity) else {
         return;
     };
+    // Capability fallback must not run the cosmetic "pop out" resize or a grid
+    // write that the window cannot support (including a failed retile request).
+    if window.layout_decision(false) != LayoutDecision::Tile {
+        return;
+    }
     let Some(frame) = ctx.windows.frame(entity) else {
         return;
     };
@@ -948,66 +989,189 @@ pub(super) fn window_visibility_removed_trigger(
 pub(super) struct RetileState<'w, 's> {
     previous_strips: Query<'w, 's, &'static PreviousTiledStrip>,
     pending_reassignments: Query<'w, 's, (), With<WindowSpaceReassignmentPending>>,
+    pending_defaults: Query<'w, 's, (), With<WindowDefaultsPending>>,
+    displays: Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>,
+    topology: Res<'w, super::topology::NativeTopology>,
+    window_manager: Res<'w, WindowManager>,
+    time: Res<'w, bevy::time::Time>,
 }
 
-pub(super) fn retile_window_trigger(
-    trigger: On<RetileWindow>,
-    active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
-    apps: Query<(Entity, &Application)>,
-    mut workspaces: Query<
-        (
-            Entity,
-            &mut LayoutStrip,
-            &mut Position,
-            Has<ActiveWorkspaceMarker>,
-        ),
-        Without<Window>,
-    >,
-    state: RetileState,
-    initializing: Option<Res<Initializing>>,
-    mut ctx: WindowCtx,
+impl RetileState<'_, '_> {
+    fn destination(&self, window_id: WinID, config: &Config) -> Option<(WorkspaceId, IRect)> {
+        let workspace_id = self
+            .topology
+            .observe_memberships(&self.window_manager)
+            .ok()?
+            .unique_space(window_id)?;
+        if self.topology.is_fullscreen(workspace_id) {
+            return None;
+        }
+        let owner = self
+            .topology
+            .known_displays()
+            .find_map(|(display, spaces)| spaces.contains(&workspace_id).then_some(display.id()))?;
+        let (display, dock) = self
+            .displays
+            .iter()
+            .find(|(display, _)| display.id() == owner)?;
+        Some((workspace_id, display.actual_display_bounds(dock, config)))
+    }
+}
+
+type PendingRetiles<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, &'static RetilePending),
+    (
+        With<Window>,
+        Without<WindowDefaultsPending>,
+        Without<WindowUnavailable>,
+        Without<WindowSpaceReassignmentPending>,
+        Without<WindowVisibility>,
+    ),
+>;
+
+type RetileWorkspaces<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        &'static mut Position,
+        Has<ActiveWorkspaceMarker>,
+    ),
+    (Without<Window>, Without<PendingSpaceDestruction>),
+>;
+
+pub(super) fn retry_pending_retiles(
+    pending: PendingRetiles,
+    time: Res<bevy::time::Time>,
+    mut commands: Commands,
 ) {
+    for (entity, retry) in &pending {
+        if time.elapsed() >= retry.0 {
+            commands.trigger(RetileWindow(entity));
+        }
+    }
+}
+
+fn prepare_retile(
+    entity: Entity,
+    destination_ready: bool,
+    state: &RetileState,
+    ctx: &mut WindowCtx,
+) -> bool {
     let RetileState {
         previous_strips,
         pending_reassignments,
+        pending_defaults,
+        time,
+        ..
     } = state;
-    // finish_setup handles the initial strip assignment during init.
-    if initializing.is_some() {
-        return;
+    // Initial placement owns insertion. A window returning from visibility or
+    // native fullscreen can already have a remembered route while defaults
+    // remain deferred; preserve that route and still check capabilities below.
+    if pending_defaults.contains(entity) && previous_strips.get(entity).is_err() {
+        return false;
     }
-    let entity = trigger.event().0;
     if pending_reassignments.get(entity).is_ok() {
         debug!(
             ?entity,
             "deferring retile until native Space reassignment settles"
         );
-        return;
+        if ctx
+            .windows
+            .get_tracked(entity)
+            .is_some_and(|(_, _, state)| state.is_floating())
+        {
+            ctx.commands.entity(entity).insert(RetilePending(
+                time.elapsed() + std::time::Duration::from_secs(5),
+            ));
+        }
+        return false;
     }
 
+    let Some(window) = ctx.windows.get(entity) else {
+        return false;
+    };
+    let decision = if !destination_ready
+        || window.role().is_err()
+        || !matches!(window.try_is_full_screen(), Ok(false))
+    {
+        LayoutDecision::Defer
+    } else {
+        window.layout_decision(false)
+    };
+    match decision {
+        LayoutDecision::Defer => {
+            ctx.commands.entity(entity).insert((
+                Floating,
+                RetilePending(time.elapsed() + std::time::Duration::from_secs(5)),
+            ));
+            return false;
+        }
+        LayoutDecision::Float(reason) => {
+            debug!(?entity, ?reason, "refusing unsupported retile");
+            ctx.commands
+                .entity(entity)
+                .remove::<RetilePending>()
+                .insert(Floating);
+            return false;
+        }
+        LayoutDecision::Tile => {}
+    }
+    ctx.commands.entity(entity).remove::<RetilePending>();
+    // Removing Floating invokes this observer too. Let that invocation own the
+    // insertion so a deferred request cannot insert twice.
     if ctx
         .windows
-        .get(entity)
-        .is_some_and(|window| window.role().is_err())
+        .get_tracked(entity)
+        .is_some_and(|(_, _, state)| state.is_floating())
     {
-        // The marker was removed because the windows was destroyed.
-        return;
+        ctx.commands.entity(entity).remove::<Floating>();
+        return false;
     }
+    true
+}
 
-    if ctx.windows.get(entity).is_some_and(window_is_fixed_size) {
-        debug!(?entity, "refusing to retile fixed-size window");
-        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-            entity_commands.try_insert(Floating);
-        }
+pub(super) fn retile_window_trigger(
+    trigger: On<RetileWindow>,
+    apps: Query<(Entity, &Application)>,
+    mut workspaces: RetileWorkspaces,
+    state: RetileState,
+    initializing: Option<Res<Initializing>>,
+    mut ctx: WindowCtx,
+) {
+    let entity = trigger.event().0;
+    // finish_setup owns the initial strip assignment.
+    if initializing.is_some() {
         return;
     }
+    // A retry may outlive a Space switch; only current native membership owns
+    // the destination, including when a remembered tiled route is stale.
+    let destination = ctx
+        .windows
+        .get(entity)
+        .and_then(|window| state.destination(window.id(), &ctx.config))
+        .filter(|(space, _)| {
+            workspaces
+                .iter()
+                .any(|(_, strip, _, _)| strip.id() == *space)
+        });
+    if !prepare_retile(entity, destination.is_some(), &state, &mut ctx) {
+        return;
+    }
+    let Some((workspace_id, display_bounds)) = destination else {
+        return;
+    };
+    let previous_strips = &state.previous_strips;
 
     debug!("Entity {entity} is tiled again.");
-    let (display, dock) = *active_display;
-    let display_bounds = display.actual_display_bounds(dock, &ctx.config);
-    let mut insert_at = previous_strips
+    let previous = previous_strips
         .get(entity)
         .ok()
-        .map(|previous| previous.index);
+        .filter(|previous| previous.workspace_id == workspace_id);
+    let mut insert_at = previous.map(|previous| previous.index);
 
     if let Some((window, _, parent)) = ctx.windows.get_parent(entity)
         && let Ok((_, app)) = apps.get(parent)
@@ -1025,7 +1189,6 @@ pub(super) fn retile_window_trigger(
         insert_at = properties.insertion().or(insert_at);
     }
 
-    let previous = previous_strips.get(entity).ok().copied();
     for (_, mut strip, _, _) in &mut workspaces {
         strip.remove(entity);
     }
@@ -1033,36 +1196,26 @@ pub(super) fn retile_window_trigger(
     // The strip the window ended up in, and whether that strip is the one
     // currently on screen.
     let mut landed_in = None;
-    if let Some(previous) = previous {
-        for (strip_entity, mut strip, _, active) in &mut workspaces {
-            if strip.id() == previous.workspace_id {
-                strip.insert_at(insert_at.unwrap_or(previous.index), entity);
-                landed_in = Some((strip_entity, active));
-                break;
-            }
-        }
-    }
-
-    if landed_in.is_none()
-        && let Some((strip_entity, mut active_strip, _, _)) =
-            workspaces.iter_mut().find(|(_, _, _, active)| *active)
+    if let Some((strip_entity, mut target_strip, _, active)) = workspaces
+        .iter_mut()
+        .find(|(_, strip, _, _)| strip.id() == workspace_id)
     {
-        landed_in = Some((strip_entity, true));
+        landed_in = Some((strip_entity, active));
         if let Some(index) = insert_at {
-            active_strip.insert_at(index, entity);
+            target_strip.insert_at(index, entity);
         } else {
             // Insert at the column the floating window visually overlaps so the
             // strip doesn't have to scroll to the end to expose the new column.
             let insertion = ctx.windows.frame(entity).and_then(|frame| {
                 let center_x = frame.center().x;
-                active_strip.all_columns().into_iter().position(|top| {
+                target_strip.all_columns().into_iter().position(|top| {
                     ctx.windows
                         .frame(top)
                         .is_some_and(|col| col.center().x > center_x)
                 })
             });
-            let insertion = insertion.unwrap_or(active_strip.len());
-            active_strip.insert_at(insertion, entity);
+            let insertion = insertion.unwrap_or(target_strip.len());
+            target_strip.insert_at(insertion, entity);
         }
     }
 
@@ -1235,6 +1388,7 @@ fn transfer_window_ownership(
             WindowFrameMotion,
             FullscreenDefaultsDeferred,
             WindowDefaultsApplied,
+            RestoredWindowPlacement,
         )>();
     }
 }
@@ -1378,11 +1532,10 @@ pub(super) fn spawn_window_trigger(mut trigger: On<SpawnWindowTrigger>, mut ctx:
             continue;
         };
 
-        // Fixed-size capability is physical and known before layout starts,
-        // so classify it immediately. Configured floating/grid defaults stay
-        // transactional in `apply_window_defaults`: a failed grid write must
-        // retry before the Floating marker becomes final.
-        let starts_floating = window_is_fixed_size(&window);
+        // Pending capability/rule reads retain identity without reserving a
+        // column. The defaults transaction will retry and decide placement.
+        let starts_floating = WindowProperties::new(&app, &window, &ctx.config).pending
+            || window.layout_decision(false) != LayoutDecision::Tile;
 
         log_spawned_window(&window);
 
@@ -1449,7 +1602,7 @@ pub(super) fn spawn_window_trigger(mut trigger: On<SpawnWindowTrigger>, mut ctx:
                 bundle_id,
                 title,
                 frame: window_frame,
-                floating: false,
+                floating: starts_floating,
             }));
     }
 
@@ -1500,6 +1653,9 @@ fn mark_window_defaults_applied(entity: Entity, commands: &mut Commands) {
 pub(super) struct DefaultGeometry<'w, 's> {
     topology: Res<'w, super::topology::NativeTopology>,
     displays: Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>,
+    restored: Query<'w, 's, &'static RestoredWindowPlacement>,
+    restore_retry: Option<Res<'w, RestoreRetry>>,
+    workspaces: Query<'w, 's, &'static LayoutStrip>,
     manager: Res<'w, WindowManager>,
     retries: ResMut<'w, super::defaults::DefaultRetries>,
     time: Res<'w, bevy::time::Time>,
@@ -1557,6 +1713,14 @@ pub(super) fn apply_window_defaults(
             continue;
         };
 
+        if geometry
+            .restore_retry
+            .as_ref()
+            .is_some_and(|retry| retry.preserves_defaults(entity, window.incarnation()))
+        {
+            continue;
+        }
+
         let now = geometry.time.elapsed();
         if !geometry.retries.admit(entity, window.incarnation(), now) {
             continue;
@@ -1580,22 +1744,50 @@ pub(super) fn apply_window_defaults(
         debug!("Applying window defaults for '{}'", window.id());
 
         let initializing = initializing.is_some();
-        let fixed_size = match window.is_resizable() {
-            Ok(resizable) => !resizable,
-            Err(error) => {
-                debug!(window_id = window.id(), %error, "unable to query whether AXSize is settable; keeping configured layout policy");
-                false
-            }
+        let restored = geometry
+            .restored
+            .get(entity)
+            .is_ok_and(|placement| placement.incarnation == window.incarnation())
+            && geometry
+                .workspaces
+                .iter()
+                .any(|strip| strip.contains(entity));
+        let decision = if restored {
+            window.layout_decision(false)
+        } else {
+            properties.layout_decision(window)
         };
+        if decision == LayoutDecision::Defer {
+            commands.entity(entity).insert(Floating);
+            continue;
+        }
 
         // Do not add padding to floating windows.
-        if properties.floating() || fixed_size {
-            if fixed_size && let Ok(mut entity_commands) = commands.get_entity(entity) {
-                debug!(window_id = window.id(), "floating fixed-size window");
-                entity_commands.try_insert(Floating);
+        if let LayoutDecision::Float(reason) = decision {
+            debug!(
+                window_id = window.id(),
+                ?reason,
+                "applying floating defaults"
+            );
+            // Preference-only floating remains transactional so startup restore
+            // can still match a saved tiled layout. Physical limits cannot be
+            // overridden by a saved session.
+            if reason != crate::window_policy::FloatReason::Rule {
+                commands.entity(entity).insert(Floating);
+            }
+            let grid = properties.grid_ratios();
+            let grid_capability = if !initializing && grid.is_some() {
+                window.layout_decision(false)
+            } else {
+                decision
+            };
+            if grid_capability == LayoutDecision::Defer {
+                continue;
             }
             // Skip grid_ratios during init: we don't know this window's display.
-            let applied = if !initializing && let Some((rx, ry, rw, rh)) = properties.grid_ratios()
+            let applied = if !initializing
+                && grid_capability == LayoutDecision::Tile
+                && let Some((rx, ry, rw, rh)) = grid
             {
                 let Some(viewport) = geometry.viewport(window.id(), &config) else {
                     continue;
@@ -1666,7 +1858,7 @@ pub(super) fn apply_window_defaults(
         // Use padded display width (matching window_resize command behavior).
         // Safe during init: this only resizes, it doesn't reposition, so a
         // window on an inactive display stays put.
-        if let Some(width) = properties.width_ratio() {
+        if !restored && let Some(width) = properties.width_ratio() {
             let Some(viewport) = geometry.viewport(window.id(), &config) else {
                 continue;
             };
@@ -1692,21 +1884,10 @@ pub(super) fn apply_window_defaults(
 pub(super) struct ApplyWindowPositionsCtx<'w, 's> {
     focus: Res<'w, FocusCoordinator>,
     topology: Res<'w, super::topology::NativeTopology>,
-    pending_spaces: Query<'w, 's, &'static PendingSpaceDestruction>,
+    window_manager: Res<'w, WindowManager>,
+    restored: Query<'w, 's, &'static RestoredWindowPlacement>,
+    restore_retry: Option<Res<'w, RestoreRetry>>,
     window: WindowCtx<'w, 's>,
-}
-
-impl ApplyWindowPositionsCtx<'_, '_> {
-    fn eligible_restore_spaces(&self) -> HashSet<WorkspaceId> {
-        crate::ecs::restore::eligible_restore_space_ids(
-            self.topology
-                .known_displays()
-                .flat_map(|(_, spaces)| spaces.iter().copied()),
-            self.pending_spaces
-                .iter()
-                .map(|pending| pending.workspace_id),
-        )
-    }
 }
 
 fn finish_pending_window_defaults(entity: Entity, commands: &mut Commands) {
@@ -1717,6 +1898,7 @@ fn finish_pending_window_defaults(entity: Entity, commands: &mut Commands) {
             FullscreenDefaultsDeferred,
             InitialWindowMarker,
             WindowOwnershipChanged,
+            RestoredWindowPlacement,
         )>();
     }
 }
@@ -1734,21 +1916,17 @@ pub(super) fn apply_window_positions(
     >,
     apps: Query<&Application>,
     initializing: Option<Res<Initializing>>,
-    restore: Option<Res<crate::ecs::restore::SessionRestore>>,
-    restoration: Option<Res<SpoolState>>,
     ctx: ApplyWindowPositionsCtx,
 ) {
-    let present_spaces = if restore.is_some() && restoration.is_some() {
-        ctx.eligible_restore_spaces()
-    } else {
-        HashSet::new()
-    };
     let ApplyWindowPositionsCtx {
         focus,
-        topology: _,
-        pending_spaces: _,
+        topology,
+        window_manager,
+        restored,
+        restore_retry,
         window: mut ctx,
     } = ctx;
+    let mut memberships = None;
     for (entity, initial_window) in added {
         if workspaces.iter().any(|(strip, _)| strip.tabbed(entity)) {
             debug!("Ignoring tabbed {entity} attributes.");
@@ -1759,6 +1937,12 @@ pub(super) fn apply_window_positions(
         let Some((window, _, parent)) = ctx.windows.get_parent(entity) else {
             continue;
         };
+        if restore_retry
+            .as_ref()
+            .is_some_and(|retry| retry.preserves_defaults(entity, window.incarnation()))
+        {
+            continue;
+        }
         let Ok(app) = apps.get(parent) else {
             continue;
         };
@@ -1770,28 +1954,30 @@ pub(super) fn apply_window_positions(
             continue;
         }
 
-        // A saved-state match only describes intent. The restore pass may have
-        // rejected that state against a different topology snapshot, so only
-        // skip defaults after ECS confirms that the window was actually placed.
+        let properties = WindowProperties::new(app, window, &ctx.config);
+        let decision = properties.layout_decision(window);
+        if decision == LayoutDecision::Defer {
+            ctx.commands
+                .entity(entity)
+                .insert(Floating)
+                .remove::<WindowDefaultsApplied>();
+            continue;
+        }
+
+        // Only an applied restore owns precedence, including a unique fallback
+        // match. Identity matches alone can have been rejected by the planner.
         let already_inserted = workspaces.iter().any(|(strip, _)| strip.contains(entity));
         if already_inserted
-            && crate::ecs::restore::matches_startup_restore_state(
-                window,
-                app,
-                restore.as_deref(),
-                restoration.as_deref(),
-                &ctx.config,
-                &present_spaces,
-            )
+            && window.layout_decision(false) == LayoutDecision::Tile
+            && restored
+                .get(entity)
+                .is_ok_and(|placement| placement.incarnation == window.incarnation())
         {
             finish_pending_window_defaults(entity, &mut ctx.commands);
             continue;
         }
 
-        let properties = WindowProperties::new(app, window, &ctx.config);
-
-        let fixed_size = window_is_fixed_size(window);
-        if properties.floating() || fixed_size {
+        if matches!(decision, LayoutDecision::Float(_)) {
             if let Some(mut strip) = workspaces
                 .iter_mut()
                 .find_map(|(strip, _)| strip.contains(entity).then_some(strip))
@@ -1806,14 +1992,22 @@ pub(super) fn apply_window_positions(
             continue;
         }
 
-        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-            entity_commands.try_remove::<Floating>();
-        }
-
         if !already_inserted {
+            // Capability retries can finish after startup or a Space switch.
+            // Place on the observed owner, never on whichever Space is active now.
+            let membership =
+                memberships.get_or_insert_with(|| topology.observe_memberships(&window_manager));
+            let Some(workspace_id) = membership
+                .as_ref()
+                .ok()
+                .and_then(|members| members.unique_space(window.id()))
+                .filter(|space| !topology.is_fullscreen(*space))
+            else {
+                continue;
+            };
             let Some(mut strip) = workspaces
                 .iter_mut()
-                .find_map(|(strip, active)| active.then_some(strip))
+                .find_map(|(strip, _)| (strip.id() == workspace_id).then_some(strip))
             else {
                 continue;
             };
@@ -1840,6 +2034,10 @@ pub(super) fn apply_window_positions(
                 }
                 None => strip.append(entity),
             }
+        }
+
+        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
+            entity_commands.try_remove::<Floating>();
         }
 
         // During init, skip per-window reshuffles. finish_setup does a single

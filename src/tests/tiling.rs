@@ -8,6 +8,49 @@ use bevy::prelude::*;
 
 use super::*;
 
+#[cfg(feature = "lua")]
+#[test]
+fn edge_padding_reload_repositions_and_resizes_existing_windows() {
+    let config_with_padding = |padding| {
+        let lua = mlua::Lua::new();
+        let value = lua
+            .load(format!(
+                "return {{ options = {{ auto_center = false }}, \
+                 swipe = {{ continuous = false }}, \
+                 padding = {{ top = {padding}, bottom = {padding}, \
+                 left = {padding}, right = {padding} }} }}"
+            ))
+            .eval()
+            .unwrap();
+        crate::config::config_from_lua(&lua, value).unwrap()
+    };
+    let mut harness = TestHarness::new()
+        .with_config(config_with_padding(8))
+        .with_windows(3);
+    harness.pump_frames(20);
+    assert_window_at!(harness.world(), 0, 8, TEST_MENUBAR_HEIGHT + 8);
+    assert_window_size!(
+        harness.world(),
+        0,
+        TEST_WINDOW_WIDTH,
+        TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - 16
+    );
+
+    {
+        let mut config = harness.world().resource_mut::<Config>();
+        config.replace_inner_from(&config_with_padding(4));
+        config.set_changed();
+    }
+    harness.pump_frames(20);
+    assert_window_at!(harness.world(), 0, 4, TEST_MENUBAR_HEIGHT + 4);
+    assert_window_size!(
+        harness.world(),
+        0,
+        TEST_WINDOW_WIDTH,
+        TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - 8
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn test_window_shuffle() {

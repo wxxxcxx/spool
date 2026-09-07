@@ -2,6 +2,16 @@
 
 This document provides project-specific guidance for AI agents contributing to Spool. It builds upon the core philosophy and technical architecture of the codebase.
 
+## Documentation Location
+
+Keep project documentation in `docs/`; use [docs/README.md](docs/README.md) as the index.
+The domain glossary is [docs/CONTEXT.md](docs/CONTEXT.md), and architecture guidance
+is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). When a skill refers to root-level
+`CONTEXT.md`, read and update `docs/CONTEXT.md` instead. Keep research in
+`docs/research/`, reviews in `docs/reviews/`, and decisions in `docs/adr/`.
+Only the repository entry point (`README.md`), agent instructions (`AGENTS.md`),
+license, and tool-owned skill files stay outside `docs/`.
+
 ## 1. Bevy ECS Architecture & Patterns
 
 Spool is built on Bevy and follows a strict Data-Driven Design (ECS).

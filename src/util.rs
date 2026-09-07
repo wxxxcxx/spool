@@ -94,7 +94,8 @@ impl AXUIWrapper {
     }
 
     /// Wraps an already retained raw pointer of type `T` into a `CFRetained<Self>`.
-    /// This function assumes the caller has already handled the retention count.
+    /// Use this for Create/Copy results: it consumes their existing owned
+    /// reference without incrementing the count. Borrowed results use `retain`.
     ///
     /// # Type Parameters
     ///
@@ -390,4 +391,46 @@ where
         id.is_some_and(|id| id.as_u32() == display_id)
             .then(|| getter(screen))
     })
+}
+
+#[cfg(test)]
+mod ax_ownership_tests {
+    use accessibility_sys::{AXValueCreate, kAXValueTypeCGPoint};
+    use objc2_core_foundation::{CFGetRetainCount, CGPoint};
+
+    use super::*;
+
+    #[test]
+    fn created_ax_values_transfer_exactly_one_owned_reference() {
+        let mut point = CGPoint::new(123.0, 456.0);
+        let raw = unsafe {
+            AXValueCreate(
+                kAXValueTypeCGPoint,
+                NonNull::from(&mut point).as_ptr().cast(),
+            )
+        };
+        let probe = AXUIWrapper::retain(raw).unwrap();
+        let before = CFGetRetainCount(Some(probe.as_ref()));
+        let owned = AXUIWrapper::from_retained(raw).unwrap();
+        assert_eq!(CFGetRetainCount(Some(probe.as_ref())), before);
+        drop(owned);
+        assert_eq!(CFGetRetainCount(Some(probe.as_ref())), before - 1);
+    }
+
+    #[test]
+    fn borrowed_ax_values_keep_their_owners_reference() {
+        let mut point = CGPoint::new(321.0, 654.0);
+        let raw = unsafe {
+            AXValueCreate(
+                kAXValueTypeCGPoint,
+                NonNull::from(&mut point).as_ptr().cast(),
+            )
+        };
+        let owned = AXUIWrapper::from_retained(raw).unwrap();
+        let before = CFGetRetainCount(Some(owned.as_ref()));
+        let borrowed = AXUIWrapper::retain(raw).unwrap();
+        assert_eq!(CFGetRetainCount(Some(owned.as_ref())), before + 1);
+        drop(borrowed);
+        assert_eq!(CFGetRetainCount(Some(owned.as_ref())), before);
+    }
 }

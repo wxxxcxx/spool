@@ -176,5 +176,25 @@
 
       packages.spool = lib.makeOverridable mkSpool { };
       packages.spool-lua = self'.packages.spool.override { enableLua = true; };
+
+      checks.package-contract =
+        let
+          variants = [
+            self'.packages.default
+            (self'.packages.spool.override { enableLua = false; })
+          ];
+          overlayPackage = (self.overlays.default pkgs pkgs).spool;
+        in
+        assert lib.assertMsg (
+          builtins.all (
+            package:
+            lib.getExe package == "${package}/bin/spool"
+            && package.system == pkgs.stdenv.hostPlatform.system
+          ) variants
+        ) "Spool package variants must expose bin/spool for the selected host architecture";
+        assert lib.assertMsg (
+          overlayPackage.system == pkgs.stdenv.hostPlatform.system
+        ) "Spool's overlay must select the host architecture";
+        pkgs.runCommand "spool-package-contract" { } "touch $out";
     };
 }

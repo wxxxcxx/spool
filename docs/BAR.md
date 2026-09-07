@@ -35,9 +35,11 @@ menus and status items. Use the width limit and notch side to avoid crowded area
 - Other Spaces show up to four application icons as a compact deck, with at
   least 5px exposed edges, without added backing plates or icon outlines. The first
   window in layout order is the front card; rendering proceeds back to front.
-  Each icon retains its expanded size and Y position; collapse/expansion moves
-  icons only horizontally. Icons beyond the four-card limit fade without
-  moving vertically, including when a transition is interrupted.
+  All collapsed icons use the normal icon size and share one horizontal lane,
+  including members of Stack and Tabs columns. Collapse/expansion interpolates
+  between this uniform deck and the expanded column geometry. Single and floating
+  icons retain their size and Y position; icons beyond the four-card limit fade
+  without moving vertically, including when a transition is interrupted.
 - Empty Spaces use a full-size outlined placeholder in the content region,
   never a synthetic application icon. Native fullscreen status is indicated only
   by a small bottom-right expand-arrows badge on window icons, in both expanded
@@ -151,7 +153,7 @@ in operational queries or Lua window sets.
 
 The Bar uses the `bar` section in the active `init.lua`. Merge it into the same
 `spool.setup` call as window-manager settings; a second setup call replaces the
-whole configuration. The [default Lua configuration](config/default.lua)
+whole configuration. The [default Lua configuration](../config/default.lua)
 contains every Bar setting:
 
 ```lua
@@ -245,8 +247,9 @@ Drag tests cover pointer/grab-offset geometry, display bounds, animated slot
 stability, whole-column and floating previews, command agreement, and the real
 mouse-event state path through release and cancellation. They do not create
 live native panels or operate the user's windows.
-Additional tests cover borderless collapsed icons, unchanged vertical geometry
-through interrupted transitions, cold-start read-only icons and their handoff
+Additional tests cover borderless, uniformly sized and aligned collapsed icons,
+interrupted transitions between collapsed and expanded stack geometry, unchanged
+single-window vertical geometry, cold-start read-only icons and their handoff
 to AX discovery, inventory failures, closed/ignored-surface cleanup, and exclusion
 from focus, drag and operational queries.
 Live Space switching, drag gestures, multi-display behavior and

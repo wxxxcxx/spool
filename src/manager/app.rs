@@ -1,12 +1,12 @@
 use accessibility_sys::{
-    AXObserverRef, AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
-    kAXErrorSuccess,
+    AXObserverRef, AXUIElementCreateApplication, AXUIElementRef, kAXErrorSuccess,
 };
 use bevy::ecs::component::Component;
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use objc2_core_foundation::{CFRetained, CFString, kCFRunLoopCommonModes};
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::pin::Pin;
 use std::ptr::null_mut;
@@ -29,11 +29,6 @@ use crate::platform::{
     Pid, ProcessSerialNumber, WinID, WindowIncarnation,
 };
 use crate::util::{AXUIAttributes, AXUIWrapper, MacResult, add_run_loop, remove_run_loop};
-
-/// How long any one accessibility call may wait on the app that owns the
-/// element before giving up. See [`ApplicationOS::new`] for why this is set at
-/// all; the default is six seconds.
-const AX_MESSAGING_TIMEOUT_SEC: f32 = 0.25;
 
 /// A static `LazyLock` that holds a list of `AXNotification` strings to be observed for application-level events.
 /// These notifications are general events related to an application's lifecycle and state changes,
@@ -94,13 +89,16 @@ pub trait ApplicationApi: Send + Sync {
     ///
     /// Returns an `Error` if the window list cannot be retrieved.
     fn window_list(&self, config: &Config) -> Vec<Window>;
-    /// Starts observing application-level accessibility notifications.
+    /// Starts observing supported application-level accessibility notifications.
+    /// `Ok(true)` means no retryable registrations remain, not that every
+    /// requested notification is supported. Inventory reconciliation is fallback.
     ///
     /// # Errors
     ///
     /// Returns an `Error` if observers cannot be registered.
     fn observe(&mut self) -> Result<bool>;
     /// Starts observing window-specific accessibility notifications for a given window.
+    /// Unsupported notifications settle without making the window untrackable.
     ///
     /// # Arguments
     ///
@@ -210,17 +208,8 @@ impl ApplicationOS {
         process: &dyn ProcessApi,
         events: &EventSender,
     ) -> Result<Self> {
-        let refer = unsafe {
-            let ptr = AXUIElementCreateApplication(process.pid());
-            // Without this, a synchronous AX call to an app that stops servicing
-            // its accessibility port (beachballing, paused in a debugger) blocks
-            // the main thread for the default six-second timeout, per call. Set
-            // on the application element so it covers every element obtained
-            // through it, windows included; a call that trips it fails with
-            // `kAXErrorCannotComplete`, treated like any other AX error.
-            AXUIElementSetMessagingTimeout(ptr, AX_MESSAGING_TIMEOUT_SEC);
-            AXUIWrapper::retain(ptr)?
-        };
+        let refer =
+            AXUIWrapper::from_retained(unsafe { AXUIElementCreateApplication(process.pid()) })?;
         let bundle_id = process
             .application()
             .as_ref()
@@ -340,7 +329,8 @@ impl ApplicationApi for ApplicationOS {
     ///
     /// # Returns
     ///
-    /// `Ok(bool)` where `true` means all observers were successfully registered and `retry` list is empty, otherwise `Err(Error)`.
+    /// `Ok(true)` once every notification is registered or known unsupported;
+    /// `Ok(false)`/`Err` retain retryable registration failures.
     fn observe(&mut self) -> Result<bool> {
         self.handler
             .add_observer(&self.element, &AX_NOTIFICATIONS, ObserverType::Application)
@@ -355,7 +345,8 @@ impl ApplicationApi for ApplicationOS {
     ///
     /// # Returns
     ///
-    /// `Ok(bool)` where `true` means all observers were successfully registered and `retry` list is empty, otherwise `Err(Error)`.
+    /// `Ok(true)` once every notification is registered or known unsupported;
+    /// `Ok(false)`/`Err` retain retryable registration failures.
     fn observe_window(&mut self, window: &Window) -> Result<bool> {
         if let Some(element) = window.element() {
             self.handler
@@ -419,7 +410,7 @@ impl ApplicationApi for ApplicationOS {
 /// An enum representing the type of observer being used.
 /// `Application` refers to an observer for application-level events.
 /// `Window(WinID)` refers to an observer for a specific window, identified by its `WinID`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum ObserverType {
     Application,
     Window(WinID, WindowIncarnation),
@@ -567,6 +558,81 @@ impl ObserverContext {
     }
 }
 
+#[derive(Default)]
+struct NotificationRegistrations {
+    // Registration support belongs to one observer target, not the entire app
+    // family. A reused window ID must not inherit another incarnation's result.
+    settled: HashSet<(ObserverType, &'static str)>,
+}
+
+impl NotificationRegistrations {
+    fn add(
+        &mut self,
+        which: ObserverType,
+        notifications: &[&'static str],
+        mut register: impl FnMut(&'static str) -> i32,
+    ) -> Result<Vec<&'static str>> {
+        let mut retry = Vec::new();
+        let mut any_settled = false;
+        let mut first_error = None;
+        for &name in notifications {
+            if self.settled.contains(&(which, name)) {
+                any_settled = true;
+                continue;
+            }
+            let result = register(name);
+            if result == accessibility_sys::kAXErrorSuccess
+                || result == accessibility_sys::kAXErrorNotificationAlreadyRegistered
+                || result == accessibility_sys::kAXErrorNotificationUnsupported
+            {
+                if result == accessibility_sys::kAXErrorNotificationUnsupported {
+                    debug!(
+                        ?which,
+                        notification = name,
+                        result,
+                        "AX notification unsupported; using reconciliation fallback"
+                    );
+                }
+                self.settled.insert((which, name));
+                any_settled = true;
+            } else {
+                // A transport or permission failure affects the endpoint, not
+                // this notification. Let the caller back off the whole probe.
+                if matches!(
+                    result,
+                    accessibility_sys::kAXErrorCannotComplete
+                        | accessibility_sys::kAXErrorAPIDisabled
+                ) {
+                    return Err(Error::macos(
+                        format!("AXObserverAddNotification({name})"),
+                        result,
+                    ));
+                }
+                error!(
+                    ?which,
+                    notification = name,
+                    result,
+                    "error adding AX observer"
+                );
+                first_error.get_or_insert_with(|| {
+                    Error::macos(format!("AXObserverAddNotification({name})"), result)
+                });
+                retry.push(name);
+            }
+        }
+        if !any_settled && let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(retry)
+    }
+
+    fn remove(&mut self, which: ObserverType, notifications: &[&'static str]) {
+        for &name in notifications {
+            self.settled.remove(&(which, name));
+        }
+    }
+}
+
 /// `AxObserverHandler` manages the lifecycle of an `AXObserver`,
 /// including its creation, registration of notifications, and removal from the run loop.
 struct AxObserverHandler {
@@ -574,6 +640,7 @@ struct AxObserverHandler {
     events: EventSender,
     pid: Pid,
     contexts: Arc<RwLock<Vec<Pin<Box<ObserverContext>>>>>,
+    registrations: NotificationRegistrations,
 }
 
 impl Drop for AxObserverHandler {
@@ -614,6 +681,7 @@ impl AxObserverHandler {
             events,
             pid,
             contexts: Arc::new(RwLock::new(Vec::new())),
+            registrations: NotificationRegistrations::default(),
         })
     }
 
@@ -627,7 +695,8 @@ impl AxObserverHandler {
     ///
     /// # Returns
     ///
-    /// `Ok(Vec<&str>)` containing a list of notifications that could not be registered (retries), otherwise `Err(Error)`.
+    /// The notifications still eligible for retry. Unsupported notifications
+    /// are settled for this observer target, not reported as permission errors.
     pub fn add_observer(
         &mut self,
         element: &AXUIWrapper,
@@ -637,42 +706,26 @@ impl AxObserverHandler {
         let observer: AXObserverRef = self.observer.as_ptr();
         let context_ptr = self.get_or_insert_context(which).as_ptr();
 
-        // TODO: retry re-registering these.
-        let mut retry = vec![];
-        let added = notifications
-            .iter()
-            .filter_map(|name| {
-                debug!("adding {name} {element:x?} {observer:?}");
-                let notification = CFString::from_static_str(name);
-                match unsafe {
-                    AXObserverAddNotification(
-                        observer,
-                        element.as_ptr(),
-                        &notification,
-                        context_ptr.cast(),
-                    )
-                } {
-                    accessibility_sys::kAXErrorSuccess
-                    | accessibility_sys::kAXErrorNotificationAlreadyRegistered => Some(*name),
-                    result => {
-                        error!("error adding {name} {element:x?} {observer:?}: {result}");
-                        // AX can fail individual notification registrations for
-                        // reasons other than CannotComplete. Any non-success is
-                        // still incomplete and must remain eligible for retry.
-                        retry.push(*name);
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
-        if added.is_empty() {
-            Err(Error::PermissionDenied(format!(
-                "{}: unable to register any observers!",
-                function_name!()
-            )))
-        } else {
-            Ok(retry)
-        }
+        let _span = tracing::debug_span!(
+            "ax_observer_registration",
+            pid = self.pid,
+            ?which,
+            ?element,
+            ?observer
+        )
+        .entered();
+        self.registrations.add(which, notifications, |name| {
+            debug!("adding {name} {element:x?} {observer:?}");
+            let notification = CFString::from_static_str(name);
+            unsafe {
+                AXObserverAddNotification(
+                    observer,
+                    element.as_ptr(),
+                    &notification,
+                    context_ptr.cast(),
+                )
+            }
+        })
     }
 
     /// Removes accessibility notifications from being observed for a given UI element.
@@ -688,6 +741,7 @@ impl AxObserverHandler {
         element: &AXUIWrapper,
         notifications: &[&'static str],
     ) {
+        self.registrations.remove(*which, notifications);
         if self.get_context(*which).is_none() {
             debug!("{which:?} ({element}) already un-observed, skipping!");
             return;
@@ -763,13 +817,15 @@ impl AxObserverHandler {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
+        io::{self, Write},
         mem::ManuallyDrop,
         ptr::NonNull,
-        sync::{Arc, RwLock},
+        sync::{Arc, Mutex, RwLock},
     };
     use stdext::sync::rw_lock::RwLockExt as _;
 
-    use super::ObserverType;
+    use super::{NotificationRegistrations, ObserverType};
     use crate::{events::EventSender, manager::app::AxObserverHandler, util::AXUIWrapper};
 
     #[test]
@@ -782,6 +838,7 @@ mod tests {
             events,
             pid: 1,
             contexts: Arc::new(RwLock::new(Vec::new())),
+            registrations: NotificationRegistrations::default(),
         });
 
         let first = handler.get_or_insert_context(ObserverType::Window(42, 1));
@@ -789,5 +846,206 @@ mod tests {
 
         assert_eq!(reused, first);
         assert_eq!(handler.contexts.as_ref().force_read().len(), 1);
+    }
+
+    #[test]
+    fn unsupported_ax_notifications_stop_retrying() {
+        let notifications = [
+            "AXFocusedWindowChanged",
+            "AXWindowMoved",
+            "AXWindowResized",
+            "AXMenuOpened",
+            "AXMenuClosed",
+        ];
+        let mut registrations = NotificationRegistrations::default();
+        let mut complete = false;
+        let mut attempts = 0;
+        for _ in 0..3 {
+            if complete {
+                break;
+            }
+            complete = registrations
+                .add(ObserverType::Application, &notifications, |_| {
+                    attempts += 1;
+                    accessibility_sys::kAXErrorNotificationUnsupported
+                })
+                .is_ok_and(|retry| retry.is_empty());
+        }
+        assert_eq!(
+            attempts,
+            notifications.len(),
+            "-25207 must settle as unsupported, not be re-registered on each reconciliation"
+        );
+        assert!(
+            complete,
+            "an element supporting no notifications must not be misreported as a permission failure"
+        );
+    }
+
+    #[test]
+    fn ax_communication_failure_stops_the_registration_batch() {
+        let mut registrations = NotificationRegistrations::default();
+        let mut attempts = 0;
+        let error = registrations
+            .add(ObserverType::Application, &super::AX_NOTIFICATIONS, |_| {
+                attempts += 1;
+                accessibility_sys::kAXErrorCannotComplete
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error.macos_code(),
+            Some(accessibility_sys::kAXErrorCannotComplete)
+        );
+        assert_eq!(
+            attempts, 1,
+            "an unavailable AX endpoint must not be called again for every notification"
+        );
+    }
+
+    #[test]
+    fn ax_registration_retries_only_unsettled_notifications() {
+        let mut registrations = NotificationRegistrations::default();
+        let mut attempts = HashMap::new();
+        let notifications = ["AXCreated", "AXMenuOpened", "AXWindowResized"];
+        let mut register = |name| {
+            let attempt = attempts.entry(name).or_insert(0);
+            *attempt += 1;
+            match name {
+                "AXCreated" => accessibility_sys::kAXErrorNotificationAlreadyRegistered,
+                "AXMenuOpened" => accessibility_sys::kAXErrorNotificationUnsupported,
+                _ if *attempt == 1 => accessibility_sys::kAXErrorCannotComplete,
+                _ => accessibility_sys::kAXErrorSuccess,
+            }
+        };
+        assert_eq!(
+            registrations
+                .add(ObserverType::Application, &notifications, &mut register)
+                .unwrap_err()
+                .macos_code(),
+            Some(accessibility_sys::kAXErrorCannotComplete)
+        );
+        assert!(
+            registrations
+                .add(ObserverType::Application, &notifications, &mut register)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registrations
+                .add(ObserverType::Application, &notifications, |_| panic!(
+                    "settled notifications must not be re-registered"
+                ))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(attempts["AXCreated"], 1);
+        assert_eq!(attempts["AXMenuOpened"], 1);
+        assert_eq!(attempts["AXWindowResized"], 2);
+    }
+
+    #[test]
+    fn ax_registration_preserves_actual_errors_and_can_recover() {
+        for code in [
+            accessibility_sys::kAXErrorCannotComplete,
+            accessibility_sys::kAXErrorAPIDisabled,
+        ] {
+            let mut registrations = NotificationRegistrations::default();
+            let notifications = ["AXCreated"];
+            let error = registrations
+                .add(ObserverType::Application, &notifications, |_| code)
+                .unwrap_err();
+            assert_eq!(error.macos_code(), Some(code));
+            assert!(
+                registrations
+                    .add(ObserverType::Application, &notifications, |_| {
+                        accessibility_sys::kAXErrorSuccess
+                    })
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn ax_registration_cache_is_per_target_incarnation_and_clears_on_remove() {
+        let mut registrations = NotificationRegistrations::default();
+        let notifications = ["AXTitleChanged"];
+        let mut attempts = 0;
+        let mut register = |_| {
+            attempts += 1;
+            accessibility_sys::kAXErrorNotificationUnsupported
+        };
+        for which in [
+            ObserverType::Application,
+            ObserverType::Window(42, 1),
+            ObserverType::Window(42, 2),
+            ObserverType::Window(43, 1),
+        ] {
+            for _ in 0..2 {
+                assert!(
+                    registrations
+                        .add(which, &notifications, &mut register)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        registrations.remove(ObserverType::Window(42, 1), &notifications);
+        assert!(
+            registrations
+                .add(ObserverType::Window(42, 1), &notifications, &mut register)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            attempts, 5,
+            "each target is probed once; removing a subscription resets only that target"
+        );
+    }
+
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unsupported_ax_notifications_never_emit_error_logs() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || CapturedLog(captured.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut registrations = NotificationRegistrations::default();
+            for _ in 0..3 {
+                assert!(
+                    registrations
+                        .add(ObserverType::Application, &["AXWindowResized"], |_| {
+                            accessibility_sys::kAXErrorNotificationUnsupported
+                        })
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        });
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(!log.contains("ERROR"), "{log}");
+        assert_eq!(
+            log.matches("AX notification unsupported").count(),
+            1,
+            "{log}"
+        );
     }
 }

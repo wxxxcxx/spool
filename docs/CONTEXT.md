@@ -23,6 +23,18 @@ _Avoid_: Unmanaged window
 **Window Visibility**:
 Whether a tracked window is visible, minimized, or hidden. Visibility is independent of whether the window is tiled or floating.
 
+**Window Admission**:
+The decision to track an independent application window, ignore a non-window or excluded surface, or defer while its identity evidence is incomplete. It does not decide tiling preference.
+
+**Layout Capability**:
+The operations the current backend can perform on a window, distinguished as supported, unsupported, or unknown. Capability does not describe the window's purpose.
+
+**Layout Preference**:
+A user's initial or explicit choice of tiled or floating behavior. A preference cannot create missing capabilities.
+
+**Deferred Tile Request**:
+A retained request to tile after temporary capability or native-state uncertainty clears, distinct from a completed choice to float.
+
 **Layout State**:
 The Spool-owned arrangement of tiled windows, including strip membership, column structure, ordering, and logical sizes.
 

@@ -190,10 +190,10 @@ impl ActiveDisplayMut<'_, '_> {
     }
 }
 
-/// Markers indicating something on screen is still animating; used by the
-/// event pump to decide how long it may sleep.
+/// Work that needs prompt ticks; used by the event pump to bound its sleep.
 #[derive(SystemParam)]
 pub struct FrameActivity<'w, 's> {
+    initializing: Option<Res<'w, Initializing>>,
     repositioning: Query<'w, 's, (), With<RepositionMarker>>,
     resizing: Query<'w, 's, (), With<ResizeMarker>>,
     window_motion: Query<'w, 's, (), With<WindowFrameMotion>>,
@@ -204,10 +204,11 @@ pub struct FrameActivity<'w, 's> {
 }
 
 impl FrameActivity<'_, '_> {
-    /// Returns `true` while any window is being moved, resized or scrolled, or
-    /// a flash message is on screen — i.e. while frames still need drawing.
+    /// Startup retains `Initializing` until incremental discovery settles. Its
+    /// cursor must progress even when no window is animating and no event arrives.
     pub fn mid_frame(&self) -> bool {
-        !self.repositioning.is_empty()
+        self.initializing.is_some()
+            || !self.repositioning.is_empty()
             || !self.resizing.is_empty()
             || !self.window_motion.is_empty()
             || !self.scrolling.is_empty()

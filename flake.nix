@@ -21,7 +21,7 @@
         systems = lib.platforms.darwin;
         flake = {
           overlays.default = final: prev: {
-            spool = self.packages.aarch64-darwin.default;
+            spool = self.packages.${final.stdenv.hostPlatform.system}.default;
           };
         };
         perSystem =

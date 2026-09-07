@@ -93,25 +93,25 @@ AX 仍然适合窗口几何管理。公开头文件提供 `AXWindows`、`AXPosit
 Spool 当前已经链接私有 `SkyLight.framework`，并声明了
 `SLSManagedDisplayGetCurrentSpace`、`SLSSpaceGetType`、
 `SLSCopyManagedDisplaySpaces`、`SLSCopyWindowsWithOptionsAndTags` 等符号：
-[`src/manager/skylight.rs:11`](./src/manager/skylight.rs#L11)、
-[`src/manager/skylight.rs:128`](./src/manager/skylight.rs#L128)、
-[`src/manager/skylight.rs:180`](./src/manager/skylight.rs#L180)、
-[`src/manager/skylight.rs:222`](./src/manager/skylight.rs#L222)。
+[`src/manager/skylight.rs:11`](../../src/manager/skylight.rs#L11)、
+[`src/manager/skylight.rs:128`](../../src/manager/skylight.rs#L128)、
+[`src/manager/skylight.rs:180`](../../src/manager/skylight.rs#L180)、
+[`src/manager/skylight.rs:222`](../../src/manager/skylight.rs#L222)。
 
 当前实现从 `SLSCopyManagedDisplaySpaces` 的私有字典读取
 `Display Identifier`、`Spaces` 和 `id64`，并按显示器返回 Space 列表：
-[`src/manager.rs:222`](./src/manager.rs#L222)。每屏活动 Space 则由
+[`src/manager.rs:222`](../../src/manager.rs#L222)。每屏活动 Space 则由
 `SLSManagedDisplayGetCurrentSpace` 读取，`SLSSpaceGetType == 4` 用来识别原生
-全屏 Space：[`src/manager.rs:384`](./src/manager.rs#L384)。
+全屏 Space：[`src/manager.rs:384`](../../src/manager.rs#L384)。
 
 事件层同时使用：
 
 - 公开的 `NSWorkspaceActiveSpaceDidChangeNotification`；
 - SDK 未公开的 `NSWorkspaceActiveDisplayDidChangeNotification`：
-  [`src/platform/workspace.rs:264`](./src/platform/workspace.rs#L264)；
+  [`src/platform/workspace.rs:264`](../../src/platform/workspace.rs#L264)；
 - 私有 `SLSRegisterConnectionNotifyProc` 以及逆向得到的事件号 1327/1328/1329：
-  [`src/platform/notify.rs:15`](./src/platform/notify.rs#L15)、
-  [`src/platform/notify.rs:157`](./src/platform/notify.rs#L157)。
+  [`src/platform/notify.rs:15`](../../src/platform/notify.rs#L15)、
+  [`src/platform/notify.rs:157`](../../src/platform/notify.rs#L157)。
 
 本机 SDK 也把相关二进制符号放在
 `System/Library/PrivateFrameworks/SkyLight.framework/.../SkyLight.tbd`
@@ -220,10 +220,10 @@ active-display-changed 通知。
 
 当前 `ActiveWorkspaceMarker` 是全局单例：新 marker 加入时会从所有其他
 `LayoutStrip` 移除它，见
-[`src/ecs/workspace.rs:825`](./src/ecs/workspace.rs#L825)。
+[`src/ecs/workspace.rs:825`](../../src/ecs/workspace.rs#L825)。
 `ActiveDisplay` 参数也依赖单个 `ActiveWorkspaceMarker` 和单个
 `ActiveDisplayMarker`：
-[`src/ecs/params.rs:82`](./src/ecs/params.rs#L82)。这个不变量无法直接表达
+[`src/ecs/params.rs:82`](../../src/ecs/params.rs#L82)。这个不变量无法直接表达
 “显示器 A 的 Space 1 和显示器 B 的 Space 5 同时可见”。
 
 推荐的新不变量是：
@@ -241,10 +241,10 @@ Space，比较前后快照，而不是只更新当前 menu-bar display。
 ### ECS 与布局
 
 当前一条 `LayoutStrip` 由 `(native workspace id, virtual_index)` 标识：
-[`src/ecs/layout.rs:294`](./src/ecs/layout.rs#L294)。同一原生 Space 可以有多条
+[`src/ecs/layout.rs:294`](../../src/ecs/layout.rs#L294)。同一原生 Space 可以有多条
 row，`SelectedVirtualMarker` 记住该原生 Space 当前选中的 row；切换 row 只是在
 ECS 内替换 marker，并移动窗口位置，不触发 macOS Space 切换：
-[`src/ecs/workspace.rs:1110`](./src/ecs/workspace.rs#L1110)。
+[`src/ecs/workspace.rs:1110`](../../src/ecs/workspace.rs#L1110)。
 
 迁移后应删除 `virtual_index` 和 `SelectedVirtualMarker`，而不是把
 `virtual_index` 永久固定为 0。目标模型是 `NativeSpace -> LayoutStrip` 一对一。
@@ -259,8 +259,8 @@ ECS 内替换 marker，并移动窗口位置，不触发 macOS Space 切换：
 
 Spool 已经用 `SLSSpaceGetType == 4` 识别全屏 Space，并创建
 `NativeFullscreenMarker`/特殊 fullscreen strip：
-[`src/manager.rs:395`](./src/manager.rs#L395)、
-[`src/ecs/workspace.rs:449`](./src/ecs/workspace.rs#L449)。
+[`src/manager.rs:395`](../../src/manager.rs#L395)、
+[`src/ecs/workspace.rs:449`](../../src/ecs/workspace.rs#L449)。
 
 迁移后要继续把它建模为 system-owned `SpaceKind::Fullscreen`，而不是普通可创建、
 可删除、可重排的 workspace。它可以拥有临时的一条特殊 `LayoutStrip`，但：
@@ -287,8 +287,8 @@ Space 复制实体，否则 focus、关闭、tab/group 和持久化都会重复�
 
 当前保存格式把多个 `SavedStrip { virtual_index, columns }` 放在同一个
 `SavedWorkspace { workspace_id, active_virtual_index }` 下：
-[`src/ecs/state.rs:55`](./src/ecs/state.rs#L55)、
-[`src/ecs/state.rs:250`](./src/ecs/state.rs#L250)。
+[`src/ecs/state.rs:55`](../../src/ecs/state.rs#L55)、
+[`src/ecs/state.rs:250`](../../src/ecs/state.rs#L250)。
 
 原生 Space 的私有 `id64` 没有公开的跨 Dock restart、重新登录、系统升级或
 Space 重建稳定性承诺；ordinal 又会受 MRU、全屏和用户重排影响。因此 state v3
@@ -301,8 +301,8 @@ Space 重建稳定性承诺；ordinal 又会受 MRU、全屏和用户重排影�
 
 旧 state v2 必须只读迁移并保留备份；首次运行不能直接覆盖。当前恢复文档已经
 采用“匹配不明确就跳过窗口”的保守策略，并且断开的显示器不创建占位状态：
-[`CONFIGURATION.md:319`](./CONFIGURATION.md#L319)、
-[`CONFIGURATION.md:345`](./CONFIGURATION.md#L345)。原生 Space 恢复应维持同样
+[`docs/CONFIGURATION.md:319`](../CONFIGURATION.md#L319)、
+[`docs/CONFIGURATION.md:345`](../CONFIGURATION.md#L345)。原生 Space 恢复应维持同样
 的安全边界。
 
 ### query/subscribe 与旧版 SpoolBar
@@ -312,8 +312,8 @@ Bevy world 投影结构化列，不再经过 query/subscribe 或 CLI。
 
 当前 state document version 是 2，公开字段是 `native_workspace_id` 加
 `virtual_workspace_number`，主数组名为 `virtual_workspaces`：
-[`QUERY_AND_SUBSCRIBE_FORMAT.md:35`](./QUERY_AND_SUBSCRIBE_FORMAT.md#L35)、
-[`QUERY_AND_SUBSCRIBE_FORMAT.md:152`](./QUERY_AND_SUBSCRIBE_FORMAT.md#L152)。
+[`docs/QUERY_AND_SUBSCRIBE_FORMAT.md:35`](../QUERY_AND_SUBSCRIBE_FORMAT.md#L35)、
+[`docs/QUERY_AND_SUBSCRIBE_FORMAT.md:152`](../QUERY_AND_SUBSCRIBE_FORMAT.md#L152)。
 
 旧 SpoolBar 曾直接解码这些字段，并通过旧 workspace 命令操作；这些路径随
 Swift 工程一并移除。
@@ -334,12 +334,12 @@ spaces[] = {
 ### CLI 与 Lua
 
 当前 CLI/Lua 的 `workspace.select`、`move_window`、`add` 都直接映射到虚拟 row
-操作：[`crates/lua/src/lib.rs:200`](./crates/lua/src/lib.rs#L200)。Lua 的纯
+操作：[`crates/lua/src/lib.rs:200`](../../crates/lua/src/lib.rs#L200)。Lua 的纯
 `WindowSet` 还把 `ws:view`、`ws:shift` 和 named scratchpad 的 stash workspace
 作为同步、可提交的模型操作：
-[`SCRIPTING.md:198`](./SCRIPTING.md#L198)、
-[`SCRIPTING.md:246`](./SCRIPTING.md#L246)、
-[`SCRIPTING.md:270`](./SCRIPTING.md#L270)。
+[`docs/SCRIPTING.md:198`](../SCRIPTING.md#L198)、
+[`docs/SCRIPTING.md:246`](../SCRIPTING.md#L246)、
+[`docs/SCRIPTING.md:270`](../SCRIPTING.md#L270)。
 
 原生迁移后：
 

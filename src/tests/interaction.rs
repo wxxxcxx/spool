@@ -8,6 +8,109 @@ use crate::ecs::native_space::VisibleNativeSpaceMarker;
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 
 #[test]
+fn space_recovery_keeps_geometry_frozen_until_membership_is_confirmed() {
+    let omitted_space = TEST_WORKSPACE_ID + 1;
+    let mut harness = TestHarness::new()
+        .with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, omitted_space],
+        )
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(1200, 0, 2800, 1200),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(1, omitted_space, |_| {});
+    harness.pump_frames(30);
+    let window = find_window_entity(1, harness.world());
+    let source = {
+        let world = harness.world();
+        world
+            .query::<(Entity, &LayoutStrip)>()
+            .iter(world)
+            .find_map(|(entity, strip)| (strip.id() == omitted_space).then_some(entity))
+            .unwrap()
+    };
+    let destination = IRect::new(1300, 100, 1700, 900);
+    harness.mock_state.update_window(1, |window| {
+        window.workspace_id = EXT_WORKSPACE_ID;
+    });
+    harness
+        .mock_state
+        .os_set_window_frame_silently(1, destination);
+    for space in [TEST_WORKSPACE_ID, omitted_space, EXT_WORKSPACE_ID] {
+        harness
+            .mock_state
+            .script_workspace_membership_queries(space, std::iter::repeat_n(Err(()), 1000));
+    }
+    harness
+        .mock_state
+        .destroy_workspace(TEST_DISPLAY_ID, omitted_space);
+    harness.world().write_message(Event::DisplayConfigured {
+        display_id: TEST_DISPLAY_ID,
+    });
+    harness.pump_frames(1);
+    assert!(
+        harness
+            .world()
+            .get::<PendingSpaceDestruction>(source)
+            .is_some()
+    );
+    assert!(
+        harness
+            .world()
+            .get::<WindowSpaceReassignmentPending>(window)
+            .is_some()
+    );
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, omitted_space, false);
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, false);
+    let writes = harness.mock_state.frame_write_attempts(1);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(30);
+    assert_eq!(harness.mock_state.actual_window_frame(1), Some(destination));
+    assert_eq!(harness.mock_state.frame_write_attempts(1), writes);
+    assert!(
+        harness
+            .world()
+            .get::<PendingSpaceDestruction>(source)
+            .is_none()
+    );
+    assert!(
+        harness
+            .world()
+            .get::<WindowSpaceReassignmentPending>(window)
+            .is_some(),
+        "Space existence alone cannot confirm its windows' membership"
+    );
+
+    for space in [TEST_WORKSPACE_ID, omitted_space, EXT_WORKSPACE_ID] {
+        harness
+            .mock_state
+            .script_workspace_membership_queries(space, []);
+    }
+    harness.pump_frames(40);
+    let world = harness.world();
+    let owners = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.contains(window))
+        .map(LayoutStrip::id)
+        .collect::<Vec<_>>();
+    assert_eq!(owners, vec![EXT_WORKSPACE_ID]);
+    assert!(
+        world
+            .get::<WindowSpaceReassignmentPending>(window)
+            .is_none()
+    );
+}
+
+#[test]
 fn native_space_move_suspends_source_frame_until_membership_confirmation() {
     use crate::ecs::{DesiredWindowFrame, PresentedWindowFrame, WindowFrameMotion};
     use bevy::ecs::system::RunSystemOnce as _;

@@ -496,6 +496,203 @@ mod tests {
         );
     }
 
+    fn unresolved_fullscreen_harness() -> TestHarness {
+        use crate::tests::{TEST_DISPLAY_ID, TEST_PROCESS_ID};
+        use bevy::math::IRect;
+
+        let fullscreen = TEST_WORKSPACE_ID + 1;
+        let mut harness = TestHarness::new().with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, 1200, 800),
+            vec![TEST_WORKSPACE_ID, fullscreen],
+        );
+        drop(harness.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            fullscreen,
+            10,
+            IRect::new(0, 0, 1200, 800),
+        ));
+        harness
+            .mock_state
+            .update_window(10, |window| window.is_full_screen = true);
+        harness.mock_state.os_withdraw_window(10);
+        harness
+            .mock_state
+            .activate_workspace(TEST_DISPLAY_ID, fullscreen, true);
+        harness
+            .mock_state
+            .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, false);
+        harness.pump_frames(15);
+        assert_eq!(unresolved_ids(&mut harness), vec![10]);
+        harness
+    }
+
+    fn assert_tracked_fullscreen_icon(harness: &mut TestHarness, visible: bool) {
+        let fullscreen = TEST_WORKSPACE_ID + 1;
+        let state = harness.world().run_system_once(snapshot).unwrap();
+        let space = state.displays[0]
+            .spaces
+            .iter()
+            .find(|space| space.id == fullscreen)
+            .unwrap();
+        assert_eq!(space.kind, spool_shared_types::state::SpaceKind::Fullscreen);
+        assert_eq!(space.visible, visible);
+        assert_eq!(space.windows().map(|w| w.id).collect::<Vec<_>>(), vec![10]);
+        assert!(space.unresolved.is_empty());
+        let layout = BarLayout::resolve(&state.displays[0], 1200.0, 0.0);
+        assert_eq!(
+            layout
+                .items
+                .iter()
+                .filter(|item| matches!(
+                    item.kind,
+                    ItemKind::Window { window_id: 10, space_id, fullscreen: true, collapsed, .. }
+                        if space_id == fullscreen && collapsed != visible
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn startup_fullscreen_icon_survives_activation_and_ax_discovery() {
+        use crate::ecs::{FullscreenDefaultsDeferred, WindowDefaultsPending};
+        use crate::tests::TEST_DISPLAY_ID;
+
+        let fullscreen = TEST_WORKSPACE_ID + 1;
+        let mut harness = unresolved_fullscreen_harness();
+        harness.mock_state.os_restore_withdrawn_window(10);
+        let native_frame = harness.mock_state.actual_window_frame(10);
+        for visible in [true, false, true, false, true] {
+            if visible {
+                harness.mock_state.os_restore_withdrawn_window(10);
+            } else {
+                harness.mock_state.os_withdraw_window(10);
+            }
+            harness.mock_state.activate_workspace(
+                TEST_DISPLAY_ID,
+                if visible {
+                    fullscreen
+                } else {
+                    TEST_WORKSPACE_ID
+                },
+                visible,
+            );
+            harness.world().write_message(Event::SpaceChanged);
+            for _ in 0..15 {
+                harness.pump_frames(1);
+                assert_tracked_fullscreen_icon(&mut harness, visible);
+            }
+        }
+        assert_eq!(harness.mock_state.actual_window_frame(10), native_frame);
+        assert_eq!(harness.mock_state.frame_write_attempts(10), 0);
+        assert_eq!(harness.mock_state.resize_write_attempts(10), 0);
+        let window = find_window_entity(10, harness.world());
+        assert!(
+            harness
+                .world()
+                .get::<FullscreenDefaultsDeferred>(window)
+                .is_some()
+        );
+
+        harness.mock_state.update_window(10, |window| {
+            window.workspace_id = TEST_WORKSPACE_ID;
+            window.is_full_screen = false;
+        });
+        harness
+            .mock_state
+            .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, false);
+        harness
+            .mock_state
+            .destroy_workspace(TEST_DISPLAY_ID, fullscreen);
+        harness.world().write_message(Event::SpaceDestroyed {
+            space_id: fullscreen,
+        });
+        harness.pump_frames(20);
+        assert!(
+            harness
+                .world()
+                .get::<FullscreenDefaultsDeferred>(window)
+                .is_none()
+        );
+        assert!(
+            harness
+                .world()
+                .get::<WindowDefaultsPending>(window)
+                .is_none()
+        );
+        let state = harness.world().run_system_once(snapshot).unwrap();
+        assert_eq!(state.displays[0].spaces.len(), 1);
+        assert_eq!(state.displays[0].spaces[0].id, TEST_WORKSPACE_ID);
+        assert_eq!(
+            state.displays[0].spaces[0]
+                .windows()
+                .map(|w| w.id)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+    }
+
+    #[test]
+    fn startup_fullscreen_icon_survives_delayed_ax_discovery() {
+        use crate::ecs::topology::NativeTopology;
+        use crate::tests::{TEST_DISPLAY_ID, TEST_PROCESS_ID};
+
+        let mut harness = unresolved_fullscreen_harness();
+        harness
+            .mock_state
+            .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID + 1, true);
+        harness.world().write_message(Event::SpaceChanged);
+        harness.pump_frames(1);
+        assert_eq!(unresolved_ids(&mut harness), vec![10]);
+        let generation = harness.world().resource::<NativeTopology>().generation();
+
+        harness.mock_state.os_restore_withdrawn_window(10);
+        harness.world().write_message(Event::ReconcileWindows {
+            scope: crate::events::ReconcileScope::Application(TEST_PROCESS_ID),
+        });
+        harness.pump_frames(1);
+        assert_eq!(
+            harness.world().resource::<NativeTopology>().generation(),
+            generation
+        );
+        assert_tracked_fullscreen_icon(&mut harness, true);
+        for _ in 0..15 {
+            harness.pump_frames(1);
+            assert_tracked_fullscreen_icon(&mut harness, true);
+        }
+    }
+
+    #[test]
+    fn startup_fullscreen_discovery_retries_failed_membership() {
+        use crate::tests::TEST_DISPLAY_ID;
+
+        let fullscreen = TEST_WORKSPACE_ID + 1;
+        let mut harness = unresolved_fullscreen_harness();
+        harness
+            .mock_state
+            .activate_workspace(TEST_DISPLAY_ID, fullscreen, true);
+        harness.mock_state.os_restore_withdrawn_window(10);
+        harness
+            .mock_state
+            .script_workspace_membership_queries(fullscreen, std::iter::repeat_n(Err(()), 100));
+        harness.world().write_message(Event::SpaceChanged);
+        harness.pump_frames(1);
+        let window = find_window_entity(10, harness.world());
+        assert!(
+            harness
+                .world()
+                .query::<&LayoutStrip>()
+                .iter(harness.world())
+                .all(|strip| !strip.contains(window))
+        );
+        harness
+            .mock_state
+            .script_workspace_membership_queries(fullscreen, []);
+        harness.pump_frames(20);
+        assert_tracked_fullscreen_icon(&mut harness, true);
+    }
+
     fn unresolved_harness() -> TestHarness {
         use crate::tests::{TEST_DISPLAY_ID, TEST_PROCESS_ID};
         use bevy::math::IRect;

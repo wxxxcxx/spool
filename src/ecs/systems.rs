@@ -9,8 +9,6 @@ use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single, SystemParam,
 };
 use bevy::math::IRect;
-use bevy::tasks::AsyncComputeTaskPool;
-use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::{HashMap, HashSet};
@@ -33,16 +31,15 @@ use crate::ecs::reconcile::{WindowStateSync, WindowUnavailable};
 use crate::ecs::window_frame::{DefaultWindowFrame, InteractiveWindowFrame, WindowFrameCorrection};
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, BruteforceWindows, DesiredWindowFrame, DockPosition,
-    FlashMessage, Floating, Initializing, LowPowerMode, MissionControlActive, ObservedWindowFrame,
-    Position, PresentedWindowFrame, ReadDisplayProperties, RestoreWindowState, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, WidthRatio, WindowFrameCommitSuspended,
-    WindowFrameMotion, WindowProperties, WindowVisibility,
+    ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, FlashMessage, Floating,
+    Initializing, LowPowerMode, MissionControlActive, ObservedWindowFrame, Position,
+    PresentedWindowFrame, ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger,
+    SpawnCommandsExt, WidthRatio, WindowFrameCommitSuspended, WindowFrameMotion, WindowProperties,
+    WindowVisibility,
 };
 use crate::events::{Event, FocusSource, InputEvent};
-use crate::manager::{
-    Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
-};
+use crate::manager::discovery::{DiscoveryOwner, WindowDiscovery};
+use crate::manager::{Application, Display, Process, Window, WindowManager, WindowOS};
 use crate::overlay::{FlashMessageManager, OverlayManager, SpaceOverlayTarget};
 use crate::platform::{PlatformCallbacks, WinID, WindowIncarnation, WorkspaceId};
 
@@ -213,10 +210,17 @@ pub fn gather_displays(topology: Res<super::topology::NativeTopology>, mut comma
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(crate) fn add_existing_process(
     window_manager: Res<WindowManager>,
-    processes: Populated<(Entity, &BProcess), With<ExistingMarker>>,
+    processes: Populated<(Entity, &mut BProcess), With<ExistingMarker>>,
     mut commands: Commands,
 ) {
-    for (entity, process) in processes {
+    for (entity, mut process) in processes {
+        if !process.ready() {
+            commands
+                .entity(entity)
+                .remove::<ExistingMarker>()
+                .insert(FreshMarker);
+            continue;
+        }
         let Ok(app) = window_manager.new_application(&*process.0) else {
             error!("creating aplication from process '{}'", process.name());
             return;
@@ -244,13 +248,13 @@ pub(crate) fn add_existing_application(
     workspaces: Query<&LayoutStrip>,
     fresh_apps: Populated<(&mut Application, Entity), With<ExistingMarker>>,
     config: Res<Config>,
+    mut discovery: Option<NonSendMut<WindowDiscovery>>,
     mut commands: Commands,
 ) {
     let spaces = workspaces
         .into_iter()
         .map(LayoutStrip::id)
         .collect::<Vec<_>>();
-    let thread_pool = AsyncComputeTaskPool::get();
 
     for (mut app, entity) in fresh_apps {
         let mut offscreen_windows = vec![];
@@ -274,14 +278,61 @@ pub(crate) fn add_existing_application(
         }
 
         if !offscreen_windows.is_empty() {
-            let pid = app.pid();
-            let bundle_id = app.bundle_id();
-            let config = config.clone();
-            let bruteforce_task = thread_pool.spawn(async move {
-                bruteforce_windows(pid, bundle_id.as_deref(), offscreen_windows, &config)
-            });
-            commands.spawn(BruteforceWindows(bruteforce_task));
+            // Only real platform setup installs this NonSend owner. Mock
+            // inventories must never fall through to native AX discovery.
+            if let Some(discovery) = discovery.as_mut() {
+                discovery.enqueue(
+                    DiscoveryOwner {
+                        application: entity,
+                        pid: app.pid(),
+                        psn: app.psn(),
+                    },
+                    app.bundle_id(),
+                    offscreen_windows,
+                    config.clone(),
+                );
+            } else {
+                debug!(pid = app.pid(), "native discovery is not installed");
+            }
         }
+    }
+}
+
+fn discovery_owner_is_running(
+    owner: DiscoveryOwner,
+    application: Option<&Application>,
+) -> crate::errors::Result<bool> {
+    let Some(application) = application else {
+        return Ok(false);
+    };
+    if application.pid() != owner.pid || application.psn() != owner.psn {
+        return Ok(false);
+    }
+    application.is_running()
+}
+
+pub(crate) fn advance_window_discovery(
+    mut discovery: Option<NonSendMut<WindowDiscovery>>,
+    applications: Query<&Application>,
+    exiting: Option<Res<super::exit_restore::ExitInProgress>>,
+    mut commands: Commands,
+) {
+    let Some(discovery) = discovery.as_mut() else {
+        return;
+    };
+    if exiting.is_some() {
+        discovery.cancel();
+        return;
+    }
+    for (owner, window) in discovery.advance(|owner| {
+        discovery_owner_is_running(owner, applications.get(owner.application).ok())
+    }) {
+        // Discovery revalidates the exact owner after probing, before returning
+        // publications. No native calls intervene before these spawn commands.
+        commands.trigger(SpawnWindowTrigger::for_application(
+            owner.application,
+            vec![window],
+        ));
     }
 }
 
@@ -299,7 +350,7 @@ pub(crate) fn finish_setup(
     process_query: Query<Entity, With<ExistingMarker>>,
     windows: Windows,
     applications: Query<&Application>,
-    mut bruteforce_tasks: Query<(Entity, &mut BruteforceWindows)>,
+    discovery: Option<NonSend<WindowDiscovery>>,
     mut workspaces: Query<&mut LayoutStrip>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -309,17 +360,9 @@ pub(crate) fn finish_setup(
         return;
     }
 
-    // Reap the bruteforced windows.
-    if !bruteforce_tasks.is_empty() {
-        for (entity, mut job) in &mut bruteforce_tasks {
-            if let Some(found_windows) = future::block_on(future::poll_once(&mut job.0)) {
-                commands.trigger(SpawnWindowTrigger::new(found_windows));
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_despawn();
-                }
-            }
-        }
-        // Wait for the next tick to finish initialization.
+    // Keep Initializing until discovery drains and its final spawn commands
+    // have had a tick to settle. Restore's grace period must start afterwards.
+    if discovery.is_some_and(|discovery| discovery.is_pending()) {
         return;
     }
 
@@ -386,7 +429,8 @@ pub(crate) fn finish_setup(
 /// observes the application for events, and adds its windows to the manager.
 /// This system processes `BProcess` entities marked with `FreshMarker`.
 /// If the process is not yet ready, it continues observing it. If ready, it attempts to create and observe an `Application`.
-/// A `Timeout` is added to the application if it takes too long to become observable.
+/// Observer registration is retried by reconciliation; an empty window list does
+/// not limit the lifetime of an otherwise running application.
 ///
 /// # Arguments
 ///
@@ -399,7 +443,6 @@ pub(super) fn add_launched_process(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    const APP_OBSERVABLE_TIMEOUT_SEC: u64 = 5;
     let mut already_seen = HashSet::new();
 
     for (entity, mut process, children) in fresh_processes {
@@ -434,18 +477,13 @@ pub(super) fn add_launched_process(
             return;
         };
 
-        if app.observe().is_ok_and(|good| good) {
-            let timeout = Timeout::new(
-                Duration::from_secs(APP_OBSERVABLE_TIMEOUT_SEC),
-                Some(format!(
-                    "{app} did not become observable in {APP_OBSERVABLE_TIMEOUT_SEC}s.",
-                )),
-                &mut commands,
-            );
-            commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
-        } else {
-            debug!("failed to register some observers {}", process.name());
+        if !app.observe().is_ok_and(|good| good) {
+            debug!("some observers need reconciliation for {}", process.name());
         }
+        // A running accessory app can have no windows for hours. Observation
+        // failure or an empty inventory is not an application lifetime signal.
+        commands.spawn((app, FreshMarker, ChildOf(entity)));
+        commands.entity(entity).remove::<FreshMarker>();
     }
 }
 
@@ -460,7 +498,7 @@ pub(super) fn add_launched_process(
 /// * `windows` - A query for all `Window` components, used to check for existing windows.
 /// * `commands` - Bevy commands to spawn entities and manage components.
 pub(super) fn add_launched_application(
-    app_query: Populated<(&mut Application, Entity, Has<Children>), With<FreshMarker>>,
+    app_query: Populated<(&mut Application, Entity), With<FreshMarker>>,
     windows: Windows,
     config: Res<Config>,
     mut commands: Commands,
@@ -468,27 +506,20 @@ pub(super) fn add_launched_application(
     // TODO: maybe refactor this with add_existing_application_windows()
     let find_window = |window_id| windows.find(window_id);
 
-    for (app, entity, has_children) in app_query {
+    for (app, entity) in app_query {
         let mut create_windows = app.window_list(&config);
         // Retain the non-existing windows, so they can be created.
         create_windows.retain(|window| find_window(window.id()).is_none());
 
+        // Subsequent discoveries and observer retries belong to reconciliation,
+        // including applications that have no eligible window yet.
+        commands.entity(entity).remove::<FreshMarker>();
         if !create_windows.is_empty() {
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<FreshMarker>();
-            }
             debug!(
                 "spawn! (polling path found {} new windows for {entity})",
                 create_windows.len(),
             );
             commands.trigger(SpawnWindowTrigger::for_application(entity, create_windows));
-        } else if has_children {
-            // Windows were already created via AXCreated notification path.
-            // Remove FreshMarker so the Timeout gets cleaned up.
-            debug!("removing FreshMarker from {entity}: windows already created via AXCreated");
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<FreshMarker>();
-            }
         }
     }
 }
@@ -755,6 +786,12 @@ pub(crate) fn pump_events(
     // floor under how soon a pump could start, so an event landing right after
     // one returned had to wait out the rest of it. That latency is worse than
     // the redundant work skipping the wait costs.
+    let frame_active = activity.mid_frame();
+    if frame_active {
+        // Apply before sleeping as well as after draining: discovery may have
+        // been queued in Update after the previous pump chose an idle timeout.
+        *timeout = LOOP_TIMEOUT_STEP;
+    }
     platform.pump_cocoa_event_loop(f64::from(*timeout) / 1000.0);
 
     let deadline = Instant::now() + PUMP_BUDGET;
@@ -802,7 +839,6 @@ pub(crate) fn pump_events(
     received_events.extend(pending_mouse.take());
     messages.write_batch(received_events);
 
-    let frame_active = activity.mid_frame();
     let low_power = low_power_mode.is_some_and(|low_power| low_power.0);
     *timeout = next_pump_timeout(*timeout, drained, frame_active, low_power);
 }
@@ -1086,7 +1122,10 @@ mod overlay_target_tests {
 
 #[cfg(test)]
 mod event_pump_timing_tests {
+    use bevy::ecs::{system::SystemState, world::World};
+
     use super::next_pump_timeout;
+    use crate::ecs::{Initializing, params::FrameActivity};
 
     #[test]
     fn active_window_animation_does_not_sleep_away_its_frame_budget() {
@@ -1095,6 +1134,101 @@ mod event_pump_timing_tests {
             1,
             "window animation must return to layout and AX presentation without first waiting a full frame"
         );
+    }
+
+    #[test]
+    fn pending_discovery_keeps_the_startup_pump_at_one_millisecond() {
+        let mut world = World::new();
+        // finish_setup retains this until discovery and its final publication settle.
+        world.insert_resource(Initializing);
+        let mut activity = SystemState::<FrameActivity>::new(&mut world);
+        for (low_power, current) in [(false, 50), (true, 500)] {
+            assert_eq!(
+                next_pump_timeout(
+                    current,
+                    true,
+                    activity.get(&world).unwrap().mid_frame(),
+                    low_power
+                ),
+                1,
+                "discovery must progress even without OS events, including low-power mode"
+            );
+        }
+        world.remove_resource::<Initializing>();
+        assert_eq!(
+            next_pump_timeout(16, true, activity.get(&world).unwrap().mid_frame(), false),
+            17
+        );
+    }
+}
+
+#[cfg(test)]
+mod discovery_lifecycle_tests {
+    use super::*;
+    use crate::errors::{Error, Result};
+    use crate::manager::app::MockApplicationApi;
+    use crate::platform::ProcessSerialNumber;
+
+    fn owner() -> DiscoveryOwner {
+        DiscoveryOwner {
+            application: Entity::from_raw_u32(1).unwrap(),
+            pid: 42,
+            psn: ProcessSerialNumber { high: 0, low: 7 },
+        }
+    }
+
+    fn application(owner: DiscoveryOwner, running: Result<bool>) -> Application {
+        let mut application = MockApplicationApi::new();
+        application.expect_pid().return_const(owner.pid);
+        application.expect_psn().return_const(owner.psn);
+        application
+            .expect_is_running()
+            .returning(move || running.clone());
+        Application::new(Box::new(application))
+    }
+
+    #[test]
+    fn discovery_rejects_missing_exited_and_reused_application_owners() {
+        let original = owner();
+        assert!(!discovery_owner_is_running(original, None).unwrap());
+        let exited = application(original, Ok(false));
+        assert!(!discovery_owner_is_running(original, Some(&exited)).unwrap());
+        let replacement = application(
+            DiscoveryOwner {
+                psn: ProcessSerialNumber { high: 0, low: 8 },
+                ..original
+            },
+            Ok(true),
+        );
+        assert!(!discovery_owner_is_running(original, Some(&replacement)).unwrap());
+        let other_pid = application(
+            DiscoveryOwner {
+                pid: 43,
+                ..original
+            },
+            Ok(true),
+        );
+        assert!(!discovery_owner_is_running(original, Some(&other_pid)).unwrap());
+    }
+
+    #[test]
+    fn discovery_does_not_treat_unknown_liveness_as_process_exit() {
+        let original = owner();
+        let live = application(original, Ok(true));
+        assert!(discovery_owner_is_running(original, Some(&live)).unwrap());
+        let unknown = application(original, Err(Error::Generic("unavailable".to_string())));
+        assert!(discovery_owner_is_running(original, Some(&unknown)).is_err());
+    }
+
+    #[test]
+    fn discovery_mock_startup_finishes_without_installing_native_ax() {
+        let mut harness = crate::tests::TestHarness::new();
+        assert!(!harness.app.world().contains_non_send::<WindowDiscovery>());
+        for _ in 0..3 {
+            harness.app.update();
+        }
+        assert!(!harness.app.world().contains_resource::<Initializing>());
+        assert!(!harness.app.world().contains_non_send::<WindowDiscovery>());
     }
 }
 

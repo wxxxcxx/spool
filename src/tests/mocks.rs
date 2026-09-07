@@ -26,6 +26,7 @@ pub(crate) struct MockAppData {
     pub(crate) is_frontmost: bool,
     pub(crate) connection: Option<crate::platform::ConnID>,
     pub(crate) running: bool,
+    pub(crate) ready: bool,
 }
 
 /// Data for a mocked window.
@@ -45,6 +46,8 @@ pub(crate) struct MockWindowData {
     pub(crate) identifier: String,
     pub(crate) is_full_screen: bool,
     pub(crate) resizable: bool,
+    pub(crate) movable: bool,
+    pub(crate) capabilities_available: bool,
     pub(crate) border_radius: Option<f64>,
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
@@ -68,6 +71,8 @@ impl Default for MockWindowData {
             identifier: "testid".to_string(),
             is_full_screen: false,
             resizable: true,
+            movable: true,
+            capabilities_available: true,
             border_radius: None,
             horizontal_padding: 0,
             vertical_padding: 0,
@@ -119,6 +124,9 @@ struct MockStateInner {
     window_observer_failures: HashMap<WinID, u32>,
     window_observer_attempts: HashMap<WinID, u32>,
     application_inventory_failures: HashMap<Pid, u32>,
+    application_ax_errors: HashMap<Pid, i32>,
+    application_observer_attempts: HashMap<Pid, u32>,
+    application_inventory_attempts: HashMap<Pid, u32>,
     incomplete_application_inventories: HashSet<Pid>,
     omitted_application_inventory_windows: HashSet<(Pid, WinID)>,
     focused_window_query_failures: HashMap<Pid, u32>,
@@ -178,6 +186,9 @@ impl MockState {
                 window_observer_failures: HashMap::new(),
                 window_observer_attempts: HashMap::new(),
                 application_inventory_failures: HashMap::new(),
+                application_ax_errors: HashMap::new(),
+                application_observer_attempts: HashMap::new(),
+                application_inventory_attempts: HashMap::new(),
                 incomplete_application_inventories: HashSet::new(),
                 omitted_application_inventory_windows: HashSet::new(),
                 focused_window_query_failures: HashMap::new(),
@@ -238,6 +249,7 @@ impl MockState {
                 is_frontmost: true,
                 connection: Some(0),
                 running: true,
+                ready: true,
             },
         );
     }
@@ -527,6 +539,31 @@ impl MockState {
             .force_write()
             .application_inventory_failures
             .insert(pid, attempts);
+    }
+
+    pub fn set_application_ax_error(&self, pid: Pid, error: Option<i32>) {
+        let mut inner = self.inner.force_write();
+        if let Some(code) = error {
+            inner.application_ax_errors.insert(pid, code);
+        } else {
+            inner.application_ax_errors.remove(&pid);
+        }
+    }
+
+    pub fn application_ax_attempts(&self, pid: Pid) -> (u32, u32) {
+        let inner = self.inner.force_read();
+        (
+            inner
+                .application_observer_attempts
+                .get(&pid)
+                .copied()
+                .unwrap_or_default(),
+            inner
+                .application_inventory_attempts
+                .get(&pid)
+                .copied()
+                .unwrap_or_default(),
+        )
     }
 
     pub fn set_application_inventory_complete(&self, pid: Pid, complete: bool) {
@@ -880,7 +917,19 @@ impl MockState {
                 .force_read()
                 .windows
                 .get(&id)
+                .filter(|window| window.capabilities_available)
                 .map(|window| window.resizable)
+                .ok_or(Error::InvalidWindow)
+        });
+
+        let s = self.clone();
+        mw.expect_is_movable().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .filter(|window| window.capabilities_available)
+                .map(|window| window.movable)
                 .ok_or(Error::InvalidWindow)
         });
 
@@ -1216,6 +1265,10 @@ impl MockState {
         application.expect_window_inventory().returning(move |_| {
             let (identities, candidate_keys, complete) = {
                 let mut inner = s.inner.force_write();
+                *inner.application_inventory_attempts.entry(pid).or_default() += 1;
+                if let Some(&code) = inner.application_ax_errors.get(&pid) {
+                    return Err(Error::macos("mock AXWindows", code));
+                }
                 if let Some(remaining) = inner.application_inventory_failures.get_mut(&pid)
                     && *remaining > 0
                 {
@@ -1384,7 +1437,16 @@ impl MockState {
             });
         }
 
-        ma.expect_observe().returning(|| Ok(true));
+        let s = self.clone();
+        ma.expect_observe().returning(move || {
+            let mut inner = s.inner.force_write();
+            *inner.application_observer_attempts.entry(pid).or_default() += 1;
+            if let Some(&code) = inner.application_ax_errors.get(&pid) {
+                Err(Error::macos("AXObserverAddNotification(AXCreated)", code))
+            } else {
+                Ok(true)
+            }
+        });
         self.mock_application_windows(&mut ma, pid);
 
         Application::new(Box::new(ma))
@@ -1520,6 +1582,10 @@ impl MockState {
         let mut wm = MockWindowManagerApi::new();
 
         let s = self.clone();
+        wm.expect_new_application()
+            .returning(move |process| Ok(s.create_application(process.pid())));
+
+        let s = self.clone();
         wm.expect_active_display_id()
             .returning(move || Ok(s.inner.force_read().active_display_id));
 
@@ -1623,7 +1689,14 @@ impl MockState {
             .returning(move || s.inner.force_read().apps.get(&pid).map(|a| a.psn).unwrap());
         mp.expect_is_observable().returning(|| true);
         mp.expect_application().return_const(None);
-        mp.expect_ready().return_const(true);
+        let s = self.clone();
+        mp.expect_ready().returning(move || {
+            s.inner
+                .force_read()
+                .apps
+                .get(&pid)
+                .is_some_and(|app| app.ready)
+        });
         mp.expect_force_track().return_const(());
 
         mp

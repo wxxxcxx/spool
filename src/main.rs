@@ -30,6 +30,7 @@ mod overlay;
 mod platform;
 mod reader;
 mod util;
+mod window_policy;
 
 #[cfg(test)]
 mod tests;

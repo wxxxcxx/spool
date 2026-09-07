@@ -487,10 +487,10 @@ impl BarLayout {
 
 fn space_width(space: &BarSpace, metrics: &BarMetrics) -> f64 {
     if !space.visible {
-        let deck = collapsed_deck(space, metrics);
+        let deck = collapsed_deck(space);
         let deck = deck
             .last()
-            .map_or(metrics.icon_size, |icon| icon.x + icon.size);
+            .map_or(metrics.icon_size, |icon| icon.x + metrics.icon_size);
         return label_extent(metrics) + deck + 6.0;
     }
     let columns = space
@@ -548,48 +548,28 @@ fn column_icon_y(column: &BarColumn, index: usize, metrics: &BarMetrics) -> f64 
 
 struct CollapsedIcon {
     kind: ItemKind,
-    size: f64,
     x: f64,
-    y: f64,
 }
 
-fn collapsed_deck(space: &BarSpace, metrics: &BarMetrics) -> Vec<CollapsedIcon> {
-    let mut deck = space
-        .columns
-        .iter()
-        .flat_map(|column| {
-            column
-                .windows
+fn collapsed_deck(space: &BarSpace) -> Vec<CollapsedIcon> {
+    // Column geometry belongs to expanded Spaces. Collapsed icons share one
+    // full-size horizontal lane, regardless of their original layout role.
+    space
+        .windows()
+        .map(|window| collapsed_window_kind(space, window))
+        .chain(
+            space
+                .unresolved
                 .iter()
-                .enumerate()
-                .map(move |(index, window)| CollapsedIcon {
-                    kind: collapsed_window_kind(space, window),
-                    size: column_icon_size(column, metrics),
-                    x: 0.0,
-                    y: column_icon_y(column, index, metrics),
-                })
-        })
-        .chain(space.floating.iter().map(|window| CollapsedIcon {
-            kind: collapsed_window_kind(space, window),
-            size: metrics.icon_size,
-            x: 0.0,
-            y: 0.0,
-        }))
-        .chain(space.unresolved.iter().map(|surface| CollapsedIcon {
-            kind: surface_kind(space, surface, true),
-            size: metrics.icon_size,
-            x: 0.0,
-            y: 0.0,
-        }))
+                .map(|surface| surface_kind(space, surface, true)),
+        )
         .take(4)
-        .collect::<Vec<_>>();
-    // Preserve each icon's vertical geometry and expose at least 5px at the right,
-    // including when adjacent columns use different icon sizes.
-    for index in 1..deck.len() {
-        deck[index].x =
-            deck[index - 1].x + 5.0 + (deck[index - 1].size - deck[index].size).max(0.0);
-    }
-    deck
+        .enumerate()
+        .map(|(index, kind)| CollapsedIcon {
+            kind,
+            x: count(index) * 5.0,
+        })
+        .collect()
 }
 
 fn place_expanded(space: &BarSpace, rect: Rect, metrics: &BarMetrics, items: &mut Vec<PlacedItem>) {
@@ -729,17 +709,17 @@ fn place_collapsed(
     metrics: &BarMetrics,
     items: &mut Vec<PlacedItem>,
 ) {
-    let deck = collapsed_deck(space, metrics);
+    let deck = collapsed_deck(space);
     let content = content_rect(rect, metrics);
-    let width = deck.last().map_or(0.0, |icon| icon.x + icon.size);
+    let width = deck.last().map_or(0.0, |icon| icon.x + metrics.icon_size);
     // Paint back to front: the first logical window remains the front card.
     for icon in deck.iter().rev() {
         items.push(PlacedItem {
             rect: Rect {
                 x: content.x + (content.width - width) / 2.0 + icon.x,
-                y: rect.y + icon.y,
-                width: icon.size,
-                height: icon.size,
+                y: rect.y,
+                width: metrics.icon_size,
+                height: metrics.icon_size,
             },
             kind: icon.kind.clone(),
         });
@@ -949,6 +929,33 @@ pub(super) mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn collapsed_stack_icons_match_single_window_size_and_baseline() {
+        for icon_size in [12.0, 20.0, 32.0] {
+            let metrics = BarMetrics {
+                icon_size,
+                ..BarMetrics::default()
+            };
+            let mut display = display();
+            display.spaces[1].visible = false;
+            let layout = BarLayout::resolve_with_metrics(&display, 1200.0, 0.0, metrics);
+            let icons = layout
+                .items
+                .iter()
+                .filter_map(|item| match item.kind {
+                    ItemKind::Window { space_id: 11, .. } => Some(item.rect),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(icons.len(), 4);
+            for icon in icons {
+                assert!((icon.width - metrics.icon_size).abs() < f64::EPSILON);
+                assert!((icon.height - metrics.icon_size).abs() < f64::EPSILON);
+                assert!((icon.y - metrics.vertical_padding).abs() < f64::EPSILON);
+            }
+        }
     }
 
     #[test]
@@ -1267,7 +1274,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn collapsing_preserves_each_icons_y_and_size() {
+    fn collapsing_preserves_single_and_floating_icon_geometry() {
         for icon_size in [18.0, 22.0, 36.0] {
             for label_width in [0.0, 24.0] {
                 let mut display = display();
@@ -1289,6 +1296,9 @@ pub(super) mod tests {
                         continue;
                     };
                     let original = expanded.items.iter().find(|item| matches!(item.kind, ItemKind::Window { window_id: id, space_id: 11, .. } if id == window_id)).unwrap();
+                    if matches!(original.kind, ItemKind::Window { stacked: true, .. }) {
+                        continue;
+                    }
                     assert!(
                         (item.rect.y - original.rect.y).abs() < 0.001,
                         "window {window_id} moved vertically"

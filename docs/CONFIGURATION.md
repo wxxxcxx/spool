@@ -7,7 +7,7 @@ Configuration discovery checks these locations in order:
 2. `$HOME/.spool.lua`
 3. `$XDG_CONFIG_HOME/spool/init.lua` (normally `~/.config/spool/init.lua`)
 
-If none exists, Spool creates the [default init.lua](config/default.lua) in the
+If none exists, Spool creates the [default init.lua](../config/default.lua) in the
 XDG config directory without overwriting an existing script. TOML configuration
 (`spool.toml`, `bar.toml`, `~/.spool`, and `SPOOL_CONFIG`) is no longer supported.
 Existing TOML files are left untouched but are not read, created, or watched.
@@ -161,14 +161,20 @@ structured `spool query` responses and `spool subscribe` event stream.
 
 ## 6. Window Rules (`windows`)
 
-Define specific behaviors for applications based on their Title or Bundle ID.
+Define initial window behavior using optional AND-combined matchers. Rules sort
+by descending `priority`, then ascending name. Each field uses the first explicit
+value, including `false`; passthrough keys accumulate. See [Window policy](WINDOW_POLICY.md)
+for admission, retries, editable defaults, and migration limits.
 
 | Option | Type | Description |
 | :--- | :--- | :--- |
-| `title` | Regex | **(Required)** Regex pattern to match the window title. |
+| `title` | Regex | Optional window-title pattern. Omission imposes no title requirement. |
 | `bundle_id` | String | Optional Bundle ID to match (e.g., `com.apple.Terminal`). |
+| `role` | String | Optional exact AX role, e.g. `AXWindow`. |
+| `subrole` | String | Optional exact AX subrole, e.g. `AXDialog`. |
+| `priority` | Integer | Higher wins; default `0`. Shipped preferences use `-100`. |
 | `floating` | Boolean | Start the tracked window outside the tiling layout. |
-| `track` | Boolean | Force Spool to track this app/window even if macOS reports the app as unobservable or the window has a non-standard role/subrole. |
+| `track` | Boolean | `false` excludes new candidates; `true` permits nonstandard independent AXWindow subroles and may expand process observation. Cannot force controls, menus, or attached windows into independent tracking. |
 | `index` | Integer | Preferred position in the strip when spawned. |
 | `dont_focus` | Boolean | Prevent the window from taking focus when spawned. |
 | `width` | Positive Float | Initial width ratio for the window. Values above `1.0` create an oversized, horizontally scrollable window. |
@@ -191,10 +197,17 @@ spool.setup { windows = {
 
 ### Tracking LSUIElement or non-standard windows
 
-Some applications (e.g., BetterTouchTool, ProtonVPN) are flagged as background apps
-(`LSUIElement`) or expose windows with unusual accessibility roles such as `AXTable`
-or `AXTextField`. Spool normally ignores these processes and windows. Use `track = true`
-to opt in and forcibly track the matching windows.
+Regular and Accessory applications, including menu-bar utilities commonly using
+`LSUIElement`, are observed by default. Independent standard, floating, dialog,
+and system-dialog windows do not need `track=true`. Purpose does not inherently
+force float: the editable template supplies low-priority preferences, and existing
+scripts are not rewritten or auto-merged.
+
+Use `track=true` for verified independent windows with nonstandard subroles, not
+to promote AXTable/AXTextField controls. Admission applies to new candidates:
+reloading `track=false` does not revoke already tracked identities. Initial layout
+rules do not reclassify every existing window on reload; pending defaults use new
+rules, and dynamic settings keep their existing update behavior.
 
 ```lua
 spool.setup { windows = {
@@ -226,10 +239,10 @@ The saved session includes:
 - display/screen association
 - window identity for matching across restarts
 
-Matched startup windows use the saved session before static `windows` rules.
-That means saved layout, Space, display, and tiled/floating state
-win over configured `index`, `floating`, `width`, and `grid` rules during
-restore. Unmatched startup windows, and all windows created after the restore
+Matched eligible startup windows use the saved tiled layout before initial
+`index`, `floating`, `width`, and `grid` preferences. Saved state cannot bypass
+admission or known movement/resize limitations. Unmatched startup windows,
+and all windows created after the restore
 grace period ends, keep normal `windows` behavior.
 
 | Option | Type | Default | Description |
@@ -339,12 +352,12 @@ In addition to static configuration, Lua scripting allows:
 - **Persistent State (`spool.state`)**: Store and mutate data across reloads and daemon restarts.
 - **Programmatic Layout Transformations (`ws`)**: Pure layout operations (`ws:focus`, `ws:swap`, `ws:float`, `ws:shift`, `ws:view`, etc.) for custom workflows like named scratchpads.
 
-For complete documentation, event specifications, API reference, and examples, see the **[Lua Scripting Guide](./SCRIPTING.md)**.
+For complete documentation, event specifications, API reference, and examples, see the **[Lua Scripting Guide](SCRIPTING.md)**.
 
 ## 9. Bar (`bar`)
 
 Bar styling is part of `spool.setup`, not a separate file. See [Bar Configuration](BAR.md#configuration)
-for all defaults and [config/default.lua](config/default.lua) for the generated startup script.
+for all defaults and [config/default.lua](../config/default.lua) for the generated startup script.
 
 ```lua
 spool.setup {

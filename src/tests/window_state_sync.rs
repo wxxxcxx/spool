@@ -15,6 +15,183 @@ use crate::manager::{Application, Window};
 use super::*;
 
 #[test]
+fn application_ax_failure_backs_off_event_storms_and_recovers() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(20);
+    let pid = TEST_PROCESS_ID + 1;
+    harness
+        .mock_state
+        .spawn_app(pid, "unresponsive.test", "Unresponsive");
+    harness
+        .mock_state
+        .set_application_ax_error(pid, Some(accessibility_sys::kAXErrorCannotComplete));
+    let app = harness.mock_state.create_application(pid);
+    let application = harness.world().spawn(app).id();
+    let healthy_before = harness
+        .mock_state
+        .application_ax_attempts(TEST_PROCESS_ID)
+        .1;
+
+    for _ in 0..100 {
+        harness
+            .world()
+            .write_message(crate::events::Event::ReconcileWindows {
+                scope: crate::events::ReconcileScope::All,
+            });
+        harness.pump_frames(1);
+    }
+
+    let (observers, inventories) = harness.mock_state.application_ax_attempts(pid);
+    assert!(
+        (1..=4).contains(&observers),
+        "ten seconds of AX failure must use bounded retries, got {observers}"
+    );
+    assert_eq!(
+        inventories, 0,
+        "do not query AXWindows after communication failed"
+    );
+    assert!(harness.world().get::<Application>(application).is_some());
+    assert!(
+        harness
+            .mock_state
+            .application_ax_attempts(TEST_PROCESS_ID)
+            .1
+            > healthy_before
+    );
+
+    harness.mock_state.set_application_ax_error(pid, None);
+    let _window =
+        harness
+            .mock_state
+            .spawn_window(pid, TEST_WORKSPACE_ID, 77, IRect::new(0, 0, 400, 400));
+    harness.pump_frames(80);
+    let window = find_window_entity(77, harness.world());
+    assert_eq!(
+        harness.world().get::<ChildOf>(window).unwrap().parent(),
+        application
+    );
+    let attempts = harness.mock_state.application_ax_attempts(pid);
+    harness.pump_frames(30);
+    let recovered = harness.mock_state.application_ax_attempts(pid);
+    assert_eq!(
+        recovered.0, attempts.0,
+        "successful observers remain settled"
+    );
+    assert!(
+        recovered.1 > attempts.1,
+        "recovery restores regular inventory audits"
+    );
+}
+
+#[test]
+fn application_ax_inventory_failure_preserves_layout_and_retries() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(20);
+    let entity = find_window_entity(0, harness.world());
+    let incarnation = harness.world().get::<Window>(entity).unwrap().incarnation();
+    let desired = harness
+        .world()
+        .get::<crate::ecs::DesiredWindowFrame>(entity)
+        .unwrap()
+        .0;
+    let before = harness.mock_state.application_ax_attempts(TEST_PROCESS_ID);
+    harness.mock_state.set_application_ax_error(
+        TEST_PROCESS_ID,
+        Some(accessibility_sys::kAXErrorCannotComplete),
+    );
+    for _ in 0..100 {
+        harness
+            .world()
+            .write_message(crate::events::Event::ReconcileWindows {
+                scope: crate::events::ReconcileScope::All,
+            });
+        harness.pump_frames(1);
+    }
+    let attempts = harness.mock_state.application_ax_attempts(TEST_PROCESS_ID);
+    assert_eq!(attempts.0, before.0);
+    assert!((1..=4).contains(&(attempts.1 - before.1)));
+    assert_eq!(find_window_entity(0, harness.world()), entity);
+    assert_eq!(
+        harness.world().get::<Window>(entity).unwrap().incarnation(),
+        incarnation
+    );
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::DesiredWindowFrame>(entity)
+            .unwrap()
+            .0,
+        desired
+    );
+    let world = harness.world();
+    let mut strips = world.query::<&LayoutStrip>();
+    assert!(strips.iter(world).any(|strip| strip.contains(entity)));
+
+    harness
+        .mock_state
+        .set_application_ax_error(TEST_PROCESS_ID, None);
+    harness.pump_frames(80);
+    assert_eq!(find_window_entity(0, harness.world()), entity);
+    assert!(
+        harness
+            .mock_state
+            .application_ax_attempts(TEST_PROCESS_ID)
+            .1
+            > attempts.1
+    );
+}
+
+#[test]
+fn application_ax_cooldown_does_not_prevent_exit_or_block_a_reused_pid() {
+    let mut harness = TestHarness::new();
+    harness.pump_frames(20);
+    let pid = TEST_PROCESS_ID + 1;
+    harness
+        .mock_state
+        .spawn_app(pid, "unresponsive.test", "Unresponsive");
+    harness
+        .mock_state
+        .set_application_ax_error(pid, Some(accessibility_sys::kAXErrorCannotComplete));
+    let app = harness.mock_state.create_application(pid);
+    let old = harness.world().spawn(app).id();
+    for _ in 0..100 {
+        harness
+            .world()
+            .write_message(crate::events::Event::ReconcileWindows {
+                scope: crate::events::ReconcileScope::All,
+            });
+        harness.pump_frames(1);
+    }
+    harness
+        .mock_state
+        .update_app(pid, |app| app.running = false);
+    harness
+        .world()
+        .write_message(crate::events::Event::ReconcileWindows {
+            scope: crate::events::ReconcileScope::Application(pid),
+        });
+    harness.pump_frames(1);
+    assert!(harness.world().get::<Application>(old).is_none());
+
+    harness
+        .mock_state
+        .spawn_app(pid, "replacement.test", "Replacement");
+    harness.mock_state.set_application_ax_error(pid, None);
+    let before = harness.mock_state.application_ax_attempts(pid);
+    let app = harness.mock_state.create_application(pid);
+    let replacement = harness.world().spawn(app).id();
+    assert_ne!(old, replacement);
+    harness
+        .world()
+        .write_message(crate::events::Event::ReconcileWindows {
+            scope: crate::events::ReconcileScope::Application(pid),
+        });
+    harness.pump_frames(1);
+    let after = harness.mock_state.application_ax_attempts(pid);
+    assert_eq!(after, (before.0 + 1, before.1 + 1));
+}
+
+#[test]
 fn frame_audit_leaves_physical_writes_to_the_presentation_committer() {
     let mut harness = TestHarness::new().with_windows(1);
     harness.pump_frames(30);

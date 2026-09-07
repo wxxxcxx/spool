@@ -89,6 +89,330 @@ fn restore_obeys_current_inactive_space_membership() {
     assert_eq!(owners, vec![actual_space]);
 }
 
+fn late_fallback_restore_harness() -> TestHarness {
+    let config = crate::config::Config::try_from(
+        r#"{"restore":{"startup_grace_ms":10000},
+            "windows":{"float":{"title":"^Window 0$","floating":true}}}"#,
+    )
+    .unwrap();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_state(target_restore_state(TEST_WORKSPACE_ID));
+    harness.pump_frames(5);
+    assert!(
+        harness
+            .world()
+            .contains_resource::<crate::ecs::restore::SessionRestore>()
+    );
+    harness
+}
+
+#[test]
+fn fallback_restore_takes_precedence_over_initial_floating_rule() {
+    let mut harness = late_fallback_restore_harness();
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        10,
+        IRect::new(40, 50, 440, 350),
+    );
+    harness.mock_state.update_window(10, |window| {
+        window.title = "Window 0".into();
+        window.identifier.clear();
+    });
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger::new(vec![window]));
+    harness.world().flush();
+    let entity = crate::tests::harness::find_window_entity(10, harness.world());
+    let world = harness.world();
+    assert!(
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .any(|strip| strip.id() == TEST_WORKSPACE_ID && strip.contains(entity)),
+        "the unique fallback must actually restore before initial defaults run"
+    );
+    harness.pump_frames(10);
+
+    let entity = crate::tests::harness::find_window_entity(10, harness.world());
+    let world = harness.world();
+    assert!(
+        world.get::<crate::ecs::Floating>(entity).is_none(),
+        "an applied fallback restore must win over the initial floating preference"
+    );
+    let owners = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.contains(entity))
+        .map(LayoutStrip::id)
+        .collect::<Vec<_>>();
+    assert_eq!(owners, vec![TEST_WORKSPACE_ID]);
+    assert!(
+        world
+            .get::<crate::ecs::WindowDefaultsPending>(entity)
+            .is_none()
+    );
+}
+
+#[test]
+fn fallback_restore_survives_deferred_membership_and_initial_floating_rule() {
+    for membership in [Err(()), Ok(vec![])] {
+        let mut harness = late_fallback_restore_harness();
+        let window = harness.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            TEST_WORKSPACE_ID,
+            10,
+            IRect::new(40, 50, 440, 350),
+        );
+        harness.mock_state.update_window(10, |window| {
+            window.title = "Window 0".into();
+            window.identifier.clear();
+        });
+        harness
+            .mock_state
+            .script_workspace_membership_queries(TEST_WORKSPACE_ID, [membership]);
+        harness
+            .world()
+            .trigger(SpawnWindowTrigger::new(vec![window]));
+        harness.world().flush();
+        let entity = crate::tests::harness::find_window_entity(10, harness.world());
+        let world = harness.world();
+        assert!(
+            world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .all(|strip| !strip.contains(entity)),
+            "unresolved membership cannot establish a restore destination"
+        );
+
+        harness.pump_frames(1);
+        harness.pump_frames(10);
+        let world = harness.world();
+        assert!(world.contains_resource::<crate::ecs::restore::SessionRestore>());
+        assert!(
+            world.get::<crate::ecs::Floating>(entity).is_none(),
+            "membership recovery within startup grace must preserve restore precedence"
+        );
+        let owners = world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .filter(|strip| strip.contains(entity))
+            .map(LayoutStrip::id)
+            .collect::<Vec<_>>();
+        assert_eq!(owners, vec![TEST_WORKSPACE_ID]);
+        assert!(
+            world
+                .get::<crate::ecs::WindowDefaultsPending>(entity)
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn deferred_fallback_restore_preserves_explicit_floating_choice() {
+    let config =
+        crate::config::Config::try_from(r#"{"restore":{"startup_grace_ms":10000}}"#).unwrap();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_state(target_restore_state(TEST_WORKSPACE_ID));
+    harness.pump_frames(5);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        10,
+        IRect::new(40, 50, 440, 350),
+    );
+    harness.mock_state.update_window(10, |window| {
+        window.title = "Window 0".into();
+        window.identifier.clear();
+    });
+    harness
+        .mock_state
+        .script_workspace_membership_queries(TEST_WORKSPACE_ID, std::iter::repeat_n(Err(()), 1000));
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger::new(vec![window]));
+    harness.mock_state.update_app(TEST_PROCESS_ID, |app| {
+        app.focused_window_id = Some(10);
+    });
+    harness.world().write_message(Event::window_focused(10));
+    harness.pump_frames(1);
+    let entity = crate::tests::harness::find_window_entity(10, harness.world());
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::Floating>(entity)
+            .is_none()
+    );
+    harness.world().write_message(Event::ActionRequested {
+        action: crate::commands::Action::Window(crate::commands::Operation::ToggleFloating),
+    });
+    harness.pump_frames(1);
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::Floating>(entity)
+            .is_some()
+    );
+
+    harness
+        .mock_state
+        .script_workspace_membership_queries(TEST_WORKSPACE_ID, []);
+    harness.pump_frames(10);
+    let world = harness.world();
+    assert!(
+        world.get::<crate::ecs::Floating>(entity).is_some(),
+        "initial defaults and deferred restore must not undo a later explicit floating choice"
+    );
+    assert!(
+        world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .all(|strip| !strip.contains(entity))
+    );
+    assert!(
+        world
+            .get::<crate::ecs::WindowDefaultsPending>(entity)
+            .is_none()
+    );
+}
+
+#[test]
+fn fallback_restore_takes_precedence_over_initial_geometry_rules() {
+    for rule in [
+        serde_json::json!({"title":"^Window 0$", "width":0.8}),
+        serde_json::json!({"title":"^Window 0$", "floating":true, "grid":"2:2:1:1:1:1"}),
+    ] {
+        let config = crate::config::Config::try_from(
+            serde_json::json!({
+                "restore":{"startup_grace_ms":10000},
+                "windows":{"restored":rule},
+            })
+            .to_string()
+            .as_str(),
+        )
+        .unwrap();
+        let mut harness = TestHarness::new()
+            .with_config(config)
+            .with_state(target_restore_state(TEST_WORKSPACE_ID));
+        harness.pump_frames(5);
+        let window = harness.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            TEST_WORKSPACE_ID,
+            10,
+            IRect::new(40, 50, 440, 350),
+        );
+        harness.mock_state.update_window(10, |window| {
+            window.title = "Window 0".into();
+            window.identifier.clear();
+        });
+        harness
+            .world()
+            .trigger(SpawnWindowTrigger::new(vec![window]));
+        harness.world().flush();
+        let entity = crate::tests::harness::find_window_entity(10, harness.world());
+        let world = harness.world();
+        assert!(
+            world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .any(|strip| strip.id() == TEST_WORKSPACE_ID && strip.contains(entity))
+        );
+        harness.pump_frames(30);
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::Floating>(entity)
+                .is_none()
+        );
+        assert_eq!(
+            harness.mock_state.actual_window_frame(10).unwrap().width(),
+            400,
+            "initial width/grid preferences cannot resize a restored tiled window"
+        );
+    }
+}
+
+#[test]
+fn fallback_restore_does_not_bypass_capability_loss_before_defaults() {
+    for resizable in [true, false] {
+        let mut harness = late_fallback_restore_harness();
+        let window = harness.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            TEST_WORKSPACE_ID,
+            10,
+            IRect::new(40, 50, 440, 350),
+        );
+        harness.mock_state.update_window(10, |window| {
+            window.title = "Window 0".into();
+            window.identifier.clear();
+        });
+        harness
+            .world()
+            .trigger(SpawnWindowTrigger::new(vec![window]));
+        harness.world().flush();
+        let entity = crate::tests::harness::find_window_entity(10, harness.world());
+        let world = harness.world();
+        assert!(
+            world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .any(|strip| strip.id() == TEST_WORKSPACE_ID && strip.contains(entity))
+        );
+
+        harness.mock_state.update_window(10, |window| {
+            window.resizable = resizable;
+            window.movable = !resizable;
+        });
+        harness.pump_frames(20);
+        let world = harness.world();
+        assert!(world.get::<crate::ecs::Floating>(entity).is_some());
+        assert!(
+            world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .all(|strip| !strip.contains(entity))
+        );
+        assert_eq!(harness.mock_state.frame_write_attempts(10), 0);
+    }
+}
+
+#[test]
+fn ambiguous_fallback_restore_keeps_initial_floating_rules() {
+    let mut harness = late_fallback_restore_harness();
+    let windows = [10, 11]
+        .into_iter()
+        .map(|id| {
+            let window = harness.mock_state.spawn_window(
+                TEST_PROCESS_ID,
+                TEST_WORKSPACE_ID,
+                id,
+                IRect::new(40, 50, 440, 350),
+            );
+            harness.mock_state.update_window(id, |window| {
+                window.title = "Window 0".into();
+                window.identifier.clear();
+            });
+            window
+        })
+        .collect();
+    harness.world().trigger(SpawnWindowTrigger::new(windows));
+    harness.pump_frames(10);
+
+    for id in [10, 11] {
+        let entity = crate::tests::harness::find_window_entity(id, harness.world());
+        let world = harness.world();
+        assert!(world.get::<crate::ecs::Floating>(entity).is_some());
+        assert!(
+            world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .all(|strip| !strip.contains(entity))
+        );
+    }
+}
+
 #[test]
 fn restore_retries_transient_membership_failure_without_another_notification() {
     let mut harness = TestHarness::new().with_windows(2);
@@ -113,6 +437,121 @@ fn restore_retries_transient_membership_failure_without_another_notification() {
         .find(|strip| strip.id() == TEST_WORKSPACE_ID)
         .expect("strip");
     assert_eq!(strip.all_windows(), vec![first, second]);
+}
+
+#[test]
+fn restore_recovery_retries_unresolved_membership_without_another_event() {
+    let other = TEST_WORKSPACE_ID + 1;
+    for (space, members) in [
+        (other, vec![0, 1]),
+        (other, vec![1]),
+        (TEST_WORKSPACE_ID, vec![]),
+    ] {
+        let mut harness = TestHarness::new().with_windows(2).with_display(
+            TEST_DISPLAY_ID,
+            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+            vec![TEST_WORKSPACE_ID, other],
+        );
+        harness.pump_frames(30);
+        let mut saved = target_restore_state(TEST_WORKSPACE_ID);
+        saved.spaces[0].columns = vec![
+            SavedColumn::Single(saved_window(1)),
+            SavedColumn::Single(saved_window(0)),
+        ];
+        harness.world().insert_resource(saved);
+        harness
+            .mock_state
+            .script_workspace_membership_queries(space, [Ok(members)]);
+        harness.world().trigger(RestoreWindowState);
+        harness
+            .mock_state
+            .script_workspace_membership_queries(space, []);
+        harness.pump_frames(15);
+        let first = crate::tests::harness::find_window_entity(1, harness.world());
+        let second = crate::tests::harness::find_window_entity(0, harness.world());
+        let world = harness.world();
+        let strip = world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+            .unwrap();
+        assert_eq!(strip.all_windows(), vec![first, second]);
+    }
+}
+
+#[test]
+fn restore_ignores_unrelated_membership_ambiguity() {
+    let other = TEST_WORKSPACE_ID + 1;
+    let mut harness = TestHarness::new().with_windows(3).with_display(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+        vec![TEST_WORKSPACE_ID, other],
+    );
+    harness.pump_frames(30);
+    let mut saved = target_restore_state(TEST_WORKSPACE_ID);
+    saved.spaces[0].columns = vec![
+        SavedColumn::Single(saved_window(1)),
+        SavedColumn::Single(saved_window(0)),
+    ];
+    harness.world().insert_resource(saved);
+    harness
+        .mock_state
+        .script_workspace_membership_queries(other, [Ok(vec![2])]);
+    harness.world().trigger(RestoreWindowState);
+    let expected =
+        [1, 0, 2].map(|id| crate::tests::harness::find_window_entity(id, harness.world()));
+    let world = harness.world();
+    let strip = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .unwrap();
+    assert_eq!(strip.all_windows(), expected);
+}
+
+#[test]
+fn restore_membership_retry_expires_with_startup_grace() {
+    let other = TEST_WORKSPACE_ID + 1;
+    let mut harness = TestHarness::new().with_windows(2).with_display(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+        vec![TEST_WORKSPACE_ID, other],
+    );
+    harness.pump_frames(30);
+    let mut saved = target_restore_state(TEST_WORKSPACE_ID);
+    saved.spaces[0].columns = vec![
+        SavedColumn::Single(saved_window(1)),
+        SavedColumn::Single(saved_window(0)),
+    ];
+    harness.world().insert_resource(saved);
+    harness
+        .mock_state
+        .script_workspace_membership_queries(other, std::iter::repeat_n(Ok(vec![0, 1]), 1000));
+    harness.world().trigger(RestoreWindowState);
+    harness.pump_frames(30);
+    assert!(
+        !harness
+            .world()
+            .contains_resource::<crate::ecs::restore::SessionRestore>()
+    );
+    assert!(!harness.world().contains_resource::<SpoolState>());
+    harness
+        .mock_state
+        .script_workspace_membership_queries(other, []);
+    harness.pump_frames(30);
+    let first = crate::tests::harness::find_window_entity(1, harness.world());
+    let second = crate::tests::harness::find_window_entity(0, harness.world());
+    let world = harness.world();
+    let strip = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .unwrap();
+    assert_eq!(
+        strip.all_windows(),
+        vec![second, first],
+        "expired restore cannot reorder windows later"
+    );
 }
 
 #[test]

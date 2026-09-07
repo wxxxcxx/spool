@@ -363,37 +363,6 @@ pub(crate) struct NativeSpaceReconciliationCtx<'w, 's> {
     topology: Res<'w, NativeTopology>,
 }
 
-// A target-only observation cannot distinguish a completed move from an
-// overlapping source/target snapshot during a native Space transition.
-fn unique_memberships(
-    topology: &NativeTopology,
-    manager: &WindowManager,
-) -> Option<HashMap<WinID, Option<WorkspaceId>>> {
-    if !topology.is_complete() {
-        return None;
-    }
-    let mut spaces = topology
-        .known_displays()
-        .flat_map(|(_, spaces)| spaces.iter().copied())
-        .collect::<Vec<_>>();
-    spaces.sort_unstable();
-    spaces.dedup();
-    let mut memberships = HashMap::new();
-    for space in spaces {
-        for id in manager.windows_in_workspace(space).ok()? {
-            memberships
-                .entry(id)
-                .and_modify(|previous| {
-                    if *previous != Some(space) {
-                        *previous = None;
-                    }
-                })
-                .or_insert(Some(space));
-        }
-    }
-    Some(memberships)
-}
-
 #[allow(clippy::too_many_lines)]
 pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliationCtx) {
     const MOVE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -414,11 +383,11 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
     if transactions.moves.is_empty() && transactions.follows.is_empty() {
         return;
     }
-    let memberships = unique_memberships(&topology, &window_manager);
+    let memberships = topology.observe_memberships(&window_manager).ok();
     let belongs_to = |id, space| {
         memberships
             .as_ref()
-            .is_some_and(|members| members.get(&id) == Some(&Some(space)))
+            .is_some_and(|members| members.unique_space(id) == Some(space))
     };
     transactions.moves.retain(|pending| {
         let timed_out = time.elapsed().saturating_sub(pending.submitted) >= MOVE_TIMEOUT;
@@ -458,8 +427,22 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
                 if strip.id() == pending.target_space_id {
                     match &pending.layout {
                         PendingMoveLayout::AssociatedWindows => {
-                            strip.append_tab_group(&moved_entities);
-                            target_anchor = moved_entities.first().copied();
+                            let tiled = moved_entities
+                                .iter()
+                                .copied()
+                                .filter(|entity| {
+                                    windows
+                                        .get_tracked(*entity)
+                                        .is_some_and(|(_, _, state)| state.is_tiled())
+                                })
+                                .collect::<Vec<_>>();
+                            for entity in &moved_entities {
+                                if !tiled.contains(entity) {
+                                    strip.remove(*entity);
+                                }
+                            }
+                            strip.append_tab_group(&tiled);
+                            target_anchor = tiled.first().copied();
                         }
                         PendingMoveLayout::Column(column) => {
                             strip.append_column(column.clone());

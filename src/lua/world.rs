@@ -7,17 +7,19 @@
 //!
 //! Two invariants:
 //!
-//! * **The caches are per batch, not per dispatch.** Handlers that overlap
-//!   are reading the same frame's world, so [`DispatchWorld`] clears them
-//!   only when the last dispatch in the batch finishes.
+//! * **The caches belong to an explicit input batch.** Handlers from one
+//!   worker message share reads; a later message gets a new snapshot even
+//!   while earlier handlers are suspended. The current batch is installed
+//!   only while polling its handler, never across a suspension point.
 //! * **No borrow may be held across an await.** These are `RefCell`s on a
 //!   single thread, so a borrow spanning a suspension point is not a wait —
 //!   it is a `BorrowMutError` panic the moment another dispatch touches the
 //!   same cell. Every read below takes what it needs, drops the borrow,
 //!   *then* awaits.
 
-use std::cell::{Cell, RefCell};
-use std::future::Future;
+use std::cell::RefCell;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -124,10 +126,6 @@ impl<T> SharedRead<T> {
         }
     }
 
-    fn clear(&self) {
-        self.cached.borrow_mut().take();
-    }
-
     /// The value, reading it through `read` if this is the first ask.
     async fn get<F>(&self, read: impl FnOnce() -> F) -> Shared<T>
     where
@@ -173,15 +171,25 @@ impl<T> SharedRead<T> {
     }
 }
 
-/// World access for the dispatches currently in flight, and the reads they share.
-pub(super) struct DispatchWorld {
-    access: WorldAccess,
-    /// How many dispatches are running. Zero means a script is reaching for the
-    /// world from somewhere that has none — top-level code, say — which is an
-    /// error rather than a stale answer.
-    in_flight: Cell<usize>,
+/// Point-in-time reads shared only by handlers from the same input message.
+pub(super) struct DispatchBatch {
     state: SharedRead<SpoolQueryState>,
     window_set: SharedRead<WindowSet>,
+}
+
+impl DispatchBatch {
+    pub(super) fn new() -> Rc<Self> {
+        Rc::new(Self {
+            state: SharedRead::new(),
+            window_set: SharedRead::new(),
+        })
+    }
+}
+
+/// World access shared by interpreters, with a poll-scoped batch for API calls.
+pub(super) struct DispatchWorld {
+    access: WorldAccess,
+    current: RefCell<Option<Rc<DispatchBatch>>>,
     /// Unlike the other two caches, this survives the batch — the store only
     /// changes on a write, tracked by the revision stamp.
     script_state: RefCell<Option<(u64, ScriptState)>>,
@@ -191,42 +199,47 @@ impl DispatchWorld {
     pub(super) fn new(access: WorldAccess) -> Rc<Self> {
         Rc::new(Self {
             access,
-            in_flight: Cell::new(0),
-            state: SharedRead::new(),
-            window_set: SharedRead::new(),
+            current: RefCell::new(None),
             script_state: RefCell::new(None),
         })
     }
 
-    /// Marks a dispatch as running. World access is available until the returned
-    /// guard is dropped; when the last one goes, the batch's reads go with it.
-    pub(super) fn enter(self: &Rc<Self>) -> Dispatch {
-        self.in_flight.set(self.in_flight.get() + 1);
-        Dispatch {
-            world: Rc::clone(self),
-        }
+    /// Installs task-local access for each poll, restoring it before another
+    /// handler or a reload can execute on the same interpreter thread.
+    pub(super) async fn with_batch<T>(
+        &self,
+        batch: &Rc<DispatchBatch>,
+        future: impl Future<Output = T>,
+    ) -> T {
+        let mut future = pin!(future);
+        poll_fn(|cx| {
+            let previous = self.current.replace(Some(Rc::clone(batch)));
+            let _restore = scopeguard::guard(previous, |previous| {
+                self.current.replace(previous);
+            });
+            future.as_mut().poll(cx)
+        })
+        .await
     }
 
-    /// `Err` when nothing is dispatching, so `spool.query` at script top level
-    /// says why rather than handing back an answer from nowhere.
-    fn available(&self, call: &str) -> Result<(), String> {
-        if self.in_flight.get() == 0 {
-            return Err(format!("{call} is {NO_DISPATCH}"));
-        }
-        Ok(())
+    fn batch(&self, call: &str) -> Result<Rc<DispatchBatch>, String> {
+        self.current
+            .borrow()
+            .clone()
+            .ok_or_else(|| format!("{call} is {NO_DISPATCH}"))
     }
 
     /// The query documents, read once per batch however many handlers ask.
     pub(super) async fn query_state(&self) -> Result<Arc<SpoolQueryState>, String> {
-        self.available("spool.query")?;
-        self.state.get(|| self.access.state()).await
+        let batch = self.batch("spool.query")?;
+        batch.state.get(|| self.access.state()).await
     }
 
     /// The layout tree, read once per batch. Handlers each transform their own
     /// copy, so this hands out the shared read and they clone from it.
     pub(super) async fn layout(&self) -> Result<Arc<WindowSet>, String> {
-        self.available("the window set")?;
-        self.window_set.get(|| self.access.window_set()).await
+        let batch = self.batch("the window set")?;
+        batch.window_set.get(|| self.access.window_set()).await
     }
 
     /// The script state store, re-read whenever the revision says the cached
@@ -234,7 +247,7 @@ impl DispatchWorld {
     /// mid-read leaves the copy marked older than it is — re-read needlessly
     /// next time, which is the harmless direction to be wrong in.
     pub(super) async fn script_state(&self) -> Result<ScriptState, String> {
-        self.available("spool.state")?;
+        self.batch("spool.state")?;
         let revision = self.access.revision.load(Ordering::Acquire);
         let cached = self.script_state.borrow().clone();
         match cached {
@@ -254,26 +267,44 @@ impl DispatchWorld {
         &self,
         write: &ScriptStateWrite,
     ) -> Result<WriteOutcome, String> {
-        self.available("spool.state")?;
+        self.batch("spool.state")?;
         self.access.write_script_state(write).await
     }
 }
 
-/// One dispatch in flight. Dropping it releases the batch's reads if it was the
-/// last one.
-pub(super) struct Dispatch {
-    world: Rc<DispatchWorld>,
-}
+#[cfg(test)]
+mod tests {
+    use async_channel::unbounded;
+    use futures_lite::future::{block_on, poll_once};
 
-impl Drop for Dispatch {
-    fn drop(&mut self) {
-        let remaining = self.world.in_flight.get().saturating_sub(1);
-        self.world.in_flight.set(remaining);
-        if remaining == 0 {
-            // The next batch is a different frame's world. The store is left
-            // alone: it is keyed by revision, not by batch.
-            self.world.state.clear();
-            self.world.window_set.clear();
-        }
+    use super::*;
+
+    #[test]
+    fn a_suspended_or_cancelled_dispatch_does_not_expose_top_level_world_access() {
+        let (world_tx, requests) = unbounded();
+        let (store_tx, _store_rx) = unbounded();
+        let world = DispatchWorld::new(WorldAccess::new(
+            world_tx,
+            store_tx,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        let batch = DispatchBatch::new();
+        let mut pending = Box::pin(world.with_batch(&batch, world.query_state()));
+        assert!(block_on(poll_once(pending.as_mut())).is_none());
+        assert_eq!(requests.len(), 1);
+
+        assert!(
+            block_on(world.query_state())
+                .unwrap_err()
+                .contains(NO_DISPATCH)
+        );
+        assert!(
+            block_on(world.script_state())
+                .unwrap_err()
+                .contains(NO_DISPATCH)
+        );
+        drop(pending);
+        assert!(block_on(world.layout()).unwrap_err().contains(NO_DISPATCH));
+        assert_eq!(requests.len(), 1, "top-level calls cannot enqueue reads");
     }
 }

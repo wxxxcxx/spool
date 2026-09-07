@@ -32,6 +32,7 @@ type ProcessCallbackFn = extern "C-unwind" fn(
     context: *const c_void,
 ) -> OSStatus;
 
+#[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     /// Retrieves the application event target.
     /// This function returns an `EventTargetRef` that represents the application's event queue.

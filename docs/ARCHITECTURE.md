@@ -8,7 +8,7 @@ Spool manages macOS windows as a **sliding strip** (inspired by Niri and PaperWM
 
 The primary problem Spool solves is providing a predictable, stable, and ergonomic tiling experience on macOS. By using Bevy's ECS, we gain:
 - **Declarative Logic:** layout state is rendered into a desired window frame; effects and OS observations are separate projections.
-- **High Performance:** Parallel system execution and efficient change detection.
+- **Change-Driven Work:** Efficient change detection and budgeted event/discovery processing.
 - **Modularity:** Functionality is divided into decoupled plugins and systems.
 
 ## 2. The Bevy Bridge
@@ -30,17 +30,52 @@ Bevy is typically used for games, so Spool implements a custom bridge to interac
 
 The flow is intentionally one-way. An ordinary macOS readback never mutates tiled Layout State. User- or application-driven geometry is first collected as a `Geometry Gesture`; only the settled final frame becomes a single Layout State action. Floating windows are the exception because no tiling neighbours depend on their geometry.
 
-**Note:** All AppKit/Accessibility calls must happen on the **Main Thread**. Spool ensures this by using `NonSend` resources and executing critical synchronization systems on the main thread.
+**Note:** All AppKit/Accessibility calls must happen on the **Main Thread**.
+Spool uses `NonSend` platform owners and single-threaded executors for startup
+and frame schedules; platform initialization rejects a non-main caller.
+
+### Native Discovery and Callback Lifetime
+
+`src/manager/discovery.rs` owns a resumable `WindowDiscovery` queue on the main
+thread. Applications take turns probing inactive-Space AX tokens. Identity and
+attribute reads are separate steps, with a 256-step/2ms per-tick budget and a
+250ms active-work allowance per application. These time limits are soft: one
+synchronous native call may overrun them. Waiting between ticks does not consume
+an application's allowance. The process-wide AX timeout is initialized through
+the system-wide accessibility object, and initialization fails if setting it
+fails; setting only an application object's timeout does not cover its windows.
+
+Discovery validates the application entity, PID, process serial number, and
+liveness before publication. Exit cancels pending probes. Startup retains
+`Initializing` until the queue and its last spawn batch settle, so restore grace
+starts afterwards; the event pump keeps its short timeout during this work.
+Neither AX handles nor discovered windows enter a background task pool.
+
+Deferred admission retains its discovered token for at most three metadata
+attempts within the original application allowance; definitive rejection does
+not retry. Resolved windows awaiting publication retain their native handles
+across unknown liveness results for up to three checks, at most once per tick.
+Publication and scanning share the tick budget, and exhaustion is explicit.
+
+WindowServer and KVO callbacks use non-reused opaque tokens to acquire owned
+context leases. Teardown retires the token before unregistering, making late
+delivery inert even if native removal fails. KVO's synchronous initial callback
+only requests reconciliation; it never mutates the process being registered.
 
 ### The Lua Worker (optional `lua` feature)
 
 The embedded scripting runtime is the one deliberate exception to "everything interesting happens on the main thread". A handler is arbitrary user code of unbounded duration, and `pump_events` is itself main-thread-pinned, so running handlers inline meant a slow script stalled the frame clock. `src/lua/worker.rs` runs the interpreter on a dedicated thread instead:
 
-- **Main → worker:** `dispatch_lua_events` and `command_lua_handler` extract plain data (`LuaEvent`, `StateSnapshot`) out of the world and send it over an unbounded channel. Neither ever blocks.
-- **Worker → main:** `drain_lua_outbox` non-blockingly drains queued `Command`s and flash messages onto the command bus, one frame behind.
-- **The query round-trip:** `spool.query*` still reads the *live* world. The worker sends a request carrying a reply channel and blocks on it; `serve_lua_queries` answers it from `QueryStateParams` in `PreUpdate` (before the pump) and again in `PostUpdate`. Shutdown drops the request queue, which unblocks any waiting handler with an error rather than a hang.
+- **Main → worker:** `dispatch_lua_events` and `command_lua_handler` send plain event data and keybind IDs over an unbounded channel. Neither ever blocks.
+- **Worker → main:** `drain_lua_outbox` non-blockingly drains queued `Action`s and flash messages onto the command bus.
+- **The query round-trip:** `spool.query*` sends a reply channel and asynchronously awaits the answer; other handlers can run meanwhile. `serve_lua_queries` answers from `QueryStateParams` in `PreUpdate` (before the pump) and again in `PostUpdate`, sharing each extraction among that pass's waiters.
+- **Snapshot ownership:** Each input message owns a `DispatchBatch`. Its handlers share reads, while later batches remain independent of suspended callbacks. `DispatchWorld` installs the batch only during each future poll, so reload top-level code cannot borrow an old callback's world access. Script state is separately cached by revision.
+- **Reload ownership:** Retired runtimes may finish in-flight actions, but only the installed runtime publishes handler availability. Keybind callback IDs are process-unique, so an event queued before reload cannot invoke a replacement callback. A failed reload retains the working runtime and configuration.
+- **Flash duration boundary:** Lua flash durations are validated before entering the outbox; worker messages and ECS timers carry `Duration`, never unvalidated floating-point seconds.
 
-This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches the world only through an `extract` callback, which on the main thread is a direct query and on the worker is that round-trip.
+`src/lua/runtime.rs` reaches the world through `DispatchWorld` rather than ECS
+borrows. Only plain data crosses the worker channels; Lua values and platform
+objects stay on their owning threads.
 
 ## 3. Crate & Module Map
 
@@ -94,6 +129,7 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 
 ### Resources
 - **`WindowManager`:** A wrapper for the global window management state and OS bridge.
+- **`WindowDiscovery`:** A main-thread-only queue for incremental inactive-Space discovery.
 - **`Config`:** The current user configuration.
 - **`SpoolState`**: The v3 durable snapshot of displays and one layout per native Space, used for recovery after restarts.
 - **`SessionRestore`**: A short-lived startup resource that keeps loaded state and restore timing active until the startup grace period expires.

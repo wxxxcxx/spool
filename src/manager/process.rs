@@ -7,8 +7,7 @@ use objc2_foundation::{
 };
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::ecs::BProcess;
 use crate::errors::{Error, Result};
@@ -188,10 +187,9 @@ pub struct Process {
 
     /// A retained reference to the `WorkspaceObserver`, used for KVO.
     pub observer: Retained<WorkspaceObserver>,
-    /// Atomic boolean to track if "finishedLaunching" is being observed.
-    observing_launched: AtomicBool,
-    /// Atomic boolean to track if "activationPolicy" is being observed.
-    observing_activated: AtomicBool,
+    /// Main-thread-owned registrations, published before synchronous Initial delivery.
+    observing_launched: Option<usize>,
+    observing_activated: Option<usize>,
     /// When `true`, the process is tracked regardless of its activation policy.
     force_track: bool,
 }
@@ -206,6 +204,28 @@ impl Drop for Process {
 }
 
 impl Process {
+    #[cfg(test)]
+    pub(crate) fn for_observation_test(observer: Retained<WorkspaceObserver>) -> Self {
+        let mut process = Self {
+            psn: ProcessSerialNumber::default(),
+            pid: 123,
+            name: "observation fixture".to_owned(),
+            application: None,
+            policy: NSApplicationActivationPolicy::Prohibited,
+            observer,
+            observing_launched: None,
+            observing_activated: None,
+            force_track: false,
+        };
+        process.observe_with("activationPolicy", |_| {});
+        process
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observation_context_for_test(&self) -> *mut std::ffi::c_void {
+        self.observing_activated.unwrap() as *mut std::ffi::c_void
+    }
+
     /// Creates a new `Process` instance. It retrieves process information (PID, name) and attempts to get an `NSRunningApplication` instance.
     /// It also initializes the observation flags for application launch and activation policy.
     ///
@@ -237,13 +257,13 @@ impl Process {
             application: apps,
             policy: NSApplicationActivationPolicy::Prohibited,
             observer,
-            observing_launched: AtomicBool::new(false),
-            observing_activated: AtomicBool::new(false),
+            observing_launched: None,
+            observing_activated: None,
             force_track: false,
         })
     }
 
-    /// Checks if the application associated with this process is observable (i.e., has a regular activation policy).
+    /// Regular and accessory applications may both own independent windows.
     /// It updates the internal `policy` field based on the `NSRunningApplication`'s activation policy.
     ///
     /// # Returns
@@ -252,7 +272,7 @@ impl Process {
     pub fn is_observable(&mut self) -> bool {
         if let Some(app) = &self.application {
             self.policy = app.activationPolicy();
-            self.policy == NSApplicationActivationPolicy::Regular
+            policy_can_own_windows(self.policy)
         } else {
             self.policy = NSApplicationActivationPolicy::Prohibited;
             false
@@ -286,10 +306,8 @@ impl Process {
     /// # Side Effects
     ///
     /// - Adds a KVO observer to the `NSRunningApplication`.
-    pub fn observe_finished_launching(&self) {
-        if !self.observing_launched.swap(true, Ordering::Acquire) {
-            self.observe("finishedLaunching");
-        }
+    pub fn observe_finished_launching(&mut self) {
+        self.observe("finishedLaunching");
     }
 
     /// Unsubscribes from "finishedLaunching" key-value observations.
@@ -297,10 +315,8 @@ impl Process {
     /// # Side Effects
     ///
     /// - Removes the KVO observer from the `NSRunningApplication`.
-    pub fn unobserve_finished_launching(&self) {
-        if self.observing_launched.swap(false, Ordering::Release) {
-            self.unobserve("finishedLaunching");
-        }
+    pub fn unobserve_finished_launching(&mut self) {
+        self.unobserve("finishedLaunching");
     }
 
     /// Subscribes to "activationPolicy" key-value observations for the associated `NSRunningApplication`.
@@ -309,10 +325,8 @@ impl Process {
     /// # Side Effects
     ///
     /// - Adds a KVO observer to the `NSRunningApplication`.
-    pub fn observe_activation_policy(&self) {
-        if !self.observing_activated.swap(true, Ordering::Acquire) {
-            self.observe("activationPolicy");
-        }
+    pub fn observe_activation_policy(&mut self) {
+        self.observe("activationPolicy");
     }
 
     /// Unsubscribes from "activationPolicy" key-value observations.
@@ -320,10 +334,8 @@ impl Process {
     /// # Side Effects
     ///
     /// - Removes the KVO observer from the `NSRunningApplication`.
-    pub fn unobserve_activation_policy(&self) {
-        if self.observing_activated.swap(false, Ordering::Release) {
-            self.unobserve("activationPolicy");
-        }
+    pub fn unobserve_activation_policy(&mut self) {
+        self.unobserve("activationPolicy");
     }
 
     /// Helper function to add a key-value observer for a specified `flavor` (key path).
@@ -336,20 +348,42 @@ impl Process {
     /// # Side Effects
     ///
     /// - Adds a KVO observer to the `NSRunningApplication`.
-    fn observe(&self, flavor: &str) {
-        if let Some(app) = self.application.as_ref() {
-            unsafe {
-                let key_path = NSString::from_str(flavor);
-                let options = NSKeyValueObservingOptions::New | NSKeyValueObservingOptions::Initial;
-                app.addObserver_forKeyPath_options_context(
-                    &self.observer,
-                    key_path.as_ref(),
-                    options,
-                    NonNull::from(self).as_ptr().cast(),
-                );
-            }
-            debug!("observing {flavor} for {}", &self.name);
+    fn observe(&mut self, flavor: &'static str) {
+        let Some(app) = self.application.clone() else {
+            return;
+        };
+        let observer = self.observer.clone();
+        self.observe_with(flavor, |token| unsafe {
+            let key_path = NSString::from_str(flavor);
+            let options = NSKeyValueObservingOptions::New | NSKeyValueObservingOptions::Initial;
+            app.addObserver_forKeyPath_options_context(
+                &observer,
+                key_path.as_ref(),
+                options,
+                token as *mut std::ffi::c_void,
+            );
+        });
+    }
+
+    fn observation_slot(&mut self, flavor: &'static str) -> &mut Option<usize> {
+        match flavor {
+            "finishedLaunching" => &mut self.observing_launched,
+            "activationPolicy" => &mut self.observing_activated,
+            _ => unreachable!("unsupported process observation"),
         }
+    }
+
+    pub(crate) fn observe_with(&mut self, flavor: &'static str, register: impl FnOnce(usize)) {
+        if self.observation_slot(flavor).is_some() {
+            return;
+        }
+        let Some(token) = self.observer.register_process_observation(self.pid, flavor) else {
+            error!("callback token space exhausted");
+            return;
+        };
+        *self.observation_slot(flavor) = Some(token);
+        register(token);
+        debug!("observing {flavor} for {}", &self.name);
     }
 
     /// Helper function to remove a key-value observer for a specified `flavor` (key path).
@@ -362,18 +396,29 @@ impl Process {
     /// # Side Effects
     ///
     /// - Removes a KVO observer from the `NSRunningApplication`.
-    fn unobserve(&self, flavor: &str) {
-        if let Some(app) = self.application.as_ref() {
+    fn unobserve(&mut self, flavor: &'static str) {
+        let app = self.application.clone();
+        let observer = self.observer.clone();
+        self.unobserve_with(flavor, |token| {
+            let Some(app) = app else { return };
             unsafe {
                 let key_path = NSString::from_str(flavor);
                 app.removeObserver_forKeyPath_context(
-                    &self.observer,
+                    &observer,
                     key_path.as_ref(),
-                    NonNull::from(self).as_ptr().cast(),
+                    token as *mut std::ffi::c_void,
                 );
             }
-            debug!("removed {flavor} observers for {}", &self.name);
-        }
+        });
+    }
+
+    pub(crate) fn unobserve_with(&mut self, flavor: &'static str, unregister: impl FnOnce(usize)) {
+        let Some(token) = self.observation_slot(flavor).take() else {
+            return;
+        };
+        self.observer.retire_process_observation(token);
+        unregister(token);
+        debug!("removed {flavor} observers for {}", &self.name);
     }
 
     /// Checks if the process is ready for window tracking (finished launching and observable).
@@ -407,5 +452,30 @@ impl Process {
         }
         self.unobserve_activation_policy();
         true
+    }
+}
+
+fn policy_can_own_windows(policy: NSApplicationActivationPolicy) -> bool {
+    matches!(
+        policy,
+        NSApplicationActivationPolicy::Regular | NSApplicationActivationPolicy::Accessory
+    )
+}
+
+#[cfg(test)]
+mod window_policy_tests {
+    use super::*;
+
+    #[test]
+    fn window_policy_observes_accessory_applications_without_force_track() {
+        assert!(policy_can_own_windows(
+            NSApplicationActivationPolicy::Regular
+        ));
+        assert!(policy_can_own_windows(
+            NSApplicationActivationPolicy::Accessory
+        ));
+        assert!(!policy_can_own_windows(
+            NSApplicationActivationPolicy::Prohibited
+        ));
     }
 }
