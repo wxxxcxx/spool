@@ -62,10 +62,10 @@ The pre-Spool geometry and exact identity of a window already present when this 
 _Avoid_: Window state, restore state
 
 **Exit-Restorable Window**:
-A launch window whose fullscreen state was confirmed windowed at startup and remains confirmed windowed at graceful exit.
+A live, accessible tracked window confirmed windowed at graceful exit. An eligible launch snapshot supplies its preferred frame; otherwise its current frame is used.
 
 **Exit Restoration**:
-The graceful-exit rollback of eligible launch window geometry. It does not alter Native Space membership, window visibility, focus, or z-order.
+The graceful-exit restoration of eligible launch geometry, constrained to a currently available display. Windows without a launch snapshot also have their current geometry constrained. Oversized windows are resized to fit when the application permits; refused writes are logged and retried at most once to correct the origin. It does not alter Native Space membership, window visibility, focus, or z-order.
 _Avoid_: Exit centering
 
 **Native Space**:

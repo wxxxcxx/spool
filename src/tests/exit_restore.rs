@@ -69,6 +69,66 @@ fn exit_restores_the_exact_startup_window_frame() {
 }
 
 #[test]
+fn exit_clamps_partly_offscreen_startup_frame_on_unchanged_display() {
+    for x in [-400, -1200] {
+        let mut harness = TestHarness::new().with_window(0, |window| {
+            window.frame = IRect::new(x, 80, x + 500, 480);
+        });
+        harness.pump_frames(10);
+        exit_spool(&mut harness);
+        assert_eq!(
+            harness.mock_state.actual_window_frame(0),
+            Some(IRect::new(0, 80, 500, 480))
+        );
+    }
+}
+
+#[test]
+fn exit_fits_oversized_startup_window_within_the_screen() {
+    let mut harness = TestHarness::new().with_window(0, |window| {
+        window.frame = IRect::new(
+            -100,
+            -100,
+            TEST_DISPLAY_WIDTH + 100,
+            TEST_DISPLAY_HEIGHT + 100,
+        );
+    });
+    harness.pump_frames(10);
+    exit_spool(&mut harness);
+    assert_eq!(
+        harness.mock_state.actual_window_frame(0),
+        Some(IRect::new(
+            0,
+            TEST_MENUBAR_HEIGHT,
+            TEST_DISPLAY_WIDTH,
+            TEST_DISPLAY_HEIGHT
+        ))
+    );
+}
+
+#[test]
+fn exit_brings_new_offscreen_windows_back_onto_the_screen() {
+    let mut harness = TestHarness::new();
+    harness.pump_frames(10);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::new(40, 60, 440, 360),
+    );
+    harness
+        .world()
+        .trigger(SpawnWindowTrigger::new(vec![window]));
+    harness.pump_frames(5);
+    set_current_frame(&mut harness, 0, IRect::new(-800, 140, -300, 540));
+    exit_spool(&mut harness);
+    assert_eq!(
+        harness.mock_state.actual_window_frame(0),
+        Some(IRect::new(0, 140, 500, 540))
+    );
+}
+
+#[test]
 fn exit_does_not_restore_a_window_that_ax_reported_fullscreen_at_startup() {
     let current_frame = IRect::new(200, 160, 700, 560);
     let mut harness = TestHarness::new().with_window(0, |window| {
@@ -315,37 +375,22 @@ fn changed_display_geometry_clamps_the_startup_frame_without_resizing_it() {
 
 #[test]
 fn missing_launch_display_leaves_the_window_on_its_current_display() {
-    let current_frame = IRect::new(1200, 140, 1700, 540);
-    let mut harness = TestHarness::new().with_window(0, |window| {
-        window.frame = IRect::new(100, 80, 600, 480);
-    });
-    harness.pump_frames(10);
-    harness.mock_state.remove_display(TEST_DISPLAY_ID);
-    harness.mock_state.add_display(
-        EXT_DISPLAY_ID,
-        IRect::new(
-            TEST_DISPLAY_WIDTH,
-            0,
-            TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
-            EXT_DISPLAY_HEIGHT,
+    for (current_frame, expected_frame) in [
+        (
+            IRect::new(1200, 140, 1700, 540),
+            IRect::new(1200, 140, 1700, 540),
         ),
-        vec![TEST_WORKSPACE_ID],
-    );
-
-    let display_entity = {
-        let world = harness.world();
-        world
-            .query::<(Entity, &Display)>()
-            .iter(world)
-            .find_map(|(entity, display)| (display.id() == TEST_DISPLAY_ID).then_some(entity))
-            .expect("launch display")
-    };
-    harness
-        .world()
-        .entity_mut(display_entity)
-        .remove::<(Display, ActiveDisplayMarker)>();
-    harness.world().spawn((
-        Display::new(
+        (
+            IRect::new(-800, 140, -300, 540),
+            IRect::new(TEST_DISPLAY_WIDTH, 140, TEST_DISPLAY_WIDTH + 500, 540),
+        ),
+    ] {
+        let mut harness = TestHarness::new().with_window(0, |window| {
+            window.frame = IRect::new(100, 80, 600, 480);
+        });
+        harness.pump_frames(10);
+        harness.mock_state.remove_display(TEST_DISPLAY_ID);
+        harness.mock_state.add_display(
             EXT_DISPLAY_ID,
             IRect::new(
                 TEST_DISPLAY_WIDTH,
@@ -353,17 +398,42 @@ fn missing_launch_display_leaves_the_window_on_its_current_display() {
                 TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
                 EXT_DISPLAY_HEIGHT,
             ),
-            TEST_MENUBAR_HEIGHT,
-        ),
-        ActiveDisplayMarker,
-    ));
-    set_current_frame(&mut harness, 0, current_frame);
-    exit_spool(&mut harness);
+            vec![TEST_WORKSPACE_ID],
+        );
 
-    assert_eq!(
-        harness.mock_state.actual_window_frame(0),
-        Some(current_frame)
-    );
+        let display_entity = {
+            let world = harness.world();
+            world
+                .query::<(Entity, &Display)>()
+                .iter(world)
+                .find_map(|(entity, display)| (display.id() == TEST_DISPLAY_ID).then_some(entity))
+                .expect("launch display")
+        };
+        harness
+            .world()
+            .entity_mut(display_entity)
+            .remove::<(Display, ActiveDisplayMarker)>();
+        harness.world().spawn((
+            Display::new(
+                EXT_DISPLAY_ID,
+                IRect::new(
+                    TEST_DISPLAY_WIDTH,
+                    0,
+                    TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+                    EXT_DISPLAY_HEIGHT,
+                ),
+                TEST_MENUBAR_HEIGHT,
+            ),
+            ActiveDisplayMarker,
+        ));
+        set_current_frame(&mut harness, 0, current_frame);
+        exit_spool(&mut harness);
+
+        assert_eq!(
+            harness.mock_state.actual_window_frame(0),
+            Some(expected_frame)
+        );
+    }
 }
 
 #[test]
@@ -414,5 +484,23 @@ fn one_constrained_window_does_not_block_other_launch_frame_restores() {
         harness.mock_state.actual_window_frame(1),
         Some(second_startup),
         "another window must still restore after a constrained write"
+    );
+}
+
+#[test]
+fn rejected_offscreen_correction_is_bounded_and_does_not_block_other_windows() {
+    let second_startup = IRect::new(520, 100, 920, 500);
+    let mut harness = TestHarness::new()
+        .with_window(0, |window| window.frame = IRect::new(80, 80, 480, 480))
+        .with_window(1, |window| window.frame = second_startup);
+    harness.pump_frames(10);
+    set_current_frame(&mut harness, 0, IRect::new(-800, 80, -400, 480));
+    harness.mock_state.constrain_frame_writes(0, true);
+    let attempts = harness.mock_state.frame_write_attempts(0);
+    exit_spool(&mut harness);
+    assert_eq!(harness.mock_state.frame_write_attempts(0) - attempts, 2);
+    assert_eq!(
+        harness.mock_state.actual_window_frame(1),
+        Some(second_startup)
     );
 }

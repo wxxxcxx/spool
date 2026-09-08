@@ -139,7 +139,7 @@ objects stay on their owning threads.
 | `src/ecs/window_frame.rs` | Desired/presented frame projections and animation. |
 | `src/ecs/window_geometry.rs` | Debounced adoption of externally initiated move/resize gestures. |
 | `src/ecs/reconcile.rs` | Lifecycle audits and bounded desired/observed convergence. |
-| `src/ecs/exit_restore.rs` | Session-local restoration of eligible pre-Spool window geometry. |
+| `src/ecs/exit_restore.rs` | Session-local launch-frame restoration and on-screen placement of live tracked windows at exit. |
 | `src/ecs/systems.rs` | Bevy systems for lifecycle management, event pumping, and state syncing. |
 | `src/ecs/params.rs` | High-level Bevy `SystemParam` abstractions for querying the World. |
 | `src/ecs/triggers.rs` | Reactive event handlers (Observers) for OS and internal events. |

@@ -1,4 +1,4 @@
-//! Restores the geometry of windows that existed before this Spool process.
+//! Restores launch geometry and brings tracked windows inside present displays.
 //!
 //! This session-local launch snapshot is deliberately separate from
 //! [`super::state::SpoolState`], which persists Spool's layout for a later
@@ -14,7 +14,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::Without;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, Query, Res, SystemParam};
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{debug, info, warn};
 
@@ -49,8 +49,7 @@ pub(super) fn begin_exit(
 }
 
 /// The exact pre-Spool frame and identity of one confirmed windowed startup
-/// window. Absence of this component means exit restoration must leave the
-/// window alone.
+/// window. Without a snapshot, exit only constrains the current geometry.
 #[derive(Clone, Component, Copy, Debug)]
 pub(crate) struct LaunchWindowSnapshot {
     window_id: WinID,
@@ -59,7 +58,83 @@ pub(crate) struct LaunchWindowSnapshot {
     psn: ProcessSerialNumber,
     frame: IRect,
     display_id: CGDirectDisplayID,
-    display_bounds: IRect,
+}
+
+fn nearest_viewport(
+    frame: IRect,
+    viewports: &[(CGDirectDisplayID, IRect)],
+) -> Option<(CGDirectDisplayID, IRect)> {
+    viewports.iter().copied().min_by_key(|(id, viewport)| {
+        let overlap = frame.intersect(*viewport);
+        let area = i64::from(overlap.width().max(0)) * i64::from(overlap.height().max(0));
+        let dx = (i64::from(viewport.min.x) - i64::from(frame.max.x))
+            .max(i64::from(frame.min.x) - i64::from(viewport.max.x))
+            .max(0);
+        let dy = (i64::from(viewport.min.y) - i64::from(frame.max.y))
+            .max(i64::from(frame.min.y) - i64::from(viewport.max.y))
+            .max(0);
+        (
+            Reverse(area),
+            i128::from(dx).pow(2) + i128::from(dy).pow(2),
+            *id,
+        )
+    })
+}
+
+fn fit_frame(frame: IRect, viewport: IRect) -> IRect {
+    let size = frame.size().clamp(IVec2::ONE, viewport.size());
+    let origin = clamp_origin_to_viewport(frame.min, size, viewport);
+    IRect::from_corners(origin, origin + size)
+}
+
+fn restore_frame(window: &mut Window, target: IRect, viewport: IRect) -> bool {
+    let mut observed = match window.set_frame(target) {
+        Ok(frame) => frame,
+        Err(error) => {
+            warn!(window_id = window.id(), %error, "unable to restore exit window frame");
+            return false;
+        }
+    };
+    if observed.intersect(viewport) != observed {
+        // A minimum size may reject shrinking. One bounded retry corrects the
+        // origin using the accepted size and keeps an oversized title bar reachable.
+        let size = observed.size();
+        let mut origin = clamp_origin_to_viewport(observed.min, size, viewport);
+        if size.x > viewport.width() {
+            origin.x = viewport.min.x;
+        }
+        if size.y > viewport.height() {
+            origin.y = viewport.min.y;
+        }
+        let corrected = IRect::from_corners(origin, origin + size);
+        if corrected != observed {
+            match window.set_frame(corrected) {
+                Ok(frame) => observed = frame,
+                Err(error) => {
+                    warn!(window_id = window.id(), %error, "unable to correct exit window position");
+                }
+            }
+        }
+    }
+    if observed != target {
+        warn!(
+            window_id = window.id(),
+            ?target,
+            ?observed,
+            "application constrained exit-frame restoration"
+        );
+    }
+    let inside =
+        observed.width() > 0 && observed.height() > 0 && observed.intersect(viewport) == observed;
+    if !inside {
+        warn!(
+            window_id = window.id(),
+            ?observed,
+            ?viewport,
+            "application could not fit its window inside the exit viewport"
+        );
+    }
+    inside
 }
 
 fn fullscreen_state(
@@ -128,20 +203,13 @@ impl LaunchCapture<'_, '_> {
             return None;
         }
 
-        let Some((display_id, display_bounds)) = self
+        let viewports = self
             .displays
             .iter()
-            .map(|display| {
-                let overlap = frame.intersect(display.bounds());
-                let width = overlap.width().max(0);
-                let height = overlap.height().max(0);
-                let area = i64::from(width) * i64::from(height);
-                (display.id(), display.bounds(), area)
-            })
-            .filter(|(_, _, area)| *area > 0)
-            .max_by_key(|(display_id, _, area)| (*area, Reverse(*display_id)))
-            .map(|(display_id, display_bounds, _)| (display_id, display_bounds))
-        else {
+            .map(|display| (display.id(), display.bounds()))
+            .filter(|(_, bounds)| bounds.width() > 0 && bounds.height() > 0)
+            .collect::<Vec<_>>();
+        let Some((display_id, _)) = nearest_viewport(frame, &viewports) else {
             debug!(
                 window_id = window.id(),
                 ?frame,
@@ -163,7 +231,6 @@ impl LaunchCapture<'_, '_> {
             psn: application.psn(),
             frame,
             display_id,
-            display_bounds,
         })
     }
 }
@@ -172,7 +239,10 @@ impl LaunchCapture<'_, '_> {
 /// the final schedule, making this the last geometry writer of a graceful exit.
 pub(super) fn restore_launch_windows(
     mut exit_events: MessageReader<AppExit>,
-    mut windows: Query<(&mut Window, &ChildOf, &LaunchWindowSnapshot), Without<WindowUnavailable>>,
+    mut windows: Query<
+        (&mut Window, &ChildOf, Option<&LaunchWindowSnapshot>),
+        Without<WindowUnavailable>,
+    >,
     applications: Query<&Application>,
     displays: Query<(&Display, Option<&DockPosition>)>,
     spaces: Query<&NativeSpace>,
@@ -183,16 +253,25 @@ pub(super) fn restore_launch_windows(
         return;
     }
 
+    let viewports = displays
+        .iter()
+        .filter_map(|(display, dock)| {
+            display
+                .checked_actual_display_bounds(dock, &config)
+                .map(|viewport| (display.id(), viewport))
+        })
+        .collect::<Vec<_>>();
     let mut restored = 0;
     for (mut window, child, snapshot) in &mut windows {
         let Ok(application) = applications.get(child.parent()) else {
             continue;
         };
-        let identity_matches = window.id() == snapshot.window_id
-            && window.incarnation() == snapshot.incarnation
-            && window.pid().is_ok_and(|pid| pid == snapshot.pid)
-            && application.pid() == snapshot.pid
-            && application.psn() == snapshot.psn
+        let identity_matches = snapshot.is_none_or(|snapshot| {
+            window.id() == snapshot.window_id
+                && window.incarnation() == snapshot.incarnation
+                && application.pid() == snapshot.pid
+                && application.psn() == snapshot.psn
+        }) && window.pid().is_ok_and(|pid| pid == application.pid())
             && application.is_running().is_ok_and(|running| running)
             && application.owns_window(&window).is_ok_and(|owned| owned);
         if !identity_matches {
@@ -206,44 +285,82 @@ pub(super) fn restore_launch_windows(
             continue;
         }
 
-        let Some((display, dock)) = displays
-            .iter()
-            .find(|(display, _)| display.id() == snapshot.display_id)
-        else {
-            debug!(
+        let current = match window.update_frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                warn!(window_id = window.id(), %error, "unable to read exit window frame");
+                continue;
+            }
+        };
+        // If the original display disappeared, preserve the current placement
+        // when possible instead of moving the window to an obsolete coordinate.
+        let launch_target = snapshot.and_then(|snapshot| {
+            viewports
+                .iter()
+                .find(|(id, _)| *id == snapshot.display_id)
+                .map(|(_, viewport)| (snapshot.frame, *viewport))
+        });
+        let Some((frame, viewport)) = launch_target.or_else(|| {
+            nearest_viewport(current, &viewports).map(|(_, viewport)| (current, viewport))
+        }) else {
+            warn!(
                 window_id = window.id(),
-                display_id = snapshot.display_id,
-                "launch display is no longer present"
+                "no usable display for exit restoration"
             );
             continue;
         };
+        let target = fit_frame(frame, viewport);
+        if target == current {
+            continue;
+        }
 
-        let target = if display.bounds() == snapshot.display_bounds {
-            snapshot.frame
-        } else {
-            let size = snapshot.frame.size();
-            let viewport = display.actual_display_bounds(dock, &config);
-            let origin = clamp_origin_to_viewport(snapshot.frame.min, size, viewport);
-            IRect::from_corners(origin, origin + size)
-        };
+        if restore_frame(&mut window, target, viewport) {
+            restored += 1;
+        }
+    }
 
-        match window.set_frame(target) {
-            Ok(observed) => {
-                restored += 1;
-                if observed != target {
-                    warn!(
-                        window_id = window.id(),
-                        ?target,
-                        ?observed,
-                        "application constrained launch-frame restoration"
-                    );
+    info!(
+        restored,
+        "exit cleanup restored window frames inside present displays"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_frame_fits_negative_coordinate_and_dock_limited_viewports() {
+        for viewport in [IRect::new(-1600, -880, 0, 0), IRect::new(60, 30, 1000, 700)] {
+            for x in [-3000, -800, 0, 1400] {
+                for y in [-1800, 0, 600, 1200] {
+                    for size in [IVec2::new(400, 300), IVec2::new(3000, 2000)] {
+                        let frame = IRect::from_corners(IVec2::new(x, y), IVec2::new(x, y) + size);
+                        let fitted = fit_frame(frame, viewport);
+                        assert_eq!(fitted.intersect(viewport), fitted);
+                        assert_eq!(fit_frame(fitted, viewport), fitted);
+                    }
                 }
-            }
-            Err(error) => {
-                warn!(window_id = window.id(), %error, "unable to restore launch window frame");
             }
         }
     }
 
-    info!(restored, "exit cleanup restored launch window frames");
+    #[test]
+    fn exit_display_selection_prefers_overlap_then_distance_and_stable_id() {
+        let left = (2, IRect::new(-1600, -880, 0, 0));
+        let right = (1, IRect::new(0, 20, 1024, 768));
+        assert_eq!(
+            nearest_viewport(IRect::new(-800, -800, -400, -400), &[right, left]),
+            Some(left)
+        );
+        assert_eq!(
+            nearest_viewport(IRect::new(-2400, -700, -2000, -300), &[right, left]),
+            Some(left)
+        );
+        assert_eq!(
+            nearest_viewport(IRect::new(1600, 100, 2000, 500), &[left, right]),
+            Some(right)
+        );
+        assert_eq!(nearest_viewport(IRect::new(0, 0, 100, 100), &[]), None);
+    }
 }
