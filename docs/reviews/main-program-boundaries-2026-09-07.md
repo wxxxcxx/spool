@@ -1561,3 +1561,72 @@ documented native-tab-creation mismatch is still a release blocker. Mock tests
 do not establish real macOS multi-display/AX acceptance. No live daemon action,
 desktop manipulation, deployment, Nix work, publication, staging or commit was
 performed.
+
+## Deterministic Multi-Display Command Selection (2026-09-08 UTC)
+
+### Findings and Changes
+
+- **P1: Directional transfer and focus depended on the first ECS peer.** With
+  three or more displays, commands could miss a valid destination or choose a
+  farther display. Directional focus also checked one display before a separate
+  cursor-based selector could choose another. Three red regressions reproduced
+  nearest-peer selection, focused-display versus cursor-display confusion, and
+  next-display cycling that skipped a third screen. Log:
+  `/tmp/spool-main-review-20260908-display-navigation-red.log`.
+- A shared pure selector in `src/commands/display_navigation.rs` now chooses
+  targets from fresh native inventory. Explicit next-display commands cycle by
+  X origin, Y origin and display identity. North/south fallback uses the focused
+  display, prefers horizontal overlap and ranks directional edge distances;
+  it does not wrap when no target exists. Local layout navigation remains first.
+  Window movement retains the staged native-confirmation transaction.
+- **P2: Pointer navigation trusted stale placement and unsafe geometry.** The
+  command now requires complete topology, unique visible-Space ownership,
+  matching native/ECS geometry, and a unique target strip with the correct
+  display parent. An unready selected destination is rejected, not replaced by
+  an arbitrary peer. Explicit mouse cycling resolves unique cursor ownership
+  using half-open bounds, avoiding ambiguity at shared display edges.
+- Candidate windows must be available, visible, uniquely present in the target
+  native Space, and positively intersect its usable viewport. Selection has a
+  stable identity tie-break. Empty eligible targets land at the usable center;
+  candidate targets land inside their visible intersection. Widened distance
+  arithmetic and overflow-safe midpoints handle extreme coordinate origins.
+- Removed obsolete first-peer accessors from active-display system parameters.
+  Architecture and configuration documentation describe the common selection
+  policy and its admission boundaries.
+
+### Coverage
+
+Eight pure selector tests cover all input permutations, directional preference,
+diagonal fallback, duplicate/missing identities, invalid geometry, stable ties,
+integer endpoints, half-open ownership and positive visible intersections.
+Seven command-level tests cover nearest-peer transfers, focus source identity,
+three-display cycling, spatial window-transfer order, unknown/stale topology,
+invalid window candidates and extreme landing coordinates. The direction-focus
+test asserts the exact destination center, so a no-op cannot pass merely because
+the cursor already started on the target display.
+
+### Verification
+
+- Final locked workspace tests passed: 986 passed, 2 ignored (869 daemon,
+  20 IPC, 6 Lua client, 91 shared types). Log:
+  `/tmp/spool-main-review-20260908-display-navigation-workspace-final.log`.
+- Final locked Lua-free daemon tests passed: 730 passed, 2 ignored. Log:
+  `/tmp/spool-main-review-20260908-display-navigation-without-lua-final.log`.
+- Strict all-targets Clippy passed for default workspace and Lua-free builds.
+  Locked `cargo check` passed in both configurations. Logs use the `clippy`,
+  `clippy-without-lua`, `check` and `check-without-lua` suffixes under
+  `/tmp/spool-main-review-20260908-display-navigation-`.
+- Formatting and diff-whitespace checks passed. Final full-suite counts include
+  the current checkout's separate overlay continuity regression; this phase
+  adds 15 display-navigation tests and preserves unrelated changes.
+
+### Remaining Scope
+
+Target-width admission after intervening destination changes, native window
+associations outside recorded tab groups, and gesture-specific edge-warp
+selection remain review targets. Pointer-only navigation to an empty display
+may also need to cancel an earlier pending follow; that interaction is a review
+hypothesis, not yet a reproduced finding or a claimed fix. The documented
+native-tab-creation mismatch remains a release blocker. Mock tests do not
+establish real macOS multi-display/AX acceptance. No live daemon action, desktop
+manipulation, deployment, Nix work, publication, staging or commit was performed.
