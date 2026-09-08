@@ -179,6 +179,13 @@ membership scan is needed when no available tracked windows are floating.
 Snapshot visibility also requires a currently observed visible native Space;
 intersecting a display rectangle alone is insufficient.
 
+Public query records and WindowSet records share their floating membership,
+Space visibility, and per-window projection. Their frame field reads only
+Observed geometry; a missing readback is represented as an absent frame, not
+as Presented or Desired geometry. Their output shapes differ (flat versus
+structured), but those facts do not. Bar's retained, read-only identities
+remain a separate presentation policy.
+
 `WorkspaceSet.active` is per-display native visibility, not the global
 `ActiveWorkspaceMarker`. `DisplaySet.active` identifies the globally active
 display from the same topology epoch, not a retained `ActiveDisplayMarker`.

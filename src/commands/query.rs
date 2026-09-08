@@ -1,5 +1,6 @@
 use bevy::app::{App, PostUpdate, PreUpdate};
 use bevy::ecs::entity::Entity;
+use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::Added;
 use bevy::ecs::resource::Resource;
@@ -265,7 +266,9 @@ pub(super) fn register_query_commands(app: &mut App) {
     app.add_systems(PreUpdate, (state_subscribe_handler, state_query_handler));
     app.add_systems(
         PostUpdate,
-        state_event_broadcast_handler.run_if(active_subscribers),
+        state_event_broadcast_handler
+            .after(crate::ecs::focus::project_confirmed_focus)
+            .run_if(active_subscribers),
     );
 }
 
@@ -417,7 +420,7 @@ fn collect_state_broadcast_events_for_intent(
 
     if intent.window_focused {
         let focus = FocusBroadcastSnapshot::from(&state.active);
-        if focus.window_id.is_some() && cache.focus.as_ref() != Some(&focus) {
+        if cache.focus.as_ref() != Some(&focus) {
             outgoing.push(StateEvent::WindowFocused {
                 window_id: focus.window_id,
                 bundle_id: focus.bundle_id.clone(),
@@ -450,6 +453,7 @@ fn state_event_broadcast_handler(
     mut messages: MessageReader<Event>,
     mut subscribers: ResMut<StateSubscribers>,
     focused_changes: Query<Entity, Added<FocusedMarker>>,
+    mut focus_removed: RemovedComponents<FocusedMarker>,
     active_workspace_changes: Query<Entity, Added<ActiveWorkspaceMarker>>,
     state: QueryStateParams,
 ) {
@@ -459,6 +463,7 @@ fn state_event_broadcast_handler(
         return;
     }
 
+    let lost_focus = focus_removed.read().count() > 0;
     let signals = StateBroadcastSignals {
         space_changed: !active_workspace_changes.is_empty(),
         windows_changed: events.iter().any(|event| {
@@ -471,7 +476,7 @@ fn state_event_broadcast_handler(
                 .and_then(|(_, entity)| state.windows().get_tracked(entity))
                 .is_some_and(|(_, _, window_state)| window_state.is_floating())
         }),
-        window_focused: !focused_changes.is_empty(),
+        window_focused: lost_focus || !focused_changes.is_empty(),
     };
     let intent = StateBroadcastIntent::from_events(events.iter().copied(), signals);
     let raw_events = if subscribers.streams.iter().any(|subscriber| subscriber.raw) {
@@ -857,6 +862,69 @@ mod tests {
     };
     use crate::events::Event as SpoolEvent;
 
+    #[test]
+    fn subscriber_observes_focus_marker_removal_without_a_source_event() {
+        use bevy::ecs::system::RunSystemOnce as _;
+        use spool_shared_types::wire::Request;
+        let name = format!("spool-focus-projection-test-{}", std::process::id());
+        let server = spool_local_ipc::Server::bind(&name).unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = spool_local_ipc::Client::connect(&name)
+                .unwrap()
+                .subscribe(&Request::Subscribe { raw: false })
+                .unwrap();
+            let mut events = Vec::new();
+            while let Ok(event) = stream.recv_blocking() {
+                events.push(event);
+            }
+            events
+        });
+        let channel = Arc::new(server.recv_blocking().unwrap().subscriber.unwrap());
+        let mut harness = crate::tests::TestHarness::new()
+            .with_windows(1)
+            .with_focused_window(0);
+        harness.pump_frames(20);
+        let baseline = harness
+            .world()
+            .run_system_once(|state: QueryStateParams| state.extract())
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline.active.focused_window_id, Some(0));
+        harness
+            .world()
+            .resource_mut::<StateSubscribers>()
+            .streams
+            .push(Subscriber {
+                channel,
+                alive: Arc::new(AtomicBool::new(true)),
+                raw: false,
+                cache: StateBroadcastCache::from_state(&baseline),
+            });
+        let entity = crate::tests::find_window_entity(0, harness.world());
+        harness.world().entity_mut(entity).remove::<FocusedMarker>();
+        harness
+            .world()
+            .run_system_once(state_event_broadcast_handler)
+            .unwrap();
+        harness.world().entity_mut(entity).insert(FocusedMarker);
+        harness
+            .world()
+            .run_system_once(state_event_broadcast_handler)
+            .unwrap();
+        // Dropping the producer closes the stream, so a missing event cannot hang the test.
+        drop(harness);
+        let focus = client
+            .join()
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                StateEvent::WindowFocused { window_id, .. } => Some(window_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(focus, vec![None, Some(0)]);
+    }
+
     fn query_state_with_active_window(
         window_id: WinID,
         bundle_id: &str,
@@ -911,6 +979,39 @@ mod tests {
                 focused: true,
                 windows,
             }],
+        }
+    }
+
+    #[test]
+    fn focus_loss_and_return_both_invalidate_subscribers() {
+        let focused = query_state_with_active_window(1, "test", "one", 1, vec![1]);
+        let mut state = focused.clone();
+        let mut cache = StateBroadcastCache::from_state(&state);
+        state.active.focused_window_id = None;
+        state.active.focused_bundle_id = None;
+        state.active.focused_app_name = None;
+        state.active.focused_window_title = None;
+        state.spaces[0].windows[0].focused = false;
+        let intent = StateBroadcastIntent {
+            window_focused: true,
+            ..Default::default()
+        };
+        for (state, expected) in [(&state, None), (&focused, Some(1))] {
+            let outgoing =
+                collect_state_broadcast_events_for_intent(&intent, Some(state), &mut cache, |_| {
+                    None
+                });
+            assert_eq!(outgoing.len(), 1, "each focus transition must invalidate");
+            assert!(
+                matches!(outgoing[0], StateEvent::WindowFocused { window_id, .. } if window_id == expected)
+            );
+            assert!(
+                collect_state_broadcast_events_for_intent(&intent, Some(state), &mut cache, |_| {
+                    None
+                },)
+                .is_empty(),
+                "unchanged focus must remain coalesced"
+            );
         }
     }
 

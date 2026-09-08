@@ -641,7 +641,7 @@ struct SavedSpaceBuilder {
     columns: Vec<SavedColumn>,
 }
 
-/// The world access [`QueryState::extract`] needs, bundled so callers (the
+/// The world access [`QueryStateParams::extract`] needs, bundled so callers (the
 /// socket query handler, the embedded Lua runtime) take one parameter instead
 /// of six.
 type QueryWorkspaceProjection = (
@@ -671,33 +671,16 @@ impl QueryStateParams<'_, '_> {
         &self.windows
     }
 
-    /// Builds the state document from the current world.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the window manager cannot enumerate a workspace.
-    pub fn extract(&self) -> crate::errors::Result<SpoolQueryState> {
-        SpoolQueryState::extract(
-            &self.workspaces,
-            &self.displays,
-            &self.windows,
-            &self.apps,
-            &self.window_manager,
-            &self.config,
-        )
+    fn space_is_visible(&self, child: &ChildOf, strip: &LayoutStrip) -> bool {
+        self.displays
+            .get(child.parent())
+            .is_ok_and(|(display, _, _)| {
+                self.topology.visible_space(display.id()) == Some(strip.id())
+            })
     }
-}
 
-/// Reads the layout as the tree a script transforms. Unlike
-/// [`QueryState::extract`], which flattens each workspace into a list of
-/// windows, this keeps the strip's column structure — needed for `ws:swap`,
-/// `ws:east`, `ws:stack` and friends to know what is beside what.
-impl QueryStateParams<'_, '_> {
-    pub fn extract_window_set(&self) -> WindowSet {
-        use spool_shared_types::windowset::{DisplaySet, WorkspaceSet};
-
-        let focused_entity = self.windows.focused().map(|(_, entity)| entity);
-        let sliver_width = self.config.sliver_width();
+    /// Both public read models use one complete membership scan per extraction.
+    fn floating_by_space(&self) -> HashMap<WorkspaceId, Vec<Entity>> {
         let floating = self
             .windows
             .iter()
@@ -708,22 +691,44 @@ impl QueryStateParams<'_, '_> {
                     .then_some((window.id(), entity))
             })
             .collect::<HashMap<_, _>>();
-        let memberships = if floating.is_empty() {
-            None
-        } else {
-            self.topology.observe_memberships(&self.window_manager).ok()
+        if floating.is_empty() {
+            return HashMap::new();
+        }
+        let Ok(memberships) = self.topology.observe_memberships(&self.window_manager) else {
+            return HashMap::new();
         };
+        self.workspaces
+            .iter()
+            .map(|(_, strip, _, _, _)| {
+                (
+                    strip.id(),
+                    memberships
+                        .windows_in_space(strip.id())
+                        .filter_map(|id| floating.get(&id).copied())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Reads the layout as the tree a script transforms. Unlike
+/// [`QueryStateParams::extract`], which flattens each workspace into a list of
+/// windows, this keeps the strip's column structure — needed for `ws:swap`,
+/// `ws:east`, `ws:stack` and friends to know what is beside what.
+impl QueryStateParams<'_, '_> {
+    pub fn extract_window_set(&self) -> WindowSet {
+        use spool_shared_types::windowset::{DisplaySet, WorkspaceSet};
+
+        let focused_entity = self.windows.focused().map(|(_, entity)| entity);
+        let sliver_width = self.config.sliver_width();
+        let floating = self.floating_by_space();
 
         // Group the workspace strips by the display entity that owns them, so
         // each display can be built with its own workspaces in one pass.
         let mut strips_by_display: HashMap<Entity, Vec<WorkspaceSet>> = HashMap::new();
         for (child, strip, native, _, _) in self.workspaces {
-            let space_visible = self
-                .displays
-                .get(child.parent())
-                .is_ok_and(|(display, _, _)| {
-                    self.topology.visible_space(display.id()) == Some(strip.id())
-                });
+            let space_visible = self.space_is_visible(child, strip);
             let columns = strip
                 .columns()
                 .filter_map(|column| {
@@ -731,11 +736,11 @@ impl QueryStateParams<'_, '_> {
                 })
                 .collect();
             // Native membership, not visibility or a remembered strip, owns a float's Space.
-            let floating = memberships
-                .as_ref()
+            let floating = floating
+                .get(&strip.id())
                 .into_iter()
-                .flat_map(|memberships| memberships.windows_in_space(strip.id()))
-                .filter_map(|window_id| floating.get(&window_id).copied())
+                .flatten()
+                .copied()
                 .filter_map(|entity| {
                     self.window_record(entity, focused_entity, sliver_width, space_visible)
                 })
@@ -841,19 +846,39 @@ impl QueryStateParams<'_, '_> {
         sliver_width: i32,
         space_visible: bool,
     ) -> Option<WindowRec> {
+        let window = self.window_state(entity, focused, sliver_width, space_visible)?;
+        Some(WindowRec {
+            id: window.window_id,
+            app_name: window.app_name,
+            bundle_id: window.bundle_id,
+            title: window.title,
+            frame: window.frame,
+            floating: window.floating,
+            visible: window.visible,
+            focused: window.focused,
+        })
+    }
+
+    fn window_state(
+        &self,
+        entity: Entity,
+        focused: Option<Entity>,
+        sliver_width: i32,
+        space_visible: bool,
+    ) -> Option<SpoolWindowState> {
         let (window, _, state) = self.windows.get_tracked(entity)?;
         let (_, _, app_entity) = self.windows.get_parent(entity)?;
         let app = self.apps.get(app_entity).ok()?;
-        let frame = self.windows.frame(entity);
+        let frame = self.windows.observed_frame(entity);
         // Minimized and hidden windows are never on screen, whatever their last
         // known frame says.
         let hidden = !state.is_visible();
-        let visible = frame
+        let visibility = frame
             .and_then(|frame| window_visibility(frame, &self.displays, sliver_width))
-            .is_some_and(|(_, visible)| space_visible && visible && !hidden);
+            .map(|(display, visible)| (display, space_visible && visible && !hidden));
 
-        Some(WindowRec {
-            id: window.id(),
+        Some(SpoolWindowState {
+            window_id: window.id(),
             app_name: app.name().to_string(),
             bundle_id: app.bundle_id().unwrap_or_default().clone(),
             title: window.title().unwrap_or_default(),
@@ -864,47 +889,36 @@ impl QueryStateParams<'_, '_> {
                 height: frame.height(),
             }),
             floating: state.is_floating(),
-            visible,
+            display_id: visibility.map(|(display, _)| display),
+            visible: visibility.is_some_and(|(_, visible)| visible),
             focused: focused == Some(entity),
         })
     }
 }
 
-/// Projects ECS state into a public query document.
-pub trait QueryState: std::marker::Sized {
-    fn extract(
-        workspaces: &Query<QueryWorkspaceProjection>,
-        displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
-        windows: &Windows,
-        apps: &Query<&Application>,
-        window_manager: &WindowManager,
-        config: &Config,
-    ) -> crate::errors::Result<Self>;
-}
-
 /// Builds the query/subscribe state document from the ECS world.
-///
-/// A free function rather than an inherent method because [`SpoolQueryState`]
-/// belongs to the shared protocol crate, which knows nothing about the ECS.
-impl QueryState for SpoolQueryState {
+impl QueryStateParams<'_, '_> {
     #[allow(clippy::too_many_lines)]
-    fn extract(
-        workspaces: &Query<QueryWorkspaceProjection>,
-        displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
-        windows: &Windows,
-        apps: &Query<&Application>,
-        window_manager: &WindowManager,
-        config: &Config,
-    ) -> crate::errors::Result<Self> {
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "preserve the query adapter Result contract; unknown observations are represented in the payload"
+    )]
+    pub fn extract(&self) -> crate::errors::Result<SpoolQueryState> {
+        let Self {
+            workspaces,
+            displays,
+            windows,
+            window_manager,
+            config,
+            ..
+        } = self;
         let focused_entity = windows.focused().map(|(_, entity)| entity);
         let sliver_width = config.sliver_width();
+        let floating = self.floating_by_space();
 
         let active_display = displays
             .iter()
             .find_map(|(display, entity, active)| active.then_some((display.id(), entity)));
-        let active_workspace_id = workspaces
-            .iter()
-            .find_map(|(_, strip, _, active, _)| active.then_some(strip.id()));
 
         let mut windows_by_space: HashMap<WorkspaceId, Vec<SpoolWindowState>> = HashMap::new();
         let mut active = SpoolActiveState {
@@ -912,56 +926,20 @@ impl QueryState for SpoolQueryState {
             ..SpoolActiveState::default()
         };
 
-        for (child, strip, _, active_workspace, visible_space) in workspaces {
-            let floating =
-                if active_workspace || visible_space && active_workspace_id != Some(strip.id()) {
-                    window_manager
-                        .windows_in_workspace(strip.id())
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
-                .into_iter()
-                .filter_map(|window_id| {
-                    let (_, entity) = windows.find(window_id)?;
-                    let (_, _, state) = windows.get_tracked(entity)?;
-                    (state.is_floating() && state.is_visible() && !strip.contains(entity))
-                        .then_some(entity)
-                });
+        for (child, strip, _, active_workspace, _) in workspaces {
+            let space_visible = self.space_is_visible(child, strip);
+            let floating = floating.get(&strip.id()).into_iter().flatten().copied();
             let row_windows = strip
                 .all_windows()
                 .into_iter()
+                .filter(|&entity| {
+                    windows
+                        .get_tracked(entity)
+                        .is_some_and(|(_, _, state)| state.is_tiled())
+                })
                 .chain(floating)
                 .filter_map(|entity| {
-                    let (window, _, state) = windows.get_tracked(entity)?;
-                    let (_, _, app_entity) = windows.get_parent(entity)?;
-                    let app = apps.get(app_entity).ok()?;
-                    let bundle_id = app.bundle_id().unwrap_or_default().clone();
-                    let app_name = app.name().to_string();
-                    let title = window.title().unwrap_or_default();
-                    let frame = windows.frame(entity);
-                    // Minimized and hidden windows are never on screen, whatever
-                    // their last known frame says.
-                    let hidden = !state.is_visible();
-                    let visibility = frame
-                        .and_then(|frame| window_visibility(frame, displays, sliver_width))
-                        .map(|(display_id, visible)| (display_id, visible && !hidden));
-                    Some(SpoolWindowState {
-                        window_id: window.id(),
-                        bundle_id,
-                        app_name,
-                        title,
-                        focused: focused_entity == Some(entity),
-                        floating: state.is_floating(),
-                        display_id: visibility.map(|(display_id, _)| display_id),
-                        frame: frame.map(|frame| Frame {
-                            x: frame.min.x,
-                            y: frame.min.y,
-                            width: frame.width(),
-                            height: frame.height(),
-                        }),
-                        visible: visibility.is_some_and(|(_, visible)| visible),
-                    })
+                    self.window_state(entity, focused_entity, sliver_width, space_visible)
                 })
                 .collect::<Vec<_>>();
 
@@ -997,8 +975,9 @@ impl QueryState for SpoolQueryState {
             .collect::<HashMap<_, _>>();
         let visible_spaces = workspaces
             .iter()
-            .filter_map(|(child, strip, _, _, visible)| {
-                visible.then_some((child.parent(), strip.id()))
+            .filter_map(|(child, strip, _, _, _)| {
+                self.space_is_visible(child, strip)
+                    .then_some((child.parent(), strip.id()))
             })
             .collect::<HashMap<_, _>>();
         let mut display_states = displays
@@ -1012,7 +991,7 @@ impl QueryState for SpoolQueryState {
         display_states.sort_by_key(|display| display.display_id);
 
         let mut spaces = Vec::new();
-        for (child, strip, native, _, visible) in workspaces {
+        for (child, strip, native, _, _) in workspaces {
             let Some(display_id) = display_ids.get(&child.parent()).copied() else {
                 continue;
             };
@@ -1027,7 +1006,7 @@ impl QueryState for SpoolQueryState {
                 display_id,
                 ordinal: native.ordinal,
                 kind: native.kind,
-                visible,
+                visible: self.space_is_visible(child, strip),
                 focused: active.space_id == Some(strip.id()),
                 windows: space_windows,
             });

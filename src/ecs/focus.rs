@@ -377,6 +377,17 @@ impl FocusCoordinator {
             .and_then(|memory| memory.tiled.last())
     }
 
+    pub(crate) fn last_tiled_matching(
+        &self,
+        workspace: WorkspaceId,
+        eligible: impl FnMut(Entity) -> bool,
+    ) -> Option<Entity> {
+        self.by_workspace
+            .get(&workspace)?
+            .tiled
+            .newest_matching(eligible)
+    }
+
     pub(crate) fn last_floating(&self, workspace: WorkspaceId) -> Option<Entity> {
         self.by_workspace
             .get(&workspace)
@@ -460,7 +471,7 @@ fn maintain_focus_singleton(_trigger: On<Add, FocusedMarker>, mut config: Global
     config.set_ffm_flag(None);
 }
 
-fn project_confirmed_focus(
+pub(crate) fn project_confirmed_focus(
     coordinator: Res<FocusCoordinator>,
     windows: Query<(Entity, Has<FocusedMarker>), With<Window>>,
     mut commands: Commands,

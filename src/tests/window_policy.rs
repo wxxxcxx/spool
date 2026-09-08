@@ -39,16 +39,22 @@ fn assert_tiled(harness: &mut TestHarness, id: WinID) {
 #[test]
 fn new_window_inserts_after_previous_focus_when_it_takes_focus_before_placement() {
     for anchor in 0..3 {
-        assert_new_window_insertion(anchor, None);
+        assert_new_window_insertion(anchor, None, false);
     }
 }
 
 #[test]
 fn explicit_new_window_index_overrides_focus_anchor() {
-    assert_new_window_insertion(1, Some(0));
+    assert_new_window_insertion(1, Some(0), false);
 }
 
-fn assert_new_window_insertion(anchor: WinID, insertion: Option<usize>) {
+#[test]
+fn new_window_searches_past_a_minimized_focus_anchor() {
+    assert_new_window_insertion(0, None, true);
+    assert_new_window_insertion(0, Some(0), true);
+}
+
+fn assert_new_window_insertion(anchor: WinID, insertion: Option<usize>, minimize_recent: bool) {
     let config = insertion.map_or_else(Config::default, |index| {
         Config::try_from(
             format!(r#"{{"windows":{{"new":{{"title":"Window 3","index":{index}}}}}}}"#).as_str(),
@@ -60,6 +66,17 @@ fn assert_new_window_insertion(anchor: WinID, insertion: Option<usize>) {
     harness.mock_state.focus_window(anchor);
     harness.world().write_message(Event::window_focused(anchor));
     harness.pump_frames(5);
+    if minimize_recent {
+        harness.mock_state.focus_window(1);
+        harness.world().write_message(Event::window_focused(1));
+        harness.pump_frames(5);
+        let recent = find_window_entity(1, harness.world());
+        harness
+            .world()
+            .entity_mut(recent)
+            .insert(crate::ecs::WindowVisibility::Minimized);
+        harness.world().flush();
+    }
     let window = harness.mock_state.spawn_window(
         TEST_PROCESS_ID,
         TEST_WORKSPACE_ID,

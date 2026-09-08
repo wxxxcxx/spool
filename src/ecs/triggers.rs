@@ -2020,14 +2020,19 @@ pub(super) fn apply_window_positions(
                 || {
                     // Native focus may already belong to the new window before
                     // it has a column. Retain the owning Space's tiled anchor.
+                    let eligible = |entity| {
+                        strip.contains(entity)
+                            && ctx
+                                .windows
+                                .get_tracked(entity)
+                                .is_some_and(|(_, _, state)| state.is_tiled() && state.is_visible())
+                    };
                     ctx.windows
                         .focused()
-                        .and_then(|(_, entity)| strip.index_of(entity).ok())
-                        .or_else(|| {
-                            focus
-                                .last_tiled(workspace_id)
-                                .and_then(|entity| strip.index_of(entity).ok())
-                        })
+                        .map(|(_, entity)| entity)
+                        .filter(|&entity| eligible(entity))
+                        .or_else(|| focus.last_tiled_matching(workspace_id, eligible))
+                        .and_then(|entity| strip.index_of(entity).ok())
                         .map(|index| index + 1)
                 },
                 Some,

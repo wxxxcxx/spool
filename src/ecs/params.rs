@@ -524,6 +524,13 @@ impl Windows<'_, '_> {
             .map(|(_, _, _, _, _, _, ratio, _, _)| ratio.0)
     }
 
+    /// Physical facts never fall back to an animation sample or layout intent.
+    pub(crate) fn observed_frame(&self, entity: Entity) -> Option<IRect> {
+        let (_, _, _, observed, _, _, _, _, _) = self.positions.get(entity).ok()?;
+        observed.map(|frame| frame.0)
+    }
+
+    /// Best available geometry for legacy layout calculations, not a physical fact.
     pub fn frame(&self, entity: Entity) -> Option<IRect> {
         self.positions
             .get(entity)

@@ -1073,6 +1073,42 @@ fn failed_geometry_setter_and_followup_read_invalidate_the_overlay_projection() 
         harness.world().get::<ObservedWindowFrame>(entity).is_none(),
         "without a confirmed follow-up read, the overlay must not retain stale geometry"
     );
+    let (query, snapshot) = harness
+        .world()
+        .run_system_once(|state: crate::ecs::state::QueryStateParams| {
+            (state.extract().unwrap(), state.extract_window_set())
+        })
+        .unwrap();
+    let published = query
+        .spaces
+        .iter()
+        .flat_map(|space| &space.windows)
+        .find(|window| window.window_id == 0)
+        .unwrap();
+    assert!(
+        published.frame.is_none(),
+        "failed readback must not publish an unconfirmed frame"
+    );
+    assert!(!published.visible);
+    assert!(snapshot.window(0).unwrap().frame.is_none());
+    assert!(!snapshot.window(0).unwrap().visible);
+    harness.pump_frames(15);
+    let query = harness
+        .world()
+        .run_system_once(|state: crate::ecs::state::QueryStateParams| state.extract())
+        .unwrap()
+        .unwrap();
+    assert!(
+        query
+            .spaces
+            .iter()
+            .flat_map(|space| &space.windows)
+            .find(|window| window.window_id == 0)
+            .unwrap()
+            .frame
+            .is_some(),
+        "successful readback restores public geometry"
+    );
 }
 
 #[test]

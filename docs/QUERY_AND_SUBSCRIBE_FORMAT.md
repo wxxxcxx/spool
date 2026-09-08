@@ -114,6 +114,17 @@ not require SIP to be disabled.
 A window contains `window_id`, `bundle_id`, `app_name`, `title`, `focused`,
 `floating`, `display_id`, `frame`, and `visible`.
 
+`frame` contains only successfully observed native geometry. If readback is
+unavailable it is `null`, never an animation target or layout estimate, and
+`visible` is false. Visibility additionally requires the window's native Space
+to be observed visible; screen intersection alone is insufficient.
+
+Floating windows on inactive Spaces, or hidden/minimized floating windows,
+remain in the complete state when their available identity and unique native
+membership can be established. Failed or ambiguous membership observations
+temporarily omit those entries without retiring the tracked identity. Query
+and Lua WindowSet use the same membership and window projection policy.
+
 ## Events
 
 `subscribe --json` prints one JSON object per line. Event names and payloads
@@ -131,6 +142,10 @@ are:
 
 Optional fields may be `null`. Consumers should ignore unknown fields and
 events so minor additions remain forward compatible.
+
+`window_focused` also reports loss of tracked focus with `window_id: null`.
+Returning to the previously focused window is a new change, not a duplicate
+of the state before focus was lost.
 
 `windows_changed` excludes focus, title and frame-only changes.
 `on_screen_changed` means visible membership or display assignment changed; it

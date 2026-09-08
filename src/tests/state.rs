@@ -142,6 +142,33 @@ fn layout_snapshot(harness: &mut TestHarness) -> spool_shared_types::windowset::
         .unwrap()
 }
 
+fn assert_query_window_matches_snapshot(harness: &mut TestHarness, id: crate::platform::WinID) {
+    let snapshot = layout_snapshot(harness);
+    let expected = snapshot.window(id).expect("snapshot window");
+    let state = harness
+        .world()
+        .run_system_once(extract_query_state)
+        .unwrap()
+        .unwrap();
+    let window = state
+        .spaces
+        .iter()
+        .flat_map(|space| &space.windows)
+        .find(|window| window.window_id == id)
+        .expect("query window");
+    assert_eq!(window.visible, expected.visible);
+    assert_eq!(window.frame, expected.frame);
+    assert_eq!(window.floating, expected.floating);
+    assert_eq!(window.focused, expected.focused);
+    assert_eq!(
+        state
+            .on_screen()
+            .iter()
+            .any(|window| window.window_id == id),
+        expected.visible
+    );
+}
+
 #[test]
 fn window_set_includes_floating_windows_on_inactive_spaces() {
     let mut harness = floating_snapshot_harness(FLOAT_SPACE);
@@ -153,6 +180,7 @@ fn window_set_includes_floating_windows_on_inactive_spaces() {
     assert!(snapshot.window(1).unwrap().floating);
     assert!(!snapshot.window(1).unwrap().visible);
     assert!(snapshot.workspace(FLOAT_SPACE).unwrap().columns.is_empty());
+    assert_query_window_matches_snapshot(&mut harness, 1);
 }
 
 #[test]
@@ -170,6 +198,7 @@ fn window_set_does_not_mark_inactive_tiled_windows_visible_from_geometry_alone()
     assert_eq!(snapshot.workspace_of(1).unwrap().space_id, FLOAT_SPACE);
     assert!(!snapshot.window(1).unwrap().visible);
     assert!(snapshot.window(0).unwrap().visible);
+    assert_query_window_matches_snapshot(&mut harness, 1);
 }
 
 #[test]
@@ -184,6 +213,7 @@ fn window_set_keeps_hidden_floating_records_without_marking_them_visible() {
     let window = snapshot.window(1).expect("hidden window is still tracked");
     assert!(window.floating);
     assert!(!window.visible);
+    assert_query_window_matches_snapshot(&mut harness, 1);
 }
 
 #[test]
@@ -274,11 +304,76 @@ fn window_set_distinguishes_known_membership_from_unknown_visibility() {
     );
     assert!(!snapshot.window(1).unwrap().visible);
     assert!(!snapshot.window(0).unwrap().visible);
+    assert_query_window_matches_snapshot(&mut harness, 0);
+    assert_query_window_matches_snapshot(&mut harness, 1);
     harness
         .world()
         .run_system_once(crate::ecs::topology::gather_initial_topology)
         .unwrap();
     assert!(layout_snapshot(&mut harness).window(1).unwrap().visible);
+    assert_query_window_matches_snapshot(&mut harness, 1);
+}
+
+#[test]
+fn public_query_requires_complete_unique_floating_membership() {
+    for other_members in [Ok(vec![1]), Err(())] {
+        let mut harness = floating_snapshot_harness(TEST_WORKSPACE_ID);
+        let frame = harness.mock_state.actual_window_frame(1);
+        let writes = harness.mock_state.frame_write_attempts(1);
+        harness
+            .mock_state
+            .script_workspace_membership_queries(TEST_WORKSPACE_ID, [Ok(vec![0, 1])]);
+        harness
+            .mock_state
+            .script_workspace_membership_queries(FLOAT_SPACE, [other_members]);
+        let query = harness
+            .world()
+            .run_system_once(extract_query_state)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !query
+                .spaces
+                .iter()
+                .flat_map(|space| &space.windows)
+                .any(|window| window.window_id == 1)
+        );
+        assert!(
+            query
+                .spaces
+                .iter()
+                .flat_map(|space| &space.windows)
+                .any(|window| window.window_id == 0)
+        );
+        assert_eq!(harness.mock_state.actual_window_frame(1), frame);
+        assert_eq!(harness.mock_state.frame_write_attempts(1), writes);
+        assert_query_window_matches_snapshot(&mut harness, 1);
+    }
+}
+
+#[test]
+fn public_query_uses_native_floating_membership_instead_of_a_retained_column() {
+    let mut harness = floating_snapshot_harness(FLOAT_SPACE);
+    let entity = crate::tests::find_window_entity(1, harness.world());
+    let world = harness.world();
+    world
+        .query::<&mut LayoutStrip>()
+        .iter_mut(world)
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .unwrap()
+        .append(entity);
+    let query = harness
+        .world()
+        .run_system_once(extract_query_state)
+        .unwrap()
+        .unwrap();
+    let owners = query
+        .spaces
+        .iter()
+        .filter(|space| space.windows.iter().any(|window| window.window_id == 1))
+        .map(|space| space.space_id)
+        .collect::<Vec<_>>();
+    assert_eq!(owners, vec![FLOAT_SPACE]);
 }
 
 #[test]

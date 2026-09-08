@@ -263,7 +263,24 @@ mod tests {
         state.extract().unwrap()
     }
 
+    fn original_space(state: &BarSnapshot) -> &BarSpace {
+        state.displays[0]
+            .spaces
+            .iter()
+            .find(|space| space.id == TEST_WORKSPACE_ID)
+            .unwrap()
+    }
+
     fn hide_space(harness: &mut TestHarness) {
+        harness.mock_state.activate_workspace(
+            crate::tests::TEST_DISPLAY_ID,
+            TEST_WORKSPACE_ID + 1,
+            false,
+        );
+        harness
+            .world()
+            .run_system_once(crate::ecs::topology::gather_initial_topology)
+            .unwrap();
         let entity = harness
             .world()
             .query::<(bevy::prelude::Entity, &LayoutStrip)>()
@@ -292,7 +309,7 @@ mod tests {
         }
         hide_space(&mut harness);
         let state = harness.world().run_system_once(snapshot).unwrap();
-        let space = &state.displays[0].spaces[0];
+        let space = original_space(&state);
         assert!(!space.visible);
         assert_eq!(
             space.windows().map(|window| window.id).collect::<Vec<_>>(),
@@ -339,7 +356,7 @@ mod tests {
         hide_space(&mut harness);
         let state = harness.world().run_system_once(snapshot).unwrap();
         assert_eq!(
-            state.displays[0].spaces[0]
+            original_space(&state)
                 .floating
                 .iter()
                 .map(|window| window.id)
@@ -357,9 +374,9 @@ mod tests {
         harness.pump_frames(2);
         hide_space(&mut harness);
         let state = harness.world().run_system_once(snapshot).unwrap();
-        assert_eq!(state.displays[0].spaces[0].windows().count(), 2);
+        assert_eq!(original_space(&state).windows().count(), 2);
         assert!(
-            state.displays[0].spaces[0]
+            original_space(&state)
                 .windows()
                 .all(|window| !window.focused && !window.visible)
         );
@@ -375,7 +392,7 @@ mod tests {
         hide_space(&mut harness);
         let state = harness.world().run_system_once(snapshot).unwrap();
         assert_eq!(
-            state.displays[0].spaces[0]
+            original_space(&state)
                 .windows()
                 .map(|window| window.id)
                 .collect::<Vec<_>>(),
@@ -433,7 +450,7 @@ mod tests {
             assert!(harness.world().get::<WindowUnavailable>(entity).is_some());
             let state = harness.world().run_system_once(snapshot).unwrap();
             assert_eq!(
-                state.displays[0].spaces[0]
+                original_space(&state)
                     .windows()
                     .map(|window| window.id)
                     .collect::<Vec<_>>(),
@@ -448,7 +465,7 @@ mod tests {
             harness.world().write_message(Event::SpaceChanged);
             harness.pump_frames(2);
             let state = harness.world().run_system_once(snapshot).unwrap();
-            assert_eq!(state.displays[0].spaces[0].windows().count(), 2);
+            assert_eq!(original_space(&state).windows().count(), 2);
             assert_eq!(find_window_entity(1, harness.world()), entity);
         }
     }
