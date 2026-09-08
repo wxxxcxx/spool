@@ -68,6 +68,12 @@ can still use the requested or last navigation window while AX focus resolves.
 
 ### Capture steps
 
+For stale Bar icons, enable `spool::bar=debug` on the daemon. The
+`bar_window_identities` record lists `(display_id, space_id, window_id)` only
+when that list changes. It includes read-only fallback icons but no titles.
+Compare this presentation list with `query state`: unavailable tracked windows
+can retain layout identity while no longer being actionable or shown in the Bar.
+
 1. Save `spool log --tail 300` before restarting anything.
 2. Run `spool log -f --tail 100`, reproduce once, and record the time and symptom.
 3. Capture `spool query state --json` and, when relevant,

@@ -85,23 +85,33 @@ impl BarStateParams<'_, '_> {
                         }
                     })
                     .ok();
-                if let Some(strip) = strips.get(&space.id) {
-                    self.project_windows(space, strip, &floating, membership.as_ref());
-                }
                 // The broad membership list also contains retained, ordered-out
                 // surfaces (for example Calendar after its last window closes).
-                // Keep that list for tracked windows, never for unknown icons.
-                let presented = self
+                // A failed query is not evidence that tracked windows vanished.
+                let presented = match self
                     .window_manager
                     .presentation_windows_in_workspace(space.id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect::<HashSet<_>>();
+                {
+                    Ok(ids) => Some(ids.into_iter().collect::<HashSet<_>>()),
+                    Err(crate::errors::Error::NotFound(_)) => Some(HashSet::new()),
+                    Err(_) => None,
+                };
+                if let Some(strip) = strips.get(&space.id) {
+                    self.project_windows(
+                        space,
+                        strip,
+                        &floating,
+                        membership.as_ref(),
+                        presented.as_ref(),
+                    );
+                }
                 space.unresolved = membership
                     .iter()
                     .flatten()
                     .filter_map(|id| {
-                        if tracked.contains(id) || !presented.contains(id) {
+                        if tracked.contains(id)
+                            || !presented.as_ref().is_some_and(|ids| ids.contains(id))
+                        {
                             return None;
                         }
                         let pid = *owners.get(id)?;
@@ -132,6 +142,7 @@ impl BarStateParams<'_, '_> {
         strip: &LayoutStrip,
         floating: &[Entity],
         membership: Option<&HashSet<i32>>,
+        presented: Option<&HashSet<i32>>,
     ) {
         let known = space
             .windows()
@@ -147,7 +158,9 @@ impl BarStateParams<'_, '_> {
                             .get(*entity)
                             .is_ok_and(|(_, _, _, floating, _, _, _)| !floating)
                     })
-                    .filter_map(|entity| self.window_record(entity, space.visible, &known))
+                    .filter_map(|entity| {
+                        self.window_record(entity, space.visible, &known, presented)
+                    })
                     .collect::<Vec<_>>();
                 if windows.is_empty() {
                     return None;
@@ -189,7 +202,7 @@ impl BarStateParams<'_, '_> {
                     )
                 })
             })
-            .filter_map(|entity| self.window_record(entity, space.visible, &known))
+            .filter_map(|entity| self.window_record(entity, space.visible, &known, presented))
             .collect();
     }
 
@@ -198,8 +211,15 @@ impl BarStateParams<'_, '_> {
         entity: Entity,
         space_visible: bool,
         known: &HashMap<i32, BarWindow>,
+        presented: Option<&HashSet<i32>>,
     ) -> Option<BarWindow> {
         let (window, _, parent, _, focused, unavailable, hidden) = self.windows.get(entity).ok()?;
+        // Cmd-W may withdraw AX and order out a retained native surface without
+        // destroying its ID. Preserve its layout identity, not a phantom icon.
+        // Minimized/hidden windows and uncertain native queries retain icons.
+        if unavailable && !hidden && presented.is_some_and(|ids| !ids.contains(&window.id())) {
+            return None;
+        }
         let (_, app) = self.apps.get(parent.parent()).ok()?;
         Some(BarWindow {
             id: window.id(),
@@ -351,6 +371,92 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0]
         );
+    }
+
+    #[test]
+    fn closed_retained_surface_has_no_bar_icon_and_can_return() {
+        for collapsed in [false, true] {
+            let mut harness = TestHarness::new().with_windows(2);
+            harness.pump_frames(15);
+            let entity = find_window_entity(1, harness.world());
+            // Ghostty and OPPO retain a normal-layer opaque surface after Cmd-W,
+            // but remove the window from both AX and ordered Space membership.
+            harness.mock_state.update_window(1, |window| {
+                window.visible = false;
+                window.ordered_out = true;
+            });
+            harness.mock_state.os_withdraw_window(1);
+            harness.world().write_message(Event::SpaceChanged);
+            harness.pump_frames(2);
+            if collapsed {
+                hide_space(&mut harness);
+            }
+            assert!(harness.world().get::<WindowUnavailable>(entity).is_some());
+            let state = harness.world().run_system_once(snapshot).unwrap();
+            assert_eq!(
+                state.displays[0].spaces[0]
+                    .windows()
+                    .map(|window| window.id)
+                    .collect::<Vec<_>>(),
+                vec![0],
+                "closed retained surface remained in the Bar (collapsed={collapsed})"
+            );
+            harness.mock_state.os_restore_withdrawn_window(1);
+            harness.mock_state.update_window(1, |window| {
+                window.visible = true;
+                window.ordered_out = false;
+            });
+            harness.world().write_message(Event::SpaceChanged);
+            harness.pump_frames(2);
+            let state = harness.world().run_system_once(snapshot).unwrap();
+            assert_eq!(state.displays[0].spaces[0].windows().count(), 2);
+            assert_eq!(find_window_entity(1, harness.world()), entity);
+        }
+    }
+
+    #[test]
+    fn unavailable_minimized_and_hidden_windows_keep_bar_icons() {
+        for visibility in [WindowVisibility::Minimized, WindowVisibility::Hidden] {
+            let mut harness = TestHarness::new().with_windows(2);
+            harness.pump_frames(15);
+            let entity = find_window_entity(1, harness.world());
+            harness.mock_state.update_window(1, |window| {
+                window.visible = false;
+                window.ordered_out = true;
+            });
+            harness.mock_state.os_withdraw_window(1);
+            harness.world().write_message(Event::SpaceChanged);
+            harness.pump_frames(2);
+            harness.world().entity_mut(entity).insert(visibility);
+            let state = harness.world().run_system_once(snapshot).unwrap();
+            assert_eq!(state.displays[0].spaces[0].windows().count(), 2);
+        }
+    }
+
+    #[test]
+    fn failed_presentation_inventory_keeps_unavailable_bar_identity() {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.pump_frames(15);
+        let entity = find_window_entity(0, harness.world());
+        harness.mock_state.update_window(0, |window| {
+            window.visible = false;
+            window.ordered_out = true;
+        });
+        harness.mock_state.os_withdraw_window(0);
+        harness.world().write_message(Event::SpaceChanged);
+        harness.pump_frames(2);
+        harness
+            .world()
+            .run_system_once(move |state: BarStateParams| {
+                let known = HashMap::new();
+                assert!(state.window_record(entity, true, &known, None).is_some());
+                assert!(
+                    state
+                        .window_record(entity, true, &known, Some(&HashSet::new()))
+                        .is_none()
+                );
+            })
+            .unwrap();
     }
 
     #[test]
