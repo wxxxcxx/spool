@@ -19,10 +19,12 @@
 | --- | --- | --- |
 | 应用是否可能有窗口 | Regular、Accessory；明确 bundle 的 `track=true` 可扩大进程观察范围 | Accessory 不等于默认 float |
 | 是否跟踪具体窗口 | 有效 AX 窗口 ID、role/subrole、已知父关系、准入规则 | 无截图、不能 resize、不可见不等于应忽略 |
-| 默认布局意图 | 既有恢复语义、用户规则；无偏好时尝试 tile | Settings 标题不是核心用途分类 |
+| 默认布局意图 | 既有恢复语义、用户规则；兜底准入默认 float，其余无偏好时尝试 tile | Settings 标题不是核心用途分类 |
 | 此刻能否执行 | backend 能力，加已有可用性、全屏、可见性和 Space 迁移保护 | AX 报错不等于永久不支持 |
 
 Floating Window 仍是 Tracked Window，参与现有查询和聚焦流程，不占 strip 栏位。窗口身份与导航视图应否显示它仍是两个问题。
+
+新平铺窗口默认插入所属 Space 当前焦点所在列之后。若原生焦点已先切到尚未入列的新窗口，则使用该 Space 最近的有效平铺焦点；只有没有有效锚点时才追加到末尾。显式 `index` 与已应用的会话恢复位置保留优先级，不从其他 Space 借用锚点。浮动窗口不参与列插入。
 
 ## 准入契约
 
@@ -31,6 +33,20 @@ Floating Window 仍是 Tracked Window，参与现有查询和聚焦流程，不�
 3. 默认接收 `AXWindow` 下的 `AXStandardWindow`、`AXFloatingWindow`、`AXDialog`、`AXSystemDialog`。独立 dialog 不再仅因 subrole 被排除，也不因此在核心里默认 float。
 4. 已确认 AXParent role 为 `AXWindow`、`AXSheet`、`AXDrawer` 时，不另建独立跟踪项。父属性不可用不等于已证明是子窗口：以 AX 窗口列表为基础，不把缺失父属性作为全局否决条件。
 5. role/subrole 读取失败与实际返回非标准值不同。元数据或必要规则匹配尚未确定时暂缓准入；应用 inventory 保留原始身份供核对，不把它当作窗口销毁。
+
+### 非标准窗口兜底（2026-09-08）
+
+在上述标准准入之外，非标准 subrole 的 `AXWindow` 可通过通用证据纳入，不按 Finder bundle、标题或 `Quick Look` 字符串开特例：父级明确为 `AXApplication`，AX 位置有限、尺寸有限且为正，WindowServer 当前屏幕列表中存在同 ID 的正常层或原生浮动层（layer 0 / `kCGFloatingWindowLevel`）、正 alpha surface，并且 AX 关闭或最小化按钮至少存在一个。按钮不存在与通信失败分别记为否定和未知；缺少必要证据则暂缓，不猜测可交互性。
+
+兜底窗口携带默认浮动偏好，参与既有查询、Bar、焦点与 overlay 目标选择，不占 strip 栏位。显式 `floating=false` 或手动平铺可覆盖此偏好，但不能绕过移动/缩放能力。`track=false`、非窗口控件、已知附属窗口仍不能通过按钮兜底放行；显式 `track=true` 保留原有语义。
+
+AXWindows 枚举与分步补充发现共享判定；附加属性仅对需要兜底的候选读取，后者每步至多一次同步 AX 调用。屏幕 surface 只用于新兜底身份的准入，不是窗口存活规则：已跟踪窗口后续隐藏、最小化或短暂丢失属性时，仍通过原始 AX 身份进行生命周期对账。首次发现时不在屏幕上的非标准窗口需等到可见后再纳入。
+
+这不是 DockDoor 最终显示过滤器的完整移植，也没有修改 overlay 的原生层级；未聚焦预览仍可见时的遮挡须另做真实桌面验收。
+
+原生 Space 枚举另补充独立浮动 surface：候选必须已经由对应 Space 的原生列表返回、无原生父窗口、有窗口属性与浮动标签，再由 CoreGraphics 确认浮动层、正 alpha 和有效身份。此步骤只补足旧普通窗口标签过滤漏掉的成员，不直接授予跟踪资格，也不猜测当前 Space。每次 Space 枚举有此类候选时至多增加一次 CoreGraphics 列表读取。2026-09-08 现场 Quick Look 的 `parent=0, attributes=0x2, tags=0x1000c2802` 属于 Space 1，但旧过滤返回 false。
+
+现场验收还覆盖关闭和重新打开：窗口 325 关闭后从可见状态移除，重开后以 `floating=true` 再次投影。焦点可能先于准入到达，因此此前记录为 Untracked 的同 ID 后续出现 tracked entity 时必须重验；对账不选择不可用的旧实例，并优先匹配当前确认的实例。已确认 Finder 原生焦点、Spool 焦点和 overlay 目标均能指向 325。这里验证的是目标选择和生命周期，不等于所有多显示器、后台浮动预览遮挡或动画场景均已验收。
 
 AX 列表和私有 WindowServer 列表提供互补发现证据。后者为空或失败不再否决前者；补找窗口按 ID 差集计算，不用数量相同代替身份相同。已启动但暂时无窗口的应用保留观察，后续由通知和 inventory reconciliation 发现窗口，不再因五秒内没有窗口而清理应用。
 

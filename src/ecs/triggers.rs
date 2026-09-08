@@ -1534,8 +1534,12 @@ pub(super) fn spawn_window_trigger(mut trigger: On<SpawnWindowTrigger>, mut ctx:
 
         // Pending capability/rule reads retain identity without reserving a
         // column. The defaults transaction will retry and decide placement.
-        let starts_floating = WindowProperties::new(&app, &window, &ctx.config).pending
-            || window.layout_decision(false) != LayoutDecision::Tile;
+        let properties = WindowProperties::new(&app, &window, &ctx.config);
+        // Preserve the existing restore-before-rules transaction for ordinary
+        // windows; only fallback admission adds an initial floating preference.
+        let starts_floating = properties.pending
+            || window.layout_decision(window.default_floating() && properties.floating())
+                != LayoutDecision::Tile;
 
         log_spawned_window(&window);
 
@@ -2014,14 +2018,17 @@ pub(super) fn apply_window_positions(
             // Attempt inserting the window at a pre-defined position.
             let insert_at = properties.insertion().map_or_else(
                 || {
-                    // Otherwise attempt inserting it after the current focus.
-                    let focused_window = ctx.windows.focused();
-                    // Insert to the right of the currently focused window
-                    focused_window
+                    // Native focus may already belong to the new window before
+                    // it has a column. Retain the owning Space's tiled anchor.
+                    ctx.windows
+                        .focused()
                         .and_then(|(_, entity)| strip.index_of(entity).ok())
-                        .and_then(|insert_at| {
-                            (insert_at + 1 < strip.len()).then_some(insert_at + 1)
+                        .or_else(|| {
+                            focus
+                                .last_tiled(workspace_id)
+                                .and_then(|entity| strip.index_of(entity).ok())
                         })
+                        .map(|index| index + 1)
                 },
                 Some,
             );

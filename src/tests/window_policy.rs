@@ -37,6 +37,124 @@ fn assert_tiled(harness: &mut TestHarness, id: WinID) {
 }
 
 #[test]
+fn new_window_inserts_after_previous_focus_when_it_takes_focus_before_placement() {
+    for anchor in 0..3 {
+        assert_new_window_insertion(anchor, None);
+    }
+}
+
+#[test]
+fn explicit_new_window_index_overrides_focus_anchor() {
+    assert_new_window_insertion(1, Some(0));
+}
+
+fn assert_new_window_insertion(anchor: WinID, insertion: Option<usize>) {
+    let config = insertion.map_or_else(Config::default, |index| {
+        Config::try_from(
+            format!(r#"{{"windows":{{"new":{{"title":"Window 3","index":{index}}}}}}}"#).as_str(),
+        )
+        .unwrap()
+    });
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.pump_frames(20);
+    harness.mock_state.focus_window(anchor);
+    harness.world().write_message(Event::window_focused(anchor));
+    harness.pump_frames(5);
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        3,
+        IRect::new(0, 0, 400, 400),
+    );
+    harness
+        .world()
+        .trigger(crate::ecs::SpawnWindowTrigger::new(vec![window]));
+    harness.world().flush();
+    let new = find_window_entity(3, harness.world());
+    harness.mock_state.focus_window(3);
+    harness.world().write_message(Event::window_focused(3));
+    // AX may confirm the new focus before defaults insert its column.
+    let world = harness.world();
+    let marked = world
+        .query_filtered::<Entity, With<crate::ecs::FocusedMarker>>()
+        .iter(world)
+        .collect::<Vec<_>>();
+    for entity in marked {
+        world
+            .entity_mut(entity)
+            .remove::<crate::ecs::FocusedMarker>();
+    }
+    world.entity_mut(new).insert(crate::ecs::FocusedMarker);
+    harness.pump_frames(20);
+    let first = find_window_entity(anchor, harness.world());
+    let world = harness.world();
+    let strip = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .unwrap();
+    let expected = insertion.unwrap_or_else(|| strip.index_of(first).unwrap() + 1);
+    assert_eq!(strip.index_of(new).unwrap(), expected);
+}
+
+#[test]
+fn window_policy_fallback_defaults_to_float_without_geometry_writes() {
+    let mut harness = TestHarness::new().with_window(1, |window| {
+        window.subrole = "Quick Look".into();
+        window.default_floating = true;
+    });
+    harness.pump_frames(30);
+    assert_outside_layout(&mut harness, 1);
+    assert_eq!(harness.mock_state.frame_write_attempts(1), 0);
+}
+
+#[test]
+fn window_policy_explicit_rule_overrides_fallback_float() {
+    let config =
+        Config::try_from(r#"{"windows":{"preview":{"subrole":"Quick Look","floating":false}}}"#)
+            .unwrap();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_window(1, |window| {
+            window.subrole = "Quick Look".into();
+            window.default_floating = true;
+        });
+    harness.pump_frames(30);
+    assert_tiled(&mut harness, 1);
+}
+
+#[test]
+fn window_policy_manual_retile_overrides_fallback_float() {
+    let mut harness = TestHarness::new().with_window(1, |window| {
+        window.subrole = "Quick Look".into();
+        window.default_floating = true;
+    });
+    harness.pump_frames(30);
+    let entity = assert_outside_layout(&mut harness, 1);
+    harness.world().trigger(RetileWindow(entity));
+    harness.pump_frames(30);
+    assert_tiled(&mut harness, 1);
+}
+
+#[test]
+fn window_policy_fallback_identity_survives_missing_admission_candidate() {
+    let mut harness = TestHarness::new().with_window(1, |window| {
+        window.subrole = "Quick Look".into();
+        window.default_floating = true;
+    });
+    harness.pump_frames(30);
+    let entity = assert_outside_layout(&mut harness, 1);
+    // The mock inventory retains the raw AX identity but omits this candidate.
+    harness.mock_state.update_window(1, |window| {
+        window.role = "AXUnknown".into();
+        window.ordered_out = true;
+    });
+    harness.pump_frames(80);
+    assert_eq!(assert_outside_layout(&mut harness, 1), entity);
+    assert_eq!(harness.mock_state.frame_write_attempts(1), 0);
+}
+
+#[test]
 fn window_policy_does_not_infer_float_from_dialog_purpose() {
     let mut harness = TestHarness::new().with_window(1, |window| {
         window.title = "Settings".into();

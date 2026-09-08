@@ -138,7 +138,7 @@ enum Probe<T> {
 impl<T> Probe<T> {
     fn admitted(id: WinID, window: T, decision: Admission) -> Self {
         match decision {
-            Admission::Track => Self::Resolved(id, Some(window)),
+            Admission::Track | Admission::TrackFloating => Self::Resolved(id, Some(window)),
             Admission::Ignore => Self::Resolved(id, None),
             Admission::Defer => Self::Deferred(id),
         }
@@ -440,6 +440,7 @@ enum Attribute {
     Title,
     Parent,
     ParentRole,
+    Fallback(u8),
 }
 
 impl NativeProbe {
@@ -497,19 +498,39 @@ impl NativeProbe {
                             .parent
                             .as_ref()
                             .and_then(|parent| parent.role().ok());
-                        self.stage = ProbeStage::Admit(candidate);
-                        return Probe::Pending;
+                        if candidate
+                            .evidence
+                            .needs_fallback(&self.config, self.bundle_id.as_deref())
+                        {
+                            Attribute::Fallback(0)
+                        } else {
+                            self.stage = ProbeStage::Admit(candidate);
+                            return Probe::Pending;
+                        }
+                    }
+                    Attribute::Fallback(step) => {
+                        candidate
+                            .window
+                            .read_fallback_step(&mut candidate.evidence, step);
+                        if step == 4 {
+                            self.stage = ProbeStage::Admit(candidate);
+                            return Probe::Pending;
+                        }
+                        Attribute::Fallback(step + 1)
                     }
                 };
                 self.stage = ProbeStage::Inspect(candidate, next);
             }
             ProbeStage::Admit(candidate) => {
                 let Candidate {
-                    window, evidence, ..
+                    mut window,
+                    evidence,
+                    ..
                 } = *candidate;
                 let id = window.id();
                 let decision = evidence.admission(&self.config, self.bundle_id.as_deref());
-                debug!(id, ?decision, "discovered window admission");
+                window.set_admission_preference(decision);
+                debug!(id, ?decision, fallback = ?evidence.fallback, "discovered window admission");
                 return Probe::admitted(id, Window::new(Box::new(window)), decision);
             }
         }
@@ -586,6 +607,7 @@ mod tests {
                         subrole: Some("AXStandardWindow".into()),
                         title: title.ok(),
                         parent_role: Some("AXApplication".into()),
+                        ..Default::default()
                     };
                     Probe::admitted(42, 42, evidence.admission(&config, Some("test")))
                 },

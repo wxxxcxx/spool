@@ -3,8 +3,48 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Admission {
     Track,
+    TrackFloating,
     Ignore,
     Defer,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FallbackEvidence {
+    pub geometry: Option<bool>,
+    pub surface: Option<bool>,
+    pub close_button: Option<bool>,
+    pub minimize_button: Option<bool>,
+}
+
+pub(crate) fn admission_with_fallback(
+    role: Option<&str>,
+    subrole: Option<&str>,
+    parent_role: Option<&str>,
+    track: Option<bool>,
+    evidence: FallbackEvidence,
+) -> Admission {
+    let base = admission(role, subrole, parent_role, track);
+    if base != Admission::Ignore || track == Some(false) || role != Some("AXWindow") {
+        return base;
+    }
+    match parent_role {
+        Some("AXApplication") => {}
+        None => return Admission::Defer,
+        Some(_) => return Admission::Ignore,
+    }
+    let buttons = match (evidence.close_button, evidence.minimize_button) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    };
+    let required = [evidence.geometry, evidence.surface, buttons];
+    if required.contains(&Some(false)) {
+        Admission::Ignore
+    } else if required.contains(&None) {
+        Admission::Defer
+    } else {
+        Admission::TrackFloating
+    }
 }
 
 /// A missing AX attribute is not the same thing as an explicit `AXUnknown` value.
@@ -72,6 +112,132 @@ pub(crate) fn layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn interactive_evidence() -> FallbackEvidence {
+        FallbackEvidence {
+            geometry: Some(true),
+            surface: Some(true),
+            close_button: Some(true),
+            minimize_button: Some(false),
+        }
+    }
+
+    #[test]
+    fn quick_look_and_other_independent_nonstandard_windows_use_floating_fallback() {
+        for subrole in ["Quick Look", "AXUnknown", "CustomToolWindow"] {
+            assert_eq!(
+                admission_with_fallback(
+                    Some("AXWindow"),
+                    Some(subrole),
+                    Some("AXApplication"),
+                    None,
+                    interactive_evidence()
+                ),
+                Admission::TrackFloating
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_does_not_admit_controls_attached_windows_or_explicit_exclusions() {
+        for (role, parent, track) in [
+            ("AXMenu", "AXApplication", None),
+            ("AXSheet", "AXApplication", Some(true)),
+            ("AXWindow", "AXWindow", None),
+            ("AXWindow", "AXSheet", None),
+            ("AXWindow", "AXDrawer", Some(true)),
+            ("AXWindow", "AXApplication", Some(false)),
+        ] {
+            assert_eq!(
+                admission_with_fallback(
+                    Some(role),
+                    Some("Quick Look"),
+                    Some(parent),
+                    track,
+                    interactive_evidence()
+                ),
+                Admission::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_requires_positive_geometry_surface_and_button_evidence() {
+        for evidence in [
+            FallbackEvidence {
+                geometry: Some(false),
+                ..interactive_evidence()
+            },
+            FallbackEvidence {
+                surface: Some(false),
+                ..interactive_evidence()
+            },
+            FallbackEvidence {
+                close_button: Some(false),
+                ..interactive_evidence()
+            },
+        ] {
+            assert_eq!(
+                admission_with_fallback(
+                    Some("AXWindow"),
+                    Some("Quick Look"),
+                    Some("AXApplication"),
+                    None,
+                    evidence
+                ),
+                Admission::Ignore
+            );
+        }
+        for evidence in [
+            FallbackEvidence {
+                geometry: None,
+                ..interactive_evidence()
+            },
+            FallbackEvidence {
+                surface: None,
+                ..interactive_evidence()
+            },
+            FallbackEvidence {
+                close_button: None,
+                ..interactive_evidence()
+            },
+        ] {
+            assert_eq!(
+                admission_with_fallback(
+                    Some("AXWindow"),
+                    Some("Quick Look"),
+                    Some("AXApplication"),
+                    None,
+                    evidence
+                ),
+                Admission::Defer
+            );
+        }
+        assert_eq!(
+            admission_with_fallback(
+                Some("AXWindow"),
+                Some("Quick Look"),
+                None,
+                None,
+                interactive_evidence()
+            ),
+            Admission::Defer
+        );
+        assert_eq!(
+            admission_with_fallback(
+                Some("AXWindow"),
+                Some("Quick Look"),
+                Some("AXApplication"),
+                None,
+                FallbackEvidence {
+                    close_button: None,
+                    minimize_button: Some(true),
+                    ..interactive_evidence()
+                }
+            ),
+            Admission::TrackFloating
+        );
+    }
 
     #[test]
     fn independent_dialogs_are_tracked_without_implying_float() {

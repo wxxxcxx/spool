@@ -884,6 +884,7 @@ fn configure_main_thread_schedules(app: &mut BevyApp) {
 struct WindowProperties {
     params: Vec<WindowParams>,
     pending: bool,
+    default_floating: bool,
 }
 
 impl WindowProperties {
@@ -901,6 +902,7 @@ impl WindowProperties {
         Self {
             params: matched.params,
             pending: matched.pending,
+            default_floating: window.default_floating(),
         }
     }
 
@@ -916,7 +918,7 @@ impl WindowProperties {
         self.params
             .iter()
             .find_map(|props| props.floating)
-            .unwrap_or(false)
+            .unwrap_or(self.default_floating)
     }
 
     pub fn insertion(&self) -> Option<usize> {

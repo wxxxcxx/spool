@@ -727,9 +727,11 @@ impl ReconcileState<'_, '_> {
         let tracked_entity = self
             .windows
             .iter_mut()
-            .find_map(|(entity, window, parent, ..)| {
-                (parent.parent() == app_entity && window.id() == window_id).then_some(entity)
-            });
+            .filter_map(|(entity, window, parent, unavailable, ..)| {
+                (parent.parent() == app_entity && window.id() == window_id && unavailable.is_none())
+                    .then_some(entity)
+            })
+            .min_by_key(|entity| Some(*entity) != snapshot.confirmed_entity());
         if !self
             .focus
             .snapshot()

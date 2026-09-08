@@ -52,6 +52,7 @@ pub(crate) struct MockWindowData {
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
     pub(crate) child_role: bool,
+    pub(crate) default_floating: bool,
 }
 
 impl Default for MockWindowData {
@@ -77,6 +78,7 @@ impl Default for MockWindowData {
             horizontal_padding: 0,
             vertical_padding: 0,
             child_role: false,
+            default_floating: false,
         }
     }
 }
@@ -931,6 +933,14 @@ impl MockState {
         let mut mw = MockWindowApi::new();
 
         mw.expect_id().return_const(id);
+        let s = self.clone();
+        mw.expect_default_floating().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .is_some_and(|window| window.default_floating)
+        });
         mw.expect_incarnation().return_const(incarnation);
 
         let s = self.clone();

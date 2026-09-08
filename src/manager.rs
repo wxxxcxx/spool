@@ -21,7 +21,7 @@ use objc2_core_graphics::{
     CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
     kCGWindowAlpha, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "lua")]
 use std::path::Path;
 use std::ptr::null_mut;
@@ -943,9 +943,18 @@ fn window_owner_from_description(
 fn presentation_owner_from_description(
     description: &CFDictionary<CFString, CFNumber>,
 ) -> Option<(WinID, Pid)> {
+    interactive_owner_from_description(description, false)
+}
+
+fn interactive_owner_from_description(
+    description: &CFDictionary<CFString, CFNumber>,
+    allow_floating: bool,
+) -> Option<(WinID, Pid)> {
     let layer = description.get(unsafe { kCGWindowLayer })?.as_i32()?;
     let alpha = description.get(unsafe { kCGWindowAlpha })?.as_f64()?;
-    if layer != 0 || !alpha.is_finite() || alpha <= 0.0 {
+    let admitted_layer =
+        layer == 0 || (allow_floating && layer == objc2_core_graphics::kCGFloatingWindowLevel);
+    if !admitted_layer || !alpha.is_finite() || alpha <= 0.0 {
         return None;
     }
     let (id, pid) = window_owner_from_description(description)?;
@@ -974,6 +983,7 @@ fn space_window_list_for_connection(
     let iterator = window_iterator_for_connection(main_cid, spaces, cid, also_minimized)?;
     let count = spaces.len();
     let mut window_list = Vec::with_capacity(count);
+    let mut floating_candidates = Vec::new();
     while unsafe { SLSWindowIteratorAdvance(&raw const *iterator) } {
         let tags = unsafe { SLSWindowIteratorGetTags(&raw const *iterator) };
         let attributes = unsafe { SLSWindowIteratorGetAttributes(&raw const *iterator) };
@@ -985,9 +995,38 @@ fn space_window_list_for_connection(
         );
         if found_valid_window(parent_wid, attributes, tags) {
             window_list.push(window_id);
+        } else if floating_membership_candidate(parent_wid, attributes, tags) {
+            floating_candidates.push(window_id);
+        }
+    }
+    // Native floating panels can lack the ordinary-window tag. This only
+    // supplements Space membership; AX admission still controls tracking.
+    if !floating_candidates.is_empty() {
+        let options = CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements;
+        if let Some(info) = CGWindowListCopyWindowInfo(options, kCGNullWindowID) {
+            let array = unsafe { info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
+            let floating_ids = array
+                .iter()
+                .filter_map(|description| {
+                    let layer = description.get(unsafe { kCGWindowLayer })?.as_i32()?;
+                    (layer == objc2_core_graphics::kCGFloatingWindowLevel)
+                        .then(|| interactive_owner_from_description(&description, true))
+                        .flatten()
+                        .map(|(id, _)| id)
+                })
+                .collect::<HashSet<_>>();
+            window_list.extend(
+                floating_candidates
+                    .into_iter()
+                    .filter(|id| floating_ids.contains(id)),
+            );
         }
     }
     Ok(window_list)
+}
+
+fn floating_membership_candidate(parent_wid: WinID, attributes: i64, tags: i64) -> bool {
+    parent_wid == 0 && attributes & 0x2 != 0 && tags & 0x2 != 0
 }
 
 fn window_iterator_for_connection(
@@ -1204,6 +1243,36 @@ mod native_space_runtime_tests {
             window_owner_from_description(&description),
             Some((42, 1000))
         );
+    }
+
+    #[test]
+    fn native_floating_membership_does_not_require_ordinary_window_tags() {
+        // Finder Quick Look sample from the native read-only inspector.
+        let tags = 0x0001_000c_2802;
+        assert!(!found_valid_window(0, 0x2, tags));
+        assert!(floating_membership_candidate(0, 0x2, tags));
+        assert!(!floating_membership_candidate(100, 0x2, tags));
+        assert!(!floating_membership_candidate(0, 0, tags));
+        assert!(!floating_membership_candidate(0, 0x2, 0));
+    }
+
+    #[test]
+    fn fallback_surface_accepts_native_float_but_not_system_or_retained_surfaces() {
+        for layer in [0, objc2_core_graphics::kCGFloatingWindowLevel] {
+            assert_eq!(
+                interactive_owner_from_description(&window_description(42, 1000, layer, 1.0), true),
+                Some((42, 1000))
+            );
+        }
+        for (layer, alpha) in [(8, 1.0), (25, 1.0), (101, 0.0), (3, 0.0), (0, f64::NAN)] {
+            assert_eq!(
+                interactive_owner_from_description(
+                    &window_description(42, 1000, layer, alpha),
+                    true
+                ),
+                None
+            );
+        }
     }
 
     #[test]

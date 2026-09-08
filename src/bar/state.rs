@@ -214,6 +214,16 @@ impl BarStateParams<'_, '_> {
         presented: Option<&HashSet<i32>>,
     ) -> Option<BarWindow> {
         let (window, _, parent, _, focused, unavailable, hidden) = self.windows.get(entity).ok()?;
+        if unavailable
+            && self
+                .windows
+                .iter()
+                .any(|(other, _, _, _, _, unavailable, _)| {
+                    other.id() == window.id() && !unavailable
+                })
+        {
+            return None;
+        }
         // Cmd-W may withdraw AX and order out a retained native surface without
         // destroying its ID. Preserve its layout identity, not a phantom icon.
         // Minimized/hidden windows and uncertain native queries retain icons.
@@ -370,6 +380,35 @@ mod tests {
                 .map(|window| window.id)
                 .collect::<Vec<_>>(),
             vec![0]
+        );
+    }
+
+    #[test]
+    fn reopened_identity_replaces_unavailable_bar_projection() {
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.pump_frames(15);
+        let old = find_window_entity(1, harness.world());
+        let parent = harness.world().get::<ChildOf>(old).unwrap().parent();
+        harness.mock_state.os_withdraw_window(1);
+        harness.world().write_message(Event::SpaceChanged);
+        harness.pump_frames(2);
+        assert!(harness.world().get::<WindowUnavailable>(old).is_some());
+        let replacement = harness.mock_state.spawn_window(
+            crate::tests::TEST_PROCESS_ID,
+            TEST_WORKSPACE_ID,
+            1,
+            bevy::math::IRect::new(100, 100, 400, 300),
+        );
+        harness
+            .world()
+            .spawn((replacement, ChildOf(parent), Floating));
+        let state = harness.world().run_system_once(snapshot).unwrap();
+        assert_eq!(
+            state.displays[0].spaces[0]
+                .windows()
+                .filter(|window| window.id == 1)
+                .count(),
+            1
         );
     }
 

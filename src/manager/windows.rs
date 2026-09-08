@@ -1,8 +1,8 @@
 use accessibility_sys::{
     AXUIElementCreateApplication, AXUIElementIsAttributeSettable, AXUIElementRef, AXValueCreate,
-    AXValueGetValue, kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXParentAttribute,
-    kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute, kAXValueTypeCGPoint,
-    kAXValueTypeCGSize,
+    AXValueGetValue, kAXCloseButtonAttribute, kAXErrorAttributeUnsupported, kAXErrorNoValue,
+    kAXMinimizeButtonAttribute, kAXParentAttribute, kAXPositionAttribute, kAXRaiseAction,
+    kAXSizeAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -10,8 +10,8 @@ use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use mockall::automock;
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFHash, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
-    kCFBooleanFalse, kCFBooleanTrue,
+    CFArray, CFBoolean, CFDictionary, CFHash, CFNumber, CFRetained, CFString, CFType, CGPoint,
+    CGRect, CGSize, kCFBooleanFalse, kCFBooleanTrue,
 };
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
@@ -31,6 +31,7 @@ use crate::manager::{Origin, Size, irect_from};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WindowIncarnation, macos_major_version};
 use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
 use crate::window_policy::{self, Admission, LayoutDecision};
+use objc2_core_graphics::{CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct EnhancedUiKey {
@@ -163,6 +164,7 @@ pub enum WindowPadding {
 
 #[automock]
 pub trait WindowApi: Send + Sync {
+    fn default_floating(&self) -> bool;
     fn id(&self) -> WinID;
     fn incarnation(&self) -> WindowIncarnation;
     fn frame(&self) -> IRect;
@@ -267,6 +269,7 @@ const CPS_USER_GENERATED: u32 = 0x200;
 
 #[derive(Debug)]
 pub struct WindowOS {
+    default_floating: bool,
     id: WinID,
     ax_element: CFRetained<AXUIWrapper>,
     frame: IRect,
@@ -293,9 +296,17 @@ pub(super) struct WindowEvidence {
     pub subrole: Option<String>,
     pub title: Option<String>,
     pub parent_role: Option<String>,
+    pub fallback: window_policy::FallbackEvidence,
+    pub position_valid: Option<bool>,
 }
 
 impl WindowEvidence {
+    pub(super) fn needs_fallback(&self, config: &Config, bundle_id: Option<&str>) -> bool {
+        self.role.as_deref() == Some("AXWindow")
+            && self.subrole.is_some()
+            && self.parent_role.as_deref() == Some("AXApplication")
+            && self.admission(config, bundle_id) == Admission::Defer
+    }
     pub(super) fn admission(&self, config: &Config, bundle_id: Option<&str>) -> Admission {
         let rules = config.match_window_rules(
             self.title.as_deref(),
@@ -307,11 +318,12 @@ impl WindowEvidence {
         if rules.pending {
             Admission::Defer
         } else {
-            window_policy::admission(
+            window_policy::admission_with_fallback(
                 self.role.as_deref(),
                 self.subrole.as_deref(),
                 self.parent_role.as_deref(),
                 rules.params.iter().find_map(|rule| rule.track),
+                self.fallback,
             )
         }
     }
@@ -319,7 +331,7 @@ impl WindowEvidence {
 
 impl WindowOS {
     /// Creates a new `Window` instance using an empty configuration.
-    /// Non-standard windows are rejected unless they match a `track = true` rule.
+    /// Non-standard windows require an explicit rule or independent-window evidence.
     ///
     /// # Arguments
     ///
@@ -352,7 +364,7 @@ impl WindowOS {
     ) -> Result<Self> {
         let id = ax_window_id(element.as_ptr())?;
         let window = Self::from_element(id, element);
-        let evidence = WindowEvidence {
+        let mut evidence = WindowEvidence {
             role: window.role().ok(),
             subrole: window.subrole().ok(),
             title: window.title().ok(),
@@ -360,13 +372,20 @@ impl WindowOS {
                 .parent_element()
                 .and_then(|parent| parent.role())
                 .ok(),
+            ..Default::default()
         };
+        if evidence.needs_fallback(config, bundle_id) {
+            for step in 0..5 {
+                window.read_fallback_step(&mut evidence, step);
+            }
+        }
         window.admit(evidence, config, bundle_id)
     }
 
     /// Construction without AX reads; discovery gathers evidence across ticks.
     pub(super) fn from_element(id: WinID, element: &CFRetained<AXUIWrapper>) -> Self {
         Self {
+            default_floating: false,
             id,
             ax_element: element.clone(),
             frame: IRect::default(),
@@ -384,26 +403,120 @@ impl WindowOS {
             .get_attribute(&CFString::from_static_str(kAXParentAttribute))
     }
 
+    /// Each stage issues at most one cross-process AX read.
+    pub(super) fn read_fallback_step(&self, evidence: &mut WindowEvidence, step: u8) {
+        match step {
+            0 => {
+                evidence.position_valid = self
+                    .ax_element
+                    .get_attribute::<AXUIWrapper>(&CFString::from_static_str(kAXPositionAttribute))
+                    .ok()
+                    .and_then(|value| {
+                        let mut point = CGPoint::default();
+                        unsafe {
+                            AXValueGetValue(
+                                value.as_ptr(),
+                                kAXValueTypeCGPoint,
+                                NonNull::from(&mut point).as_ptr().cast(),
+                            )
+                        }
+                        .then_some(point.x.is_finite() && point.y.is_finite())
+                    });
+            }
+            1 => {
+                let size_valid = self
+                    .ax_element
+                    .get_attribute::<AXUIWrapper>(&CFString::from_static_str(kAXSizeAttribute))
+                    .ok()
+                    .and_then(|value| {
+                        let mut size = CGSize::default();
+                        unsafe {
+                            AXValueGetValue(
+                                value.as_ptr(),
+                                kAXValueTypeCGSize,
+                                NonNull::from(&mut size).as_ptr().cast(),
+                            )
+                        }
+                        .then_some(
+                            size.width.is_finite()
+                                && size.height.is_finite()
+                                && size.width > 0.0
+                                && size.height > 0.0,
+                        )
+                    });
+                evidence.fallback.geometry = evidence
+                    .position_valid
+                    .zip(size_valid)
+                    .map(|(position, size)| position && size);
+            }
+            2 | 3 => {
+                let attribute = if step == 2 {
+                    kAXCloseButtonAttribute
+                } else {
+                    kAXMinimizeButtonAttribute
+                };
+                let exists = match self
+                    .ax_element
+                    .get_attribute::<AXUIWrapper>(&CFString::from_static_str(attribute))
+                {
+                    Ok(_) => Some(true),
+                    Err(error)
+                        if error.macos_code() == Some(kAXErrorNoValue)
+                            || error.macos_code() == Some(kAXErrorAttributeUnsupported) =>
+                    {
+                        Some(false)
+                    }
+                    Err(_) => None,
+                };
+                if step == 2 {
+                    evidence.fallback.close_button = exists;
+                } else {
+                    evidence.fallback.minimize_button = exists;
+                }
+            }
+            _ => {
+                let options = CGWindowListOption::OptionOnScreenOnly
+                    | CGWindowListOption::ExcludeDesktopElements;
+                evidence.fallback.surface = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+                    .map(|info| {
+                        let array =
+                            unsafe { info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
+                        array.iter().any(|description| {
+                            super::interactive_owner_from_description(&description, true)
+                                .is_some_and(|(id, _)| id == self.id)
+                        })
+                    });
+            }
+        }
+    }
+
+    pub(super) fn set_admission_preference(&mut self, decision: Admission) {
+        self.default_floating = decision == Admission::TrackFloating;
+    }
+
     /// Pure admission shared by `AXWindows` inventory and staged discovery.
     pub(super) fn admit(
-        self,
+        mut self,
         evidence: WindowEvidence,
         config: &Config,
         bundle_id: Option<&str>,
     ) -> Result<Self> {
         let decision = evidence.admission(config, bundle_id);
+        debug!(window_id = self.id, ?decision, fallback = ?evidence.fallback,
+            "window admission");
         let WindowEvidence {
             role,
             subrole,
             title,
             ..
         } = evidence;
-        if decision != Admission::Track {
+        if !matches!(decision, Admission::Track | Admission::TrackFloating) {
             return Err(Error::invalid_window(&format!(
                 "Window admission {decision:?}, id: {}, role {role:?}, subrole {subrole:?}",
                 self.id()
             )));
         }
+        self.set_admission_preference(decision);
 
         trace!(
             "created {} title: {} role: {} subrole: {}",
@@ -641,6 +754,9 @@ impl WindowOS {
 }
 
 impl WindowApi for WindowOS {
+    fn default_floating(&self) -> bool {
+        self.default_floating
+    }
     /// Returns the ID of the window.
     ///
     /// # Returns
@@ -975,6 +1091,42 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn window_policy_fallback_evidence_obeys_rules_and_skips_standard_windows() {
+        let mut evidence = WindowEvidence {
+            role: Some("AXWindow".into()),
+            subrole: Some("Quick Look".into()),
+            title: Some(String::new()),
+            parent_role: Some("AXApplication".into()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        assert!(evidence.needs_fallback(&config, Some("test")));
+        assert_eq!(evidence.admission(&config, Some("test")), Admission::Defer);
+        evidence.fallback = window_policy::FallbackEvidence {
+            geometry: Some(true),
+            surface: Some(true),
+            close_button: Some(true),
+            minimize_button: Some(false),
+        };
+        assert_eq!(
+            evidence.admission(&config, Some("test")),
+            Admission::TrackFloating
+        );
+        for (track, expected) in [(false, Admission::Ignore), (true, Admission::Track)] {
+            let config = Config::try_from(
+                format!(r#"{{"windows":{{"rule":{{"track":{track}}}}}}}"#).as_str(),
+            )
+            .unwrap();
+            assert_eq!(evidence.admission(&config, Some("test")), expected);
+            assert!(!evidence.needs_fallback(&config, Some("test")));
+        }
+        evidence.subrole = Some("AXStandardWindow".into());
+        evidence.fallback = window_policy::FallbackEvidence::default();
+        assert_eq!(evidence.admission(&config, Some("test")), Admission::Track);
+        assert!(!evidence.needs_fallback(&config, Some("test")));
+    }
 
     #[test]
     fn window_policy_distinguishes_absent_titles_from_failed_title_reads() {

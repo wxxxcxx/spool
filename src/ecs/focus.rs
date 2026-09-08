@@ -138,7 +138,7 @@ impl FocusSnapshot {
             ObservedFocus::Untracked {
                 pid: known_pid,
                 window_id: Some(known_window_id),
-            } => known_pid == Some(pid) && known_window_id == window_id,
+            } => tracked_entity.is_none() && known_pid == Some(pid) && known_window_id == window_id,
             ObservedFocus::Unresolved | ObservedFocus::Untracked { .. } => false,
         }
     }
@@ -762,6 +762,20 @@ pub(super) fn stray_focus_observer(
 mod tests {
     use super::*;
     use bevy::ecs::world::World;
+
+    #[test]
+    fn newly_tracked_identity_revalidates_previously_untracked_focus() {
+        let mut world = World::new();
+        let entity = world.spawn(()).id();
+        let mut focus = FocusCoordinator::default();
+        focus.observe(FocusSignal::Untracked {
+            generation: None,
+            pid: Some(836),
+            window_id: Some(325),
+        });
+        assert!(!focus.snapshot().needs_revalidation(836, 325, None));
+        assert!(focus.snapshot().needs_revalidation(836, 325, Some(entity)));
+    }
 
     #[test]
     fn record_and_read_per_tier() {
