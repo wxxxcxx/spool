@@ -196,6 +196,16 @@ $ spool install
 $ spool start
 ```
 
+Read captured service output, or follow new records without restarting Spool:
+
+```shell
+$ spool log --tail 200
+$ spool log -f
+```
+
+See [Logs and diagnostics](docs/LOGGING.md) for capture limitations and the
+diagnostic information plan. Foreground output is not captured automatically.
+
 ### Installing an app launcher
 
 To start Spool from Spotlight, Alfred, Raycast, or another application launcher,

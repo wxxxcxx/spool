@@ -236,6 +236,16 @@ impl FocusCoordinator {
     }
 
     pub(super) fn observe(&mut self, signal: FocusSignal) -> FocusUpdate {
+        let before = self.snapshot();
+        let result = self.apply_signal(signal);
+        if before != self.snapshot() {
+            debug!(target: "spool::focus_diagnostics", ?signal, ?result, ?before,
+                after = ?self.snapshot(), "focus_observation");
+        }
+        result
+    }
+
+    fn apply_signal(&mut self, signal: FocusSignal) -> FocusUpdate {
         match signal {
             FocusSignal::Resolve { pid, candidate } => {
                 FocusUpdate::Started(self.begin_resolution(pid, candidate))
@@ -324,6 +334,8 @@ impl FocusCoordinator {
         let generation = self.next_generation();
         self.resolving = None;
         self.requested = Some(FocusRequest { entity });
+        debug!(target: "spool::focus_diagnostics", generation, ?entity,
+            observed = ?self.observed, "focus_request");
         generation
     }
 

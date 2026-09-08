@@ -22,6 +22,7 @@ mod config;
 mod ecs;
 mod errors;
 mod events;
+mod logs;
 #[cfg(feature = "lua")]
 mod lua;
 mod manager;
@@ -107,6 +108,10 @@ pub enum SubCmd {
 
     /// Restarts the `spool` background service.
     Restart,
+
+    /// Reads captured service logs, optionally following new output.
+    #[command(alias = "logs")]
+    Log(logs::LogArgs),
 
     /// Dispatches an action via a Unix socket to the running `spool` daemon.
     #[command(alias = "send-cmd")]
@@ -248,6 +253,7 @@ fn main() -> Result<()> {
         SubCmd::Start => service()?.start()?,
         SubCmd::Stop => service()?.stop()?,
         SubCmd::Restart => service()?.restart()?,
+        SubCmd::Log(args) => logs::run(&service()?, &args)?,
         SubCmd::Action { action } => client::run(ClientRequest::Action(action))?,
         SubCmd::Query { query } => {
             let (kind, format) = query.request();

@@ -6,9 +6,11 @@
 - [Window admission and layout policy](WINDOW_POLICY.md)
 - [Lua scripting](SCRIPTING.md)
 - [Query and subscribe format](QUERY_AND_SUBSCRIBE_FORMAT.md)
+- [Logs and diagnostic information plan](LOGGING.md)
 - [Built-in bar](BAR.md)
 - [Nix installation](NIX.md)
 - [Window lifecycle probe](examples/window_lifecycle_probe.md)
+- [Overlay rendering probe](examples/overlay_render_probe.md)
 - [Release verification](RELEASING.md)
 
 ## Architecture

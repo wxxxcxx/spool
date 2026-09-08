@@ -1390,6 +1390,7 @@ pub(super) fn update_overlays(
     inputs: OverlayInputs,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mut window_config_cache: Local<HashMap<WorkspaceId, OverlayWindowConfigCache>>,
+    mut diagnostic_targets: Local<Vec<SpaceOverlayTarget>>,
 ) {
     let Some(mut overlay_mgr) = overlay_mgr else {
         return;
@@ -1475,6 +1476,16 @@ pub(super) fn update_overlays(
         });
     }
     window_config_cache.retain(|space_id, _| target_space_ids.contains(space_id));
+
+    if tracing::enabled!(target: "spool::focus_diagnostics", tracing::Level::DEBUG)
+        && *diagnostic_targets != targets
+    {
+        debug!(target: "spool::focus_diagnostics", focus = ?inputs.focus.snapshot(),
+            marker_window = ?inputs.windows.focused().map(|(window, _)| window.id()),
+            frames = ?targets.iter().map(|target| (target.space_id, target.focused_window_id, target.focused_abs_cg)).collect::<Vec<_>>(),
+            "overlay_targets");
+        diagnostic_targets.clone_from(&targets);
+    }
 
     let dim_color = inputs.config.dim_inactive_color();
     overlay_mgr.update(dim_opacity, dim_color, &targets);
@@ -1722,6 +1733,9 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                 width_ratio.0 = desired_ratio;
             }
         }
+        let diagnostic_started =
+            tracing::enabled!(target: "spool::focus_diagnostics", tracing::Level::DEBUG)
+                .then(Instant::now);
         let result = write_presented_frame(
             &mut window,
             target,
@@ -1731,6 +1745,14 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
 
         match result {
             Ok(frame) => {
+                if let Some(started) = diagnostic_started
+                    && observed.as_ref().map(|observed| observed.0) != Some(frame)
+                {
+                    debug!(target: "spool::focus_diagnostics", window_id = window.id(), ?entity,
+                        desired = ?desired.0, ?target, before = ?observed.as_ref().map(|frame| frame.0),
+                        readback = ?frame, write_us = started.elapsed().as_micros(),
+                        "frame_commit");
+                }
                 if let Some(request) = transfer {
                     commands.entity(entity).insert(DisplayTransferReadback {
                         frame,

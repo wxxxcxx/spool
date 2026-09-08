@@ -84,6 +84,43 @@ pub use window_frame::{
 #[cfg(feature = "lua")]
 pub(crate) use triggers::apply_config_side_effects;
 
+#[allow(clippy::too_many_arguments)]
+fn overlay_dirty(
+    strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
+    focus_gained: Query<(), Added<FocusedMarker>>,
+    workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
+    native_space_changed: ChangedNativeSpaces,
+    focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>,
+    focused_resized: Query<(), (With<FocusedMarker>, Changed<Bounds>)>,
+    // Overlay targets also include requested/navigation windows and hidden
+    // Spaces. Their readbacks remain relevant while FocusedMarker is absent.
+    observed_moved: Query<(), Changed<ObservedWindowFrame>>,
+    config: Option<Res<Config>>,
+    focus: Option<Res<focus::FocusCoordinator>>,
+    mission_control: Option<Res<MissionControlActive>>,
+    mut focus_lost: RemovedComponents<FocusedMarker>,
+    mut workspace_lost: RemovedComponents<ActiveWorkspaceMarker>,
+    mut observed_lost: RemovedComponents<ObservedWindowFrame>,
+    mut native_space_removed: RemovedComponents<native_space::NativeSpace>,
+    mut window_removed: RemovedComponents<Window>,
+) -> bool {
+    !strip_changed.is_empty()
+        || !focus_gained.is_empty()
+        || !workspace_changed.is_empty()
+        || !native_space_changed.is_empty()
+        || !focused_moved.is_empty()
+        || !focused_resized.is_empty()
+        || !observed_moved.is_empty()
+        || config.is_some_and(|config| config.is_changed())
+        || focus.is_some_and(|focus| focus.is_changed())
+        || mission_control.is_some_and(|state| state.is_changed())
+        || focus_lost.read().next().is_some()
+        || workspace_lost.read().next().is_some()
+        || observed_lost.read().next().is_some()
+        || native_space_removed.read().next().is_some()
+        || window_removed.read().next().is_some()
+}
+
 /// Registers the Bevy systems for the `WindowManager`.
 /// This function adds various systems to the `Update` schedule, including event dispatchers,
 /// process/application/window lifecycle management, animation, and periodic watchers.
@@ -107,43 +144,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
             .next()
             .is_none_or(|marker| !marker.is_user_swiping)
     };
-    // The overlay must refresh not just when the active strip's layout changes,
-    // but also whenever focus moves, including focus loss, which otherwise
-    // leaves a stale outline.
-    // Position changes on the focused window also dirty the overlay so that
-    // dragging a floating window moves the highlight with it.
-    let overlay_dirty =
-        |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
-         focus_gained: Query<(), Added<FocusedMarker>>,
-         workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
-         native_space_changed: ChangedNativeSpaces,
-         focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>,
-         focused_resized: Query<(), (With<FocusedMarker>, Changed<Bounds>)>,
-         observed_moved: Query<(), (With<FocusedMarker>, Changed<ObservedWindowFrame>)>,
-         config: Option<Res<Config>>,
-         focus: Option<Res<focus::FocusCoordinator>>,
-         mission_control: Option<Res<MissionControlActive>>,
-         mut focus_lost: RemovedComponents<FocusedMarker>,
-         mut workspace_lost: RemovedComponents<ActiveWorkspaceMarker>,
-         mut observed_lost: RemovedComponents<ObservedWindowFrame>,
-         mut native_space_removed: RemovedComponents<native_space::NativeSpace>,
-         mut window_removed: RemovedComponents<Window>| {
-            !strip_changed.is_empty()
-                || !focus_gained.is_empty()
-                || !workspace_changed.is_empty()
-                || !native_space_changed.is_empty()
-                || !focused_moved.is_empty()
-                || !focused_resized.is_empty()
-                || !observed_moved.is_empty()
-                || config.is_some_and(|config| config.is_changed())
-                || focus.is_some_and(|focus| focus.is_changed())
-                || mission_control.is_some_and(|state| state.is_changed())
-                || focus_lost.read().next().is_some()
-                || workspace_lost.read().next().is_some()
-                || observed_lost.read().next().is_some()
-                || native_space_removed.read().next().is_some()
-                || window_removed.read().next().is_some()
-        };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
     let bar_dirty =
@@ -969,6 +969,61 @@ mod main_thread_tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn overlay_refreshes_moving_navigation_target_while_focus_is_unresolved() {
+        use bevy::ecs::change_detection::DetectChangesMut as _;
+        use bevy::ecs::system::{Local, ResMut};
+        use bevy::math::IRect;
+
+        #[derive(Resource, Default)]
+        struct ProjectedFrame {
+            frame: Option<IRect>,
+            updates: usize,
+        }
+
+        let mut app = BevyApp::new();
+        app.init_resource::<ProjectedFrame>();
+        // Finder's observed readbacks from the VS Code -> Finder trace.
+        let frames = [1070, 1034, 1020].map(|x| IRect::new(x, 34, x + 896, 990));
+        let window = app
+            .world_mut()
+            .spawn((ObservedWindowFrame(frames[0]), FocusedMarker))
+            .id();
+        app.add_systems(
+            PostUpdate,
+            (
+                move |mut windows: Query<&mut ObservedWindowFrame>, mut tick: Local<usize>| {
+                    windows
+                        .get_mut(window)
+                        .unwrap()
+                        .set_if_neq(ObservedWindowFrame(frames[(*tick).min(2)]));
+                    *tick += 1;
+                },
+                (move |windows: Query<&ObservedWindowFrame>,
+                       mut projected: ResMut<ProjectedFrame>| {
+                    projected.frame = Some(windows.get(window).unwrap().0);
+                    projected.updates += 1;
+                })
+                .run_if(overlay_dirty),
+            )
+                .chain(),
+        );
+        app.update();
+        app.world_mut().entity_mut(window).remove::<FocusedMarker>();
+        // Drain the removal invalidation. Subsequent readbacks must still
+        // reach the overlay without a new focus event or the one-second audit.
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().resource::<ProjectedFrame>().frame,
+            Some(frames[2]),
+            "overlay kept an intermediate Finder frame after the final readback"
+        );
+        let updates = app.world().resource::<ProjectedFrame>().updates;
+        app.update();
+        assert_eq!(app.world().resource::<ProjectedFrame>().updates, updates);
+    }
 
     #[test]
     fn timeouts_preserve_duration_boundaries_without_float_round_trips() {

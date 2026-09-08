@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use objc2::rc::Retained;
@@ -57,10 +57,130 @@ struct DecorationDrawState {
     border_rect: Option<NSRect>,
 }
 
+fn decoration_damage(
+    previous: Option<&DecorationDrawState>,
+    next: &DecorationDrawState,
+    bounds: NSRect,
+) -> Vec<NSRect> {
+    let Some(previous) = previous.filter(|previous| previous.style == next.style) else {
+        return vec![bounds];
+    };
+    if previous == next {
+        return Vec::new();
+    }
+
+    let mut damage = Vec::new();
+    if previous.cutout != next.cutout {
+        // The common interior stays transparent. Repaint the symmetric
+        // difference and both rounded edges, including antialiasing pixels.
+        for (cutout, other) in [
+            (previous.cutout, next.cutout),
+            (next.cutout, previous.cutout),
+        ] {
+            if let Some(cutout) = cutout {
+                damage.extend(rect_difference(cutout, other));
+                damage.extend(outline_damage(cutout, next.style.cutout_radius, 0.0));
+            }
+        }
+    }
+    if previous.border_rect != next.border_rect
+        && let Some(border) = &next.style.border
+    {
+        for rect in [previous.border_rect, next.border_rect]
+            .into_iter()
+            .flatten()
+        {
+            damage.extend(outline_damage(rect, border.radius, border.width));
+        }
+    }
+    damage
+        .into_iter()
+        .filter_map(|rect| {
+            // Clear whole pixels at the clip boundary, never a fractional alpha
+            // coverage left over from a previous frame. Integral points also
+            // cover complete pixels on Retina backing stores.
+            let x = rect.origin.x.floor();
+            let y = rect.origin.y.floor();
+            let aligned = NSRect::new(
+                NSPoint::new(x, y),
+                NSSize::new(
+                    (rect.origin.x + rect.size.width).ceil() - x,
+                    (rect.origin.y + rect.size.height).ceil() - y,
+                ),
+            );
+            intersect_rect(aligned, bounds)
+        })
+        .collect()
+}
+
+fn intersect_rect(left: NSRect, right: NSRect) -> Option<NSRect> {
+    let x = left.origin.x.max(right.origin.x);
+    let y = left.origin.y.max(right.origin.y);
+    let right_edge = (left.origin.x + left.size.width).min(right.origin.x + right.size.width);
+    let bottom = (left.origin.y + left.size.height).min(right.origin.y + right.size.height);
+    (right_edge > x && bottom > y)
+        .then(|| NSRect::new(NSPoint::new(x, y), NSSize::new(right_edge - x, bottom - y)))
+}
+
+fn rect_difference(rect: NSRect, other: Option<NSRect>) -> Vec<NSRect> {
+    let Some(common) = other.and_then(|other| intersect_rect(rect, other)) else {
+        return vec![rect];
+    };
+    let right = rect.origin.x + rect.size.width;
+    let bottom = rect.origin.y + rect.size.height;
+    let common_right = common.origin.x + common.size.width;
+    let common_bottom = common.origin.y + common.size.height;
+    [
+        NSRect::new(
+            rect.origin,
+            NSSize::new(rect.size.width, common.origin.y - rect.origin.y),
+        ),
+        NSRect::new(
+            NSPoint::new(rect.origin.x, common_bottom),
+            NSSize::new(rect.size.width, bottom - common_bottom),
+        ),
+        NSRect::new(
+            NSPoint::new(rect.origin.x, common.origin.y),
+            NSSize::new(common.origin.x - rect.origin.x, common.size.height),
+        ),
+        NSRect::new(
+            NSPoint::new(common_right, common.origin.y),
+            NSSize::new(right - common_right, common.size.height),
+        ),
+    ]
+    .into_iter()
+    .filter(|rect| rect.size.width > 0.0 && rect.size.height > 0.0)
+    .collect()
+}
+
+fn outline_damage(rect: NSRect, radius: f64, width: f64) -> Vec<NSRect> {
+    let fringe = width.max(0.0) / 2.0 + 1.0;
+    let inset = radius.max(0.0) + fringe;
+    let outer = NSRect::new(
+        NSPoint::new(rect.origin.x - fringe, rect.origin.y - fringe),
+        NSSize::new(
+            rect.size.width + 2.0 * fringe,
+            rect.size.height + 2.0 * fringe,
+        ),
+    );
+    let inner = NSRect::new(
+        NSPoint::new(rect.origin.x + inset, rect.origin.y + inset),
+        NSSize::new(
+            rect.size.width - 2.0 * inset,
+            rect.size.height - 2.0 * inset,
+        ),
+    );
+    rect_difference(
+        outer,
+        (inner.size.width > 0.0 && inner.size.height > 0.0).then_some(inner),
+    )
+}
+
 // ── DecorationView: dim cutout and border on one persistent surface ──
 
 #[derive(Debug, Clone)]
 struct DecorationViewIvars {
+    last_draw_state: RefCell<Option<(NSRect, DecorationDrawState)>>,
     dim_opacity: Cell<f32>,
     dim_r: Cell<f64>,
     dim_g: Cell<f64>,
@@ -168,6 +288,7 @@ define_class!(
 impl DecorationView {
     fn new(mtm: MainThreadMarker, frame: NSRect, state: &DecorationDrawState) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(DecorationViewIvars {
+            last_draw_state: RefCell::new(None),
             dim_opacity: Cell::new(0.0),
             dim_r: Cell::new(0.0),
             dim_g: Cell::new(0.0),
@@ -195,7 +316,21 @@ impl DecorationView {
         this
     }
 
-    fn update(&self, state: &DecorationDrawState) {
+    fn update(&self, state: &DecorationDrawState) -> Vec<NSRect> {
+        let bounds = self.bounds();
+        let ivars = self.ivars();
+        let mut previous = ivars.last_draw_state.borrow_mut();
+        let damage = decoration_damage(
+            previous
+                .as_ref()
+                .and_then(|(old_bounds, state)| (*old_bounds == bounds).then_some(state)),
+            state,
+            bounds,
+        );
+        *previous = Some((bounds, state.clone()));
+        if damage.is_empty() {
+            return damage;
+        }
         let (has_cutout, cx, cy, cw, ch) =
             state.cutout.map_or((false, 0.0, 0.0, 0.0, 0.0), |rect| {
                 (
@@ -242,7 +377,10 @@ impl DecorationView {
             ivars.border_width.set(border.width);
             ivars.border_radius.set(border.radius);
         }
-        self.setNeedsDisplay(true);
+        for rect in &damage {
+            self.setNeedsDisplayInRect(*rect);
+        }
+        damage
     }
 }
 
@@ -413,6 +551,19 @@ fn advance_decoration(presentation: &mut DecorationPresentation, rate: f64, delt
     true
 }
 
+fn advance_decorations<'a>(
+    presentations: impl Iterator<Item = &'a mut DecorationPresentation>,
+    rate: f64,
+    delta: f64,
+) -> bool {
+    let mut advanced = false;
+    for presentation in presentations {
+        // Do not short-circuit: every Space receives the same time step.
+        advanced |= advance_decoration(presentation, rate, delta);
+    }
+    advanced
+}
+
 fn screen_frames(mtm: MainThreadMarker) -> Vec<ScreenFrame> {
     let screens = NSScreen::screens(mtm);
     (&screens)
@@ -500,6 +651,96 @@ mod tests {
             rect(500.0, 0.0, 500.0, 500.0),
             4.0
         ));
+    }
+
+    #[test]
+    fn unchanged_decoration_does_not_redraw() {
+        let screen = rect(0.0, 0.0, 2940.0, 1912.0);
+        let style = DecorationStyle {
+            dim_opacity: 0.2,
+            dim_color: (0.0, 0.0, 0.0),
+            cutout_radius: 12.0,
+            border: Some(border_params()),
+        };
+        let state = project_decoration(rect(100.0, 40.0, 1400.0, 1800.0), screen, &style);
+        assert!(decoration_damage(Some(&state), &state, screen).is_empty());
+    }
+
+    #[test]
+    fn moving_decoration_repaints_edges_instead_of_the_full_screen() {
+        let screen = rect(0.0, 0.0, 2940.0, 1912.0);
+        for dim_opacity in [0.0, 0.2] {
+            let style = DecorationStyle {
+                dim_opacity,
+                dim_color: (0.0, 0.0, 0.0),
+                cutout_radius: 12.0,
+                border: Some(border_params()),
+            };
+            let before = project_decoration(rect(100.0, 40.0, 1400.0, 1800.0), screen, &style);
+            let after = project_decoration(rect(108.0, 40.0, 1400.0, 1800.0), screen, &style);
+            let damage = decoration_damage(Some(&before), &after, screen);
+            let area: f64 = damage
+                .iter()
+                .map(|rect| rect.size.width * rect.size.height)
+                .sum();
+            assert!(
+                area > 0.0 && area < screen.size.width * screen.size.height * 0.1,
+                "small moves should damage less than 10% of the screen, got {area}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_backing_and_style_changes_repaint_the_whole_screen() {
+        let screen = rect(0.0, 0.0, 800.0, 600.0);
+        let before = DecorationDrawState {
+            style: DecorationStyle {
+                dim_opacity: 0.2,
+                dim_color: (0.0, 0.0, 0.0),
+                cutout_radius: 12.0,
+                border: Some(border_params()),
+            },
+            cutout: None,
+            border_rect: None,
+        };
+        assert_eq!(decoration_damage(None, &before, screen), vec![screen]);
+        let mut after = before.clone();
+        after.style.dim_opacity = 0.0;
+        assert_eq!(
+            decoration_damage(Some(&before), &after, screen),
+            vec![screen]
+        );
+    }
+
+    #[test]
+    fn fractional_damage_is_pixel_aligned_and_clipped_to_the_backing() {
+        let screen = rect(0.0, 0.0, 800.0, 600.0);
+        let before = DecorationDrawState {
+            style: DecorationStyle {
+                dim_opacity: 0.2,
+                dim_color: (0.0, 0.0, 0.0),
+                cutout_radius: 12.0,
+                border: Some(border_params()),
+            },
+            cutout: None,
+            border_rect: None,
+        };
+        let mut after = before.clone();
+        after.cutout = Some(rect(-10.25, 30.5, 400.0, 700.0));
+        after.border_rect = after.cutout;
+        let damage = decoration_damage(Some(&before), &after, screen);
+        assert!(!damage.is_empty());
+        for rect in damage {
+            assert_eq!(intersect_rect(rect, screen), Some(rect));
+            for value in [
+                rect.origin.x,
+                rect.origin.y,
+                rect.size.width,
+                rect.size.height,
+            ] {
+                assert!(value.fract().abs() < f64::EPSILON);
+            }
+        }
     }
 
     fn border_params() -> BorderParams {
@@ -601,6 +842,24 @@ mod tests {
         assert_eq!(retargeted.presented, rect(50.0, 30.0, 400.0, 400.0));
         assert!(retargeted.animating);
     }
+
+    #[test]
+    fn every_space_animation_advances_on_the_same_frame() {
+        let original = rect(0.0, 20.0, 300.0, 500.0);
+        let next = rect(100.0, 40.0, 500.0, 300.0);
+        let current = retarget_decoration(None, original, 1, true);
+        let moving = retarget_decoration(Some(current), next, 2, true);
+        let mut presentations = [moving.clone(), moving];
+
+        assert!(advance_decorations(
+            presentations.iter_mut(),
+            1.0,
+            std::f64::consts::LN_2,
+        ));
+        for presentation in presentations {
+            assert_eq!(presentation.presented, rect(50.0, 30.0, 400.0, 400.0));
+        }
+    }
 }
 
 // ── Overlay window factory ──────────────────────────────────────────────
@@ -657,6 +916,7 @@ pub struct OverlayManager {
     /// `WindowServer` to compose as part of the Space transition.
     decoration_overlays: HashMap<WorkspaceId, DecorationOverlay>,
     hidden: bool,
+    needs_render: bool,
 }
 
 struct DecorationOverlay {
@@ -666,6 +926,8 @@ struct DecorationOverlay {
     view: Retained<DecorationView>,
     presentation: Option<DecorationPresentation>,
     style: DecorationStyle,
+    ordered: bool,
+    needs_order: bool,
 }
 
 impl OverlayManager {
@@ -674,6 +936,7 @@ impl OverlayManager {
             mtm,
             decoration_overlays: HashMap::new(),
             hidden: false,
+            needs_render: false,
         }
     }
 
@@ -692,7 +955,8 @@ impl OverlayManager {
         let screens = screen_frames(self.mtm);
         self.sync_decoration_overlays(&screens, screen_h, targets, dim_opacity, dim_color);
         self.hidden = false;
-        self.render_decorations();
+        // PostUpdate advances and renders once, after all target updates.
+        self.needs_render = true;
     }
 
     fn sync_decoration_overlays(
@@ -741,6 +1005,19 @@ impl OverlayManager {
                         .setFrame(NSRect::new(NSPoint::new(0.0, 0.0), screen.frame.size));
                     overlay.display_id = screen.id;
                     overlay.screen_frame = screen.frame;
+                    overlay.needs_order = true;
+                }
+                overlay.needs_order |=
+                    overlay.presentation.as_ref().map(|p| p.target_id) != focused.map(|(_, id)| id);
+                if overlay
+                    .presentation
+                    .as_ref()
+                    .map(|p| (p.target, p.target_id))
+                    != focused
+                {
+                    tracing::debug!(target: "spool::focus_diagnostics", space_id = target.space_id,
+                        before = ?overlay.presentation, ?focused, hidden = self.hidden,
+                        "overlay_retarget");
                 }
                 overlay.presentation = focused.map(|(frame, window_id)| {
                     retarget_decoration(overlay.presentation.take(), frame, window_id, !self.hidden)
@@ -782,13 +1059,15 @@ impl OverlayManager {
                     view,
                     presentation,
                     style,
+                    ordered: false,
+                    needs_order: true,
                 },
             );
         }
     }
 
-    fn render_decorations(&self) {
-        for overlay in self.decoration_overlays.values() {
+    fn render_decorations(&mut self) {
+        for overlay in self.decoration_overlays.values_mut() {
             let draw_state = overlay.presentation.as_ref().map_or_else(
                 || DecorationDrawState {
                     style: overlay.style.clone(),
@@ -800,14 +1079,24 @@ impl OverlayManager {
                 },
             );
             if overlay.style.dim_opacity != 0.0 || draw_state.border_rect.is_some() {
-                overlay.view.update(&draw_state);
+                let changed = !overlay.view.update(&draw_state).is_empty();
                 // Commit the replacement backing contents before ordering the
                 // window. Cross-application activation must never expose the
                 // transparent buffer between the old and new decorations.
-                overlay.view.displayIfNeeded();
-                overlay.window.orderFrontRegardless();
-            } else {
+                if changed || !overlay.ordered || overlay.view.needsDisplay() {
+                    overlay.view.displayIfNeeded();
+                    tracing::debug!(target: "spool::focus_diagnostics",
+                        presentation = ?overlay.presentation, local_border = ?draw_state.border_rect,
+                        "overlay_draw");
+                }
+                if !overlay.ordered || overlay.needs_order {
+                    overlay.window.orderFrontRegardless();
+                    overlay.ordered = true;
+                }
+                overlay.needs_order = false;
+            } else if overlay.ordered {
                 overlay.window.orderOut(None::<&AnyObject>);
+                overlay.ordered = false;
             }
         }
     }
@@ -816,14 +1105,16 @@ impl OverlayManager {
         if self.hidden {
             return;
         }
-        let advanced = self.decoration_overlays.values_mut().any(|overlay| {
-            overlay
-                .presentation
-                .as_mut()
-                .is_some_and(|presentation| advance_decoration(presentation, rate, delta))
-        });
-        if advanced {
+        let advanced = advance_decorations(
+            self.decoration_overlays
+                .values_mut()
+                .filter_map(|overlay| overlay.presentation.as_mut()),
+            rate,
+            delta,
+        );
+        if advanced || self.needs_render {
             self.render_decorations();
+            self.needs_render = false;
         }
     }
 
@@ -841,16 +1132,20 @@ impl OverlayManager {
             overlay.window.close();
         }
         self.hidden = false;
+        self.needs_render = false;
     }
 
     pub fn hide_all(&mut self) {
         if self.hidden {
             return;
         }
-        for overlay in self.decoration_overlays.values() {
+        tracing::debug!(target: "spool::focus_diagnostics", "overlay_hide");
+        for overlay in self.decoration_overlays.values_mut() {
             overlay.window.orderOut(None::<&AnyObject>);
+            overlay.ordered = false;
         }
         self.hidden = true;
+        self.needs_render = false;
     }
 }
 

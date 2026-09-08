@@ -69,6 +69,32 @@ impl Service {
         self.plist_path().is_file()
     }
 
+    /// Uses the installed agent's actual capture paths, including custom paths.
+    pub fn log_paths(&self) -> Result<Vec<PathBuf>> {
+        if !self.is_installed() {
+            return Ok(unique_log_paths([
+                Some(self.raw.out_log_path.as_str()),
+                Some(self.raw.error_log_path.as_str()),
+            ]));
+        }
+        let output = Command::new("/usr/bin/plutil")
+            .args(["-convert", "json", "-o", "-", "--"])
+            .arg(self.plist_path())
+            .output()?;
+        if !output.status.success() {
+            return Err(Error::other(format!(
+                "unable to read launch agent log paths: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(Error::other)?;
+        Ok(unique_log_paths([
+            document["StandardOutPath"].as_str(),
+            document["StandardErrorPath"].as_str(),
+        ]))
+    }
+
     /// Installs the service as a launch agent by writing its plist file.
     /// If the service is already installed, a warning is logged, and installation is skipped.
     ///
@@ -94,7 +120,7 @@ impl Service {
         let mut plist = fs::File::create(plist_path)?;
         plist.write_all(contents.as_bytes())?;
         info!("installed launch agent to `{}`", plist_path.display());
-        info!("check logfile /tmp/com.wxxxcxx.spool*.log for potential error messages");
+        info!("use `spool log -f` to inspect service output");
         Ok(())
     }
 
@@ -279,6 +305,17 @@ impl Service {
     }
 }
 
+fn unique_log_paths(paths: [Option<&str>; 2]) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    for path in paths.into_iter().flatten().filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        if !result.contains(&path) {
+            result.push(path);
+        }
+    }
+    result
+}
+
 fn start_commands(service: &launchctl::Service, bootstrapped: bool) -> Vec<Vec<&str>> {
     if bootstrapped {
         vec![vec!["kickstart", service.service_target.as_str()]]
@@ -297,6 +334,44 @@ fn start_commands(service: &launchctl::Service, bootstrapped: bool) -> Vec<Vec<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_paths_omit_missing_streams_and_deduplicate_shared_files() {
+        assert_eq!(
+            unique_log_paths([Some("/tmp/shared.log"), Some("/tmp/shared.log")]),
+            vec![PathBuf::from("/tmp/shared.log")]
+        );
+        assert_eq!(
+            unique_log_paths([None, Some("/tmp/error.log")]),
+            vec![PathBuf::from("/tmp/error.log")]
+        );
+        assert!(unique_log_paths([None, Some("")]).is_empty());
+    }
+
+    #[test]
+    fn log_paths_read_the_installed_plist_not_builder_defaults() {
+        let path = env::temp_dir().join(format!("spool-agent-{}.plist", uuid::Uuid::new_v4()));
+        let _cleanup = scopeguard::guard(path.clone(), |path| {
+            let _ = fs::remove_file(path);
+        });
+        let mut raw = service();
+        raw.plist_path = path.to_str().unwrap().to_string();
+        raw.out_log_path = "/tmp/custom spool output.log".into();
+        raw.error_log_path = "/tmp/custom spool errors.log".into();
+        let service = Service {
+            raw,
+            bin_path: "/tmp/spool".into(),
+            home_dir: "/Users/test".into(),
+        };
+        fs::write(&path, service.launchd_plist().unwrap()).unwrap();
+        assert_eq!(
+            service.log_paths().unwrap(),
+            vec![
+                PathBuf::from("/tmp/custom spool output.log"),
+                PathBuf::from("/tmp/custom spool errors.log")
+            ]
+        );
+    }
 
     fn service() -> launchctl::Service {
         launchctl::Service::builder()
