@@ -120,9 +120,9 @@ impl ScriptStateStore {
     ///
     /// # Errors
     ///
-    /// If the key is unacceptable or the write would push the store past its
-    /// size limit. A write that merely lost a race is not an error — it comes
-    /// back as [`WriteOutcome::Conflict`].
+    /// If the key is unacceptable, a value cannot be stored as JSON, or the
+    /// write would exceed the size or depth limit. A write that merely lost a
+    /// race is not an error — it comes back as [`WriteOutcome::Conflict`].
     pub fn apply(&mut self, write: &ScriptStateWrite) -> Result<WriteOutcome, String> {
         let outcome = self.state.apply(write)?;
         if matches!(outcome, WriteOutcome::Applied { changed: true }) {
@@ -369,9 +369,284 @@ mod tests {
     }
 
     #[test]
+    fn loading_rejects_keys_that_live_writes_cannot_accept() {
+        let path = unique_path("invalid-key");
+        for key in [
+            String::new(),
+            "x".repeat(spool_shared_types::script_state::MAX_KEY_BYTES + 1),
+        ] {
+            let saved = json!({
+                "version": SUPPORTED_SCRIPT_STATE_VERSION,
+                "state": {key: {"Int": 1}},
+            });
+            fs::write(&path, saved.to_string()).expect("written");
+            let loaded = ScriptStateStore::read_file(&path);
+            fs::remove_file(&path).expect("removed");
+            assert!(
+                loaded.is_none(),
+                "invalid key must not enter the live store"
+            );
+        }
+    }
+
+    #[test]
+    fn loading_rejects_a_store_over_the_live_capacity_limit() {
+        let path = unique_path("over-capacity");
+        let saved = json!({
+            "version": SUPPORTED_SCRIPT_STATE_VERSION,
+            "state": {"large": {"Str": "x".repeat(
+                spool_shared_types::script_state::MAX_SERIALISED_BYTES
+            )}},
+        });
+        fs::write(&path, saved.to_string()).expect("written");
+        let loaded = ScriptStateStore::read_file(&path);
+        fs::remove_file(&path).expect("removed");
+        assert!(
+            loaded.is_none(),
+            "oversized state must not enter the live store"
+        );
+    }
+
+    #[test]
+    fn an_accepted_non_finite_write_does_not_destroy_saved_state() {
+        let path = unique_path("non-finite-round-trip");
+        let mut store = ScriptStateStore::default();
+        applied(&mut store, &set("counter", json!(7)));
+        store.write_file(&path).expect("initial state saved");
+
+        let write = ScriptStateWrite::set("bad".to_string(), ScriptValue::Float(f64::INFINITY));
+        if store.apply(&write).is_ok() {
+            store.write_file(&path).expect("accepted state saved");
+        }
+        let loaded = ScriptStateStore::read_file(&path);
+        fs::remove_file(&path).expect("removed");
+        assert_eq!(
+            loaded.as_ref().and_then(|state| state.get("counter")),
+            Some(&ScriptValue::Int(7)),
+            "an accepted write must not make the entire saved store unreadable"
+        );
+    }
+
+    #[test]
+    fn non_finite_writes_are_rejected_without_mutation() {
+        let mut store = ScriptStateStore::default();
+        applied(&mut store, &set("counter", json!(7)));
+        store.dirty = false;
+        let before = store.snapshot();
+        let revision = store.revision_handle();
+        let stamp = revision.load(Ordering::Acquire);
+
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for value in [
+                ScriptValue::Float(number),
+                ScriptValue::Map(std::collections::BTreeMap::from([(
+                    "nested".to_string(),
+                    ScriptValue::List(vec![ScriptValue::Float(number)]),
+                )])),
+            ] {
+                let write = ScriptStateWrite::set("counter".to_string(), value.clone());
+                assert!(store.apply(&write).is_err());
+                let cas = ScriptStateWrite::compare_and_set(
+                    "counter".to_string(),
+                    Some(ScriptValue::Int(7)),
+                    Some(value),
+                );
+                assert!(store.apply(&cas).is_err());
+                assert_eq!(store.state(), &before);
+                assert_eq!(revision.load(Ordering::Acquire), stamp);
+                assert!(!store.dirty);
+            }
+        }
+    }
+
+    fn nested_value(depth: usize, maps: bool, leaf: ScriptValue) -> ScriptValue {
+        (0..depth).fold(leaf, |value, _| {
+            if maps {
+                ScriptValue::Map(std::collections::BTreeMap::from([(
+                    "child".to_string(),
+                    value,
+                )]))
+            } else {
+                ScriptValue::List(vec![value])
+            }
+        })
+    }
+
+    fn assert_accepted_deep_write_preserves_saved_state(maps: bool) {
+        let path = unique_path("deep-round-trip");
+        let mut store = ScriptStateStore::default();
+        applied(&mut store, &set("counter", json!(7)));
+        store.write_file(&path).expect("initial state saved");
+
+        let value = nested_value(64, maps, ScriptValue::Int(1));
+        let write = ScriptStateWrite::set("deep".to_string(), value);
+        if store.apply(&write).is_ok() {
+            store.write_file(&path).expect("accepted state saved");
+        }
+        let bytes = fs::read(&path).expect("read saved file");
+        let loaded = ScriptStateStore::read_file(&path);
+        let decoded = serde_json::from_slice::<SavedScriptState>(&bytes);
+        fs::remove_file(&path).expect("removed");
+        assert!(bytes.len() < spool_shared_types::script_state::MAX_SERIALISED_BYTES);
+        assert_eq!(
+            loaded.as_ref().and_then(|state| state.get("counter")),
+            Some(&ScriptValue::Int(7)),
+            "saved {} bytes (maps={maps}), decode error: {:?}",
+            bytes.len(),
+            decoded.err()
+        );
+    }
+
+    #[test]
+    fn an_accepted_deep_list_does_not_destroy_saved_state() {
+        assert_accepted_deep_write_preserves_saved_state(false);
+    }
+
+    #[test]
+    fn an_accepted_deep_map_does_not_destroy_saved_state() {
+        assert_accepted_deep_write_preserves_saved_state(true);
+    }
+
+    #[test]
+    fn persistent_depth_boundary_matches_the_json_loader() {
+        for maps in [false, true] {
+            for leaf in [
+                ScriptValue::Null,
+                ScriptValue::Bool(true),
+                ScriptValue::Int(1),
+                ScriptValue::Float(1.5),
+                ScriptValue::Str("leaf".to_string()),
+                ScriptValue::List(Vec::new()),
+                ScriptValue::Map(std::collections::BTreeMap::new()),
+            ] {
+                for depth in [61, 62, 63] {
+                    let value = nested_value(depth, maps, leaf.clone());
+                    let leaf_depth =
+                        usize::from(matches!(leaf, ScriptValue::List(_) | ScriptValue::Map(_)));
+                    let expected = depth + leaf_depth <= 62;
+                    let saved = json!({
+                        "version": SUPPORTED_SCRIPT_STATE_VERSION,
+                        "state": {"deep": value},
+                    });
+                    let path = unique_path("depth-boundary");
+                    let bytes = serde_json::to_vec_pretty(&saved).expect("encodes");
+                    fs::write(&path, &bytes).expect("fixture saved");
+                    let loaded = ScriptStateStore::read_file(&path);
+                    fs::remove_file(&path).expect("removed");
+                    // This decoder has no ScriptState validation: it checks
+                    // serde_json's own limit against the persistent file shape.
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&bytes).is_ok(),
+                        expected,
+                        "depth={depth}, maps={maps}, leaf={leaf:?}"
+                    );
+                    assert_eq!(loaded.is_some(), expected);
+
+                    let mut store = ScriptStateStore::default();
+                    let write = ScriptStateWrite::set("deep".to_string(), value.clone());
+                    assert_eq!(
+                        store.apply(&write).is_ok(),
+                        expected,
+                        "write and load must agree: depth={depth}, maps={maps}, leaf={leaf:?}"
+                    );
+                    if expected {
+                        store.write_file(&path).expect("accepted state saved");
+                        let reloaded = ScriptStateStore::read_file(&path);
+                        fs::remove_file(&path).expect("removed");
+                        assert_eq!(
+                            reloaded.as_ref().and_then(|state| state.get("deep")),
+                            Some(&value)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn over_deep_writes_are_rejected_without_mutation() {
+        let mut store = ScriptStateStore::default();
+        applied(&mut store, &set("counter", json!(7)));
+        let before = store.snapshot();
+        let revision = store.revision_handle();
+        let stamp = revision.load(Ordering::Acquire);
+
+        for dirty in [false, true] {
+            store.dirty = dirty;
+            for maps in [false, true] {
+                let value = nested_value(63, maps, ScriptValue::Null);
+                for write in [
+                    ScriptStateWrite::set("counter".to_string(), value.clone()),
+                    ScriptStateWrite::set("new".to_string(), value.clone()),
+                    ScriptStateWrite::compare_and_set(
+                        "counter".to_string(),
+                        Some(ScriptValue::Int(7)),
+                        Some(value),
+                    ),
+                ] {
+                    let error = store.apply(&write).expect_err("too deep to persist");
+                    assert!(error.contains("depth"), "{error}");
+                    assert_eq!(store.state(), &before);
+                    assert_eq!(revision.load(Ordering::Acquire), stamp);
+                    assert_eq!(store.dirty, dirty);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_temp_write_preserves_the_last_saved_file() {
+        let path = unique_path("temp-write-failure");
+        let tmp_path = path.with_extension("json.tmp");
+        let mut store = ScriptStateStore::default();
+        applied(&mut store, &set("counter", json!(7)));
+        store.write_file(&path).expect("initial state saved");
+        let before = fs::read(&path).expect("read initial state");
+
+        applied(&mut store, &set("counter", json!(8)));
+        fs::create_dir(&tmp_path).expect("block the temporary file");
+        let result = store.write_file(&path);
+        let after = fs::read(&path).expect("read preserved state");
+        fs::remove_dir(&tmp_path).expect("unblock the temporary file");
+
+        assert!(result.is_err());
+        assert_eq!(after, before);
+        assert!(store.dirty);
+        store.write_file(&path).expect("retry succeeds");
+        let loaded = ScriptStateStore::read_file(&path).expect("read retried state");
+        fs::remove_file(&path).expect("removed");
+        assert_eq!(loaded.get("counter"), Some(&ScriptValue::Int(8)));
+    }
+
+    #[test]
+    fn a_failed_rename_leaves_the_destination_untouched() {
+        let path = unique_path("rename-failure");
+        let marker_path = path.join("marker");
+        fs::create_dir(&path).expect("block the destination with a directory");
+        fs::write(&marker_path, b"preserve me").expect("marker written");
+        let mut store = ScriptStateStore::default();
+        applied(&mut store, &set("counter", json!(7)));
+
+        let result = store.write_file(&path);
+        let marker = fs::read(&marker_path).expect("destination preserved");
+        let pending = ScriptStateStore::read_file(&path.with_extension("json.tmp"));
+        fs::remove_file(&marker_path).expect("marker removed");
+        fs::remove_dir(&path).expect("directory removed");
+        fs::remove_file(path.with_extension("json.tmp")).expect("temporary file removed");
+
+        assert!(result.is_err());
+        assert_eq!(marker, b"preserve me");
+        assert!(store.dirty);
+        assert_eq!(
+            pending.as_ref().and_then(|state| state.get("counter")),
+            Some(&ScriptValue::Int(7))
+        );
+    }
+
+    #[test]
     fn a_file_from_another_version_is_ignored() {
         let path = unique_path("version-mismatch");
-        let stale = json!({ "version": SUPPORTED_SCRIPT_STATE_VERSION + 1, "state": { "a": 1 } });
+        let stale = json!({ "version": SUPPORTED_SCRIPT_STATE_VERSION + 1, "state": {} });
         fs::write(&path, stale.to_string()).expect("written");
 
         assert!(ScriptStateStore::read_file(&path).is_none());

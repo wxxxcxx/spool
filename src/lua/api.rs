@@ -31,7 +31,7 @@ use super::world::DispatchWorld;
 use crate::commands::Action;
 use crate::config::{Config, config_from_lua, resolve_chord};
 use crate::ecs::state::StateQueryKind;
-use spool_shared_types::windowset_lua::returned_ops;
+use spool_shared_types::windowset_lua::returned_plan;
 
 /// One `spool.exec` call: what to run, and where the answer goes.
 struct ExecJob {
@@ -282,7 +282,7 @@ pub(super) fn install(
                 let set = world.layout().await.map_err(mlua::Error::runtime)?;
                 let window_set = lua.create_userdata((*set).clone())?;
                 let returned: Value = transform.call_async(window_set).await?;
-                let ops = returned_ops(&returned)?;
+                let ops = returned_plan(&returned)?;
                 if ops.is_empty() {
                     return Ok(false);
                 }

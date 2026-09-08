@@ -243,6 +243,7 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::WindowCreated { .. }
             | Event::ReconcileWindows { .. }
             | Event::ActionRequested { .. }
+            | Event::LayoutSpaceRequested { .. }
             | Event::StateQuery { .. }
             | Event::WindowSetQuery { .. }
             | Event::StateSubscribe { .. }

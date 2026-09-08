@@ -286,6 +286,12 @@ pub enum Event {
 
     /// An action has been requested from the window manager.
     ActionRequested { action: Action },
+    /// A script's native Space or focus operation, bound to its original snapshot
+    /// across the nested native command dispatch.
+    LayoutSpaceRequested {
+        op: spool_shared_types::windowset::LayoutOp,
+        snapshot: Arc<spool_shared_types::windowset::LayoutSnapshot>,
+    },
 
     /// A structured state query has been issued by a client.
     StateQuery {

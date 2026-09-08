@@ -31,6 +31,7 @@
 
 ## Reviews
 
+- [Main program boundary review](reviews/main-program-boundaries-2026-09-07.md)
 - [Release readiness](reviews/release-readiness.md)
 - [Code reviews and refactor reports](reviews/)
 

@@ -248,6 +248,12 @@ spool script -e 'print(spool.state.get("pads.term"))'
 spool script -e 'spool.state.set("mode", "compact")'
 ```
 
+Keys must be nonempty and at most 512 bytes. Numbers must be finite. Values may
+contain at most 62 nested list/map containers, including empty containers, and
+the store's compact JSON encoding may not exceed 1 MiB. Writes that violate
+these limits fail without changing the store. Loading saved state applies the
+same constraints so an accepted value remains readable after restart.
+
 ---
 
 ## 6. Programmatic Window Management
@@ -286,7 +292,7 @@ A handler that raises partway through changes nothing either, because it never r
 | `ws:windows()` | Every window, as records |
 | `ws:window(id)` | One window record |
 | `ws:find(pred)` / `ws:filter(pred)` | The first / all windows matching a predicate |
-| `ws:current()` | Stable ID of the focused native Space |
+| `ws:current()` | Stable ID of the focused native Space, or `nil` when unknown or ambiguous |
 | `ws:spaces()` | Stable IDs of all known native Spaces |
 | `ws:space_windows(space_id)` | The windows on a Space |
 | `ws:columns([space_id])` | The columns of a Space, each a list of window IDs |
@@ -296,6 +302,12 @@ A handler that raises partway through changes nothing either, because it never r
 | `ws:next(id)` / `ws:prev(id)` | The next/previous window, wrapping |
 
 A window record contains `id`, `app_name`, `bundle_id`, `title`, `frame`, `floating`, `visible` and `focused`.
+
+Each display can have a visible Space, but only one display holds global focus.
+`ws:current()` requires exactly one active display and one observed visible Space
+on that display. It does not fall back to the first display when the observation
+is unavailable. In that case, `ws:columns()` returns an empty list; an explicit
+Space ID can still address its retained layout.
 
 `spool.match{ app = …, bundle = …, title = …, floating = … }` builds a compiled predicate; `app`, `bundle` and `title` are regular expressions.
 
@@ -313,14 +325,120 @@ Each method returns a new window set:
 - `ws:tab(id, onto)`
 - `ws:unstack(id)`
 
+`ws:stack(id, onto)` targets the named column in the same native Space; it does
+not mean "stack onto the column to the left". It moves the named stack item,
+keeping an existing native tab group together. Missing, floating, self, and
+same-column targets do not rearrange the strip. `ws:unstack(id)` splits a stack
+item next to its source column without changing native Space membership.
+
+`ws:swap(a, b)` exchanges named entries within the same native Space, including
+entries in one stack. Unrelated stacked siblings stay in place. During replay,
+existing native tab groups move as one item, and incoming items receive the
+destination column's width. A swap does not change focus or move windows between
+native Spaces; missing, floating, and fullscreen endpoints are skipped.
+
+Snapshots preserve native tab groups even inside vertical stacks. Chained
+`swap`, `stack`, and `unstack` predictions move those groups as whole entries,
+matching replay. `ws:columns()` still returns flat lists of window IDs in layout
+order. Binary clients and the daemon must both use local IPC protocol version 4;
+versions 2 (flat snapshots) and 3 (unbound operations) are rejected explicitly.
+
+Returned operations retain the original snapshot's daemon-session, ECS-entity,
+and native-incarnation bindings. A closed/replaced window is not targeted just
+because a new window has the same numeric ID. Both named endpoints and affected
+native tab/column members are checked at replay. Each stale operation is skipped
+independently; later operations on unchanged windows can still run. Operations
+for IDs that were not tracked at capture are recorded, but cannot bind to a
+window that appears later. A new daemon session invalidates the whole old plan,
+including Space-only `view` requests.
+
+Cross-Space operations keep their bindings while queued and check again before
+the native command is submitted. A move is skipped when an associated window
+is replaced or was not tracked in the original snapshot. These checks prevent
+identity reuse; they do not lock the layout while a script runs or guarantee
+that a predicted tree still matches the current layout.
+
+For a known target, `focus` predicts its owning display and Space as active and
+selects that member inside its column without reordering native tabs. `view`
+predicts the target display and Space as active while preserving the visible
+Spaces on other displays. A view retains focus only when the known focused
+window already belongs to the target; otherwise `focused()` becomes `nil`
+because the native Space request does not identify its eventual focused window.
+
+Bound `focus` keeps its explicit native-activation behavior. It is distinct from
+ordinary window-by-ID focus, which only accepts a currently observed visible
+owning Space. The session/entity/incarnation check still applies to script focus;
+an accepted request is not proof that macOS completed the focus or Space change.
+
+`shift(id, space_id, true)` predicts following and focusing the moved window,
+even when the window is already on that Space; the same-Space case does not
+reinsert it. Without following, moving the focused window clears the predicted
+focus without guessing a replacement. Missing targets or ambiguous Space IDs
+leave the tree unchanged while recording the original intent. These updates do
+not add synthetic focus/view operations or change the original snapshot bindings.
+Hiding a Space clears its window visibility; showing one does not invent
+visibility, and a moved window cannot retain its old visibility observation.
+
+These are requested predictions, not native confirmations. Native membership
+movement and Space focus are asynchronous; operations following them in a
+returned plan are not guaranteed to wait for completion. Associated native-tab
+movement can also differ from the single-window `shift` prediction. Take a fresh
+snapshot after native confirmation when a later decision depends on the result.
+
+Known release blocker: `ws:tab(id, onto)` still replays as vertical stacking
+instead of creating a native tab group. Preserving existing groups does not
+implement native tab creation, and its prediction must not be treated as a
+confirmed native result.
+
+`ws:width(id, ratio)` requests a width for the complete tiled column, using its
+owner display's usable width after Dock and edge padding. It does not use the
+focused display as a fallback. Nonpositive or nonfinite ratios, rounded widths
+below one pixel, unrepresentable frames, and overflowing strip offsets are
+rejected before changing sizes or maximize restoration state. Ordinary columns
+wider than a display remain supported. Actual geometry still follows the
+application's constraints and the normal frame-commit pipeline.
+
 `ws:float(id)` takes a window out of the tiling layout and leaves it where it is. `ws:float(id, rect)` places it relative to display fractions:
 
 ```lua
 ws:float(id, { x = 0.1, y = 0.05, width = 0.8, height = 0.5 })
 ```
 
+Mode predictions keep the window in its original native Space and display,
+including when that Space is inactive or no Space is marked active. Repeating
+the current float/tile mode leaves predicted order and column structure intact.
+`shift` preserves floating classification; requesting the current Space does
+not extract and reinsert the window. Intent is still recorded for best-effort
+replay. Configuration-dependent retile placement and final geometry remain
+decisions of the live layout pipeline.
+
+Layout mutation replay is also best-effort during native reassignment. A
+retained source layout is not a writable placement: `swap`, `stack`, `unstack`,
+width and frame operations are skipped if their affected members are still
+owned by a move or membership-recovery barrier. Column-wide changes include
+the current column's other members. Independent operations in the same plan
+still run; rejected ones are not replayed automatically after confirmation.
+Focus and float/tile classification retain their own admission rules.
+
+When native ownership is known, snapshots include floating windows on inactive
+Spaces and hidden floating windows. A failed complete membership scan or a
+window reported in multiple Spaces leaves that floating record out of the
+snapshot until ownership is known again; this does not close or untrack the
+window. The `visible` flag requires current native Space visibility as well as
+on-display geometry and a non-hidden, non-minimized window state.
+
+Relative-coordinate addition saturates instead of wrapping. The frame-request
+pipeline rejects a rectangle whose normalized positive dimensions overflow its
+integer endpoint coordinates before changing position or size. Negative global
+origins remain valid; zero or negative requested dimensions still normalize to
+one pixel.
+
 Cross-Space transforms record native Space commands. Check
-`spool.query_state().capabilities` first: in the current backend only a
-non-following window move may be available, and it is disabled by default.
-Focus, create, delete, and the old hidden-workspace scratchpad pattern are not
-provided by the observe-only core.
+`spool.query_state().capabilities` first. Private Space control is disabled by
+default. When enabled, the backend supports requesting Space focus on the
+currently active display and may support moving windows to a user Space.
+A following move waits for membership confirmation before requesting Space
+focus, then waits for target visibility before focusing the moved window.
+Cross-display Space focus can be rejected even if the pure prediction selects
+that display. Create/delete and the old hidden-workspace scratchpad pattern are
+not provided by the observe-only core.

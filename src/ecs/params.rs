@@ -2,9 +2,8 @@ use bevy::{
     ecs::{
         entity::Entity,
         hierarchy::ChildOf,
-        query::{Has, With, Without},
+        query::{Has, Or, With, Without},
         system::{Commands, NonSend, Query, Res, ResMut, Single, SystemParam},
-        world::Mut,
     },
     math::IRect,
 };
@@ -80,7 +79,7 @@ impl GlobalState<'_> {
     }
 }
 
-/// A Bevy `SystemParam` that provides immutable access to the currently active `Display` and other displays.
+/// A Bevy `SystemParam` that provides immutable access to the currently active `Display`.
 /// It ensures that only one display is marked as active at any given time.
 #[derive(SystemParam)]
 pub struct ActiveDisplay<'w, 's> {
@@ -101,19 +100,12 @@ pub struct ActiveDisplay<'w, 's> {
         (&'static Display, Entity, Option<&'static DockPosition>),
         With<ActiveDisplayMarker>,
     >,
-    /// A query for all other `Display` components that are not marked as active.
-    other_displays: Query<'w, 's, &'static Display, Without<ActiveDisplayMarker>>,
 }
 
 impl ActiveDisplay<'_, '_> {
     /// Returns an immutable reference to the active `Display`.
     pub fn display(&self) -> &Display {
         self.display.0
-    }
-
-    /// Returns an iterator over immutable references to all other displays (non-active).
-    pub fn other(&self) -> impl Iterator<Item = &Display> {
-        self.other_displays.iter()
     }
 
     pub fn active_strip(&self) -> &LayoutStrip {
@@ -157,7 +149,12 @@ pub struct ActiveDisplayMut<'w, 's> {
         With<ActiveDisplayMarker>,
     >,
     /// A query for all other `Display` components that are not marked as active.
-    other_displays: Query<'w, 's, &'static mut Display, Without<ActiveDisplayMarker>>,
+    other_displays: Query<
+        'w,
+        's,
+        (Entity, &'static mut Display, Option<&'static DockPosition>),
+        Without<ActiveDisplayMarker>,
+    >,
 }
 
 impl ActiveDisplayMut<'_, '_> {
@@ -169,18 +166,19 @@ impl ActiveDisplayMut<'_, '_> {
         self.display.2
     }
 
-    /// Returns an iterator over mutable references to all other displays (non-active).
-    pub fn other(&mut self) -> impl Iterator<Item = Mut<'_, Display>> {
-        self.other_displays.iter_mut()
+    pub(crate) fn other_contexts(
+        &self,
+    ) -> impl Iterator<Item = (Entity, &Display, Option<&DockPosition>)> {
+        self.other_displays.iter()
     }
 
     pub fn active_strip(&mut self) -> &mut LayoutStrip {
         &mut self.strip
     }
 
-    /// Returns the `CGRect` representing the bounds of the active display.
-    pub fn bounds(&self) -> IRect {
-        self.display().bounds()
+    /// Reads the strip for command planning without marking it changed.
+    pub fn active_strip_ref(&self) -> &LayoutStrip {
+        &self.strip
     }
 
     /// Returns the `IRect` representing the bounds of the active display, correctly padded by
@@ -281,6 +279,16 @@ type AllWindows<'w, 's> = Query<
 type FocusedWindows<'w, 's> =
     Query<'w, 's, (&'static Window, Entity), (With<FocusedMarker>, Without<WindowUnavailable>)>;
 
+type ReassignedWindows<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    Or<(
+        With<super::native_space::NativeMoveOwner>,
+        With<super::workspace::WindowSpaceReassignmentPending>,
+    )>,
+>;
+
 #[derive(SystemParam)]
 pub struct Windows<'w, 's> {
     all: AllWindows<'w, 's>,
@@ -298,6 +306,7 @@ pub struct Windows<'w, 's> {
         With<FullWidthMarker>,
     >,
     positions: WindowPlacements<'w, 's>,
+    reassigned: ReassignedWindows<'w, 's>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -325,6 +334,23 @@ impl<'a> TrackedWindowState<'a> {
 }
 
 impl Windows<'_, '_> {
+    /// Retained source membership is not permission to mutate a layout while
+    /// native reassignment owns its geometry and captured column structure.
+    pub(crate) fn layout_is_writable(&self, entity: Entity) -> bool {
+        self.available.contains(entity) && !self.reassigned.contains(entity)
+    }
+
+    pub(crate) fn layout_column_is_writable(&self, strip: &LayoutStrip, entity: Entity) -> bool {
+        strip
+            .index_of(entity)
+            .and_then(|index| strip.get(index))
+            .is_ok_and(|column| {
+                column
+                    .window_iter()
+                    .all(|member| self.layout_is_writable(member))
+            })
+    }
+
     pub fn get_tracked(&self, entity: Entity) -> Option<(&Window, Entity, TrackedWindowState<'_>)> {
         let (window, entity, _, floating, visibility) = self
             .available
@@ -355,6 +381,14 @@ impl Windows<'_, '_> {
     pub fn find(&self, window_id: WinID) -> Option<(&Window, Entity)> {
         self.available
             .into_iter()
+            .find(|(window, _, _, _, _)| window.id() == window_id)
+            .map(|(window, entity, _, _, _)| (window, entity))
+    }
+
+    /// Identity lookup only: the returned window may be unavailable for AX operations.
+    pub(crate) fn find_any(&self, window_id: WinID) -> Option<(&Window, Entity)> {
+        self.all
+            .iter()
             .find(|(window, _, _, _, _)| window.id() == window_id)
             .map(|(window, entity, _, _, _)| (window, entity))
     }
@@ -488,23 +522,25 @@ impl Windows<'_, '_> {
     }
 
     pub fn moving_frame(&self, entity: Entity) -> Option<IRect> {
-        self.positions.get(entity).ok().map(
-            |(_, origin, size, _, _, desired, _, reposition, resize)| {
-                if let Some(desired) = desired {
-                    return desired.0;
-                }
-                let size = size.0;
-                let mut frame = IRect::from_corners(origin.0, origin.0 + size);
+        let (_, origin, size, _, _, desired, _, reposition, resize) =
+            self.positions.get(entity).ok()?;
+        let frame = match desired {
+            Some(desired) => desired.0,
+            None => super::window_frame::checked_window_frame(origin.0, size.0)?,
+        };
+        let size = super::window_frame::checked_frame_size(frame)?;
+        super::window_frame::checked_window_frame(
+            reposition.map_or(frame.min, |request| request.0),
+            resize.map_or(size, |request| request.0),
+        )
+    }
 
-                if let Some(reposition) = reposition {
-                    frame.min = reposition.0;
-                    frame.max = frame.min + size;
-                }
-                if let Some(resize) = resize {
-                    frame.max = frame.min + resize.0;
-                }
-                frame
-            },
+    /// Layout inputs including commands queued earlier in this frame.
+    pub fn requested_frame(&self, entity: Entity) -> Option<IRect> {
+        let (_, origin, size, _, _, _, _, reposition, resize) = self.positions.get(entity).ok()?;
+        super::window_frame::checked_window_frame(
+            reposition.map_or(origin.0, |request| request.0),
+            resize.map_or(size.0, |request| request.0),
         )
     }
 

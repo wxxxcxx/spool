@@ -135,11 +135,9 @@ pub fn serve_lua_queries(worker: Option<Res<LuaWorker>>, state: QueryStateParams
     let Some(worker) = worker else {
         return;
     };
-    // Collected up front so a waiter later in the queue isn't re-read for.
-    let requests: Vec<_> = worker.pending_world_queries().collect();
-    if requests.is_empty() {
-        return;
-    }
+    // The worker freezes and bounds this batch. Consume it lazily so query
+    // extraction also counts toward the time budget between requests.
+    let requests = worker.pending_world_queries();
 
     // Filled on the first waiter that asks for that kind, reused by the rest.
     let mut extracted_state = None;

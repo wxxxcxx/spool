@@ -30,6 +30,46 @@ Bevy is typically used for games, so Spool implements a custom bridge to interac
 
 The flow is intentionally one-way. An ordinary macOS readback never mutates tiled Layout State. User- or application-driven geometry is first collected as a `Geometry Gesture`; only the settled final frame becomes a single Layout State action. Floating windows are the exception because no tiling neighbours depend on their geometry.
 
+`Balance` and `Equalize` prepare all affected sizes from `Windows::requested_frame`,
+including earlier resize/reposition markers, before queuing any changes. Missing
+members or unrepresentable proposed endpoints reject the batch. `Balance` also
+checks the complete proposed strip width, retaining native fullscreen columns
+in that budget without resizing them. Restore markers are removed only after
+the plan has passed validation.
+
+Ordinary resize and maximize also read pending Layout State, not an intermediate
+observed animation frame. Column-width changes validate all affected members
+before replacing requests or clearing restoration state. Maximize validates its
+proposed unstack and restore frame before changing membership; native tab groups
+resize together and can restore after focus switches between members.
+`Windows::moving_frame` overlays pending requests on the desired projection and
+rejects unrepresentable frames. Resize centering uses wide intermediate arithmetic;
+viewport clamping preserves representable origins and positive-size endpoints.
+Snap rejects an unrepresentable strip translation instead of wrapping it.
+
+Stack toggles plan against a cloned strip and commit only a changed, representable
+layout. An ineligible toggle leaves both the strip's change tick and maximize
+restore state untouched. Lua unstack also validates its proposed strip before
+replacement. `LayoutStrip::stack`/`unstack` distinguish a real change from a no-op.
+Column offsets are checked for the entire strip before exposing the first
+projected entry: overflow emits no partial prefix and does not discard layout
+membership. This is an offset guard, not proof that all global-coordinate or
+command geometry arithmetic has been audited.
+
+Layout projection pairs eligible members with their representative sizes before
+packing heights. Missing or invalid geometry is omitted from the projection, not
+removed from `LayoutStrip`. A native tab item uses its first eligible member and
+emits only eligible siblings; stored membership/order remains intact for recovery.
+Column offsets and projected window widths use the same eligible master, so a
+wider follower cannot create a transient gap before the next column.
+
+Global frame projection keeps intermediate offsets in wide integers, applies
+the existing padding/sliver rules, and narrows only a representable final frame.
+Ensure-visible processing skips a no-op or invalid request without starving later
+markers. Viewport-origin changes validate both the current strip origin and its
+pending target before rebasing either or advancing the saved viewport; rejected
+rebases remain retryable. These guards do not replace native geometry readback.
+
 **Note:** All AppKit/Accessibility calls must happen on the **Main Thread**.
 Spool uses `NonSend` platform owners and single-threaded executors for startup
 and frame schedules; platform initialization rejects a non-main caller.
@@ -68,10 +108,24 @@ The embedded scripting runtime is the one deliberate exception to "everything in
 
 - **Main → worker:** `dispatch_lua_events` and `command_lua_handler` send plain event data and keybind IDs over an unbounded channel. Neither ever blocks.
 - **Worker → main:** `drain_lua_outbox` non-blockingly drains queued `Action`s and flash messages onto the command bus.
+- **Main-thread queue budgets:** Each effect, world-read, or store-access batch
+  freezes its initial pending count and handles at most 256 requests, with a
+  soft 4ms budget checked before receiving the next request. One request may
+  overrun the budget, and the first pending request always makes progress.
+  Unprocessed requests remain FIFO for a later pass; no request is consumed
+  merely to discover that the budget has expired. World-query batches are
+  consumed lazily so extraction time counts toward this budget too.
 - **The query round-trip:** `spool.query*` sends a reply channel and asynchronously awaits the answer; other handlers can run meanwhile. `serve_lua_queries` answers from `QueryStateParams` in `PreUpdate` (before the pump) and again in `PostUpdate`, sharing each extraction among that pass's waiters.
 - **Snapshot ownership:** Each input message owns a `DispatchBatch`. Its handlers share reads, while later batches remain independent of suspended callbacks. `DispatchWorld` installs the batch only during each future poll, so reload top-level code cannot borrow an old callback's world access. Script state is separately cached by revision.
 - **Reload ownership:** Retired runtimes may finish in-flight actions, but only the installed runtime publishes handler availability. Keybind callback IDs are process-unique, so an event queued before reload cannot invoke a replacement callback. A failed reload retains the working runtime and configuration.
 - **Flash duration boundary:** Lua flash durations are validated before entering the outbox; worker messages and ECS timers carry `Duration`, never unvalidated floating-point seconds.
+- **Layout replay ordering:** Each recorded layout operation runs as a cached
+  ECS system and flushes its observers before the next operation, including
+  across handler batches. A float or retile therefore settles its markers and
+  strip placement before a following stack operation reads them. Script sink
+  requests use the normal retile observer's native membership and capability
+  checks. Geometry requests share endpoint validation with the frame pipeline;
+  an invalid request cannot overwrite an earlier valid request's markers.
 
 `src/lua/runtime.rs` reaches the world through `DispatchWorld` rather than ECS
 borrows. Only plain data crosses the worker channels; Lua values and platform
@@ -106,6 +160,236 @@ objects stay on their owning threads.
 | `src/overlay.rs` | Logic for drawing active window borders and inactive window dimming. |
 
 ## 4. Key Data Entities
+
+### Layout Snapshots
+
+`WindowSet` keeps each column's canonical `StackItemSet` entries: an individual
+window or an existing native tab group. A vertical stack can contain either,
+without flattening native groups into unrelated entries. `ColumnSet::windows()`
+is a flattened read view used by Lua `columns()` and the window-bar projection;
+transforms use the structured entries for swap, stack, and unstack. The snapshot
+remains immutable-by-transform and contains only `Send` data for the Lua worker.
+
+Floating snapshot entries use a complete `NativeTopology` membership scan,
+including inactive Spaces. The scan's ordered view removes repeated IDs and
+excludes ambiguous memberships while preserving native list order. A partial
+scan cannot establish ownership: those floating entries are temporarily omitted
+from `WindowSet`, without retiring their ECS entities or changing frames. No
+membership scan is needed when no available tracked windows are floating.
+Snapshot visibility also requires a currently observed visible native Space;
+intersecting a display rectangle alone is insufficient.
+
+`WorkspaceSet.active` is per-display native visibility, not the global
+`ActiveWorkspaceMarker`. `DisplaySet.active` identifies the globally active
+display from the same topology epoch, not a retained `ActiveDisplayMarker`.
+`WindowSet::current()` requires a unique active display and a unique
+visible Space there; retained strips do not substitute for missing observations.
+Focus/view/follow predictions update these two levels separately, preserve
+other displays' visible Spaces, and keep the root and record focus flags aligned.
+Explicit window focus also selects the existing column member without changing
+native-tab order. Predicted Space changes can invalidate visibility but cannot
+establish that a hidden/minimized/offscreen window has become visible.
+
+`LayoutPlan` transports operations with an immutable `LayoutSnapshot`: a random
+daemon-session UUID and the original available tracked windows' ECS entity bits
+and native incarnations. `WindowSet` transformations preserve this provenance
+separately from the predicted tree. `ops()` is only an inspection view; execution
+uses `plan()`, including embedded callbacks, `spool.windows`, and socket clients.
+`src/ecs/layout_snapshot.rs` owns capture and identity matching. Replay checks
+every named endpoint and affected native tab/column member per operation, after
+preceding observers have flushed. Unrelated stale windows do not reject a valid
+operation, but an ID absent at capture cannot acquire a binding later.
+
+Native Space and focus operations cross the deferred command handoff as
+`LayoutSpaceRequested`, not an unbound numeric-ID action. The native command
+system revalidates session and window identities, including associated windows,
+before issuing an intent; the existing move transaction then owns its captured
+entity/incarnation bindings. These are freshness checks, not client authentication
+or a frozen world revision.
+
+`commands::dispatch_actions` is the single reader for runtime actions, including
+directional window operations, named focus, Space commands, column reorder, and
+returned script plans. It runs after the event pump and before topology refresh.
+Each command flushes its deferred changes and observers before the next command
+is accepted. A plan's operations use the same nested execution path, so native
+focus and movement do not return to a separate message reader behind later
+actions. Snapshot identity is checked again at the native command handoff.
+
+Window mutations select the still-pending focus request before confirmed focus;
+this does not optimistically change `FocusedMarker` or public focus state. An
+unavailable or hidden pending target does not redirect the mutation to the old
+window. Once normal invalidation cancels the request, confirmed focus is again
+eligible. Geometry and strip-relative commands also require the target's active
+Space ownership: tiled membership comes from the strip, floating membership
+from a successful native read. An accepted focus request on another display
+does not authorize use of the source display's viewport. Repeated floating
+movement and centering read pending geometry instead of stale observed frames.
+
+Lua callback execution remains asynchronous; its result enters the action queue
+when received. This ordering does not serialize independent state-query or
+subscription readers with actions, or wait for their asynchronous effects.
+
+The predicted tree does not make deferred operations synchronous. A Space move
+or view does not guarantee that later layout operations wait for native
+confirmation, and backend focus may reject a target on another display.
+
+The bound snapshot/plan representation uses local IPC protocol version 4.
+Versions 2 and 3 are rejected instead of interpreting incompatible postcard data.
+This is independent of persisted layout-state and public query-document versions.
+
+### Cross-Display Command Admission
+
+Display selection is a shared pure policy in `commands::display_navigation`.
+Explicit `nextdisplay` cycles by native `(min.x, min.y, display_id)`, matching
+the Bar's spatial ordering with an identity tie-break. Vertical fallback after
+local navigation is exhausted uses the requested half-plane of display centers,
+prefers horizontal overlap, then ranks edge gaps and center distance. It never
+wraps when no screen exists in that direction. Selection does not depend on ECS
+archetype/query order and uses widened arithmetic for coordinate differences.
+
+Window transfer and directional focus start from the focused display. Explicit
+mouse navigation starts from unique native cursor ownership, using half-open
+screen rectangles so a shared edge has one owner. A gap or overlapping ownership
+defers the command. Mouse/focus navigation refreshes topology and validates
+source/target geometry, unique visible Spaces and target strip parentage before
+warping. Focus candidates must be available, visible, uniquely belong to that
+Space and have positive overlap with its usable viewport. Visible width, height
+and window ID resolve selection deterministically; an empty eligible set lands
+at the usable viewport center without a window-focus request. All landing
+midpoints are overflow-safe. A selected destination that is not ready is not
+replaced with an arbitrary peer.
+
+`ToNextDisplay` remains a frame-based command that does not require experimental
+Space control. Before changing either strip or publishing geometry and focus
+effects, it checks fresh source membership, unique visible native ownership,
+matching display geometry, the destination strip's parent display, and checked
+usable viewports. Unknown reads, fullscreen/retiring destinations, unavailable
+tab siblings, native moves already in flight, and an overflowing proposed strip
+reject the request without partially removing the source layout. Pending
+initialization geometry also blocks transfer admission.
+
+The selected native tab group moves as one layout item. Tiled width ratios and
+destination heights are planned in the command and enter the shared frame
+pipeline together; there is no delayed callback carrying an old width ratio or
+bare window entity. Floating windows keep their size. `Stay` restores an eligible
+source tiled window when one exists. A successful local directional move ends
+the action instead of also crossing a display boundary in the same invocation.
+
+Admission captures an incarnation-bound `DisplayTransferFrame` for each member
+and enters the native move transaction's ownership/geometry barrier. The source
+layout remains intact. The shared committer gives each request one AX attempt,
+revalidating source membership, target ownership, geometry, visibility and
+floating classification at write time. This request is the only display-transfer
+exception to the geometry barrier. No native Space-control command is submitted.
+
+Physical readback is staged separately from source layout geometry. Only unique
+target membership for every current, available member commits the tab group
+and staged geometry. Rejection, constrained writes, incomplete observations and
+partial tab arrivals cannot prematurely migrate the layout or claim focus.
+Timeout/identity retirement releases transaction ownership without replaying the
+AX request; the membership audit retains control of the geometry barrier.
+
+Follow and Stay completion are identity-bound and canceled by later accepted
+focus commands. Follow checks current target visibility and recomputes the
+pointer destination from the current usable viewport; Stay checks the captured
+source neighbour's current membership. Neither requires experimental Space
+control. Associations beyond recorded native tabs, gesture-specific edge warp
+selection, and live macOS acceptance remain separate review scope.
+
+### Native Move Transactions
+
+Move admission distinguishes native membership from ECS layout placement. A
+complete membership read can avoid repeating an already completed native move,
+but a retained source layout still enters the existing reconciliation path.
+Only a matching layout can finish immediately without a geometry barrier;
+same-Space requests then preserve column order and grouping. Confirmation also
+retains an already-present target layout when admission could not prove a no-op.
+
+Whole-column transactions capture the requested column and the existing layout
+of additional tracked associated members, preserving source stacks and native
+tab groups. Not-yet-placed members have individual fallback slots. Confirmation
+filters this captured layout using current floating classification, never
+retiling a window merely because it was tiled when the request was submitted.
+Hidden and minimized members likewise stay outside live strips; confirmation
+updates their `PreviousTiledStrip` destination and retains the captured insertion
+index. A later show restores them through the ordinary retile path. A hidden
+same-Space request is a no-op only when its remembered destination also matches.
+Admission rejects tracked associated members that are temporarily AX-unavailable,
+instead of silently excluding their identities from the move. AX withdrawal
+after submission defers commitment; timeout still retains the geometry barrier
+for the membership audit to resolve after recovery.
+Existing entity/incarnation, availability, complete membership, and timeout
+checks still gate commitment and release of the reassignment barrier.
+
+Follow-focus requires current native visibility on a unique owning display,
+not a retained `VisibleNativeSpaceMarker`. Disabling Space control cancels
+uncompleted native Space-control follows, but not ordinary frame-based display
+follows, without rolling back submitted native movement. Reenabling
+does not revive those follows. A newer accepted native Space move without
+following cancels older pending follows only for its affected windows, including an already
+confirmed same-Space request. A new follow, accepted explicit window-focus
+request, or successful explicit Space selection supersedes all older pending
+follows. Submitted moves still reconcile and release their barriers normally.
+Ordinary display moves schedule either follow or source-restoration focus and
+supersede older pending focus completions when admitted.
+Rejected Space-focus submissions and unresolved or stale window endpoints do
+not cancel a valid pending follow. Already-issued platform focus events
+cannot be recalled by this cancellation. An observed hide or minimize cancels
+the affected member's unfinished follow, even during an AX or membership wait.
+Showing the window again does not revive that follow. Moving an already hidden
+window updates its membership and remembered route without implicitly showing
+or focusing it.
+
+`FocusRequestKind` separates explicit interaction from automatic focus restoration.
+Space restoration, native-tab detection, keeping the previous focus for a
+`dont_focus` window, and native follow completion use the automatic path. They
+must not cancel the explicit follow they may be helping to complete. Ordinary
+focus observations likewise do not act as a new command or advance cancellation.
+
+### Layout Mutation Admission
+
+A retained source strip does not grant permission to modify an in-flight move.
+`Windows::layout_is_writable` requires an available window without either
+`NativeMoveOwner` or `WindowSpaceReassignmentPending`. Local geometry/structure
+commands and named script mutations check this before changing layout or
+publishing resize/reposition requests. Focus and floating classification retain
+their separate admission paths.
+
+Column-wide changes check every affected member, not just the named or focused
+window. Stack/unstack and maximize include the original column; stacking also
+checks the destination. Reordering/dragging columns checks every column shifted
+between the two endpoints. Balance rejects atomically if any affected member
+is protected. Unrelated columns remain writable, and a rejected script operation
+does not discard independent operations later in the same plan.
+
+Rejected mutations are not queued for later replay with stale source geometry.
+Normal admission resumes only when both transaction ownership and the geometry
+barrier have cleared. Timeout alone does not bypass an unresolved membership
+barrier; native confirmation or the ordinary membership audit releases it.
+
+### Named Window Focus
+
+Ordinary `Action::FocusWindow` requests do not implicitly select another native
+Space. Admission samples topology and visibility at the request, then requires
+a complete membership scan to identify one actual Space and one visible owning
+display. It never substitutes a retained `LayoutStrip`, `VisibleNativeSpaceMarker`,
+or active-display fallback for that evidence. Floating, hidden, minimized, and
+not-yet-placed tracked windows use the same ownership check. A visible fullscreen
+Space is eligible for focus even though it is not a valid native-move destination.
+
+The sampler runs inside the ordered command executor, so it can observe a Space
+selection issued earlier in the same batch before ECS markers catch up. It does
+not wait for an asynchronous native transition: unresolved visibility still
+rejects the request. A visible secondary display does not need to be the active
+display; an unrelated visibility failure is acceptable, but incomplete global
+Space topology cannot establish unique window membership.
+
+`FocusSpacePolicy` keeps this distinct from bound script `focus`, which retains
+its existing permission to request native Space activation through window focus.
+The script endpoint still requires its original session/entity/incarnation
+binding. Neither path claims that the asynchronous OS focus request succeeded.
+Rejected ordinary focus does not cancel an otherwise valid pending follow, and
+the shared visible-Space predicate also gates follow completion.
 
 ### Components
 - **`Window`:** A wrapper around a macOS window handle (AXUIElement).
@@ -154,6 +438,11 @@ objects stay on their owning threads.
 written atomically to `spool/state.json` in the XDG state directory
 (`~/.local/state/spool/state.json` on a default macOS setup) and is loaded
 during Bevy app setup.
+
+Periodic and exit saves require a complete current native display/Space catalog
+before extracting the snapshot. A retained ECS projection is useful during an
+observation failure but is not evidence that a new durable snapshot is trustworthy;
+incomplete observations preserve the previous file until observation recovers.
 
 `src/ecs/restore.rs` owns startup restore. It keeps the loaded `SpoolState`
 alive in `SessionRestore` for the configured grace period so applications have

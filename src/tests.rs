@@ -1,8 +1,13 @@
+mod command_dispatch;
 mod display;
+mod display_commands;
 mod exit_restore;
 mod harness;
 mod interaction;
+#[cfg(feature = "lua")]
+mod layout_ops;
 mod mocks;
+mod native_focus;
 mod native_move;
 mod native_space_projection;
 mod session_restore;

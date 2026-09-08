@@ -349,10 +349,10 @@ pub enum Action {
     /// Invokes a Lua keybind handler by its registry id (see the daemon's
     /// `crate::lua`). Never produced by parsing; the runtime issues it directly.
     Lua(u32),
-    /// Layout operations a Lua handler produced by transforming a `WindowSet`.
+    /// A snapshot-bound plan a Lua handler produced by transforming a `WindowSet`.
     /// Window-addressed, unlike every other action here, and applied
     /// best-effort: see `ecs::layout_ops`. Never produced by parsing.
-    Layout(Vec<crate::windowset::LayoutOp>),
+    Layout(crate::windowset::LayoutPlan),
     /// Reorders the complete tiled column containing `window_id` relative to
     /// the complete tiled column containing `anchor_window_id`.
     ReorderColumn {

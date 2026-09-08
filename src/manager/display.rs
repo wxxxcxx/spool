@@ -147,10 +147,6 @@ impl Display {
         bounds
     }
 
-    pub fn width(&self) -> i32 {
-        self.bounds().width()
-    }
-
     pub fn menubar_height(&self) -> i32 {
         self.menubar_height_override
             .unwrap_or(self.menubar_height)
@@ -183,5 +179,39 @@ impl Display {
             _ => (),
         }
         viewport
+    }
+
+    /// Command admission must reject an invalid viewport before changing layout.
+    pub(crate) fn checked_actual_display_bounds(
+        &self,
+        dock: Option<&DockPosition>,
+        config: &Config,
+    ) -> Option<IRect> {
+        let (top, right, bottom, left) = config.edge_padding();
+        let mut viewport = self.bounds;
+        viewport.min.x = viewport.min.x.checked_add(left)?;
+        viewport.min.y = viewport
+            .min
+            .y
+            .checked_add(self.menubar_height())?
+            .checked_add(top)?;
+        viewport.max.x = viewport.max.x.checked_sub(right)?;
+        viewport.max.y = viewport.max.y.checked_sub(bottom)?;
+        match dock {
+            Some(DockPosition::Left(size)) if *size >= 0 => {
+                viewport.min.x = viewport.min.x.checked_add(*size)?;
+            }
+            Some(DockPosition::Right(size)) if *size >= 0 => {
+                viewport.max.x = viewport.max.x.checked_sub(*size)?;
+            }
+            Some(DockPosition::Bottom(size)) if *size >= 0 => {
+                viewport.max.y = viewport.max.y.checked_sub(*size)?;
+            }
+            None | Some(DockPosition::Hidden) => {}
+            _ => return None,
+        }
+        (viewport.max.x.checked_sub(viewport.min.x)? > 0
+            && viewport.max.y.checked_sub(viewport.min.y)? > 0)
+            .then_some(viewport)
     }
 }

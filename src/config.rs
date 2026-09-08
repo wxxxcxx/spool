@@ -37,6 +37,8 @@ use crate::{
 pub mod decorations;
 pub mod padding;
 pub mod swipe;
+#[cfg(feature = "lua")]
+mod validation;
 
 /// The default Lua init script, written on first launch when no script exists so the
 /// file watcher always has a concrete path to observe for hot reloading.
@@ -599,7 +601,7 @@ impl Config {
 
 fn parse_hex_color(hex: &str) -> (f64, f64, f64) {
     let hex = hex.strip_prefix('#').unwrap_or(hex);
-    if hex.len() != 6 {
+    if hex.len() != 6 || !hex.is_ascii() {
         return (1.0, 1.0, 1.0);
     }
     let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255);
@@ -884,23 +886,26 @@ impl WindowParams {
         &self.parsed_passthrough
     }
 
-    /// Parses the grid string into `(x_ratio, y_ratio, w_ratio, h_ratio)`, all 0.0–1.0.
+    /// Parses six finite grid fields into `(x_ratio, y_ratio, w_ratio, h_ratio)`.
     pub fn grid_ratios(&self) -> Option<(f64, f64, f64, f64)> {
         let grid = self.grid.as_ref()?;
-        let parts: Vec<f64> = grid.split(':').filter_map(|s| s.parse().ok()).collect();
-        if parts.len() != 6 {
+        let parts: Vec<f64> = grid
+            .split(':')
+            .map(|part| part.parse().ok())
+            .collect::<Option<_>>()?;
+        let parts: [f64; 6] = parts.try_into().ok()?;
+        if !parts.iter().all(|part| part.is_finite()) {
             return None;
         }
-        let (cols, rows) = (parts[0], parts[1]);
+        let [cols, rows, x, y, width, height] = parts;
         if cols <= 0.0 || rows <= 0.0 {
             return None;
         }
-        Some((
-            parts[2] / cols,
-            parts[3] / rows,
-            parts[4] / cols,
-            parts[5] / rows,
-        ))
+        let ratios = [x / cols, y / rows, width / cols, height / rows];
+        ratios
+            .iter()
+            .all(|ratio| ratio.is_finite())
+            .then_some((ratios[0], ratios[1], ratios[2], ratios[3]))
     }
 }
 
@@ -1050,7 +1055,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error if `value` is not a table or fails to deserialize.
+/// Returns an error if `value` is not a table, fails to deserialize, or contains
+/// a non-finite numeric setting.
 #[cfg(feature = "lua")]
 pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Result<Config> {
     use mlua::LuaSerdeExt;
@@ -1062,7 +1068,7 @@ pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Resu
     }
 
     let mut inner: InnerConfig = lua.from_value(value)?;
-    inner.bar.validate().map_err(mlua::Error::RuntimeError)?;
+    inner.validate().map_err(mlua::Error::RuntimeError)?;
 
     // Resolve window passthrough chords into keycodes. `parsed_passthrough` is `#[serde(skip)]`, so it starts empty.
     let needs_keys = inner.windows.as_ref().is_some_and(|windows| {
@@ -1636,6 +1642,22 @@ fn test_parse_hex_color_valid() {
 }
 
 #[test]
+fn grid_rejects_invalid_fields_and_non_finite_ratios() {
+    for grid in [
+        "2:bad:2:1:1:1:1",
+        "2::2:1:1:1:1",
+        "NaN:2:0:0:1:1",
+        "2:inf:0:0:1:1",
+        "2:2:0:0:NaN:1",
+        "5e-324:2:1:0:1:1",
+    ] {
+        let mut params = WindowParams::new(".*", None);
+        params.grid = Some(grid.to_string());
+        assert_eq!(params.grid_ratios(), None, "{grid}");
+    }
+}
+
+#[test]
 fn test_parse_hex_color_no_hash() {
     assert_eq!(
         parse_hex_color("89b4fa"),
@@ -1661,6 +1683,28 @@ fn test_parse_hex_color_malformed_hex() {
     // Non-hex digits fall back to 255 per channel.
     assert_eq!(parse_hex_color("ZZZZZZ"), (1.0, 1.0, 1.0));
     assert_eq!(parse_hex_color("GG0000"), (1.0, 0.0, 0.0));
+}
+
+#[test]
+fn configured_colors_handle_non_ascii_input_without_panicking() {
+    for color in [
+        "\u{4e2d}\u{6587}",
+        "#\u{4e2d}\u{6587}",
+        "\u{1f4a1}ab",
+        "a\u{e9}bcd",
+    ] {
+        let config: Config = (
+            MainOptions {
+                border_color: Some(color.to_string()),
+                dim_inactive_color: Some(color.to_string()),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        assert_eq!(config.border_color(), (1.0, 1.0, 1.0), "{color:?}");
+        assert_eq!(config.dim_inactive_color(), (1.0, 1.0, 1.0), "{color:?}");
+    }
 }
 
 #[test]
@@ -1828,6 +1872,76 @@ mod lua_setup_tests {
             let value = lua.load(source).eval().unwrap();
             assert!(config_from_lua(&lua, value).is_err());
         }
+    }
+
+    #[test]
+    fn non_finite_settings_are_rejected_before_publication() {
+        let lua = Lua::new();
+        for field in [
+            "swipe = { sensitivity = NUMBER }",
+            "swipe = { deceleration = NUMBER }",
+            "options = { swipe_sensitivity = NUMBER }",
+            "options = { swipe_deceleration = NUMBER }",
+            "options = { animation_speed = NUMBER }",
+            "options = { sliver_height = NUMBER }",
+            "options = { dim_inactive_windows = NUMBER }",
+            "options = { border_opacity = NUMBER }",
+            "options = { border_width = NUMBER }",
+            "options = { border_radius = NUMBER }",
+            "options = { window_hidden_ratio = NUMBER }",
+            "options = { preset_column_widths = { 0.5, NUMBER, 2.0 } }",
+            "decorations = { active = { border = { opacity = NUMBER } } }",
+            "decorations = { active = { border = { width = NUMBER } } }",
+            "decorations = { active = { border = { radius = NUMBER } } }",
+            "decorations = { inactive = { dim = { opacity = NUMBER } } }",
+            "decorations = { inactive = { dim = { opacity_night = NUMBER } } }",
+            "decorations = { inactive = { border = { radius = NUMBER } } }",
+            "decorations = { active = { dim = { opacity = NUMBER } } }",
+            "windows = { example = { width = NUMBER } }",
+            "windows = { example = { border_radius = NUMBER } }",
+        ] {
+            for number in ["0/0", "math.huge", "-math.huge"] {
+                let source = format!("return {{ {} }}", field.replace("NUMBER", number));
+                let value = lua.load(&source).eval().expect("valid Lua");
+                assert!(
+                    config_from_lua(&lua, value).is_err(),
+                    "non-finite configuration was accepted: {source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "clamp endpoints are exact configuration constants"
+    )]
+    fn finite_settings_keep_existing_clamps_and_oversized_widths() {
+        let config = config_from_source(
+            r#"return {
+                options = {
+                    animation_speed = -1,
+                    sliver_height = 0,
+                    window_hidden_ratio = 2,
+                    border_width = -1,
+                    border_radius = "auto",
+                    preset_column_widths = { 0.5, 1, 2 },
+                },
+                swipe = { sensitivity = -1, deceleration = 100 },
+                windows = { example = { width = 2.0 } },
+            }"#,
+        );
+        assert_eq!(config.animation_speed(), 0.0);
+        assert_eq!(config.sliver_height(), 0.1);
+        assert_eq!(config.window_hidden_ratio(), 1.0);
+        assert_eq!(config.border_width(), 0.0);
+        assert_eq!(config.swipe_sensitivity(), 0.1);
+        assert_eq!(config.swipe_deceleration(), 10.0);
+        assert_eq!(config.preset_column_widths(), vec![0.5, 1.0, 2.0]);
+        assert_eq!(
+            config.inner().windows.as_ref().unwrap()["example"].width,
+            Some(2.0)
+        );
     }
 
     #[test]

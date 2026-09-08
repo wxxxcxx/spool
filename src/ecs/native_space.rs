@@ -1,13 +1,14 @@
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::Has;
+use bevy::ecs::query::{Has, With};
 use bevy::ecs::resource::Resource;
-use bevy::ecs::system::{Commands, Local, Query, Res, SystemParam};
+use bevy::ecs::system::{Commands, In, Local, Query, Res, ResMut, SystemParam};
+use bevy::math::IRect;
 use bevy::time::Time;
 use tracing::{debug, error, instrument, warn};
 
@@ -15,16 +16,20 @@ use crate::commands::{Action, MoveFocus};
 use crate::config::Config;
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::layout_snapshot::{LayoutSession, matches_window};
 use crate::ecs::params::Windows;
 use crate::ecs::topology::NativeTopology;
+use crate::ecs::window_frame::{DisplayTransferFrame, DisplayTransferReadback};
 use crate::ecs::workspace::{
     PendingSpaceDestruction, WindowSpaceReassignmentPending, freeze_window_for_space_reassignment,
 };
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, RefreshWindowSizes, SpawnCommandsExt,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, Position,
+    PresentedWindowFrame, PreviousTiledStrip, RefreshWindowSizes, SpawnCommandsExt, WidthRatio,
+    WindowFrameCommitSuspended, WindowFrameMotion, WindowVisibility,
 };
 use crate::events::Event;
-use crate::manager::{Display, NativeSpaceIntent, WindowManager};
+use crate::manager::{Display, NativeSpaceIntent, Origin, WindowManager};
 use crate::platform::{WinID, WindowIncarnation, WorkspaceId};
 pub use spool_shared_types::state::SpaceKind;
 
@@ -81,6 +86,25 @@ struct PendingMove {
     follow: Option<MoveWindowIdentity>,
     layout: PendingMoveLayout,
     submitted: Duration,
+    display: Option<DisplayMoveCompletion>,
+}
+
+pub(crate) struct DisplayMovePlan {
+    pub(crate) members: Vec<Entity>,
+    pub(crate) target: IRect,
+    pub(crate) viewport: IRect,
+    pub(crate) target_space_id: WorkspaceId,
+    pub(crate) source_display_id: u32,
+    pub(crate) target_display_id: u32,
+    pub(crate) follow: Option<Entity>,
+    pub(crate) source_neighbour: Option<Entity>,
+    pub(crate) tiled: bool,
+}
+
+#[derive(Debug)]
+struct DisplayMoveCompletion {
+    target_display_id: u32,
+    source_follow: Option<PendingFollow>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -109,7 +133,72 @@ impl MoveWindowIdentity {
 #[derive(Debug)]
 enum PendingMoveLayout {
     AssociatedWindows,
-    Column(Column),
+    Columns(LayoutStrip),
+}
+
+impl PendingMoveLayout {
+    fn capture_column<'a>(
+        column: Column,
+        space_id: WorkspaceId,
+        sources: impl Iterator<Item = &'a LayoutStrip>,
+        members: &[MoveWindowIdentity],
+    ) -> Self {
+        let mut remaining = members
+            .iter()
+            .map(|member| member.entity)
+            .collect::<HashSet<_>>();
+        for entity in column.window_iter() {
+            remaining.remove(&entity);
+        }
+        let mut captured = LayoutStrip::new(space_id);
+        captured.append_column(column);
+        if !remaining.is_empty() {
+            let mut sources = sources.collect::<Vec<_>>();
+            sources.sort_unstable_by_key(|strip| strip.id());
+            for source in sources {
+                if remaining.is_empty() {
+                    break;
+                }
+                if !source
+                    .columns()
+                    .flat_map(Column::window_iter)
+                    .any(|entity| remaining.contains(&entity))
+                {
+                    continue;
+                }
+                let mut source = source.clone();
+                let mut associated = source.take_windows_preserving_layout(&remaining);
+                for entity in associated.all_windows() {
+                    remaining.remove(&entity);
+                }
+                captured.append_strip(&mut associated);
+            }
+            // Floats and not-yet-placed members have no source column to retain.
+            for member in members {
+                if remaining.remove(&member.entity) {
+                    captured.append(member.entity);
+                }
+            }
+        }
+        Self::Columns(captured)
+    }
+
+    fn tiled_projection(&self, space_id: WorkspaceId, tiled: &[Entity]) -> LayoutStrip {
+        let mut strip = match self {
+            Self::AssociatedWindows => {
+                let mut strip = LayoutStrip::new(space_id);
+                strip.append_tab_group(tiled);
+                strip
+            }
+            Self::Columns(captured) => captured.clone(),
+        };
+        for entity in strip.all_windows() {
+            if !tiled.contains(&entity) {
+                strip.remove(entity);
+            }
+        }
+        strip
+    }
 }
 
 #[derive(Debug)]
@@ -117,6 +206,39 @@ struct PendingFollow {
     member: MoveWindowIdentity,
     target_space_id: WorkspaceId,
     submitted: Duration,
+    visible_display: Option<u32>,
+    warp_pointer: bool,
+}
+
+impl PendingFollow {
+    fn submit(
+        member: MoveWindowIdentity,
+        target_space_id: WorkspaceId,
+        manager: &WindowManager,
+        config: &Config,
+        submitted: Duration,
+    ) -> Option<Self> {
+        if !config.space_control_enabled() {
+            return None;
+        }
+        let intent = NativeSpaceIntent::Focus {
+            space_id: target_space_id,
+            animate: config.space_switch_animation(),
+        };
+        match manager.perform_native_space_intent(&intent) {
+            Ok(()) => Some(Self {
+                member,
+                target_space_id,
+                submitted,
+                visible_display: None,
+                warp_pointer: false,
+            }),
+            Err(error) => {
+                warn!(window_id = member.window_id, space_id = target_space_id, %error, "unable to follow moved window to Space");
+                None
+            }
+        }
+    }
 }
 
 #[derive(Default, Resource)]
@@ -125,221 +247,450 @@ pub(crate) struct NativeSpaceTransactions {
     follows: Vec<PendingFollow>,
 }
 
-pub(crate) fn handle_focus_window_commands(
-    mut messages: MessageReader<Event>,
+impl NativeSpaceTransactions {
+    pub(super) fn cancel_pending_follows(&mut self) {
+        for pending in &mut self.moves {
+            pending.follow = None;
+            if let Some(display) = &mut pending.display {
+                display.source_follow = None;
+            }
+        }
+        self.follows.clear();
+    }
+
+    fn cancel_follows_for(&mut self, window_ids: &[WinID]) {
+        self.follows
+            .retain(|pending| !window_ids.contains(&pending.member.window_id));
+    }
+
+    pub(crate) fn submit_display_move(
+        &mut self,
+        plan: DisplayMovePlan,
+        windows: &Windows,
+        source: &LayoutStrip,
+        commands: &mut Commands,
+        submitted: Duration,
+    ) {
+        let identity = |entity| {
+            windows
+                .get_tracked(entity)
+                .map(|(window, _, _)| MoveWindowIdentity {
+                    window_id: window.id(),
+                    entity,
+                    incarnation: window.incarnation(),
+                })
+        };
+        let Some(members) = plan
+            .members
+            .iter()
+            .copied()
+            .map(identity)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        let window_ids = members
+            .iter()
+            .map(|member| member.window_id)
+            .collect::<Vec<_>>();
+        if self
+            .moves
+            .iter()
+            .any(|pending| pending.window_ids.iter().any(|id| window_ids.contains(id)))
+        {
+            return;
+        }
+        let follow = plan.follow.and_then(identity);
+        let source_follow = plan
+            .source_neighbour
+            .and_then(identity)
+            .filter(|_| follow.is_none())
+            .map(|member| PendingFollow {
+                member,
+                target_space_id: source.id(),
+                submitted,
+                visible_display: Some(plan.source_display_id),
+                warp_pointer: false,
+            });
+        self.cancel_pending_follows();
+        for member in &members {
+            freeze_window_for_space_reassignment(
+                member.entity,
+                source.index_of(member.entity).unwrap_or_default(),
+                commands,
+            );
+            commands.entity(member.entity).insert((
+                NativeMoveOwner,
+                DisplayTransferFrame {
+                    target: plan.target,
+                    viewport: plan.viewport,
+                    source_space_id: source.id(),
+                    target_space_id: plan.target_space_id,
+                    display_id: plan.target_display_id,
+                    incarnation: member.incarnation,
+                    tiled: plan.tiled,
+                },
+            ));
+        }
+        self.moves.push(PendingMove {
+            window_ids,
+            members,
+            target_space_id: plan.target_space_id,
+            follow,
+            layout: PendingMoveLayout::AssociatedWindows,
+            submitted,
+            display: Some(DisplayMoveCompletion {
+                target_display_id: plan.target_display_id,
+                source_follow,
+            }),
+        });
+    }
+}
+
+enum FocusSpacePolicy {
+    VisibleOnly,
+    AllowNativeActivation,
+}
+
+fn focus_window_command(
+    In((window_id, policy)): In<(WinID, FocusSpacePolicy)>,
     windows: Windows,
-    spaces: Query<(&LayoutStrip, Has<VisibleNativeSpaceMarker>)>,
+    window_manager: Res<WindowManager>,
+    mut topology: ResMut<NativeTopology>,
     mut commands: Commands,
 ) {
-    for window_id in messages.read().filter_map(|event| match event {
-        Event::ActionRequested {
-            action: Action::FocusWindow { window_id },
-        } => Some(*window_id),
-        _ => None,
-    }) {
-        let Some((_, entity)) = windows.find(window_id) else {
-            warn!(window_id, "window is not tracked");
-            continue;
-        };
-        if spaces
-            .iter()
-            .any(|(strip, visible)| strip.contains(entity) && !visible)
-        {
-            warn!(window_id, "cannot focus a window on an invisible Space");
-            continue;
-        }
-        commands.focus_entity(entity, true);
+    let Some((_, entity)) = windows.find(window_id) else {
+        warn!(window_id, "window is not tracked");
+        return;
+    };
+    if matches!(policy, FocusSpacePolicy::VisibleOnly)
+        && topology
+            .observe_visible_window_space(&window_manager, window_id)
+            .is_none()
+    {
+        warn!(
+            window_id,
+            "cannot confirm a unique visible Space for window focus"
+        );
+        return;
     }
+    commands.focus_entity(entity, true);
 }
 
 #[derive(SystemParam)]
 pub(crate) struct NativeSpaceCommandCtx<'w, 's> {
     windows: Windows<'w, 's>,
     spaces: Query<'w, 's, &'static LayoutStrip>,
+    previous_strips: Query<'w, 's, &'static PreviousTiledStrip>,
     config: Res<'w, Config>,
     window_manager: Res<'w, WindowManager>,
     transactions: bevy::ecs::system::ResMut<'w, NativeSpaceTransactions>,
     time: Res<'w, Time>,
+    session: Res<'w, LayoutSession>,
+    topology: Res<'w, NativeTopology>,
     commands: Commands<'w, 's>,
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn handle_native_space_commands(
-    mut messages: MessageReader<Event>,
-    ctx: NativeSpaceCommandCtx,
-) {
+pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceCommandCtx) {
     let NativeSpaceCommandCtx {
         windows,
         spaces,
+        previous_strips,
         config,
         window_manager,
         mut transactions,
         time,
+        session,
+        topology,
         mut commands,
     } = ctx;
-    for action in messages.read().filter_map(|event| match event {
-        Event::ActionRequested { action } => Some(action),
-        _ => None,
-    }) {
-        let move_request = match action {
-            Action::MoveWindowToSpace {
-                window_id,
-                space_id,
-                move_focus,
-            } => Some((*window_id, *space_id, *move_focus, None)),
-            Action::MoveColumnToSpace {
-                window_id,
-                space_id,
-                move_focus,
-            } => {
-                let Some((_, entity)) = windows.find(*window_id) else {
-                    warn!(window_id, "window is not tracked");
-                    continue;
-                };
-                let Some((_, _, state)) = windows.get_tracked(entity) else {
-                    continue;
-                };
-                if state.is_floating() {
-                    warn!(
-                        window_id,
-                        "a floating window does not belong to a tiled column"
-                    );
-                    continue;
-                }
-                let Some(column) = spaces
-                    .iter()
-                    .find_map(|strip| strip.column_containing(entity))
-                else {
-                    warn!(window_id, "window is not in a layout column");
-                    continue;
-                };
-                Some((*window_id, *space_id, *move_focus, Some(column)))
+    let (action, snapshot) = match &event {
+        Event::ActionRequested { action } => (Cow::Borrowed(action), None),
+        Event::LayoutSpaceRequested { op, snapshot } => {
+            use spool_shared_types::windowset::LayoutOp;
+            if !session.accepts(snapshot, *op, &windows) {
+                debug!(
+                    ?op,
+                    "skipping deferred Space command with a stale snapshot identity"
+                );
+                return;
             }
+            let action = match *op {
+                LayoutOp::MoveToWorkspace {
+                    window,
+                    space_id,
+                    follow,
+                } => Action::MoveWindowToSpace {
+                    window_id: window,
+                    space_id,
+                    move_focus: if follow {
+                        MoveFocus::Follow
+                    } else {
+                        MoveFocus::Stay
+                    },
+                },
+                LayoutOp::View { space_id } => Action::FocusSpace { space_id },
+                LayoutOp::Focus(window_id) => Action::FocusWindow { window_id },
+                _ => return,
+            };
+            (Cow::Owned(action), Some(snapshot.as_ref()))
+        }
+        _ => return,
+    };
+    let action = action.as_ref();
+    if let Action::FocusWindow { window_id } = action {
+        let policy = if snapshot.is_some() {
+            FocusSpacePolicy::AllowNativeActivation
+        } else {
+            FocusSpacePolicy::VisibleOnly
+        };
+        commands.run_system_cached_with(focus_window_command, (*window_id, policy));
+        return;
+    }
+    let move_request = match action {
+        Action::MoveWindowToSpace {
+            window_id,
+            space_id,
+            move_focus,
+        } => Some((*window_id, *space_id, *move_focus, None)),
+        Action::MoveColumnToSpace {
+            window_id,
+            space_id,
+            move_focus,
+        } => {
+            let Some((_, entity)) = windows.find(*window_id) else {
+                warn!(window_id, "window is not tracked");
+                return;
+            };
+            let Some((_, _, state)) = windows.get_tracked(entity) else {
+                return;
+            };
+            if state.is_floating() {
+                warn!(
+                    window_id,
+                    "a floating window does not belong to a tiled column"
+                );
+                return;
+            }
+            let Some(column) = spaces
+                .iter()
+                .find_map(|strip| strip.column_containing(entity))
+            else {
+                warn!(window_id, "window is not in a layout column");
+                return;
+            };
+            Some((*window_id, *space_id, *move_focus, Some(column)))
+        }
+        _ => None,
+    };
+    let Some((window_id, space_id, move_focus, column)) = move_request else {
+        let intent = match action {
+            Action::FocusSpace { space_id } => Some(NativeSpaceIntent::Focus {
+                space_id: *space_id,
+                animate: config.space_switch_animation(),
+            }),
+            Action::CreateSpace { display_id } => Some(NativeSpaceIntent::Create {
+                display_id: *display_id,
+            }),
+            Action::DeleteSpace { space_id } => Some(NativeSpaceIntent::Delete {
+                space_id: *space_id,
+            }),
             _ => None,
         };
-        let Some((window_id, space_id, move_focus, column)) = move_request else {
-            let intent = match action {
-                Action::FocusSpace { space_id } => Some(NativeSpaceIntent::Focus {
-                    space_id: *space_id,
-                    animate: config.space_switch_animation(),
-                }),
-                Action::CreateSpace { display_id } => Some(NativeSpaceIntent::Create {
-                    display_id: *display_id,
-                }),
-                Action::DeleteSpace { space_id } => Some(NativeSpaceIntent::Delete {
-                    space_id: *space_id,
-                }),
-                _ => None,
-            };
-            if let Some(intent) = intent {
-                if config.space_control_enabled() {
-                    if let Err(error) = window_manager.perform_native_space_intent(&intent) {
-                        warn!(?action, %error, "Space capability unavailable");
+        if let Some(intent) = intent {
+            if config.space_control_enabled() {
+                match window_manager.perform_native_space_intent(&intent) {
+                    Ok(()) => {
+                        if matches!(intent, NativeSpaceIntent::Focus { .. }) {
+                            transactions.cancel_pending_follows();
+                        }
                     }
-                } else {
-                    warn!(?action, "Space control is disabled");
+                    Err(error) => warn!(?action, %error, "Space capability unavailable"),
                 }
+            } else {
+                warn!(?action, "Space control is disabled");
             }
+        }
+        return;
+    };
+    if !config.space_control_enabled() {
+        warn!("Space control is disabled; enable experimental_space_control");
+        return;
+    }
+    let target_is_known = window_manager
+        .present_displays()
+        .into_iter()
+        .flat_map(|(_, spaces)| spaces)
+        .any(|candidate| candidate == space_id);
+    if !target_is_known || window_manager.workspace_is_fullscreen(space_id) {
+        warn!(space_id, "target is not a known user Space");
+        return;
+    }
+    if windows.find(window_id).is_none() {
+        warn!(window_id, "window is not tracked");
+        return;
+    }
+    let members = column.as_ref().map_or_else(
+        || {
+            windows
+                .find(window_id)
+                .map(|(_, entity)| vec![entity])
+                .unwrap_or_default()
+        },
+        |column| column.window_iter().collect(),
+    );
+    let mut window_ids = Vec::new();
+    if members
+        .iter()
+        .any(|member| windows.get_tracked(*member).is_none())
+    {
+        warn!(window_id, "column has unavailable members");
+        return;
+    }
+    for member in members {
+        let Some((window, _, _)) = windows.get_tracked(member) else {
             continue;
         };
-        if !config.space_control_enabled() {
-            warn!("Space control is disabled; enable experimental_space_control");
-            continue;
-        }
-        let target_is_known = window_manager
-            .present_displays()
-            .into_iter()
-            .flat_map(|(_, spaces)| spaces)
-            .any(|candidate| candidate == space_id);
-        if !target_is_known || window_manager.workspace_is_fullscreen(space_id) {
-            warn!(space_id, "target is not a known user Space");
-            continue;
-        }
-        if windows.find(window_id).is_none() {
-            warn!(window_id, "window is not tracked");
-            continue;
-        }
-        let members = column.as_ref().map_or_else(
-            || {
-                windows
-                    .find(window_id)
-                    .map(|(_, entity)| vec![entity])
-                    .unwrap_or_default()
-            },
-            |column| column.window_iter().collect(),
+        let member_id = window.id();
+        window_ids.extend(window_manager.get_associated_windows(member_id));
+        window_ids.push(member_id);
+    }
+    window_ids.sort_unstable();
+    window_ids.dedup();
+    if window_ids.iter().any(|id| {
+        windows
+            .find_any(*id)
+            .is_some_and(|(_, entity)| !windows.is_available(entity))
+    }) {
+        warn!(window_id, "associated window is temporarily unavailable");
+        return;
+    }
+    if snapshot.is_some_and(|snapshot| {
+        window_ids
+            .iter()
+            .any(|id| !matches_window(snapshot, *id, &windows))
+    }) {
+        debug!(
+            window_id,
+            "skipping script move with unbound or replaced associated windows"
         );
-        let mut window_ids = Vec::new();
-        if members
-            .iter()
-            .any(|member| windows.get_tracked(*member).is_none())
-        {
-            warn!(window_id, "column has unavailable members");
-            continue;
-        }
-        for member in members {
-            let Some((window, _, _)) = windows.get_tracked(member) else {
-                continue;
-            };
-            let member_id = window.id();
-            window_ids.extend(window_manager.get_associated_windows(member_id));
-            window_ids.push(member_id);
-        }
-        window_ids.sort_unstable();
-        window_ids.dedup();
-        if transactions
-            .moves
-            .iter()
-            .any(|pending| pending.window_ids.iter().any(|id| window_ids.contains(id)))
-        {
-            warn!(window_id, "window already has a pending native move");
-            continue;
-        }
-        let members = window_ids
-            .iter()
-            .filter_map(|id| {
-                windows
-                    .find(*id)
-                    .map(|(window, entity)| MoveWindowIdentity {
-                        window_id: *id,
-                        entity,
-                        incarnation: window.incarnation(),
-                    })
-            })
-            .collect::<Vec<_>>();
-        let follow = members
-            .iter()
-            .find(|member| member.window_id == window_id)
-            .copied()
-            .filter(|_| move_focus == MoveFocus::Follow);
-        let intent = NativeSpaceIntent::MoveWindows {
-            window_ids: window_ids.clone(),
-            space_id,
-        };
-        match window_manager.perform_native_space_intent(&intent) {
-            Ok(()) => {
-                for member in &members {
-                    let entity = member.entity;
-                    let index = spaces
-                        .iter()
-                        .find_map(|strip| strip.index_of(entity).ok())
-                        .unwrap_or_default();
-                    freeze_window_for_space_reassignment(entity, index, &mut commands);
-                    commands.entity(entity).insert(NativeMoveOwner);
-                }
-                transactions.moves.push(PendingMove {
-                    window_ids,
-                    members,
-                    target_space_id: space_id,
-                    follow,
-                    layout: column.map_or(
-                        PendingMoveLayout::AssociatedWindows,
-                        PendingMoveLayout::Column,
-                    ),
-                    submitted: time.elapsed(),
-                });
+        return;
+    }
+    if transactions
+        .moves
+        .iter()
+        .any(|pending| pending.window_ids.iter().any(|id| window_ids.contains(id)))
+    {
+        warn!(window_id, "window already has a pending native move");
+        return;
+    }
+    let members = window_ids
+        .iter()
+        .filter_map(|id| {
+            windows
+                .find(*id)
+                .map(|(window, entity)| MoveWindowIdentity {
+                    window_id: *id,
+                    entity,
+                    incarnation: window.incarnation(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let follow = members
+        .iter()
+        .find(|member| member.window_id == window_id)
+        .copied()
+        .filter(|member| {
+            move_focus == MoveFocus::Follow
+                && windows
+                    .get_tracked(member.entity)
+                    .is_some_and(|(_, _, state)| state.is_visible())
+        });
+    let already_at_target = topology
+        .observe_memberships(&window_manager)
+        .is_ok_and(|membership| {
+            window_ids
+                .iter()
+                .all(|id| membership.unique_space(*id) == Some(space_id))
+        });
+    let fully_reconciled = already_at_target
+        && members.iter().all(|member| {
+            windows
+                .get_tracked(member.entity)
+                .is_some_and(|(_, _, state)| {
+                    let mut owners = spaces.iter().filter(|strip| strip.contains(member.entity));
+                    if state.is_floating() {
+                        owners.next().is_none()
+                    } else if !state.is_visible() {
+                        owners.next().is_none()
+                            && previous_strips
+                                .get(member.entity)
+                                .is_ok_and(|previous| previous.workspace_id == space_id)
+                    } else {
+                        owners.next().is_some_and(|strip| strip.id() == space_id)
+                            && owners.next().is_none()
+                    }
+                })
+        });
+    if fully_reconciled {
+        if let Some(member) = follow {
+            if let Some(pending) =
+                PendingFollow::submit(member, space_id, &window_manager, &config, time.elapsed())
+            {
+                transactions.cancel_pending_follows();
+                transactions.follows.push(pending);
             }
-            Err(error) => warn!(%error, "Space operation rejected"),
+        } else {
+            transactions.cancel_follows_for(&window_ids);
         }
+        return;
+    }
+    let intent = NativeSpaceIntent::MoveWindows {
+        window_ids: window_ids.clone(),
+        space_id,
+    };
+    let submitted = if already_at_target {
+        Ok(())
+    } else {
+        window_manager.perform_native_space_intent(&intent)
+    };
+    match submitted {
+        Ok(()) => {
+            if follow.is_some() {
+                transactions.cancel_pending_follows();
+            } else {
+                transactions.cancel_follows_for(&window_ids);
+            }
+            for member in &members {
+                let entity = member.entity;
+                let index = spaces
+                    .iter()
+                    .find_map(|strip| strip.index_of(entity).ok())
+                    .or_else(|| {
+                        previous_strips
+                            .get(entity)
+                            .ok()
+                            .map(|previous| previous.index)
+                    })
+                    .unwrap_or_default();
+                freeze_window_for_space_reassignment(entity, index, &mut commands);
+                commands.entity(entity).insert(NativeMoveOwner);
+            }
+            let layout = column.map_or(PendingMoveLayout::AssociatedWindows, |column| {
+                PendingMoveLayout::capture_column(column, space_id, spaces.iter(), &members)
+            });
+            transactions.moves.push(PendingMove {
+                window_ids,
+                members,
+                target_space_id: space_id,
+                follow,
+                layout,
+                submitted: time.elapsed(),
+                display: None,
+            });
+        }
+        Err(error) => warn!(%error, "Space operation rejected"),
     }
 }
 
@@ -348,15 +699,11 @@ pub(crate) struct NativeSpaceReconciliationCtx<'w, 's> {
     window_manager: Res<'w, WindowManager>,
     windows: Windows<'w, 's>,
     config: Res<'w, Config>,
-    spaces: Query<
-        'w,
-        's,
-        (
-            &'static mut LayoutStrip,
-            Has<VisibleNativeSpaceMarker>,
-            Has<PendingSpaceDestruction>,
-        ),
-    >,
+    spaces: Query<'w, 's, (&'static mut LayoutStrip, Has<PendingSpaceDestruction>)>,
+    invisible: Query<'w, 's, (), With<WindowVisibility>>,
+    reassignments: Query<'w, 's, &'static WindowSpaceReassignmentPending>,
+    display_readbacks: Query<'w, 's, &'static DisplayTransferReadback>,
+    displays: Query<'w, 's, (&'static Display, Option<&'static crate::ecs::DockPosition>)>,
     commands: Commands<'w, 's>,
     transactions: bevy::ecs::system::ResMut<'w, NativeSpaceTransactions>,
     time: Res<'w, Time>,
@@ -372,6 +719,10 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
         windows,
         config,
         mut spaces,
+        invisible,
+        reassignments,
+        display_readbacks,
+        displays,
         mut commands,
         mut transactions,
         time,
@@ -389,7 +740,14 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
             .as_ref()
             .is_some_and(|members| members.unique_space(id) == Some(space))
     };
-    transactions.moves.retain(|pending| {
+    transactions.moves.retain_mut(|pending| {
+        if (pending.display.is_none() && !config.space_control_enabled())
+            || pending
+                .follow
+                .is_some_and(|member| invisible.contains(member.entity))
+        {
+            pending.follow = None;
+        }
         let timed_out = time.elapsed().saturating_sub(pending.submitted) >= MOVE_TIMEOUT;
         if pending
             .members
@@ -404,9 +762,13 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
             return false;
         }
         let target_ready = !topology.is_fullscreen(pending.target_space_id)
+            && pending.display.as_ref().is_none_or(|display| {
+                topology.visible_display_for_space(pending.target_space_id)
+                    == Some(display.target_display_id)
+            })
             && spaces
                 .iter()
-                .any(|(strip, _, retiring)| strip.id() == pending.target_space_id && !retiring);
+                .any(|(strip, retiring)| strip.id() == pending.target_space_id && !retiring);
         if target_ready
             && pending
                 .members
@@ -422,31 +784,40 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
                 .iter()
                 .map(|member| member.entity)
                 .collect::<Vec<_>>();
+            let tiled = moved_entities
+                .iter()
+                .copied()
+                .filter(|entity| {
+                    windows
+                        .get_tracked(*entity)
+                        .is_some_and(|(_, _, state)| state.is_tiled() && state.is_visible())
+                })
+                .collect::<Vec<_>>();
             let mut target_anchor = None;
-            for (mut strip, _, _) in &mut spaces {
+            for (mut strip, _) in &mut spaces {
                 if strip.id() == pending.target_space_id {
+                    for entity in &moved_entities {
+                        if !tiled.contains(entity) {
+                            strip.remove(*entity);
+                        }
+                    }
+                    if tiled.iter().all(|entity| strip.contains(*entity)) {
+                        continue;
+                    }
                     match &pending.layout {
                         PendingMoveLayout::AssociatedWindows => {
-                            let tiled = moved_entities
-                                .iter()
-                                .copied()
-                                .filter(|entity| {
-                                    windows
-                                        .get_tracked(*entity)
-                                        .is_some_and(|(_, _, state)| state.is_tiled())
-                                })
-                                .collect::<Vec<_>>();
-                            for entity in &moved_entities {
-                                if !tiled.contains(entity) {
-                                    strip.remove(*entity);
-                                }
-                            }
                             strip.append_tab_group(&tiled);
                             target_anchor = tiled.first().copied();
                         }
-                        PendingMoveLayout::Column(column) => {
-                            strip.append_column(column.clone());
-                            target_anchor = column.top();
+                        PendingMoveLayout::Columns(_) => {
+                            let mut projection = pending
+                                .layout
+                                .tiled_projection(pending.target_space_id, &tiled);
+                            target_anchor = projection.columns().next().and_then(Column::top);
+                            for entity in projection.all_windows() {
+                                strip.remove(entity);
+                            }
+                            strip.append_strip(&mut projection);
                         }
                     }
                 } else {
@@ -458,32 +829,71 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
             if let Some(anchor) = target_anchor {
                 commands.reshuffle_around(anchor);
             }
+            for &entity in &moved_entities {
+                let Some((window, _, state)) = windows.get_tracked(entity) else {
+                    continue;
+                };
+                if pending.display.is_some()
+                    && let Ok(readback) = display_readbacks.get(entity)
+                    && readback.incarnation == window.incarnation()
+                    && readback.tiled == state.is_tiled()
+                {
+                    commands
+                        .entity(entity)
+                        .insert((
+                            Position(readback.frame.min),
+                            Bounds(readback.frame.size()),
+                            DesiredWindowFrame(readback.frame),
+                            PresentedWindowFrame(readback.frame),
+                        ))
+                        .remove::<(WindowFrameMotion, WindowFrameCommitSuspended)>();
+                    if state.is_tiled() {
+                        commands.entity(entity).insert(WidthRatio(
+                            f64::from(readback.frame.width()) / f64::from(readback.viewport_width),
+                        ));
+                    }
+                }
+                if state.is_tiled() && !state.is_visible() {
+                    let index = reassignments
+                        .get(entity)
+                        .map_or(0, WindowSpaceReassignmentPending::source_index);
+                    commands.entity(entity).insert(PreviousTiledStrip {
+                        workspace_id: pending.target_space_id,
+                        index,
+                    });
+                } else if state.is_tiled() {
+                    commands.entity(entity).remove::<PreviousTiledStrip>();
+                }
+            }
             completed.extend_from_slice(&moved_entities);
             debug!(
                 space_id = pending.target_space_id,
                 windows = ?pending.window_ids,
                 "window-to-Space operation reconciled"
             );
-            if let Some(member) = pending.follow {
-                let intent = NativeSpaceIntent::Focus {
-                    space_id: pending.target_space_id,
-                    animate: config.space_switch_animation(),
-                };
-                match window_manager.perform_native_space_intent(&intent) {
-                    Ok(()) => {
-                        new_follows.push(PendingFollow {
-                            member,
-                            target_space_id: pending.target_space_id,
-                            submitted: time.elapsed(),
-                        });
-                    }
-                    Err(error) => warn!(
-                        window_id = member.window_id,
-                        space_id = pending.target_space_id,
-                        %error,
-                        "unable to follow moved window to Space"
-                    ),
+            if let Some(display) = &mut pending.display {
+                if let Some(member) = pending.follow {
+                    new_follows.push(PendingFollow {
+                        member,
+                        target_space_id: pending.target_space_id,
+                        submitted: time.elapsed(),
+                        visible_display: Some(display.target_display_id),
+                        warp_pointer: true,
+                    });
+                } else if let Some(mut follow) = display.source_follow.take() {
+                    follow.submitted = time.elapsed();
+                    new_follows.push(follow);
                 }
+            } else if let Some(member) = pending.follow
+                && let Some(follow) = PendingFollow::submit(
+                    member,
+                    pending.target_space_id,
+                    &window_manager,
+                    &config,
+                    time.elapsed(),
+                )
+            {
+                new_follows.push(follow);
             }
             false
         } else if timed_out {
@@ -500,31 +910,68 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
     });
     for entity in completed {
         if let Ok(mut entity) = commands.get_entity(entity) {
-            entity.try_remove::<(NativeMoveOwner, WindowSpaceReassignmentPending)>();
+            entity.try_remove::<(
+                NativeMoveOwner,
+                WindowSpaceReassignmentPending,
+                DisplayTransferFrame,
+                DisplayTransferReadback,
+            )>();
         }
     }
     // A timeout releases ownership, not the geometry barrier. The existing
     // membership audit resolves the actual destination before resuming writes.
     for entity in expired {
         if let Ok(mut entity) = commands.get_entity(entity) {
-            entity.try_remove::<NativeMoveOwner>();
+            entity.try_remove::<(
+                NativeMoveOwner,
+                DisplayTransferFrame,
+                DisplayTransferReadback,
+            )>();
         }
     }
     transactions.follows.extend(new_follows);
     transactions.follows.retain(|pending| {
-        if !pending.member.is_current(&windows)
+        if (pending.visible_display.is_none() && !config.space_control_enabled())
+            || !pending.member.is_current(&windows)
+            || invisible.contains(pending.member.entity)
             || time.elapsed().saturating_sub(pending.submitted) >= FOLLOW_TIMEOUT
         {
             return false;
         }
-        let target_visible = spaces.iter().any(|(strip, visible, retiring)| {
-            strip.id() == pending.target_space_id && visible && !retiring
-        });
+        let target_visible = topology
+            .visible_display_for_space(pending.target_space_id)
+            .is_some_and(|display| {
+                pending
+                    .visible_display
+                    .is_none_or(|expected| expected == display)
+            })
+            && spaces
+                .iter()
+                .any(|(strip, retiring)| strip.id() == pending.target_space_id && !retiring);
         if target_visible
             && pending.member.is_available(&windows)
             && belongs_to(pending.member.window_id, pending.target_space_id)
         {
-            commands.focus_entity(pending.member.entity, true);
+            if pending.warp_pointer {
+                let Some(viewport) = displays.iter().find_map(|(display, dock)| {
+                    (Some(display.id()) == pending.visible_display
+                        && topology.known_displays().any(|(native, _)| {
+                            native.id() == display.id() && !display.clone().update_geometry(native)
+                        }))
+                    .then(|| display.checked_actual_display_bounds(dock, &config))
+                    .flatten()
+                }) else {
+                    return true;
+                };
+                window_manager.warp_mouse(Origin::new(
+                    viewport.min.x.midpoint(viewport.max.x),
+                    viewport.min.y.midpoint(viewport.max.y),
+                ));
+            }
+            commands.restore_focus_entity(
+                pending.member.entity,
+                pending.visible_display.is_none() || pending.warp_pointer,
+            );
             false
         } else {
             true

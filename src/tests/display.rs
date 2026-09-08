@@ -630,7 +630,12 @@ fn test_next_display_inserts_into_target_strip() {
         .on_iteration(1, move |world, _state| {
             assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
         })
-        .on_iteration(2, move |world, _state| {
+        .on_iteration(2, move |world, state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            state.update_window(0, |window| window.workspace_id = EXT_WORKSPACE_ID);
+        })
+        .on_iteration(3, move |world, _state| {
             assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
             assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
         })
@@ -713,6 +718,11 @@ fn test_send_next_display_stays_on_source() {
             assert_on_workspace!(world, 100, TEST_WORKSPACE_ID);
         })
         .on_iteration(2, move |world, state| {
+            assert_on_workspace!(world, 100, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 100, EXT_WORKSPACE_ID);
+            state.update_window(100, |window| window.workspace_id = EXT_WORKSPACE_ID);
+        })
+        .on_iteration(3, move |world, state| {
             assert_on_workspace!(world, 100, EXT_WORKSPACE_ID);
             assert_not_on_workspace!(world, 100, TEST_WORKSPACE_ID);
             assert_eq!(state.active_display(), TEST_DISPLAY_ID);

@@ -2055,7 +2055,7 @@ pub(super) fn apply_window_positions(
                         "Not focusing new window {entity}, keeping focus on '{}'",
                         previous_window.title().unwrap_or_default()
                     );
-                    ctx.commands.focus_entity(prev, true);
+                    ctx.commands.restore_focus_entity(prev, true);
                 }
             } else {
                 debug!("Synthesizing WindowFocused for newly spawned window {entity}");

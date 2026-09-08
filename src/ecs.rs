@@ -59,6 +59,7 @@ pub mod focus;
 pub mod layout;
 #[cfg(feature = "lua")]
 pub mod layout_ops;
+pub(crate) mod layout_snapshot;
 pub mod mouse;
 pub mod native_space;
 pub mod params;
@@ -97,6 +98,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.init_resource::<reconcile::WindowStateSync>();
     app.init_resource::<window_geometry::WindowGeometrySettling>();
     app.init_resource::<topology::NativeTopology>();
+    app.init_resource::<layout_snapshot::LayoutSession>();
     app.init_resource::<defaults::DefaultRetries>();
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
@@ -506,15 +508,6 @@ impl Timeout {
             }
         }
     }
-
-    /// Creates an action timeout, which oneshots a provided system id.
-    pub fn callback(duration: Duration, system_id: SystemId, commands: &mut Commands) {
-        let timer = Timer::new(duration, bevy::time::TimerMode::Once);
-        commands.spawn(Self {
-            timer,
-            system_id: Some(system_id),
-        });
-    }
 }
 
 /// Component used as a retry mechanism for stray focus events that arrive before the target window is fully created.
@@ -661,6 +654,9 @@ pub trait SpawnCommandsExt {
 
     fn focus_entity(&mut self, entity: Entity, raise: bool);
 
+    /// Restores focus without superseding a pending native follow.
+    fn restore_focus_entity(&mut self, entity: Entity, raise: bool);
+
     #[cfg(feature = "lua")]
     fn flash_message(&mut self, message: String, duration: Duration);
 
@@ -709,7 +705,21 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     #[instrument(level = Level::TRACE, skip(self))]
     fn focus_entity(&mut self, entity: Entity, raise: bool) {
         if self.get_entity(entity).is_ok() {
-            self.trigger(focus::FocusWindow { entity, raise });
+            self.trigger(focus::FocusWindow {
+                entity,
+                raise,
+                kind: focus::FocusRequestKind::Explicit,
+            });
+        }
+    }
+
+    fn restore_focus_entity(&mut self, entity: Entity, raise: bool) {
+        if self.get_entity(entity).is_ok() {
+            self.trigger(focus::FocusWindow {
+                entity,
+                raise,
+                kind: focus::FocusRequestKind::Automatic,
+            });
         }
     }
 
@@ -964,15 +974,13 @@ mod main_thread_tests {
     fn timeouts_preserve_duration_boundaries_without_float_round_trips() {
         let mut world = bevy::ecs::world::World::new();
         for duration in [Duration::ZERO, Duration::from_nanos(1), Duration::MAX] {
-            let timeout = Timeout::new(duration, None, &mut world.commands());
-            assert_eq!(timeout.timer.duration(), duration);
-
-            let system = world.register_system(|| {});
-            Timeout::callback(duration, system, &mut world.commands());
-            world.flush();
-            assert!(world.query::<&Timeout>().iter(&world).any(|timeout| {
-                timeout.system_id == Some(system) && timeout.timer.duration() == duration
-            }));
+            for message in [None, Some("timeout".to_owned())] {
+                let has_callback = message.is_some();
+                let timeout = Timeout::new(duration, message, &mut world.commands());
+                assert_eq!(timeout.timer.duration(), duration);
+                assert_eq!(timeout.system_id.is_some(), has_callback);
+                world.flush();
+            }
         }
     }
 

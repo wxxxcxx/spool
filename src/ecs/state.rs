@@ -22,7 +22,7 @@ use crate::ecs::params::Windows;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker};
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
-use spool_shared_types::windowset::WindowSet;
+use spool_shared_types::windowset::{ColumnKind, ColumnSet, StackItemSet, WindowRec, WindowSet};
 
 pub const STATE_FILE_NAME: &str = "state.json";
 const LEGACY_STATE_VERSION: u32 = 2;
@@ -659,6 +659,8 @@ pub struct QueryStateParams<'w, 's> {
     windows: Windows<'w, 's>,
     apps: Query<'w, 's, &'static Application>,
     window_manager: Res<'w, WindowManager>,
+    topology: Res<'w, super::topology::NativeTopology>,
+    layout_session: Res<'w, super::layout_snapshot::LayoutSession>,
     config: Res<'w, Config>,
 }
 
@@ -692,80 +694,52 @@ impl QueryStateParams<'_, '_> {
 /// `ws:east`, `ws:stack` and friends to know what is beside what.
 impl QueryStateParams<'_, '_> {
     pub fn extract_window_set(&self) -> WindowSet {
-        use spool_shared_types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
+        use spool_shared_types::windowset::{DisplaySet, WorkspaceSet};
 
         let focused_entity = self.windows.focused().map(|(_, entity)| entity);
         let sliver_width = self.config.sliver_width();
-        let active_workspace_id = self
-            .workspaces
+        let floating = self
+            .windows
             .iter()
-            .find_map(|(_, strip, _, active, _)| active.then_some(strip.id()));
+            .filter_map(|(window, entity)| {
+                self.windows
+                    .get_tracked(entity)
+                    .is_some_and(|(_, _, state)| state.is_floating())
+                    .then_some((window.id(), entity))
+            })
+            .collect::<HashMap<_, _>>();
+        let memberships = if floating.is_empty() {
+            None
+        } else {
+            self.topology.observe_memberships(&self.window_manager).ok()
+        };
 
         // Group the workspace strips by the display entity that owns them, so
         // each display can be built with its own workspaces in one pass.
         let mut strips_by_display: HashMap<Entity, Vec<WorkspaceSet>> = HashMap::new();
-        for (child, strip, native, active_workspace, visible_space) in self.workspaces {
-            // Only ask for floating windows on a workspace that's actually
-            // showing, since this read goes out to the window server.
-            let floating_entities =
-                if active_workspace || visible_space && active_workspace_id != Some(strip.id()) {
-                    self.window_manager
-                        .windows_in_workspace(strip.id())
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-
-            // A window stays tracked by the strip after it's floated (so it can
-            // be re-tiled later), so it's the `Floating` marker — not strip
-            // membership — that decides whether it goes in `columns` or `floating`.
-            let mut floating = Vec::new();
-            let mut columns: Vec<ColumnSet> = Vec::new();
-            for column in strip.columns() {
-                let mut tiled = Vec::new();
-                for entity in column.window_iter() {
-                    let Some(record) = self.window_record(entity, focused_entity, sliver_width)
-                    else {
-                        continue;
-                    };
-                    if record.floating {
-                        floating.push(record);
-                    } else {
-                        tiled.push(record);
-                    }
-                }
-                if tiled.is_empty() {
-                    continue;
-                }
-                let width_ratio = column
-                    .window_iter()
-                    .find_map(|entity| self.windows.width_ratio(entity))
-                    .unwrap_or(1.0);
-                let selected = column
-                    .top()
-                    .and_then(|top| self.windows.get(top).map(|window| window.id()))
-                    .and_then(|id| tiled.iter().position(|window| window.id == id))
-                    .unwrap_or(0);
-                columns.push(ColumnSet {
-                    kind: column_kind(column),
-                    width_ratio,
-                    selected,
-                    windows: std::sync::Arc::new(tiled),
+        for (child, strip, native, _, _) in self.workspaces {
+            let space_visible = self
+                .displays
+                .get(child.parent())
+                .is_ok_and(|(display, _, _)| {
+                    self.topology.visible_space(display.id()) == Some(strip.id())
                 });
-            }
-
-            // Floating windows the strip never knew about.
-            floating.extend(
-                floating_entities
-                    .into_iter()
-                    .filter_map(|window_id| {
-                        let (_, entity) = self.windows.find(window_id)?;
-                        let (_, _, state) = self.windows.get_tracked(entity)?;
-                        (state.is_floating() && state.is_visible() && !strip.contains(entity))
-                            .then_some(entity)
-                    })
-                    .filter_map(|entity| self.window_record(entity, focused_entity, sliver_width)),
-            );
+            let columns = strip
+                .columns()
+                .filter_map(|column| {
+                    self.column_record(column, focused_entity, sliver_width, space_visible)
+                })
+                .collect();
+            // Native membership, not visibility or a remembered strip, owns a float's Space.
+            let floating = memberships
+                .as_ref()
+                .into_iter()
+                .flat_map(|memberships| memberships.windows_in_space(strip.id()))
+                .filter_map(|window_id| floating.get(&window_id).copied())
+                .filter_map(|entity| {
+                    self.window_record(entity, focused_entity, sliver_width, space_visible)
+                })
+                .collect();
 
             strips_by_display
                 .entry(child.parent())
@@ -773,7 +747,7 @@ impl QueryStateParams<'_, '_> {
                 .push(WorkspaceSet {
                     space_id: strip.id(),
                     ordinal: native.ordinal,
-                    active: active_workspace,
+                    active: space_visible,
                     columns: std::sync::Arc::new(columns),
                     floating: std::sync::Arc::new(floating),
                 });
@@ -782,7 +756,7 @@ impl QueryStateParams<'_, '_> {
         let displays = self
             .displays
             .iter()
-            .map(|(display, entity, active)| {
+            .map(|(display, entity, _)| {
                 let bounds = display.bounds();
                 let mut workspaces = strips_by_display.remove(&entity).unwrap_or_default();
                 workspaces.sort_by_key(|workspace| workspace.ordinal);
@@ -794,7 +768,7 @@ impl QueryStateParams<'_, '_> {
                         width: bounds.width(),
                         height: bounds.height(),
                     },
-                    active,
+                    active: self.topology.active_display() == Some(display.id()),
                     workspaces: std::sync::Arc::new(workspaces),
                 }
             })
@@ -803,7 +777,59 @@ impl QueryStateParams<'_, '_> {
         let focused = focused_entity
             .and_then(|entity| self.windows.get(entity))
             .map(|window| window.id());
-        WindowSet::new(displays, focused)
+        WindowSet::new(displays, focused).with_snapshot(self.layout_session.capture(&self.windows))
+    }
+
+    fn column_record(
+        &self,
+        column: &Column,
+        focused: Option<Entity>,
+        sliver_width: i32,
+        space_visible: bool,
+    ) -> Option<ColumnSet> {
+        let project_item = |members: &[Entity]| {
+            let mut tiled = Vec::new();
+            for &entity in members {
+                let Some(record) = self.window_record(entity, focused, sliver_width, space_visible)
+                else {
+                    continue;
+                };
+                if !record.floating {
+                    tiled.push(record);
+                }
+            }
+            StackItemSet::from_windows(tiled)
+        };
+        let items = match column {
+            Column::Single(entity) | Column::Fullscren(entity) => {
+                project_item(std::slice::from_ref(entity))
+                    .into_iter()
+                    .collect()
+            }
+            Column::Tabs(members) => project_item(members).into_iter().collect(),
+            Column::Stack(items) => items
+                .iter()
+                .filter_map(|item| match item {
+                    StackItem::Single(entity) => project_item(std::slice::from_ref(entity)),
+                    StackItem::Tabs(members) => project_item(members),
+                })
+                .collect(),
+        };
+        let width_ratio = column
+            .window_iter()
+            .find_map(|entity| self.windows.width_ratio(entity))
+            .unwrap_or(1.0);
+        let mut projected = ColumnSet::from_items(items, width_ratio)?;
+        if matches!(column, Column::Fullscren(_)) {
+            projected.kind = ColumnKind::Fullscreen;
+        }
+        let selected = column
+            .top()
+            .and_then(|top| self.windows.get(top).map(|window| window.id()))
+            .and_then(|id| projected.windows().position(|window| window.id == id))
+            .unwrap_or(0);
+        projected.selected = selected;
+        Some(projected)
     }
 
     /// One window, as a script sees it. `None` for an entity that is no longer
@@ -813,7 +839,8 @@ impl QueryStateParams<'_, '_> {
         entity: Entity,
         focused: Option<Entity>,
         sliver_width: i32,
-    ) -> Option<spool_shared_types::windowset::WindowRec> {
+        space_visible: bool,
+    ) -> Option<WindowRec> {
         let (window, _, state) = self.windows.get_tracked(entity)?;
         let (_, _, app_entity) = self.windows.get_parent(entity)?;
         let app = self.apps.get(app_entity).ok()?;
@@ -823,9 +850,9 @@ impl QueryStateParams<'_, '_> {
         let hidden = !state.is_visible();
         let visible = frame
             .and_then(|frame| window_visibility(frame, &self.displays, sliver_width))
-            .is_some_and(|(_, visible)| visible && !hidden);
+            .is_some_and(|(_, visible)| space_visible && visible && !hidden);
 
-        Some(spool_shared_types::windowset::WindowRec {
+        Some(WindowRec {
             id: window.id(),
             app_name: app.name().to_string(),
             bundle_id: app.bundle_id().unwrap_or_default().clone(),
@@ -843,17 +870,7 @@ impl QueryStateParams<'_, '_> {
     }
 }
 
-/// How a layout column arranges its windows, in the vocabulary a script sees.
-fn column_kind(column: &Column) -> spool_shared_types::windowset::ColumnKind {
-    use spool_shared_types::windowset::ColumnKind;
-    match column {
-        Column::Single(_) => ColumnKind::Single,
-        Column::Stack(_) => ColumnKind::Stack,
-        Column::Tabs(_) => ColumnKind::Tabs,
-        Column::Fullscren(_) => ColumnKind::Fullscreen,
-    }
-}
-
+/// Projects ECS state into a public query document.
 pub trait QueryState: std::marker::Sized {
     fn extract(
         workspaces: &Query<QueryWorkspaceProjection>,
@@ -1055,7 +1072,12 @@ pub fn periodic_state_save(
     windows: Windows,
     apps: Query<&Application>,
     path: Res<StateFilePath>,
+    topology: Res<super::topology::NativeTopology>,
 ) {
+    if !topology.is_complete() {
+        debug!("Skipping state save while the native topology observation is incomplete");
+        return;
+    }
     let state = SpoolState::extract(&workspaces, &displays, &windows, &apps);
     match save_trustworthy_state(&state, path.as_path()) {
         Ok(true) => debug!("State saved to {}", path.as_path().display()),
@@ -1076,8 +1098,13 @@ pub fn cleanup_on_exit(
     windows: Windows,
     apps: Query<&Application>,
     path: Res<StateFilePath>,
+    topology: Res<super::topology::NativeTopology>,
 ) {
     if exit_events.read().next().is_some() {
+        if !topology.is_complete() {
+            debug!("Preserving saved state on exit while native topology is incomplete");
+            return;
+        }
         info!("Exiting, saving state...");
         let state = SpoolState::extract(&workspaces, &displays, &windows, &apps);
         if let Err(error) = save_trustworthy_state(&state, path.as_path()) {

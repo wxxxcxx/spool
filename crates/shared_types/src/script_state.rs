@@ -24,11 +24,29 @@ pub const MAX_SERIALISED_BYTES: usize = 1024 * 1024;
 /// rejected rather than stored.
 pub const MAX_KEY_BYTES: usize = 512;
 
+/// Maximum nested List/Map containers, counting empty containers as well.
+/// The default JSON reader accepts 127 nested JSON containers. The saved-file
+/// wrapper and state map use two, each List/Map adds its tag object and payload
+/// container, and a scalar leaf can add one: 2 + 2 * 62 + 1 = 127.
+pub const MAX_NESTING_DEPTH: usize = 62;
+
 /// The store itself: names to values, in sorted order so the file it is saved
 /// to is stable and diffable rather than reshuffling on every write.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ScriptState(BTreeMap<String, ScriptValue>);
+
+impl<'de> Deserialize<'de> for ScriptState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let state = Self(BTreeMap::deserialize(deserializer)?);
+        for (key, value) in &state.0 {
+            Self::check_key(key).map_err(serde::de::Error::custom)?;
+            Self::check_depth(value).map_err(serde::de::Error::custom)?;
+        }
+        state.check_size().map_err(serde::de::Error::custom)?;
+        Ok(state)
+    }
+}
 
 impl ScriptState {
     /// The value stored under `key`, if any.
@@ -47,8 +65,8 @@ impl ScriptState {
     ///
     /// # Errors
     ///
-    /// If the key is unacceptable or the result would be too large. Neither
-    /// leaves the store changed.
+    /// If the key is unacceptable, the result would be too large or too deep,
+    /// or a value cannot be stored as JSON. None leaves the store changed.
     pub fn apply(&mut self, write: &ScriptStateWrite) -> Result<WriteOutcome, String> {
         Self::check_key(&write.key)?;
 
@@ -94,23 +112,37 @@ impl ScriptState {
         Ok(())
     }
 
-    /// Whether applying `write` would push the store past
-    /// [`MAX_SERIALISED_BYTES`]. Checked against a trial copy, so the store
-    /// itself is never left over the limit.
+    /// Whether applying `write` would exceed [`MAX_NESTING_DEPTH`] or
+    /// [`MAX_SERIALISED_BYTES`]. Depth is checked before cloning the value;
+    /// size is checked against a trial copy, so the store stays within bounds.
     ///
     /// # Errors
     ///
-    /// If the result would be too large, or could not be serialised at all.
+    /// If the result would be too large or too deep, or cannot be stored as JSON.
     pub fn check_capacity(&self, write: &ScriptStateWrite) -> Result<(), String> {
         let Some(value) = &write.value else {
             // Removals only ever shrink it.
             return Ok(());
         };
+        Self::check_depth(value)?;
         let mut trial = self.clone();
         trial.0.insert(write.key.clone(), value.clone());
+        trial.check_size()
+    }
+
+    fn check_depth(value: &ScriptValue) -> Result<(), String> {
+        if !value.is_within_depth(MAX_NESTING_DEPTH) {
+            return Err(format!(
+                "value exceeds the {MAX_NESTING_DEPTH} level persistent depth limit"
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_size(&self) -> Result<(), String> {
         // Measured as JSON because that is what the store is saved as; the
         // wire encoding is denser, so this stays the conservative bound.
-        let size = serde_json::to_vec(&trial)
+        let size = serde_json::to_vec(self)
             .map_err(|err| format!("value could not be stored: {err}"))?
             .len();
         if size > MAX_SERIALISED_BYTES {
@@ -214,5 +246,95 @@ impl WriteOutcome {
             serde_json::to_value(self)?,
             "outcome",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialization_rejects_invalid_keys() {
+        for key in [String::new(), "x".repeat(MAX_KEY_BYTES + 1)] {
+            let entries = BTreeMap::from([(key, ScriptValue::Int(1))]);
+            let json = serde_json::to_vec(&entries).expect("encodes");
+            assert!(serde_json::from_slice::<ScriptState>(&json).is_err());
+
+            let wire = postcard::to_allocvec(&entries).expect("encodes");
+            assert!(postcard::from_bytes::<ScriptState>(&wire).is_err());
+        }
+    }
+
+    #[test]
+    fn deserialization_rejects_an_oversized_store() {
+        let entries = BTreeMap::from([(
+            "large".to_string(),
+            ScriptValue::Str("x".repeat(MAX_SERIALISED_BYTES)),
+        )]);
+        let json = serde_json::to_vec(&entries).expect("encodes");
+        assert!(serde_json::from_slice::<ScriptState>(&json).is_err());
+
+        let wire = postcard::to_allocvec(&entries).expect("encodes");
+        assert!(postcard::from_bytes::<ScriptState>(&wire).is_err());
+    }
+
+    #[test]
+    fn deserialization_accepts_the_live_key_and_capacity_limits() {
+        let key = "\u{e9}".repeat(MAX_KEY_BYTES / 2);
+        let mut state = ScriptState::default();
+        let write = ScriptStateWrite::set(key.clone(), ScriptValue::Str(String::new()));
+        state.apply(&write).expect("valid key");
+        let overhead = serde_json::to_vec(&state).expect("encodes").len();
+        let write = ScriptStateWrite::set(
+            key,
+            ScriptValue::Str("x".repeat(MAX_SERIALISED_BYTES - overhead)),
+        );
+        state.apply(&write).expect("exact capacity is accepted");
+
+        let json = serde_json::to_vec(&state).expect("encodes");
+        assert_eq!(json.len(), MAX_SERIALISED_BYTES);
+        assert_eq!(
+            serde_json::from_slice::<ScriptState>(&json).expect("decodes"),
+            state
+        );
+        let wire = postcard::to_allocvec(&state).expect("encodes");
+        assert_eq!(
+            postcard::from_bytes::<ScriptState>(&wire).expect("decodes"),
+            state
+        );
+    }
+
+    #[test]
+    fn rejected_deep_writes_still_survive_the_binary_wire() {
+        for depth in [62, 63] {
+            let value = (0..depth).fold(ScriptValue::Int(1), |value, level| {
+                if level % 2 == 0 {
+                    ScriptValue::List(vec![value])
+                } else {
+                    ScriptValue::Map(BTreeMap::from([("child".to_string(), value)]))
+                }
+            });
+            let write = ScriptStateWrite::set("deep".to_string(), value.clone());
+            let wire = postcard::to_allocvec(&write).expect("write encodes");
+            let decoded: ScriptStateWrite = postcard::from_bytes(&wire).expect("write decodes");
+            assert_eq!(decoded, write);
+
+            let mut state = ScriptState::default();
+            assert_eq!(state.check_capacity(&decoded).is_ok(), depth == 62);
+            assert_eq!(state.apply(&decoded).is_ok(), depth == 62);
+            assert_eq!(state.is_empty(), depth != 62);
+
+            let entries = BTreeMap::from([("deep".to_string(), value)]);
+            let json = serde_json::to_vec(&entries).expect("fixture encodes");
+            let wire = postcard::to_allocvec(&entries).expect("fixture encodes");
+            assert_eq!(
+                serde_json::from_slice::<ScriptState>(&json).is_ok(),
+                depth == 62
+            );
+            assert_eq!(
+                postcard::from_bytes::<ScriptState>(&wire).is_ok(),
+                depth == 62
+            );
+        }
     }
 }

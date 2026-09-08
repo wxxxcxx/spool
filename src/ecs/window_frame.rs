@@ -10,7 +10,7 @@ use bevy::ecs::query::{With, Without};
 use bevy::ecs::system::{Commands, Query, Res};
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
-use tracing::{Level, instrument, trace};
+use tracing::{Level, debug, instrument, trace};
 
 use super::workspace::WindowSpaceReassignmentPending;
 use super::{Bounds, Position, RepositionMarker, ResizeMarker, Window};
@@ -55,6 +55,27 @@ pub(crate) struct InteractiveWindowFrame {
     pub(crate) target: IRect,
     pub(crate) start: IRect,
     pub(crate) incarnation: crate::platform::WindowIncarnation,
+}
+
+/// One physical attempt owned by a pending display transfer. Membership,
+/// rather than AX success, decides when the source layout can be released.
+#[derive(bevy::ecs::component::Component, Clone, Copy, Debug)]
+pub(crate) struct DisplayTransferFrame {
+    pub(crate) target: IRect,
+    pub(crate) viewport: IRect,
+    pub(crate) source_space_id: crate::platform::WorkspaceId,
+    pub(crate) target_space_id: crate::platform::WorkspaceId,
+    pub(crate) display_id: u32,
+    pub(crate) incarnation: crate::platform::WindowIncarnation,
+    pub(crate) tiled: bool,
+}
+
+#[derive(bevy::ecs::component::Component, Clone, Copy, Debug)]
+pub(crate) struct DisplayTransferReadback {
+    pub(crate) frame: IRect,
+    pub(crate) viewport_width: i32,
+    pub(crate) incarnation: crate::platform::WindowIncarnation,
+    pub(crate) tiled: bool,
 }
 
 /// Suspends frame-by-frame commits after an AX failure or constrained correction.
@@ -115,6 +136,22 @@ type SuspendedWindowFrames<'w, 's> = Query<
     ),
 >;
 
+pub(crate) fn checked_window_frame(origin: IVec2, size: IVec2) -> Option<IRect> {
+    if size.x <= 0 || size.y <= 0 {
+        return None;
+    }
+    let max = IVec2::new(origin.x.checked_add(size.x)?, origin.y.checked_add(size.y)?);
+    Some(IRect::from_corners(origin, max))
+}
+
+pub(crate) fn checked_frame_size(frame: IRect) -> Option<IVec2> {
+    let size = IVec2::new(
+        frame.max.x.checked_sub(frame.min.x)?,
+        frame.max.y.checked_sub(frame.min.y)?,
+    );
+    (size.x > 0 && size.y > 0).then_some(size)
+}
+
 /// Re-enables projection only when layout state produces a new desired frame.
 pub(crate) fn resume_suspended_window_frame_commits(
     windows: SuspendedWindowFrames,
@@ -149,18 +186,27 @@ pub(crate) fn apply_window_frame_requests(
             continue;
         }
 
-        if let Some(reposition) = reposition
-            && position.0 != reposition.0
-        {
-            position.0 = reposition.0;
+        let origin = reposition.map_or(position.0, |request| request.0);
+        let size = resize.map_or(bounds.0, |request| request.0);
+        let Some(target) = checked_window_frame(origin, size) else {
+            debug!(
+                ?entity,
+                ?origin,
+                ?size,
+                "ignoring an unrepresentable window frame"
+            );
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.remove::<(RepositionMarker, ResizeMarker)>();
+            }
+            continue;
+        };
+        if position.0 != origin {
+            position.0 = origin;
         }
-        if let Some(resize) = resize
-            && bounds.0 != resize.0
-        {
-            bounds.0 = resize.0;
+        if bounds.0 != size {
+            bounds.0 = size;
         }
 
-        let target = IRect::from_corners(position.0, position.0 + bounds.0);
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.remove::<(RepositionMarker, ResizeMarker)>();
             if desired.is_none_or(|desired| desired.0 != target) {

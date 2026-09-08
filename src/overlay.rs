@@ -354,21 +354,13 @@ fn retarget_decoration(
         };
     };
 
-    // One observed focus transition dirties the overlay twice: first when the
-    // coordinator confirms the new target, then when `FocusedMarker` catches
-    // up. The second projection is the same declarative state and must be
-    // idempotent; snapping it to `target` would visibly collapse the shared
-    // dim cutout/border animation midway through the focus change.
-    if allow_animation
-        && current.animating
-        && current.target_id == target_id
-        && current.target == target
-    {
-        return current;
-    }
-
     let focus_changed = current.target_id != target_id;
-    let animate = allow_animation && focus_changed && current.presented != target;
+    // A focus transition can also move or resize its destination window.
+    // Retarget from the rendered border until that transition settles; an AX
+    // geometry update must not cancel it. Settled geometry still follows
+    // immediately so ordinary dragging does not introduce border lag.
+    let animate =
+        allow_animation && (focus_changed || current.animating) && current.presented != target;
     DecorationPresentation {
         presented: if animate { current.presented } else { target },
         target,
@@ -544,6 +536,30 @@ mod tests {
         assert_eq!(repeated.presented, original);
         assert_eq!(repeated.target, next);
         assert!(repeated.animating);
+    }
+
+    #[test]
+    fn moving_focus_target_preserves_border_continuity() {
+        let original = rect(700.0, 20.0, 700.0, 900.0);
+        let initial_target = rect(0.0, 20.0, 700.0, 900.0);
+        let current = retarget_decoration(None, original, 1, true);
+        let mut moving = retarget_decoration(Some(current), initial_target, 2, true);
+
+        for step in 1..=10 {
+            advance_decoration(&mut moving, 12.0, 1.0 / 60.0);
+            let presented = moving.presented;
+            let observed = rect(0.0, 20.0, 700.0 + f64::from(step) * 20.0, 900.0);
+            moving = retarget_decoration(Some(moving), observed, 2, true);
+            assert_eq!(moving.presented, presented, "geometry update must not jump");
+            assert_eq!(moving.target, observed);
+            assert!(moving.animating);
+        }
+
+        for _ in 0..120 {
+            advance_decoration(&mut moving, 12.0, 1.0 / 60.0);
+        }
+        assert_eq!(moving.presented, moving.target);
+        assert!(!moving.animating);
     }
 
     #[test]

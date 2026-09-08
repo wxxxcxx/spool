@@ -104,7 +104,7 @@ impl BarSnapshot {
                             .map(|column| BarColumn {
                                 kind: column.kind,
                                 selected: column.selected,
-                                windows: column.windows.iter().map(BarWindow::from).collect(),
+                                windows: column.windows().map(BarWindow::from).collect(),
                             })
                             .collect();
                         BarSpace {
@@ -159,7 +159,7 @@ mod tests {
         ActiveState, DisplayState, QueryState, SpaceCapabilities, SpaceState,
     };
     use spool_shared_types::windowset::{
-        ColumnKind, ColumnSet, DisplaySet, WindowRec, WorkspaceSet,
+        ColumnKind, ColumnSet, DisplaySet, StackItemSet, WindowRec, WorkspaceSet,
     };
 
     use super::*;
@@ -197,7 +197,10 @@ mod tests {
                         kind: ColumnKind::Stack,
                         width_ratio: 0.5,
                         selected: 1,
-                        windows: Arc::new(vec![window(10, false), window(11, true)]),
+                        items: Arc::new(vec![
+                            StackItemSet::Single(window(10, false)),
+                            StackItemSet::Tabs(Arc::new(vec![window(11, true), window(12, false)])),
+                        ]),
                     }]),
                     floating: Arc::new(Vec::new()),
                 }]),
@@ -247,7 +250,7 @@ mod tests {
                 .iter()
                 .map(|w| w.id)
                 .collect::<Vec<_>>(),
-            vec![10, 11]
+            vec![10, 11, 12]
         );
         assert_eq!(space.columns[0].anchor_window_id(), Some(11));
     }

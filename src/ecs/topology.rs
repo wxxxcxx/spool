@@ -19,11 +19,22 @@ use crate::platform::{WinID, WorkspaceId};
 #[derive(Debug)]
 pub(crate) struct WindowMemberships {
     by_window: HashMap<WinID, Option<WorkspaceId>>,
+    by_space: HashMap<WorkspaceId, Vec<WinID>>,
 }
 
 impl WindowMemberships {
     pub(crate) fn unique_space(&self, window_id: WinID) -> Option<WorkspaceId> {
         self.by_window.get(&window_id).copied().flatten()
+    }
+
+    /// Unique members in the native list's order, with duplicate entries removed.
+    pub(crate) fn windows_in_space(&self, space: WorkspaceId) -> impl Iterator<Item = WinID> + '_ {
+        self.by_space
+            .get(&space)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |&window| self.unique_space(window) == Some(space))
     }
 }
 
@@ -80,8 +91,12 @@ impl NativeTopology {
         spaces.sort_unstable();
         spaces.dedup();
         let mut by_window = HashMap::new();
+        let mut by_space = HashMap::<WorkspaceId, Vec<WinID>>::new();
         for space in spaces {
             for window_id in manager.windows_in_workspace(space)? {
+                if !by_window.contains_key(&window_id) {
+                    by_space.entry(space).or_default().push(window_id);
+                }
                 by_window
                     .entry(window_id)
                     .and_modify(|previous| {
@@ -92,11 +107,46 @@ impl NativeTopology {
                     .or_insert(Some(space));
             }
         }
-        Ok(WindowMemberships { by_window })
+        Ok(WindowMemberships {
+            by_window,
+            by_space,
+        })
     }
 
     pub(crate) fn visible_space(&self, display_id: u32) -> Option<WorkspaceId> {
         self.visible.get(&display_id)?.as_ref().ok().copied()
+    }
+
+    pub(crate) fn visible_display_for_space(&self, space_id: WorkspaceId) -> Option<u32> {
+        if !self.is_complete() {
+            return None;
+        }
+        let mut owners = self
+            .known_displays()
+            .filter(|(_, spaces)| spaces.contains(&space_id));
+        let (display, _) = owners.next()?;
+        (owners.next().is_none() && self.visible_space(display.id()) == Some(space_id))
+            .then_some(display.id())
+    }
+
+    /// A preceding command may already have changed native visibility in this batch.
+    pub(crate) fn observe_visible_window_space(
+        &mut self,
+        manager: &WindowManager,
+        window_id: WinID,
+    ) -> Option<WorkspaceId> {
+        self.refresh_for_command(manager);
+        let space_id = self
+            .observe_memberships(manager)
+            .ok()?
+            .unique_space(window_id)?;
+        self.visible_display_for_space(space_id)?;
+        Some(space_id)
+    }
+
+    pub(crate) fn refresh_for_command(&mut self, manager: &WindowManager) -> bool {
+        self.sample(manager, false);
+        self.is_complete()
     }
 
     pub(crate) fn active_display(&self) -> Option<u32> {
@@ -140,6 +190,7 @@ pub(crate) fn invalidates_topology(event: &Event) -> bool {
     matches!(
         event,
         Event::SpaceChanged
+            | Event::LayoutSpaceRequested { .. }
             | Event::SpaceCreated { .. }
             | Event::SpaceDestroyed { .. }
             | Event::SystemWoke { .. }
@@ -218,6 +269,18 @@ mod tests {
         assert_eq!(memberships.unique_space(30), Some(1));
         assert_eq!(memberships.unique_space(40), Some(3));
         assert_eq!(memberships.unique_space(99), None);
+        assert_eq!(
+            memberships.windows_in_space(1).collect::<Vec<_>>(),
+            vec![30]
+        );
+        assert_eq!(
+            memberships.windows_in_space(2).collect::<Vec<_>>(),
+            vec![20]
+        );
+        assert_eq!(
+            memberships.windows_in_space(3).collect::<Vec<_>>(),
+            vec![40]
+        );
         assert!(
             manager.windows_in_workspace(2).is_err(),
             "each Space is read only once"

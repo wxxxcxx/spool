@@ -154,7 +154,7 @@ fn window_policy_deferred_startup_window_keeps_its_native_space() {
             space
                 .columns
                 .iter()
-                .any(|column| column.windows.iter().any(|window| window.id == 1))
+                .any(|column| column.windows().any(|window| window.id == 1))
         })
         .map(|space| space.space_id)
         .collect::<Vec<_>>();

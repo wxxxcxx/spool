@@ -26,7 +26,7 @@ pub use crate::script_state::WriteOutcome;
 use crate::script_state::ScriptStateWrite;
 use crate::script_value::ScriptValue;
 use crate::state::{ActiveState, QueryState, SpaceState, StateQueryKind, WindowState};
-use crate::windowset::{LayoutOp, WindowSet};
+use crate::windowset::{LayoutPlan, WindowSet};
 
 /// Something a client asks the daemon to do.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -42,7 +42,7 @@ pub enum Request {
     WindowSet,
     /// Replay a transform's recorded operations against the live world.
     /// Fire-and-forget, for the same reason [`Request::Dispatch`] is.
-    WindowSetApply(Vec<LayoutOp>),
+    WindowSetApply(LayoutPlan),
     /// Read or write the script-state store.
     ScriptState(ScriptStateRequest),
     /// Ask for state events to be pushed as they happen. `raw` adds the
@@ -129,7 +129,9 @@ mod tests {
         ))));
         round_trip(&Request::Query(StateQueryKind::Active));
         round_trip(&Request::WindowSet);
-        round_trip(&Request::WindowSetApply(vec![LayoutOp::Focus(7)]));
+        round_trip(&Request::WindowSetApply(
+            WindowSet::default().focus(7).plan(),
+        ));
         round_trip(&Request::Subscribe { raw: false });
         round_trip(&Request::Subscribe { raw: true });
         round_trip(&Request::ScriptState(ScriptStateRequest::Get {
@@ -141,12 +143,37 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_bindings_survive_both_postcard_round_trips() {
+        use crate::windowset::{LayoutSnapshot, WindowIdentity};
+        let identity = LayoutSnapshot {
+            session: [73; 16],
+            windows: [(
+                7,
+                WindowIdentity {
+                    entity: 41,
+                    incarnation: 99,
+                },
+            )]
+            .into(),
+        };
+        let set = WindowSet::default().with_snapshot(identity.clone());
+        let bytes = postcard::to_allocvec(&Response::WindowSet(Box::new(set))).unwrap();
+        let Response::WindowSet(set) = postcard::from_bytes(&bytes).unwrap() else {
+            panic!("window set response")
+        };
+        let plan = set.float(7).shift(7, 2).plan();
+        assert_eq!(*plan.snapshot, identity);
+        round_trip(&Request::WindowSetApply(plan.clone()));
+        round_trip(&Request::Dispatch(Action::Layout(plan)));
+    }
+
+    #[test]
     fn overview_actions_append_wire_tags_without_renumbering_existing_actions() {
         use crate::commands::{MoveFocus, Placement};
 
         for (action, tag) in [
             (Action::Lua(7), 11),
-            (Action::Layout(Vec::new()), 12),
+            (Action::Layout(LayoutPlan::default()), 12),
             (
                 Action::ReorderColumn {
                     window_id: 1,
@@ -191,7 +218,7 @@ mod tests {
     /// a client actually transforms, so it gets its own round trip.
     #[test]
     fn the_window_set_survives_the_wire() {
-        use crate::windowset::{ColumnSet, DisplaySet, WindowRec, WorkspaceSet};
+        use crate::windowset::{ColumnSet, DisplaySet, StackItemSet, WindowRec, WorkspaceSet};
 
         let window = |id| WindowRec {
             id,
@@ -225,6 +252,14 @@ mod tests {
                     columns: Arc::new(vec![
                         ColumnSet::single(window(1), 0.5),
                         ColumnSet::single(window(2), 0.5),
+                        ColumnSet::from_items(
+                            vec![
+                                StackItemSet::Single(window(3)),
+                                StackItemSet::Tabs(Arc::new(vec![window(4), window(5)])),
+                            ],
+                            0.5,
+                        )
+                        .expect("nested tab column"),
                     ]),
                     floating: Arc::new(Vec::new()),
                 }]),
@@ -232,13 +267,16 @@ mod tests {
             Some(1),
         );
 
-        let bytes = postcard::to_allocvec(&Response::WindowSet(Box::new(set))).expect("encodes");
+        let bytes =
+            postcard::to_allocvec(&Response::WindowSet(Box::new(set.clone()))).expect("encodes");
         let Response::WindowSet(decoded) = postcard::from_bytes(&bytes).expect("decodes") else {
             panic!("expected a window set");
         };
 
         assert_eq!(decoded.focused(), Some(1));
         assert_eq!(decoded.east(1), Some(2));
+        assert_eq!(*decoded, set);
+        assert_eq!(decoded.unstack(5), set.unstack(5));
         // Ops are deliberately not carried: a set off the wire is one nothing
         // has been asked of yet.
         assert!(decoded.ops().is_empty());

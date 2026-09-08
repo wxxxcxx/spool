@@ -15,6 +15,7 @@ use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
+use crate::ecs::window_frame::{checked_frame_size, checked_window_frame};
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, EnsureVisibleMarker,
@@ -172,10 +173,44 @@ type StableWorkspacePlacements<'w, 's> = Query<
 /// edges. For an oversized window this range is reversed: from right-aligned
 /// to left-aligned, which lets the strip pan across the hidden content.
 pub(crate) fn clamp_origin_to_viewport(origin: Origin, size: Size, viewport: IRect) -> Origin {
-    let far_edge = viewport.max - size;
-    let minimum = viewport.min.min(far_edge);
-    let maximum = viewport.min.max(far_edge);
-    origin.clamp(minimum, maximum)
+    Origin::new(
+        clamp_axis_origin(i64::from(origin.x), size.x, viewport.min.x, viewport.max.x),
+        clamp_axis_origin(i64::from(origin.y), size.y, viewport.min.y, viewport.max.y),
+    )
+}
+
+/// Preserves integer center rounding without overflowing the intermediate sum.
+pub(crate) fn centered_origin_in_viewport(frame: IRect, size: Size, viewport: IRect) -> Origin {
+    let center_x = i64::from(frame.min.x).midpoint(i64::from(frame.max.x));
+    let center_y = i64::from(frame.min.y).midpoint(i64::from(frame.max.y));
+    Origin::new(
+        clamp_axis_origin(
+            center_x - i64::from(size.x / 2),
+            size.x,
+            viewport.min.x,
+            viewport.max.x,
+        ),
+        clamp_axis_origin(
+            center_y - i64::from(size.y / 2),
+            size.y,
+            viewport.min.y,
+            viewport.max.y,
+        ),
+    )
+}
+
+fn clamp_axis_origin(origin: i64, size: i32, near: i32, far: i32) -> i32 {
+    let near = i64::from(near);
+    let far = i64::from(far) - i64::from(size);
+    let minimum = near.min(far).max(i64::from(i32::MIN));
+    let maximum = near
+        .max(far)
+        .min(i64::from(i32::MAX) - i64::from(size).max(0));
+    // Both the origin and its positive-size endpoint remain representable.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        origin.clamp(minimum, maximum) as i32
+    }
 }
 
 impl Plugin for LayoutEventsPlugin {
@@ -220,16 +255,45 @@ fn display_viewport_changed(
             continue;
         };
         let viewport = display.actual_display_bounds(dock, &config);
+        if checked_frame_size(viewport).is_none() {
+            continue;
+        }
         if let Some(mut previous) = previous {
             if previous.0 == viewport {
                 continue;
             }
-            let translation = viewport.min - previous.0.min;
-            if translation != Origin::ZERO {
-                position.0 += translation;
-                if let Some(mut pending) = pending {
-                    pending.0 += translation;
-                }
+            let translate = |origin: Origin| -> Option<Origin> {
+                Some(Origin::new(
+                    i32::try_from(
+                        i64::from(origin.x) + i64::from(viewport.min.x)
+                            - i64::from(previous.0.min.x),
+                    )
+                    .ok()?,
+                    i32::try_from(
+                        i64::from(origin.y) + i64::from(viewport.min.y)
+                            - i64::from(previous.0.min.y),
+                    )
+                    .ok()?,
+                ))
+            };
+            let Some(next_position) = translate(position.0) else {
+                continue;
+            };
+            let next_pending = if let Some(pending) = pending.as_ref() {
+                let Some(next) = translate(pending.0) else {
+                    continue;
+                };
+                Some(next)
+            } else {
+                None
+            };
+            if position.0 != next_position {
+                position.0 = next_position;
+            }
+            if let (Some(mut pending), Some(next)) = (pending, next_pending)
+                && pending.0 != next
+            {
+                pending.0 = next;
             }
             previous.0 = viewport;
         } else {
@@ -314,6 +378,18 @@ pub enum Column {
 }
 
 impl Column {
+    #[cfg(feature = "lua")]
+    fn item_containing(&self, entity: Entity) -> Option<StackItem> {
+        match self {
+            Self::Single(id) => (*id == entity).then_some(StackItem::Single(*id)),
+            Self::Tabs(tabs) => tabs
+                .contains(&entity)
+                .then(|| StackItem::Tabs(tabs.clone())),
+            Self::Stack(items) => items.iter().find(|item| item.contains(entity)).cloned(),
+            Self::Fullscren(_) => None,
+        }
+    }
+
     /// Returns the top window entity in the panel.
     /// For a `Single` panel, it's the contained window.
     /// For a `Stack` or `Tabs`, it's the first window in the vector.
@@ -417,7 +493,7 @@ impl Iterator for ColumnWindowIter<'_> {
 
 /// `LayoutStrip` manages a horizontal strip of `Panel`s, where each panel can contain a single window or a stack of windows.
 /// It provides methods for manipulating the arrangement and access to windows within the pane.
-#[derive(Component, Debug, Default)]
+#[derive(Clone, Component, Debug, Default)]
 pub struct LayoutStrip {
     id: WorkspaceId,
     columns: VecDeque<Column>,
@@ -786,8 +862,8 @@ impl LayoutStrip {
             .and_then(|col| col.at_or_last(stack_pos))
     }
 
-    /// Stacks the window with the given ID onto the panel to its left.
-    /// If the window is already in a stack or is the leftmost window, no action is taken.
+    /// Stacks the containing column onto the column to its left, keeping native
+    /// tab entries intact. Leftmost and native fullscreen endpoints are unchanged.
     ///
     /// # Arguments
     ///
@@ -795,17 +871,24 @@ impl LayoutStrip {
     ///
     /// # Returns
     ///
-    /// `Ok(())` if the stacking is successful or not needed, otherwise `Err(Error)` if the window is not found.
-    pub fn stack(&mut self, entity: Entity) -> Result<()> {
+    /// `Ok(true)` when changed, `Ok(false)` for an ineligible endpoint, or an
+    /// error when the window is not found. Rejected operations preserve the strip.
+    pub fn stack(&mut self, entity: Entity) -> Result<bool> {
         let index = self.index_of(entity)?;
         if index == 0 {
             // Can not stack to the left if left most window already.
-            return Ok(());
+            return Ok(false);
+        }
+        if [index - 1, index]
+            .into_iter()
+            .any(|index| matches!(self.columns[index], Column::Fullscren(_)))
+        {
+            return Ok(false);
         }
 
         let column_to_stack = self.columns.remove(index).unwrap();
         let items_to_stack = match column_to_stack {
-            Column::Fullscren(_) => return Ok(()),
+            Column::Fullscren(_) => unreachable!("fullscreen endpoints rejected before removal"),
             Column::Single(id) => vec![StackItem::Single(id)],
             Column::Tabs(tabs) => vec![StackItem::Tabs(tabs)],
             Column::Stack(items) => items,
@@ -813,7 +896,7 @@ impl LayoutStrip {
 
         let target_column = self.columns.remove(index - 1).unwrap();
         let new_column = match target_column {
-            Column::Fullscren(_) => return Ok(()),
+            Column::Fullscren(_) => unreachable!("fullscreen endpoints rejected before removal"),
             Column::Single(id) => {
                 Column::Stack([vec![StackItem::Single(id)], items_to_stack].concat())
             }
@@ -824,7 +907,79 @@ impl LayoutStrip {
         };
 
         self.columns.insert(index - 1, new_column);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Moves one stack item onto a named column, keeping native tabs together.
+    #[cfg(feature = "lua")]
+    pub(crate) fn stack_onto(&mut self, entity: Entity, onto: Entity) -> Result<bool> {
+        let source = self.index_of(entity)?;
+        let target = self.index_of(onto)?;
+        if source == target || matches!(self.columns[target], Column::Fullscren(_)) {
+            return Ok(false);
+        }
+        let Some(item) = self.columns[source].item_containing(entity) else {
+            return Ok(false);
+        };
+
+        for member in item.window_iter() {
+            self.remove(member);
+        }
+        // The target is in another column and cannot have been removed above.
+        let target = self.index_of(onto)?;
+        match &mut self.columns[target] {
+            Column::Single(id) => {
+                self.columns[target] = Column::Stack(vec![StackItem::Single(*id), item]);
+            }
+            Column::Tabs(tabs) => {
+                let tabs = std::mem::take(tabs);
+                self.columns[target] = Column::Stack(vec![StackItem::Tabs(tabs), item]);
+            }
+            Column::Stack(items) => items.push(item),
+            Column::Fullscren(_) => unreachable!("validated before removing the source"),
+        }
+        Ok(true)
+    }
+
+    /// Exchanges named stack items without splitting native tab groups.
+    #[cfg(feature = "lua")]
+    pub(crate) fn swap_items(&mut self, first: Entity, second: Entity) -> Result<bool> {
+        let left = self.index_of(first)?;
+        let right = self.index_of(second)?;
+        let (Some(first_item), Some(second_item)) = (
+            self.columns[left].item_containing(first),
+            self.columns[right].item_containing(second),
+        ) else {
+            return Ok(false);
+        };
+        let (Some(first_slot), Some(second_slot)) = (
+            self.columns[left].position_of(first),
+            self.columns[right].position_of(second),
+        ) else {
+            return Ok(false);
+        };
+        if left == right {
+            if first_slot == second_slot {
+                return Ok(false);
+            }
+            if let Column::Stack(items) = &mut self.columns[left] {
+                items.swap(first_slot, second_slot);
+            }
+        } else {
+            fn replace(column: &mut Column, slot: usize, item: StackItem) {
+                if let Column::Stack(items) = column {
+                    items[slot] = item;
+                } else {
+                    *column = match item {
+                        StackItem::Single(entity) => Column::Single(entity),
+                        StackItem::Tabs(tabs) => Column::Tabs(tabs),
+                    };
+                }
+            }
+            replace(&mut self.columns[left], first_slot, second_item);
+            replace(&mut self.columns[right], second_slot, first_item);
+        }
+        Ok(true)
     }
 
     /// Unstacks the window with the given ID from its entity stack.
@@ -836,17 +991,20 @@ impl LayoutStrip {
     ///
     /// # Returns
     ///
-    /// `Ok(())` if the unstacking is successful or not needed, otherwise `Err(Error)` if the window is not found.
-    pub fn unstack(&mut self, entity: Entity) -> Result<()> {
+    /// `Ok(true)` when changed, `Ok(false)` when not stacked, or an error when
+    /// the window is not found. All eligibility checks precede removal.
+    pub fn unstack(&mut self, entity: Entity) -> Result<bool> {
         let index = self.index_of(entity)?;
+        let Column::Stack(items) = &self.columns[index] else {
+            return Ok(false);
+        };
+        let item_index = items
+            .iter()
+            .position(|item| item.contains(entity))
+            .ok_or_else(|| Error::NotFound(format!("Entity {entity} not in stack")))?;
         let column = self.columns.remove(index).unwrap();
 
         if let Column::Stack(mut items) = column {
-            let item_index = items
-                .iter()
-                .position(|item| item.contains(entity))
-                .ok_or(Error::NotFound(format!("Entity {entity} not in stack")))?;
-
             let removed_item = items.remove(item_index);
 
             // Re-insert the unstacked item as a single/tabs panel
@@ -868,11 +1026,9 @@ impl LayoutStrip {
                 };
                 self.columns.insert(index, new_column);
             }
-            Ok(())
+            Ok(true)
         } else {
-            // Not in a stack, put it back
-            self.columns.insert(index, column);
-            Ok(())
+            unreachable!("validated before removing the source")
         }
     }
 
@@ -930,47 +1086,43 @@ impl LayoutStrip {
                     Column::Tabs(tabs) => vec![StackItem::Tabs(tabs.clone())],
                 };
 
-                let current_heights = items
-                    .iter()
-                    .filter_map(|item| item.top().and_then(get_window_frame))
-                    .map(|frame| frame.height())
+                // Keep the representative geometry paired with the eligible
+                // members. Missing entries must not shift the height-to-item zip.
+                let items = items
+                    .into_iter()
+                    .filter_map(|item| {
+                        let mut members = Vec::new();
+                        let mut representative = None;
+                        for entity in item.window_iter() {
+                            if let Some(size) =
+                                get_window_frame(entity).and_then(checked_frame_size)
+                            {
+                                representative.get_or_insert(size);
+                                members.push(entity);
+                            }
+                        }
+                        Some((members, representative?))
+                    })
                     .collect::<Vec<_>>();
+                let current_heights = items.iter().map(|(_, size)| size.y).collect::<Vec<_>>();
 
                 let heights =
                     binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?;
 
-                // Every window in a column shares the master's (top item's)
-                // width, so a window stacked onto a master of a different width
-                // resizes to match it instead of keeping its own width. This
-                // also matches the column slot width from column_positions,
-                // which is the widest member.
-                let column_width = items
-                    .first()
-                    .and_then(StackItem::top)
-                    .and_then(&get_window_frame)
-                    .map(|frame| frame.width())?;
+                // The first eligible item is the projection master, matching
+                // column_positions without changing the stored ordering.
+                let column_width = items.first()?.1.x;
 
                 let mut next_y = 0;
-                let frames = items
-                    .into_iter()
-                    .zip(heights)
-                    .filter_map(|(item, height)| {
-                        let entity = item.top()?;
-                        let mut frame = get_window_frame(entity)?;
-                        frame.min.x = position;
-                        frame.max.x = frame.min.x + column_width;
-
-                        frame.min.y = next_y;
-                        frame.max.y = frame.min.y + height;
-
-                        next_y = frame.max.y;
-
-                        // Return ALL windows in the item with the same frame
-                        let results = item.window_iter().map(|e| (e, frame)).collect::<Vec<_>>();
-                        Some(results)
-                    })
-                    .flatten()
-                    .collect::<Vec<_>>();
+                let mut frames = Vec::new();
+                for ((members, _), height) in items.into_iter().zip(heights) {
+                    let frame = checked_window_frame(
+                        Origin::new(position, next_y),
+                        Size::new(column_width, height),
+                    )?;
+                    next_y = frame.max.y;
+                    frames.extend(members.into_iter().map(|entity| (entity, frame)));
+                }
 
                 Some(frames)
             })
@@ -982,17 +1134,55 @@ impl LayoutStrip {
     where
         W: Fn(Entity) -> Option<IRect>,
     {
-        let mut left_edge = 0;
+        // Validate the whole projection before exposing its first entry. A
+        // checked but streaming prefix would still move half of an invalid strip.
+        let positions =
+            self.columns()
+                .try_fold((Vec::new(), 0_i32), |(mut positions, left), column| {
+                    let Some(size) = column
+                        .window_iter()
+                        .filter_map(get_window_frame)
+                        .find_map(checked_frame_size)
+                    else {
+                        return Some((positions, left));
+                    };
+                    let right = left.checked_add(size.x)?;
+                    positions.push((column, left));
+                    Some((positions, right))
+                });
+        positions.into_iter().flat_map(|(positions, _)| positions)
+    }
 
-        self.columns().filter_map(move |column| {
-            let width = column.width(get_window_frame);
-
-            width.map(|width| {
-                let temp = left_edge;
-                left_edge += width;
-                (column, temp)
-            })
+    /// Checks the complete strip before a column resize changes layout inputs.
+    pub(crate) fn accepts_column_width<W>(&self, entity: Entity, width: i32, frame: W) -> bool
+    where
+        W: Fn(Entity) -> Option<IRect>,
+    {
+        let Ok(target) = self.index_of(entity) else {
+            return false;
+        };
+        self.accepts_column_widths(|index, column| {
+            if index == target {
+                Some(width)
+            } else {
+                column.width(&frame)
+            }
         })
+    }
+
+    /// Validates a complete proposed set of widths, without partially applying it.
+    pub(crate) fn accepts_column_widths(
+        &self,
+        mut width: impl FnMut(usize, &Column) -> Option<i32>,
+    ) -> bool {
+        self.columns()
+            .enumerate()
+            .try_fold(0_i32, |total, (index, column)| {
+                let width = width(index, column)?;
+                (width > 0).then_some(())?;
+                total.checked_add(width)
+            })
+            .is_some()
     }
 
     pub fn above(&self, entity: Entity) -> Option<Entity> {
@@ -1067,6 +1257,9 @@ fn dedup_entities(entities: &[Entity]) -> Vec<Entity> {
 }
 
 fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Option<Vec<i32>> {
+    if min_height <= 0 || total_height <= 0 || heights.iter().any(|height| *height <= 0) {
+        return None;
+    }
     let mut count = heights.len();
     let mut output = vec![];
 
@@ -1084,7 +1277,7 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
                     output.push(heights[idx]);
                 }
                 remaining -= heights[idx];
-            } else if remaining >= min_height * i32::try_from(remaining_windows).ok()? {
+            } else if remaining / min_height >= i32::try_from(remaining_windows).ok()? {
                 output.push(remaining);
                 remaining = 0;
             } else {
@@ -1179,7 +1372,7 @@ fn layout_strip_changed(
             .filter(|(_, _, _, unavailable)| {
                 unavailable.is_none_or(|state| !state.excludes_from_layout_projection())
             })
-            .map(|(position, bounds, _, _)| IRect::from_corners(position.0, position.0 + bounds.0))
+            .and_then(|(position, bounds, _, _)| checked_window_frame(position.0, bounds.0))
     };
 
     let changed = changed_strips
@@ -1235,6 +1428,9 @@ fn reshuffle_layout_strip(
             return;
         };
         let display_bounds = active_display.actual_display_bounds(dock, &config);
+        if checked_frame_size(display_bounds).is_none() {
+            return;
+        }
         let Some(mut frame) = windows.moving_frame(entity) else {
             return;
         };
@@ -1246,14 +1442,14 @@ fn reshuffle_layout_strip(
         frame.min = clamp_origin_to_viewport(frame.min, size, display_bounds);
         frame.max = frame.min + size;
 
-        let mut strip_position = (frame.min - layout_position.0).with_y(display_bounds.min.y);
+        let mut strip_x = i64::from(frame.min.x) - i64::from(layout_position.0.x);
 
         // Enforce the edge invariant when auto-center is off: the leftmost
         // window must touch the left edge and the rightmost the right edge
         // if more than 1 windows in workspace.
         if !config.auto_center()
             && !config.continuous_swipe()
-            && let Some(total_strip_width) = strip
+            && let Some((last_x, last_width)) = strip
                 .last()
                 .ok()
                 .and_then(|column| column.top())
@@ -1263,18 +1459,25 @@ fn reshuffle_layout_strip(
                         .map(|position| position.0.x)
                         .zip(windows.moving_frame(last).map(|frame| frame.width()))
                 })
-                .map(|(last_x, last_width)| last_x + last_width)
         {
-            strip_position.x = if display_bounds.width() < total_strip_width {
-                strip_position.x.clamp(
-                    display_bounds.max.x - total_strip_width,
-                    display_bounds.min.x,
+            let Some(total_strip_width) = last_x.checked_add(last_width).filter(|width| *width > 0)
+            else {
+                return;
+            };
+            strip_x = if display_bounds.width() < total_strip_width {
+                strip_x.clamp(
+                    i64::from(display_bounds.max.x) - i64::from(total_strip_width),
+                    i64::from(display_bounds.min.x),
                 )
             } else {
                 // Strip fits entirely: pin the leftmost window to the left edge.
-                display_bounds.min.x
+                i64::from(display_bounds.min.x)
             };
         }
+        let Ok(strip_x) = i32::try_from(strip_x) else {
+            return;
+        };
+        let strip_position = Origin::new(strip_x, display_bounds.min.y);
 
         // Check how much of the window is hidden. Slivers don't count as
         // meaningfully visible, so subtract sliver_width from the visible
@@ -1287,8 +1490,10 @@ fn reshuffle_layout_strip(
 
             // Do not move the window if the hidden fraction is lower than threshold
             // or if the layout strip movement is shorter than the hidden width.
-            let strip_movement = (active_strip.x - strip_position.x).abs();
-            if hidden_fraction <= hidden_ratio && frame.width() - visible_width >= strip_movement {
+            let strip_movement = active_strip.x.abs_diff(strip_position.x);
+            if hidden_fraction <= hidden_ratio
+                && (frame.width() - visible_width).unsigned_abs() >= strip_movement
+            {
                 return;
             }
         }
@@ -1320,30 +1525,37 @@ fn ensure_visible_in_strip(
         let Some((_, strip_entity, strip_position, child, active_marker)) =
             strips.into_iter().find(|s| s.0.contains(entity))
         else {
-            return;
+            continue;
         };
 
         if active_marker.is_some_and(|m| m.is_added()) {
             trace!("ensure_visible_in_strip: skipping newly active workspace {strip_entity}");
-            return;
+            continue;
         }
         let Ok((display, dock)) = displays.get(child.parent()) else {
-            return;
+            continue;
         };
         let Some(size) = windows.size(entity) else {
-            return;
+            continue;
         };
         let viewport = display.actual_display_bounds(dock, &config);
+        if checked_frame_size(viewport).is_none() || size.x <= 0 || size.y <= 0 {
+            continue;
+        }
 
         // Where the entity would appear if the strip stays put.
-        let candidate_min = layout_position.0 + strip_position.0;
+        let candidate_x = i64::from(layout_position.0.x) + i64::from(strip_position.0.x);
         // Clamp into the viewport. If already on-screen, this is a no-op and
         // the strip target equals its current position — no movement.
-        let clamped_min = clamp_origin_to_viewport(candidate_min, size, viewport);
-        if clamped_min == candidate_min {
-            return;
+        let clamped_x = clamp_axis_origin(candidate_x, size.x, viewport.min.x, viewport.max.x);
+        let Ok(strip_x) = i32::try_from(i64::from(clamped_x) - i64::from(layout_position.0.x))
+        else {
+            continue;
+        };
+        if strip_x == strip_position.0.x {
+            continue;
         }
-        let strip_target = (clamped_min - layout_position.0).with_y(strip_position.0.y);
+        let strip_target = Origin::new(strip_x, strip_position.0.y);
         trace!("ensure_visible_in_strip: entity {entity}, scroll strip to {strip_target}");
         commands.reposition_entity(strip_entity, strip_target);
     }
@@ -1371,6 +1583,45 @@ struct StripWindowContext {
     swiping: bool,
     display_entity: Entity,
     stacked: bool,
+}
+
+fn projected_window_frame(
+    layout_origin: Origin,
+    size: Size,
+    context: StripWindowContext,
+    viewport: IRect,
+    horizontal_padding: i32,
+    config: &Config,
+) -> Option<IRect> {
+    let viewport_size = checked_frame_size(viewport)?;
+    if size.x <= 0 || size.y <= 0 {
+        return None;
+    }
+    let (_, pad_right, _, pad_left) = config.edge_padding();
+    let sliver_width = i64::from(config.sliver_width());
+    let h_pad = i64::from(horizontal_padding);
+    let width = i64::from(size.x);
+    let mut x = i64::from(layout_origin.x) + i64::from(context.strip_position.x);
+    let mut y = i64::from(layout_origin.y) + i64::from(context.strip_position.y);
+    // Off-screen logical offsets can exceed i32 while their visible sliver is
+    // representable. Apply the projection before narrowing the coordinates.
+    let mut offscreen = false;
+    if x + width <= i64::from(viewport.min.x) + h_pad {
+        x = i64::from(viewport.min.x) - width + sliver_width - i64::from(pad_left) + h_pad;
+        offscreen = true;
+    } else if x >= i64::from(viewport.max.x) - h_pad {
+        x = i64::from(viewport.max.x) - sliver_width + i64::from(pad_right) - h_pad;
+        offscreen = true;
+    }
+    // Keep stacked proportions and full-height swipe behavior unchanged.
+    if !context.swiping && offscreen && !context.stacked {
+        let inset = round_px(f64::from(viewport_size.y) * (1.0 - config.sliver_height()) / 2.0);
+        y += i64::from(inset);
+    }
+    checked_window_frame(
+        Origin::new(i32::try_from(x).ok()?, i32::try_from(y).ok()?),
+        size,
+    )
 }
 
 fn insert_strip_window_contexts(
@@ -1486,8 +1737,6 @@ fn position_layout_windows(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let offscreen_sliver_width = config.sliver_width();
-    let (_, pad_right, _, pad_left) = config.edge_padding();
     let mut strip_contexts = EntityHashMap::default();
     for (layout_strip, Position(strip_position), swiping, child_of) in &workspaces {
         insert_strip_window_contexts(
@@ -1509,53 +1758,23 @@ fn position_layout_windows(
             continue;
         };
         let viewport = display.actual_display_bounds(dock, &config);
-        // Gets 80% of the display height as threshold.
-        let Ok(vertical_move_threshold) = u32::try_from(viewport.height() * 8 / 10) else {
+        let Some(viewport_size) = checked_frame_size(viewport) else {
             continue;
         };
-
-        // Account for per-window horizontal_padding: reposition() adds
-        // h_pad to the virtual x, so subtract it here so the OS window
-        // lands exactly sliver_width pixels from the screen edge.
-        let h_pad = window.horizontal_padding();
-        let mut frame = IRect::from_corners(layout_position.0, layout_position.0 + bounds.0);
-        let width = frame.width();
-        frame.min += context.strip_position;
-        frame.max += context.strip_position;
-
-        let mut offscreen = false;
-        if frame.max.x <= viewport.min.x + h_pad {
-            // Window hidden to the left — position so exactly
-            // sliver_width CG pixels are visible from the real
-            // display edge.  The +h_pad accounts for the gap that
-            // reposition() adds, which can leave a window just
-            // inside the viewport edge while its CG frame is fully
-            // past it.
-            frame.min.x = viewport.min.x - width + offscreen_sliver_width - pad_left + h_pad;
-            offscreen = true;
-        } else if frame.min.x >= viewport.max.x - h_pad {
-            // Window hidden to the right — mirror of above.
-            frame.min.x = viewport.max.x - offscreen_sliver_width + pad_right - h_pad;
-            offscreen = true;
-        }
-        frame.max.x = frame.min.x + width;
-
-        // During swipe, keep full height. The vertical sliver inset only
-        // applies to horizontally off-screen windows, so they expose just
-        // a `sliver_height` fraction of their height at the viewport's
-        // vertical center.
-        if !context.swiping && offscreen {
-            // Don't compress stacked windows vertically when off-screen.
-            // The height reduction corrupts their proportions: when the
-            // column scrolls back on-screen, binpack_heights makes the
-            // last window absorb all remaining space.
-            if !context.stacked {
-                let inset =
-                    round_px(f64::from(viewport.height()) * (1.0 - config.sliver_height()) / 2.0);
-                frame.min.y += inset;
-                frame.max.y += inset;
-            }
-        }
+        // Gets 80% of the display height as threshold.
+        let Ok(vertical_move_threshold) = u32::try_from(i64::from(viewport_size.y) * 8 / 10) else {
+            continue;
+        };
+        let Some(frame) = projected_window_frame(
+            layout_position.0,
+            bounds.0,
+            *context,
+            viewport,
+            window.horizontal_padding(),
+            &config,
+        ) else {
+            continue;
+        };
 
         // Position remains a compatibility projection for the existing strip
         // math. It is the final target, never the animated/presented origin.
@@ -1577,7 +1796,480 @@ fn position_layout_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::ecs::system::RunSystemOnce;
     use bevy::prelude::*;
+
+    #[test]
+    fn projection_filters_invalid_frames_without_changing_membership() {
+        let (_, mut strip, entities) = setup_world_and_strip();
+        strip.stack(entities[1]).unwrap();
+        for invalid in [
+            IRect::new(0, 0, 0, 400),
+            IRect {
+                min: Origin::new(100, 0),
+                max: Origin::new(0, 400),
+            },
+            IRect::new(i32::MIN, 0, i32::MAX, 400),
+        ] {
+            let frame = |entity| {
+                Some(if entity == entities[0] {
+                    invalid
+                } else {
+                    IRect::new(0, 0, 400, 300)
+                })
+            };
+            let projected = strip.relative_positions(600, &frame).collect::<Vec<_>>();
+            assert_eq!(
+                projected,
+                vec![
+                    (entities[1], IRect::new(0, 0, 400, 600)),
+                    (entities[2], IRect::new(400, 0, 800, 600)),
+                ]
+            );
+            assert_eq!(strip.all_windows(), entities);
+            for height in [0, -1, i32::MIN] {
+                assert_eq!(strip.relative_positions(height, &frame).count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn binpack_rejects_invalid_inputs_without_overflow() {
+        for (heights, minimum, total) in [
+            (vec![0, 300], 100, 600),
+            (vec![i32::MIN, 300], 100, 600),
+            (vec![300, 300], 0, 600),
+            (vec![300, 300], 100, 0),
+            (vec![i32::MAX, i32::MAX], i32::MAX, i32::MAX),
+        ] {
+            assert!(
+                binpack_heights(&heights, minimum, total).is_none_or(|result| result.is_empty())
+            );
+        }
+        assert_eq!(
+            binpack_heights(&[i32::MAX], i32::MAX, i32::MAX),
+            Some(vec![i32::MAX])
+        );
+    }
+
+    #[test]
+    fn projected_frames_preserve_padding_swipe_and_stacked_height_rules() {
+        let config: Config = (
+            crate::config::MainOptions {
+                padding_left: Some(3),
+                padding_right: Some(7),
+                sliver_width: Some(16),
+                sliver_height: Some(0.5),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut world = World::new();
+        let display_entity = world.spawn_empty().id();
+        for swiping in [false, true] {
+            for stacked in [false, true] {
+                let context = StripWindowContext {
+                    strip_position: Origin::new(-1024, 20),
+                    swiping,
+                    display_entity,
+                    stacked,
+                };
+                for (x, expected_x) in [
+                    (-1000, -1403),
+                    (i32::MIN, -1403),
+                    (2000, -17),
+                    (i32::MAX, -17),
+                ] {
+                    let frame = projected_window_frame(
+                        Origin::new(x, 0),
+                        Size::new(400, 748),
+                        context,
+                        IRect::new(-1024, 20, 0, 768),
+                        8,
+                        &config,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        frame.min,
+                        Origin::new(expected_x, if swiping || stacked { 20 } else { 207 })
+                    );
+                    assert_eq!(frame.size(), Size::new(400, 748));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn projected_frames_reject_unrepresentable_final_endpoints() {
+        let mut world = World::new();
+        let context = StripWindowContext {
+            strip_position: Origin::ZERO,
+            swiping: true,
+            display_entity: world.spawn_empty().id(),
+            stacked: false,
+        };
+        let config = Config::default();
+        for (origin, size, viewport) in [
+            (
+                Origin::new(0, i32::MAX - 100),
+                Size::new(400, 200),
+                IRect::new(0, 20, 1024, 768),
+            ),
+            (
+                Origin::new(i32::MAX, 20),
+                Size::new(400, 200),
+                IRect::new(i32::MAX - 1024, 20, i32::MAX, 768),
+            ),
+            (
+                Origin::ZERO,
+                Size::new(0, 200),
+                IRect::new(0, 20, 1024, 768),
+            ),
+        ] {
+            assert!(projected_window_frame(origin, size, context, viewport, 0, &config).is_none());
+        }
+        assert_eq!(
+            projected_window_frame(
+                Origin::ZERO,
+                Size::new(i32::MAX, 200),
+                context,
+                IRect::new(0, 20, 1024, 768),
+                0,
+                &config
+            ),
+            Some(IRect::new(0, 0, i32::MAX, 200))
+        );
+    }
+
+    #[test]
+    fn ensure_visible_continues_after_noop_invalid_or_incomplete_requests() {
+        use crate::tests::{TestHarness, find_window_entity};
+        for first_x in [Some(0), Some(i32::MIN), None] {
+            let mut harness = TestHarness::new().with_windows(2);
+            harness.pump_frames(5);
+            let first = find_window_entity(0, harness.world());
+            let second = find_window_entity(1, harness.world());
+            let world = harness.world();
+            let system = world.register_system(ensure_visible_in_strip);
+            world.run_system(system).unwrap();
+            world.entity_mut(first).insert((
+                EnsureVisibleMarker,
+                LayoutPosition(Origin::new(first_x.unwrap_or(0), 0)),
+            ));
+            if first_x.is_none() {
+                world.entity_mut(first).remove::<Bounds>();
+            }
+            world
+                .entity_mut(second)
+                .insert((EnsureVisibleMarker, LayoutPosition(Origin::new(2000, 0))));
+            let strip_entity = world
+                .query_filtered::<Entity, With<LayoutStrip>>()
+                .single(world)
+                .unwrap();
+            world.run_system(system).unwrap();
+            assert_eq!(
+                world.get::<RepositionMarker>(strip_entity).unwrap().0.x,
+                -1376
+            );
+            assert!(world.get::<EnsureVisibleMarker>(first).is_none());
+            assert!(world.get::<EnsureVisibleMarker>(second).is_none());
+        }
+    }
+
+    #[test]
+    fn ensure_visible_handles_a_wide_global_candidate_with_a_representable_target() {
+        use crate::tests::{TestHarness, find_window_entity};
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.pump_frames(5);
+        let entity = find_window_entity(0, harness.world());
+        let world = harness.world();
+        let system = world.register_system(ensure_visible_in_strip);
+        world.run_system(system).unwrap();
+        let strip_entity = world
+            .query_filtered::<Entity, With<LayoutStrip>>()
+            .single(world)
+            .unwrap();
+        world
+            .entity_mut(strip_entity)
+            .insert(Position(Origin::new(1000, 20)));
+        world.entity_mut(entity).insert((
+            EnsureVisibleMarker,
+            LayoutPosition(Origin::new(i32::MAX - 400, 0)),
+        ));
+        world.run_system(system).unwrap();
+        assert_eq!(
+            world.get::<RepositionMarker>(strip_entity).unwrap().0,
+            Origin::new(1024 - i32::MAX, 20)
+        );
+    }
+
+    #[test]
+    fn reshuffle_handles_discarded_y_translation_and_full_range_movement() {
+        use crate::tests::{TestHarness, find_window_entity};
+        for (logical_y, strip_x) in [(i32::MIN, 0), (0, i32::MIN)] {
+            let config = (
+                crate::config::MainOptions {
+                    window_hidden_ratio: Some(0.5),
+                    ..Default::default()
+                },
+                vec![],
+            )
+                .into();
+            let mut harness = TestHarness::new().with_config(config).with_windows(1);
+            harness.pump_frames(5);
+            let entity = find_window_entity(0, harness.world());
+            let world = harness.world();
+            let system = world.register_system(reshuffle_layout_strip);
+            world.run_system(system).unwrap();
+            let strip_entity = world
+                .query_filtered::<Entity, With<LayoutStrip>>()
+                .single(world)
+                .unwrap();
+            world
+                .entity_mut(strip_entity)
+                .insert(Position(Origin::new(strip_x, 20)));
+            world.entity_mut(entity).insert((
+                ReshuffleAroundMarker,
+                LayoutPosition(Origin::new(0, logical_y)),
+            ));
+            world.run_system(system).unwrap();
+            assert!(world.get::<ReshuffleAroundMarker>(entity).is_none());
+            if strip_x == i32::MIN {
+                assert_eq!(
+                    world.get::<RepositionMarker>(strip_entity).unwrap().0,
+                    Origin::new(0, 20)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn window_projection_clips_before_narrowing_global_coordinates() {
+        use crate::tests::{TestHarness, find_window_entity};
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.pump_frames(5);
+        let entity = find_window_entity(0, harness.world());
+        let world = harness.world();
+        let strip_entity = world
+            .query_filtered::<Entity, With<LayoutStrip>>()
+            .single(world)
+            .unwrap();
+        world
+            .entity_mut(strip_entity)
+            .insert(Position(Origin::new(1000, 20)));
+        world
+            .entity_mut(entity)
+            .insert(LayoutPosition(Origin::new(i32::MAX - 400, 0)));
+        let config = world.resource::<Config>();
+        let expected_x = 1024 - config.sliver_width() + config.edge_padding().1
+            - world.get::<Window>(entity).unwrap().horizontal_padding();
+        world.run_system_once(position_layout_windows).unwrap();
+        let frame = world.get::<DesiredWindowFrame>(entity).unwrap().0;
+        assert_eq!(frame.min.x, expected_x);
+        assert_eq!(frame.width(), 400);
+        assert!(checked_frame_size(frame).is_some());
+    }
+
+    #[test]
+    fn viewport_rebase_accepts_a_wide_translation_when_both_results_fit() {
+        use crate::tests::TestHarness;
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.pump_frames(5);
+        let world = harness.world();
+        let strip_entity = world
+            .query_filtered::<Entity, With<LayoutStrip>>()
+            .single(world)
+            .unwrap();
+        world.entity_mut(strip_entity).insert((
+            LayoutViewport(IRect::new(i32::MIN, 20, i32::MIN + 1024, 768)),
+            Position(Origin::new(i32::MIN + 100, 20)),
+            RepositionMarker(Origin::new(i32::MIN + 200, 20)),
+        ));
+        world.run_system_once(display_viewport_changed).unwrap();
+        assert_eq!(
+            world.get::<Position>(strip_entity).unwrap().0,
+            Origin::new(100, 20)
+        );
+        assert_eq!(
+            world.get::<RepositionMarker>(strip_entity).unwrap().0,
+            Origin::new(200, 20)
+        );
+    }
+
+    #[test]
+    fn viewport_rebase_rejects_an_unrepresentable_pending_target_atomically() {
+        use crate::tests::TestHarness;
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.pump_frames(5);
+        let world = harness.world();
+        let strip_entity = world
+            .query_filtered::<Entity, With<LayoutStrip>>()
+            .single(world)
+            .unwrap();
+        let previous = IRect::new(-100, 20, 924, 768);
+        world.entity_mut(strip_entity).insert((
+            LayoutViewport(previous),
+            Position(Origin::new(0, 20)),
+            RepositionMarker(Origin::new(i32::MAX, 20)),
+        ));
+        world.run_system_once(display_viewport_changed).unwrap();
+        assert_eq!(
+            world.get::<Position>(strip_entity).unwrap().0,
+            Origin::new(0, 20)
+        );
+        assert_eq!(
+            world.get::<RepositionMarker>(strip_entity).unwrap().0,
+            Origin::new(i32::MAX, 20)
+        );
+        assert_eq!(
+            world.get::<LayoutViewport>(strip_entity).unwrap().0,
+            previous
+        );
+        world
+            .entity_mut(strip_entity)
+            .insert(RepositionMarker(Origin::new(100, 20)));
+        world.run_system_once(display_viewport_changed).unwrap();
+        assert_eq!(
+            world.get::<Position>(strip_entity).unwrap().0,
+            Origin::new(100, 20)
+        );
+        assert_eq!(
+            world.get::<RepositionMarker>(strip_entity).unwrap().0,
+            Origin::new(200, 20)
+        );
+        assert_eq!(
+            world.get::<LayoutViewport>(strip_entity).unwrap().0,
+            IRect::new(0, 20, 1024, 768)
+        );
+    }
+
+    #[test]
+    fn projection_preserves_available_stack_items_when_any_sibling_is_missing() {
+        for missing in 0..3 {
+            let (mut world, mut strip, entities) = setup_world_and_strip();
+            strip.stack(entities[1]).unwrap();
+            strip.stack(entities[2]).unwrap();
+            let last = world.spawn_empty().id();
+            strip.append(last);
+            let before = strip.all_windows();
+            let frame = |entity| (entity != entities[missing]).then(|| IRect::new(0, 0, 400, 300));
+            let projected = strip.relative_positions(600, &frame).collect::<Vec<_>>();
+            let expected = before
+                .iter()
+                .copied()
+                .filter(|entity| *entity != entities[missing])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                projected
+                    .iter()
+                    .map(|(entity, _)| *entity)
+                    .collect::<Vec<_>>(),
+                expected,
+                "missing={missing}"
+            );
+            assert_eq!(projected[0].1, IRect::new(0, 0, 400, 300));
+            assert_eq!(projected[1].1, IRect::new(0, 300, 400, 600));
+            assert_eq!(projected[2].1, IRect::new(400, 0, 800, 600));
+            assert_eq!(strip.all_windows(), before);
+            let restored = strip
+                .relative_positions(600, &|_| Some(IRect::new(0, 0, 400, 200)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                restored
+                    .iter()
+                    .map(|(entity, _)| *entity)
+                    .collect::<Vec<_>>(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn projection_keeps_available_native_tabs_without_publishing_missing_members() {
+        for missing in 0..2 {
+            let (_, mut strip, entities) = setup_world_and_strip();
+            strip.columns = VecDeque::from([Column::Stack(vec![
+                StackItem::Tabs(vec![entities[0], entities[1]]),
+                StackItem::Single(entities[2]),
+            ])]);
+            let frame = |entity| (entity != entities[missing]).then(|| IRect::new(0, 0, 400, 300));
+            let projected = strip.relative_positions(600, &frame).collect::<Vec<_>>();
+            assert_eq!(
+                projected,
+                vec![
+                    (entities[1 - missing], IRect::new(0, 0, 400, 300)),
+                    (entities[2], IRect::new(0, 300, 400, 600)),
+                ]
+            );
+            assert_eq!(strip.all_windows(), entities);
+        }
+    }
+
+    #[test]
+    fn projection_uses_the_same_master_width_for_frames_and_column_offsets() {
+        let (_, mut strip, entities) = setup_world_and_strip();
+        strip.stack(entities[1]).unwrap();
+        let frame = |entity| {
+            Some(IRect::new(
+                0,
+                0,
+                if entity == entities[1] { 700 } else { 300 },
+                300,
+            ))
+        };
+        let projected = strip.relative_positions(600, &frame).collect::<Vec<_>>();
+        assert_eq!(
+            projected,
+            vec![
+                (entities[0], IRect::new(0, 0, 300, 300)),
+                (entities[1], IRect::new(0, 300, 300, 600)),
+                (entities[2], IRect::new(300, 0, 600, 600)),
+            ]
+        );
+    }
+
+    #[test]
+    fn clamped_origins_and_endpoints_remain_representable_at_coordinate_limits() {
+        for base in [i32::MIN, -2048, 0, i32::MAX - 1024] {
+            let viewport = IRect::new(base, base, base + 1024, base + 768);
+            for size in [1, 300, 2048, i32::MAX].map(Size::splat) {
+                for origin in [i32::MIN, -999_999, -2048, 0, i32::MAX].map(Origin::splat) {
+                    let actual = clamp_origin_to_viewport(origin, size, viewport);
+                    assert!(crate::ecs::window_frame::checked_window_frame(actual, size).is_some());
+                    assert_eq!(clamp_origin_to_viewport(actual, size, viewport), actual);
+                    for (value, near, far, size) in [
+                        (actual.x, viewport.min.x, viewport.max.x, size.x),
+                        (actual.y, viewport.min.y, viewport.max.y, size.y),
+                    ] {
+                        let near = i64::from(near);
+                        let far = i64::from(far) - i64::from(size);
+                        assert!((near.min(far)..=near.max(far)).contains(&i64::from(value)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn centered_origin_preserves_existing_rounding_for_odd_sizes_and_negative_positions() {
+        let viewport = IRect::new(-1024, -1024, 1024, 1024);
+        for origin in [-101, -100, 0, 99, 100].map(Origin::splat) {
+            for width in [99, 100, 101] {
+                let frame = IRect::from_corners(origin, origin + Size::splat(width));
+                for size in [200, 201].map(Size::splat) {
+                    assert_eq!(
+                        centered_origin_in_viewport(frame, size, viewport),
+                        clamp_origin_to_viewport(
+                            IRect::from_center_size(frame.center(), size).min,
+                            size,
+                            viewport
+                        )
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn clamp_origin_supports_oversized_windows() {
@@ -1619,6 +2311,100 @@ mod tests {
         strip.append(entities[2]);
 
         (world, strip, entities)
+    }
+
+    #[test]
+    fn stacking_a_native_fullscreen_endpoint_preserves_every_column() {
+        for fullscreen_index in [0, 1] {
+            let (_, mut strip, entities) = setup_world_and_strip();
+            strip.columns[fullscreen_index] = Column::Fullscren(entities[fullscreen_index]);
+            let before: Vec<Vec<Entity>> = strip
+                .columns()
+                .map(|column| column.window_iter().collect())
+                .collect();
+            strip.stack(entities[1]).unwrap();
+            let after: Vec<Vec<Entity>> = strip
+                .columns()
+                .map(|column| column.window_iter().collect())
+                .collect();
+            assert_eq!(after, before, "fullscreen column {fullscreen_index}");
+            assert!(matches!(
+                strip.get(fullscreen_index).unwrap(),
+                Column::Fullscren(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn column_width_budget_checks_the_entire_strip_and_missing_frames() {
+        let (mut world, strip, entities) = setup_world_and_strip();
+        let frame = |_| Some(IRect::new(0, 0, 400, 500));
+        assert!(strip.accepts_column_width(entities[0], i32::MAX - 800, frame));
+        assert!(!strip.accepts_column_width(entities[0], i32::MAX - 799, frame));
+        assert!(strip.accepts_column_width(entities[1], 2048, frame));
+        for width in [0, -1, i32::MAX] {
+            assert!(!strip.accepts_column_width(entities[1], width, frame));
+        }
+        assert!(!strip.accepts_column_width(world.spawn_empty().id(), 400, frame));
+        assert!(!strip.accepts_column_width(entities[0], 400, |member| {
+            (member != entities[1]).then(|| IRect::new(0, 0, 400, 500))
+        }));
+    }
+
+    #[test]
+    fn overflowing_column_offsets_publish_no_partial_layout_projection() {
+        let (_, strip, entities) = setup_world_and_strip();
+        let frame = |entity| {
+            Some(IRect::new(
+                0,
+                0,
+                if entity == entities[0] {
+                    i32::MAX - 1
+                } else {
+                    1
+                },
+                500,
+            ))
+        };
+        assert!(
+            strip
+                .column_positions(&frame)
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            strip
+                .relative_positions(500, &frame)
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn maximum_representable_column_offsets_preserve_every_window() {
+        let (_, strip, entities) = setup_world_and_strip();
+        let frame = |entity| {
+            Some(IRect::new(
+                0,
+                0,
+                if entity == entities[0] {
+                    i32::MAX - 800
+                } else {
+                    400
+                },
+                500,
+            ))
+        };
+        let projected = strip.relative_positions(500, &frame).collect::<Vec<_>>();
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[0].1.min.x, 0);
+        assert_eq!(projected[1].1.min.x, i32::MAX - 800);
+        assert_eq!(projected[2].1.max.x, i32::MAX);
+        assert!(
+            projected
+                .iter()
+                .all(|(_, frame)| frame.width() > 0 && frame.height() == 500)
+        );
     }
 
     #[test]

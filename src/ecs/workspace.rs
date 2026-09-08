@@ -55,6 +55,12 @@ pub(crate) struct WindowSpaceReassignmentPending {
     index: usize,
 }
 
+impl WindowSpaceReassignmentPending {
+    pub(crate) fn source_index(&self) -> usize {
+        self.index
+    }
+}
+
 impl Plugin for WorkspaceEventsPlugin {
     fn build(&self, app: &mut App) {
         const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
@@ -63,15 +69,11 @@ impl Plugin for WorkspaceEventsPlugin {
         app.add_systems(
             PreUpdate,
             (
-                native_space::handle_focus_window_commands,
-                (
-                    native_space::handle_native_space_commands,
-                    super::topology::refresh_topology,
-                    invalidate_missing_workspaces,
-                )
-                    .chain()
-                    .after(super::systems::pump_events),
-            ),
+                super::topology::refresh_topology,
+                invalidate_missing_workspaces,
+            )
+                .chain()
+                .after(crate::commands::dispatch_actions),
         );
         app.add_systems(
             Update,
@@ -1187,6 +1189,6 @@ fn restore_focus_on_space_activation(
             ?entity,
             "restoring the Space's previous focus"
         );
-        commands.focus_entity(entity, true);
+        commands.restore_focus_entity(entity, true);
     }
 }

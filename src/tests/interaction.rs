@@ -160,7 +160,7 @@ fn native_space_move_suspends_source_frame_until_membership_confirmation() {
     });
     harness
         .world()
-        .run_system_once(crate::ecs::native_space::handle_native_space_commands)
+        .run_system_once(crate::commands::dispatch_actions)
         .expect("submit move");
     let offset = IVec2::new(TEST_DISPLAY_WIDTH, 0);
     let destination = IRect::from_corners(source.min + offset, source.max + offset);
@@ -227,7 +227,7 @@ fn native_space_move_timeout_keeps_geometry_frozen_until_membership_recovers() {
     });
     harness
         .world()
-        .run_system_once(crate::ecs::native_space::handle_native_space_commands)
+        .run_system_once(crate::commands::dispatch_actions)
         .expect("submit move");
     harness.world().resource_mut::<Messages<Event>>().clear();
     harness

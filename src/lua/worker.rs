@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -41,6 +41,8 @@ use spool_shared_types::windowset::WindowSet;
 /// never stop the process from exiting.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(2);
+const MAIN_BATCH_LIMIT: usize = 256;
+const MAIN_BATCH_BUDGET: Duration = Duration::from_millis(4);
 
 /// Where a runtime's script comes from — the worker builds the interpreter
 /// itself, so it needs the source rather than the built runtime.
@@ -241,20 +243,41 @@ impl LuaWorker {
         let _ = self.to_lua.try_send(ToLua::Reload(path));
     }
 
-    /// The side effects callbacks have produced since the last drain.
+    /// A bounded batch of side effects pending at entry; later effects wait
+    /// for the next main-thread pass.
     pub(super) fn drain_outbox(&self) -> impl Iterator<Item = FromLua> + '_ {
-        std::iter::from_fn(|| self.outbox.try_recv().ok())
+        drain_main_batch(&self.outbox)
     }
 
     /// The `spool.query*` and window-set calls currently waiting on the world.
     pub(super) fn pending_world_queries(&self) -> impl Iterator<Item = WorldRequest> + '_ {
-        std::iter::from_fn(|| self.world_queries.try_recv().ok())
+        drain_main_batch(&self.world_queries)
     }
 
     /// The `spool.state` calls currently waiting on the store.
     pub(super) fn pending_store_queries(&self) -> impl Iterator<Item = StoreRequest> + '_ {
-        std::iter::from_fn(|| self.store_queries.try_recv().ok())
+        drain_main_batch(&self.store_queries)
     }
+}
+
+fn drain_main_batch<T>(receiver: &Receiver<T>) -> impl Iterator<Item = T> + '_ {
+    let count = receiver.len().min(MAIN_BATCH_LIMIT);
+    let mut remaining = count;
+    let started = Instant::now();
+    std::iter::from_fn(move || {
+        // Check before receiving so an exhausted budget never discards a
+        // request. Always allow the first pending item to make progress.
+        if remaining == 0 || (remaining < count && started.elapsed() >= MAIN_BATCH_BUDGET) {
+            remaining = 0;
+            return None;
+        }
+        remaining -= 1;
+        let Ok(message) = receiver.try_recv() else {
+            remaining = 0;
+            return None;
+        };
+        Some(message)
+    })
 }
 
 impl Drop for LuaWorker {
@@ -530,6 +553,179 @@ mod tests {
         );
     }
 
+    struct MainThreadChannels {
+        worker: LuaWorker,
+        effects: Sender<FromLua>,
+        world: Sender<WorldRequest>,
+        store: Sender<StoreRequest>,
+    }
+
+    impl MainThreadChannels {
+        fn new() -> Self {
+            let (effects, outbox) = unbounded();
+            let (world, world_queries) = unbounded();
+            let (store, store_queries) = unbounded();
+            Self {
+                worker: LuaWorker {
+                    to_lua: unbounded().0,
+                    outbox,
+                    world_queries,
+                    store_queries,
+                    has_handlers: Arc::new(AtomicBool::new(false)),
+                    built_config: Arc::new(Mutex::new(None)),
+                    thread: None,
+                },
+                effects,
+                world,
+                store,
+            }
+        }
+    }
+
+    #[test]
+    fn main_thread_batches_defer_new_messages_until_the_next_pass() {
+        let channels = MainThreadChannels::new();
+        channels
+            .store
+            .try_send(StoreRequest::Read {
+                reply: bounded(1).0,
+            })
+            .unwrap();
+        let mut requests = channels.worker.pending_store_queries();
+        assert!(requests.next().is_some());
+        channels
+            .store
+            .try_send(StoreRequest::Read {
+                reply: bounded(1).0,
+            })
+            .unwrap();
+        assert!(
+            requests.next().is_none(),
+            "new store request joined a live batch"
+        );
+        drop(requests);
+        assert!(channels.worker.pending_store_queries().next().is_some());
+
+        channels
+            .world
+            .try_send(WorldRequest::State {
+                reply: bounded(1).0,
+            })
+            .unwrap();
+        let mut requests = channels.worker.pending_world_queries();
+        assert!(requests.next().is_some());
+        channels
+            .world
+            .try_send(WorldRequest::State {
+                reply: bounded(1).0,
+            })
+            .unwrap();
+        assert!(
+            requests.next().is_none(),
+            "new world request joined a live batch"
+        );
+        drop(requests);
+        assert!(channels.worker.pending_world_queries().next().is_some());
+
+        channels.effects.try_send(FromLua::ConfigChanged).unwrap();
+        let mut effects = channels.worker.drain_outbox();
+        assert!(effects.next().is_some());
+        channels.effects.try_send(FromLua::ConfigChanged).unwrap();
+        assert!(effects.next().is_none(), "new effect joined a live batch");
+        drop(effects);
+        assert!(channels.worker.drain_outbox().next().is_some());
+    }
+
+    #[test]
+    fn main_thread_store_pass_yields_without_losing_writes_or_replies() {
+        use crate::ecs::script_state::ScriptStateStore;
+        use spool_shared_types::script_value::ScriptValue;
+
+        const REQUESTS: i64 = 1024;
+        let channels = MainThreadChannels::new();
+        let mut replies = Vec::new();
+        for value in 0..REQUESTS {
+            let (reply, response) = bounded(1);
+            channels
+                .store
+                .try_send(StoreRequest::Write {
+                    write: ScriptStateWrite::set("counter".to_string(), ScriptValue::Int(value)),
+                    reply,
+                })
+                .unwrap();
+            replies.push(response);
+        }
+        let mut world = bevy::prelude::World::new();
+        world.insert_resource(channels.worker);
+        world.insert_resource(ScriptStateStore::default());
+        world
+            .run_system_cached(super::super::serve_lua_store)
+            .unwrap();
+        let answered = replies.iter().filter(|reply| !reply.is_empty()).count();
+        assert!(answered > 0, "each pass must make progress");
+        assert!(
+            answered <= 256,
+            "one pass answered {answered} requests without yielding"
+        );
+        assert!(
+            !channels.store.is_empty(),
+            "remaining requests must stay queued"
+        );
+
+        for _ in 0..REQUESTS {
+            if channels.store.is_empty() {
+                break;
+            }
+            world
+                .run_system_cached(super::super::serve_lua_store)
+                .unwrap();
+        }
+        assert!(channels.store.is_empty());
+        for reply in replies {
+            assert_eq!(
+                reply.try_recv().unwrap().unwrap(),
+                WriteOutcome::Applied { changed: true }
+            );
+        }
+        assert_eq!(
+            world.resource::<ScriptStateStore>().state().get("counter"),
+            Some(&ScriptValue::Int(REQUESTS - 1)),
+            "writes must remain FIFO across passes"
+        );
+    }
+
+    #[test]
+    fn main_thread_batch_stops_before_receiving_after_its_time_budget() {
+        let channels = MainThreadChannels::new();
+        for message in ["first", "second", "third"] {
+            channels
+                .effects
+                .try_send(FromLua::Flash {
+                    message: message.to_string(),
+                    duration: Duration::ZERO,
+                })
+                .unwrap();
+        }
+        let mut effects = channels.worker.drain_outbox();
+        assert!(effects.next().is_some());
+        std::thread::sleep(Duration::from_millis(8));
+        assert!(effects.next().is_none(), "expired batch kept receiving");
+        drop(effects);
+        let mut remaining = Vec::new();
+        for _ in 0..3 {
+            if channels.effects.is_empty() {
+                break;
+            }
+            for effect in channels.worker.drain_outbox() {
+                let FromLua::Flash { message, .. } = effect else {
+                    panic!("expected fixture flash");
+                };
+                remaining.push(message);
+            }
+        }
+        assert_eq!(remaining, ["second", "third"]);
+    }
+
     #[test]
     fn default_script_loads_bar_settings() {
         let worker = worker(crate::config::DEFAULT_LUA_SCRIPT);
@@ -545,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn bar_reload_is_atomic_and_removed_sections_reset() {
+    fn configuration_reload_is_atomic_and_removed_sections_reset() {
         let directory =
             std::env::temp_dir().join(format!("spool-bar-lua-reload-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -563,10 +759,11 @@ mod tests {
         for invalid in [
             "spool.setup { bar = { height = 'invalid' } }",
             "spool.setup { bar = { show_workspace_labels = true } }; error('abort reload')",
+            "spool.setup { swipe = { sensitivity = 0/0 }, options = { sliver_width = 99 } }",
         ] {
             std::fs::write(&script, invalid).unwrap();
             worker.send_reload(script.clone());
-            assert!(next_flash(&worker, "invalid Bar configuration").starts_with("Lua error:"));
+            assert!(next_flash(&worker, "invalid configuration").starts_with("Lua error:"));
             let config = worker.built_config().unwrap();
             assert!(!config.bar_preferences().show_workspace_labels);
             assert_eq!(config.sliver_width(), 9);
@@ -1089,6 +1286,17 @@ mod tests {
             }],
             Some(7),
         )
+        .with_snapshot(spool_shared_types::windowset::LayoutSnapshot {
+            session: [73; 16],
+            windows: [(
+                7,
+                spool_shared_types::windowset::WindowIdentity {
+                    entity: 41,
+                    incarnation: 99,
+                },
+            )]
+            .into(),
+        })
     }
 
     /// Answers the next window-set request, or panics saying what arrived.
@@ -1165,7 +1373,8 @@ mod tests {
         let Action::Layout(ops) = action else {
             panic!("expected a layout action, got {action:?}");
         };
-        assert_eq!(ops, vec![LayoutOp::Focus(7)]);
+        assert_eq!(ops.ops, vec![LayoutOp::Focus(7)]);
+        assert_eq!(ops.snapshot, test_window_set().plan().snapshot);
     }
 
     #[test]
@@ -1225,8 +1434,9 @@ mod tests {
         let FromLua::Action(Action::Layout(ops)) = next_effect(&worker, "the layout action") else {
             panic!("expected a layout action");
         };
+        assert_eq!(ops.snapshot, test_window_set().plan().snapshot);
         assert_eq!(
-            ops,
+            ops.ops,
             vec![
                 LayoutOp::Focus(7),
                 LayoutOp::SetWidth {

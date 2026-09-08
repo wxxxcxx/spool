@@ -14,7 +14,7 @@
 
 use mlua::{Function, LuaSerdeExt, UserData, UserDataMethods, Value};
 
-use crate::windowset::{LayoutOp, RelativeRect, WinID, WindowSet};
+use crate::windowset::{LayoutPlan, RelativeRect, WinID, WindowSet};
 
 /// Reads `{ x = …, y = …, width = …, height = … }` as fractions of a display.
 /// Missing fields default to a full-display rect, so `{ width = 0.5 }` is the
@@ -31,8 +31,8 @@ fn relative_rect(rect: &mlua::Table) -> mlua::Result<RelativeRect> {
     })
 }
 
-/// Reads what a `spool.windows` transform handed back: the operations recorded
-/// onto the window set it returned, or none at all if it returned nothing.
+/// Reads what a `spool.windows` transform handed back: recorded operations with
+/// that value's original snapshot bindings, or an empty plan for nil.
 ///
 /// Shared so both hosts accept and reject exactly the same return values.
 ///
@@ -40,10 +40,10 @@ fn relative_rect(rect: &mlua::Table) -> mlua::Result<RelativeRect> {
 ///
 /// Returns an error if the transform returned something other than a window set
 /// or nil, or if the userdata it returned is already borrowed.
-pub fn returned_ops(returned: &Value) -> mlua::Result<Vec<LayoutOp>> {
+pub fn returned_plan(returned: &Value) -> mlua::Result<LayoutPlan> {
     match returned {
-        Value::Nil => Ok(Vec::new()),
-        Value::UserData(data) => Ok(data.borrow::<WindowSet>()?.ops()),
+        Value::Nil => Ok(LayoutPlan::default()),
+        Value::UserData(data) => Ok(data.borrow::<WindowSet>()?.plan()),
         other => Err(mlua::Error::RuntimeError(format!(
             "spool.windows: expected a window set back, got {}",
             other.type_name()
@@ -104,7 +104,7 @@ impl UserData for WindowSet {
             Ok(workspace
                 .columns
                 .iter()
-                .map(|column| column.windows.iter().map(|window| window.id).collect())
+                .map(|column| column.windows().map(|window| window.id).collect())
                 .collect::<Vec<Vec<WinID>>>())
         });
 

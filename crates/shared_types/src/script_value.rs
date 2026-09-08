@@ -21,12 +21,27 @@ pub enum ScriptValue {
     Null,
     Bool(bool),
     Int(i64),
-    Float(f64),
+    Float(#[serde(serialize_with = "serialize_float")] f64),
     Str(String),
     List(Vec<ScriptValue>),
     /// Sorted, so a store saved to disk is stable and diffable rather than
     /// reshuffling on every write.
     Map(BTreeMap<String, ScriptValue>),
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde serialize_with requires a reference"
+)]
+fn serialize_float<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+    // JSON would silently write null, which cannot deserialize as Float.
+    // Postcard can preserve every bit and still carries rejected writes.
+    if serializer.is_human_readable() && !value.is_finite() {
+        return Err(serde::ser::Error::custom(
+            "non-finite floats cannot be stored as JSON",
+        ));
+    }
+    serializer.serialize_f64(*value)
 }
 
 /// `Eq` by hand because `f64` is not `Eq`. Two `Float`s are equal when their
@@ -48,6 +63,22 @@ impl ScriptValue {
     #[must_use]
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
+    }
+
+    /// Scalars have depth zero; every List/Map, even an empty one, uses one
+    /// level. Stop at the budget rather than recursing through rejected input.
+    pub(crate) fn is_within_depth(&self, remaining: usize) -> bool {
+        match self {
+            Self::List(values) => remaining.checked_sub(1).is_some_and(|remaining| {
+                values.iter().all(|value| value.is_within_depth(remaining))
+            }),
+            Self::Map(entries) => remaining.checked_sub(1).is_some_and(|remaining| {
+                entries
+                    .values()
+                    .all(|value| value.is_within_depth(remaining))
+            }),
+            _ => true,
+        }
     }
 }
 
@@ -161,5 +192,61 @@ mod tests {
             serde_json::Value::from(ScriptValue::Float(f64::INFINITY)),
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn non_finite_floats_cannot_be_serialized_as_persistent_values() {
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let value = ScriptValue::Float(number);
+            assert!(serde_json::to_vec(&value).is_err());
+
+            let nested = ScriptValue::Map(BTreeMap::from([(
+                "nested".to_string(),
+                ScriptValue::List(vec![value.clone()]),
+            )]));
+            assert!(serde_json::to_vec(&nested).is_err());
+
+            // The wire remains lossless even for values the store rejects.
+            let bytes = postcard::to_allocvec(&value).expect("encodes");
+            let ScriptValue::Float(decoded) = postcard::from_bytes(&bytes).expect("decodes") else {
+                panic!("expected a float");
+            };
+            assert_eq!(decoded.to_bits(), number.to_bits());
+        }
+    }
+
+    #[test]
+    fn depth_counts_empty_and_nonempty_containers() {
+        for scalar in [
+            ScriptValue::Null,
+            ScriptValue::Bool(true),
+            ScriptValue::Int(1),
+            ScriptValue::Float(1.5),
+            ScriptValue::Str("leaf".to_string()),
+        ] {
+            assert!(scalar.is_within_depth(0));
+        }
+        for container in [
+            ScriptValue::List(Vec::new()),
+            ScriptValue::Map(BTreeMap::new()),
+            ScriptValue::List(vec![ScriptValue::Null]),
+            ScriptValue::Map(BTreeMap::from([("leaf".to_string(), ScriptValue::Int(1))])),
+        ] {
+            assert!(!container.is_within_depth(0));
+            assert!(container.is_within_depth(1));
+        }
+    }
+
+    #[test]
+    fn depth_checks_every_branch_and_mixed_containers() {
+        let value = ScriptValue::Map(BTreeMap::from([
+            ("a".to_string(), ScriptValue::Int(1)),
+            (
+                "z".to_string(),
+                ScriptValue::List(vec![ScriptValue::Null, ScriptValue::Map(BTreeMap::new())]),
+            ),
+        ]));
+        assert!(!value.is_within_depth(2));
+        assert!(value.is_within_depth(3));
     }
 }

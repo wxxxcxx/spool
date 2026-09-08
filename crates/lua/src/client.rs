@@ -17,7 +17,7 @@ use spool_shared_types::commands::{Action, MoveFocus};
 use spool_shared_types::script_state::ScriptStateWrite;
 use spool_shared_types::script_value::ScriptValue;
 use spool_shared_types::state::{StateEvent, StateQueryKind};
-use spool_shared_types::windowset_lua::returned_ops;
+use spool_shared_types::windowset_lua::returned_plan;
 use spool_shared_types::wire::{
     Request, Response, ScriptStateRequest, ScriptStateResponse, WriteOutcome,
 };
@@ -246,7 +246,7 @@ fn windows(lua: &Lua, transform: LuaFunction) -> LuaResult<bool> {
     };
 
     let returned: LuaValue = transform.call(lua.create_userdata(set)?)?;
-    let ops = returned_ops(&returned)?;
+    let ops = returned_plan(&returned)?;
     if ops.is_empty() {
         return Ok(false);
     }

@@ -844,7 +844,8 @@ fn raw_state_event(event: &Event) -> Option<StateEvent> {
         Event::StateQuery { .. }
         | Event::WindowSetQuery { .. }
         | Event::StateSubscribe { .. }
-        | Event::ScriptState { .. } => return None,
+        | Event::ScriptState { .. }
+        | Event::LayoutSpaceRequested { .. } => return None,
     })
 }
 

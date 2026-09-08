@@ -114,12 +114,14 @@ struct MockStateInner {
     withdrawn_surfaces: HashMap<WinID, MockWindowData>,
     native_space_control: bool,
     native_space_intents: Vec<crate::manager::NativeSpaceIntent>,
+    associated_windows: HashMap<WinID, Vec<WinID>>,
     focus_requests: Vec<WinID>,
     window_server_inventory_available: bool,
     window_server_inventory_omissions: HashSet<WinID>,
     workspace_membership_scripts:
         HashMap<WorkspaceId, VecDeque<std::result::Result<Vec<WinID>, ()>>>,
     active_space_query_scripts: HashMap<u32, VecDeque<std::result::Result<WorkspaceId, ()>>>,
+    active_display_query_scripts: VecDeque<std::result::Result<u32, ()>>,
     present_display_topology_scripts: HashMap<u32, VecDeque<std::result::Result<(), ()>>>,
     window_observer_failures: HashMap<WinID, u32>,
     window_observer_attempts: HashMap<WinID, u32>,
@@ -177,11 +179,13 @@ impl MockState {
                 withdrawn_surfaces: HashMap::new(),
                 native_space_control: false,
                 native_space_intents: Vec::new(),
+                associated_windows: HashMap::new(),
                 focus_requests: Vec::new(),
                 window_server_inventory_available: true,
                 window_server_inventory_omissions: HashSet::new(),
                 workspace_membership_scripts: HashMap::new(),
                 active_space_query_scripts: HashMap::new(),
+                active_display_query_scripts: VecDeque::new(),
                 present_display_topology_scripts: HashMap::new(),
                 window_observer_failures: HashMap::new(),
                 window_observer_attempts: HashMap::new(),
@@ -220,8 +224,19 @@ impl MockState {
         self.inner.force_write().native_space_control = true;
     }
 
+    pub(crate) fn disable_native_space_control(&self) {
+        self.inner.force_write().native_space_control = false;
+    }
+
     pub(crate) fn native_space_intents(&self) -> Vec<crate::manager::NativeSpaceIntent> {
         self.inner.force_read().native_space_intents.clone()
+    }
+
+    pub(crate) fn set_associated_windows(&self, window: WinID, associated: Vec<WinID>) {
+        self.inner
+            .force_write()
+            .associated_windows
+            .insert(window, associated);
     }
 
     pub(crate) fn window_workspace(&self, window_id: WinID) -> Option<WorkspaceId> {
@@ -407,6 +422,13 @@ impl MockState {
             .force_write()
             .active_space_query_scripts
             .insert(display_id, responses.into_iter().collect());
+    }
+
+    pub(crate) fn script_active_display_queries(
+        &self,
+        responses: impl IntoIterator<Item = std::result::Result<u32, ()>>,
+    ) {
+        self.inner.force_write().active_display_query_scripts = responses.into_iter().collect();
     }
 
     pub(crate) fn script_present_display_topology_queries(
@@ -1586,8 +1608,14 @@ impl MockState {
             .returning(move |process| Ok(s.create_application(process.pid())));
 
         let s = self.clone();
-        wm.expect_active_display_id()
-            .returning(move || Ok(s.inner.force_read().active_display_id));
+        wm.expect_active_display_id().returning(move || {
+            let mut inner = s.inner.force_write();
+            if let Some(response) = inner.active_display_query_scripts.pop_front() {
+                return response
+                    .map_err(|()| Error::Generic("scripted active display unavailable".into()));
+            }
+            Ok(inner.active_display_id)
+        });
 
         let s = self.clone();
         wm.expect_active_display_space().returning(move |id| {
@@ -1654,7 +1682,15 @@ impl MockState {
         wm.expect_cursor_position()
             .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));
 
-        wm.expect_get_associated_windows().return_const(vec![]);
+        let s = self.clone();
+        wm.expect_get_associated_windows().returning(move |id| {
+            s.inner
+                .force_read()
+                .associated_windows
+                .get(&id)
+                .cloned()
+                .unwrap_or_default()
+        });
 
         let s = self.clone();
         wm.expect_find_window_at_point().returning(move |at_point| {

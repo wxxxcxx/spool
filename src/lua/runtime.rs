@@ -292,7 +292,7 @@ impl LuaRuntime {
             Value::Nil => {}
             Value::UserData(data) => {
                 if let Ok(window_set) = data.borrow::<WindowSet>() {
-                    let ops = window_set.ops();
+                    let ops = window_set.plan();
                     if !ops.is_empty() {
                         self.outbox.borrow_mut().actions.push(Action::Layout(ops));
                     }

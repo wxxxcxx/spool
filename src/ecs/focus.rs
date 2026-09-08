@@ -429,6 +429,13 @@ impl Plugin for FocusEventsPlugin {
 pub(super) struct FocusWindow {
     pub entity: Entity,
     pub raise: bool,
+    pub kind: FocusRequestKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FocusRequestKind {
+    Explicit,
+    Automatic,
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
@@ -625,14 +632,22 @@ fn focus_window_trigger(
     windows: Windows,
     apps: Query<&Application>,
     mut focus: ResMut<FocusCoordinator>,
+    mut transactions: ResMut<super::native_space::NativeSpaceTransactions>,
 ) {
-    let FocusWindow { entity, raise } = *trigger.event();
+    let FocusWindow {
+        entity,
+        raise,
+        kind,
+    } = *trigger.event();
     let Some((window, _, app_entity)) = windows.get_parent(entity) else {
         return;
     };
     let Ok(app) = apps.get(app_entity) else {
         return;
     };
+    if kind == FocusRequestKind::Explicit {
+        transactions.cancel_pending_follows();
+    }
     let psn = app.psn();
     focus.request(entity);
     if !raise

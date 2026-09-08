@@ -17,6 +17,11 @@ A failed reload keeps the last working configuration. Omitted settings use
 built-in defaults; removing `bar` or `spool.setup` also restores their defaults.
 Builds without the `lua` feature use built-in defaults only.
 
+Numeric settings must be finite. NaN and positive or negative infinity fail
+`spool.setup` before the candidate configuration is published; a failed reload
+keeps the working configuration. Finite values retain the documented ranges
+and existing clamping behavior.
+
 All sections below belong inside one `spool.setup { ... }` call.
 Examples show standalone calls; merge their sections when combining them.
 
@@ -46,6 +51,25 @@ General behavior settings for the window manager.
 | `disable_native_tabs` | Boolean | `false` | If enabled, Spool will not auto-merge a newly-spawned window into a tab group with an existing same-app sibling that shares its frame. Use this if you find unrelated windows being grouped together. |
 | `experimental_space_control` | Boolean | `false` | Enables capability-probed private Space control. The current backend may focus a Space on the active display or move windows to a user Space; create/delete remain unavailable. This never injects into Dock and does not require disabling SIP. |
 | `space_switch_animation` | Boolean | `true` | Uses the native Mission Control animation when focusing a Space. Requires macOS's “Move left/right a space” shortcuts to be enabled. When disabled, Spool uses the instant high-velocity gesture path. |
+
+Turning off `experimental_space_control` cancels pending follow-up Space/window
+focus, including follows waiting for membership confirmation. It does not undo
+native movement already submitted; Spool still observes and reconciles the
+result. Reenabling control does not resume canceled follows. Platform focus
+events that were already issued cannot be recalled.
+
+Hiding or minimizing a moved window also cancels its pending follow-up focus;
+showing it later does not resume that follow. Moving an already hidden or
+minimized window retains that state and updates its remembered tiled destination.
+
+An accepted explicit window selection, successful Space selection, or newer
+follow supersedes older pending follows. Automatic focus restoration does not.
+Canceling a follow never rolls back a native movement already submitted.
+
+Direct window-by-ID focus, including Bar window clicks, requires a currently
+observed visible owning Space. Floating or hidden windows do not bypass that
+check, and enabling Space control does not change it. Bound script `focus`
+retains its explicit native-activation request behavior.
 
 ---
 
@@ -157,6 +181,20 @@ commands are documented in
 See [QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md) for the
 structured `spool query` responses and `spool subscribe` event stream.
 
+### Displays
+
+`window nextdisplay`, `window nextdisplaysend` and `mouse nextdisplay` cycle
+through display positions ordered by X, then Y, with display ID breaking ties.
+Window commands start from the focused display; mouse commands start from the
+screen containing the cursor. Up/down focus and tiled movement first use the
+local layout, then select a screen in that direction, preferring horizontal
+overlap and the nearest edge. Directional navigation does not wrap at the end.
+
+An unknown/reconfiguring destination or ambiguous cursor ownership defers the
+command. Mouse navigation selects a visible window on the destination when
+possible; otherwise it lands at the center of that display's usable area.
+These commands do not require experimental native Space control.
+
 ---
 
 ## 6. Window Rules (`windows`)
@@ -178,7 +216,7 @@ for admission, retries, editable defaults, and migration limits.
 | `index` | Integer | Preferred position in the strip when spawned. |
 | `dont_focus` | Boolean | Prevent the window from taking focus when spawned. |
 | `width` | Positive Float | Initial width ratio for the window. Values above `1.0` create an oversized, horizontally scrollable window. |
-| `grid` | String | placement for floating windows: `"cols:rows:x:y:w:h"`. |
+| `grid` | String | placement for floating windows: `"cols:rows:x:y:w:h"`. Requires exactly six finite numbers, positive column/row counts, and finite resulting ratios. Malformed strings are ignored, never partially parsed. |
 | `horizontal_padding` | Integer | Gaps to the left/right of this window. |
 | `vertical_padding` | Integer | Gaps to the top/bottom of this window. |
 | `bindings_passthrough`| Array (String)| Keys that should bypass Spool and go directly to the app. |

@@ -25,10 +25,13 @@ use super::{
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::focus::{FocusCoordinator, FocusSignal};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::native_space::{NativeSpace, SpaceKind, VisibleNativeSpaceMarker};
+use crate::ecs::native_space::{NativeMoveOwner, NativeSpace, SpaceKind, VisibleNativeSpaceMarker};
 use crate::ecs::params::{FrameActivity, Windows};
 use crate::ecs::reconcile::{WindowStateSync, WindowUnavailable};
-use crate::ecs::window_frame::{DefaultWindowFrame, InteractiveWindowFrame, WindowFrameCorrection};
+use crate::ecs::window_frame::{
+    DefaultWindowFrame, DisplayTransferFrame, DisplayTransferReadback, InteractiveWindowFrame,
+    WindowFrameCorrection,
+};
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, FlashMessage, Floating,
@@ -91,6 +94,11 @@ type PendingWindowFrames<'w, 's> = Query<
             Has<super::WindowDefaultsPending>,
         ),
         (
+            Option<&'static DisplayTransferFrame>,
+            Has<NativeMoveOwner>,
+            Has<WindowVisibility>,
+        ),
+        (
             Has<Floating>,
             Option<&'static WindowFrameCorrection>,
             Option<&'static InteractiveWindowFrame>,
@@ -105,6 +113,7 @@ type PendingWindowFrames<'w, 's> = Query<
         With<WindowFrameCorrection>,
         With<InteractiveWindowFrame>,
         With<DefaultWindowFrame>,
+        With<DisplayTransferFrame>,
     )>,
 >;
 
@@ -1489,6 +1498,8 @@ pub(super) struct WindowFrameCommitCtx<'w, 's> {
         Query<'w, 's, (&'static LayoutStrip, &'static ChildOf), Without<PendingSpaceDestruction>>,
     displays: Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>,
     config: Res<'w, Config>,
+    topology: ResMut<'w, super::topology::NativeTopology>,
+    window_manager: Res<'w, WindowManager>,
     settling: ResMut<'w, super::window_geometry::WindowGeometrySettling>,
     sync: ResMut<'w, WindowStateSync>,
     time: Res<'w, Time>,
@@ -1566,6 +1577,8 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
         layout_strips,
         displays,
         config,
+        mut topology,
+        window_manager,
         mut settling,
         mut sync,
         time,
@@ -1580,6 +1593,7 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
         observed,
         (mut position, mut bounds),
         (default_frame, defaults_pending),
+        (transfer, transfer_owned, invisible),
         (floating, correction, interactive, suspended, moving, unavailable, reassigning),
     ) in &mut windows
     {
@@ -1595,7 +1609,41 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
         if interactive.is_some() {
             commands.entity(entity).remove::<InteractiveWindowFrame>();
         }
-        if unavailable || reassigning || (default_frame.is_none() && defaults_pending) {
+        if transfer.is_some() {
+            commands.entity(entity).remove::<DisplayTransferFrame>();
+        }
+        let transfer = transfer.filter(|request| {
+            !defaults_phase
+                && transfer_owned
+                && reassigning
+                && !invisible
+                && request.tiled != floating
+                && request.incarnation == window.incarnation()
+                && topology.observe_visible_window_space(&window_manager, window.id())
+                    == Some(request.source_space_id)
+                && topology.visible_display_for_space(request.target_space_id)
+                    == Some(request.display_id)
+                && !topology.is_fullscreen(request.target_space_id)
+                && displays.iter().any(|(display, dock)| {
+                    display.id() == request.display_id
+                        && display.checked_actual_display_bounds(dock, &config)
+                            == Some(request.viewport)
+                        && topology.known_displays().any(|(native, _)| {
+                            native.id() == display.id() && !display.clone().update_geometry(native)
+                        })
+                })
+                && layout_strips.iter().any(|(strip, child)| {
+                    strip.id() == request.target_space_id
+                        && !strip.is_fullscreen()
+                        && displays
+                            .get(child.parent())
+                            .is_ok_and(|(display, _)| display.id() == request.display_id)
+                })
+        });
+        if unavailable
+            || (reassigning && transfer.is_none())
+            || (default_frame.is_none() && defaults_pending)
+        {
             continue;
         }
         if default_frame.is_some_and(|request| request.incarnation != window.incarnation()) {
@@ -1603,13 +1651,16 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
         }
         // Current pointer intent supersedes animation and audit correction;
         // all three still share the same native ownership checks below.
-        let interactive = interactive.filter(|request| request.incarnation == window.incarnation());
+        let interactive = interactive
+            .filter(|request| transfer.is_none() && request.incarnation == window.incarnation());
         let correcting = default_frame.is_none()
+            && transfer.is_none()
             && interactive.is_none()
             && correction.is_some_and(|request| request.0 == desired.0)
             && !floating
             && !moving;
         if default_frame.is_none()
+            && transfer.is_none()
             && interactive.is_none()
             && !correcting
             && (suspended || !presented.is_changed())
@@ -1622,10 +1673,16 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
         if native_fullscreen || window.try_is_full_screen().unwrap_or(true) {
             continue;
         }
-        if default_frame.is_none() && interactive.is_none() && settling.contains(entity) {
+        if default_frame.is_none()
+            && interactive.is_none()
+            && transfer.is_none()
+            && settling.contains(entity)
+        {
             continue;
         }
-        let target = if let Some(request) = default_frame {
+        let target = if let Some(request) = transfer {
+            request.target
+        } else if let Some(request) = default_frame {
             presented.bypass_change_detection().0 = request.target;
             request.target
         } else if let Some(request) = interactive {
@@ -1650,6 +1707,7 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
             presented.0
         };
         if !floating
+            && transfer.is_none()
             && default_frame.is_none()
             && interactive.is_none()
             && let Some(display_width) = layout_strips
@@ -1668,11 +1726,19 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
             &mut window,
             target,
             observed.as_ref().map(|frame| frame.0),
-            correcting || interactive.is_some() || default_frame.is_some(),
+            correcting || interactive.is_some() || default_frame.is_some() || transfer.is_some(),
         );
 
         match result {
             Ok(frame) => {
+                if let Some(request) = transfer {
+                    commands.entity(entity).insert(DisplayTransferReadback {
+                        frame,
+                        viewport_width: request.viewport.width(),
+                        incarnation: request.incarnation,
+                        tiled: request.tiled,
+                    });
+                }
                 if default_frame.is_some() {
                     if position.0 != frame.min {
                         position.0 = frame.min;
@@ -1946,7 +2012,7 @@ pub(crate) fn detect_tabbed_windows(
                 .inspect_err(|err| error!("Failed to convert to tabs: {err}"))
                 .is_ok()
             {
-                commands.focus_entity(entity, false);
+                commands.restore_focus_entity(entity, false);
             }
         }
     }

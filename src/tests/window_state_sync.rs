@@ -2484,6 +2484,76 @@ fn confirmed_close_removes_only_the_destroyed_layout_member() {
 }
 
 #[test]
+fn transient_window_server_omission_reflows_available_stack_members_and_recovers() {
+    use crate::ecs::LayoutPosition;
+    for missing in 0..3 {
+        let missing_index = usize::try_from(missing).unwrap();
+        let mut harness = TestHarness::new().with_windows(3);
+        harness.pump_frames(5);
+        let entities = [0, 1, 2].map(|id| find_window_entity(id, harness.world()));
+        let world = harness.world();
+        let mut strip = world.query::<&mut LayoutStrip>().single_mut(world).unwrap();
+        strip.stack(entities[1]).unwrap();
+        strip.stack(entities[2]).unwrap();
+        harness.pump_frames(5);
+        let original = layout_window_ids(harness.world());
+        let unavailable_bounds = harness
+            .world()
+            .get::<Bounds>(entities[missing_index])
+            .unwrap()
+            .0;
+        harness
+            .mock_state
+            .omit_window_from_window_server_inventory(missing, true);
+        harness
+            .world()
+            .write_message(crate::events::Event::SpaceChanged);
+        harness.pump_frames(2);
+        assert_window_suspended(harness.world(), missing, true);
+        assert_eq!(layout_window_ids(harness.world()), original);
+        assert_eq!(
+            harness
+                .world()
+                .get::<Bounds>(entities[missing_index])
+                .unwrap()
+                .0,
+            unavailable_bounds
+        );
+        let mut bottom = 0;
+        for (id, entity) in entities.into_iter().enumerate() {
+            if id == missing_index {
+                continue;
+            }
+            assert_eq!(
+                harness.world().get::<LayoutPosition>(entity).unwrap().0.y,
+                bottom
+            );
+            bottom += harness.world().get::<Bounds>(entity).unwrap().0.y;
+        }
+        assert_eq!(bottom, TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT);
+
+        harness
+            .mock_state
+            .omit_window_from_window_server_inventory(missing, false);
+        harness
+            .world()
+            .write_message(crate::events::Event::SpaceChanged);
+        harness.pump_frames(2);
+        assert_window_suspended(harness.world(), missing, false);
+        assert_eq!(layout_window_ids(harness.world()), original);
+        let mut bottom = 0;
+        for entity in entities {
+            assert_eq!(
+                harness.world().get::<LayoutPosition>(entity).unwrap().0.y,
+                bottom
+            );
+            bottom += harness.world().get::<Bounds>(entity).unwrap().0.y;
+        }
+        assert_eq!(bottom, TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT);
+    }
+}
+
+#[test]
 fn transient_window_server_omission_restores_projection_without_mutating_layout() {
     let mut harness = TestHarness::new().with_windows(3);
     harness.pump_frames(15);

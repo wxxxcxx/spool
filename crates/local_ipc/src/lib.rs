@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver as MessageReceiver, SyncSender, TrySendErro
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const PROTOCOL_VERSION: u16 = 2;
+const PROTOCOL_VERSION: u16 = 4;
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(2);
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(1);
@@ -123,7 +123,10 @@ impl Acknowledgement {
     /// Returns an error if the client disconnected or the bounded write timed
     /// out.
     pub fn accepted(mut self) -> Result<()> {
-        write_frame(&mut self.stream, &ServerFrame::Ack)
+        write_frame(
+            &mut DeadlineIo::new(&mut self.stream, DEFAULT_DEADLINE),
+            &ServerFrame::Ack,
+        )
     }
 
     /// Tells the client why the daemon could not accept the request.
@@ -133,7 +136,10 @@ impl Acknowledgement {
     /// Returns an error if the client disconnected or the bounded write timed
     /// out.
     pub fn rejected(mut self, message: impl Into<String>) -> Result<()> {
-        write_frame(&mut self.stream, &ServerFrame::Error(message.into()))
+        write_frame(
+            &mut DeadlineIo::new(&mut self.stream, DEFAULT_DEADLINE),
+            &ServerFrame::Error(message.into()),
+        )
     }
 }
 
@@ -151,7 +157,10 @@ impl Reply {
     /// Returns an error if encoding fails, the client disconnected, or the
     /// bounded write timed out.
     pub fn send(mut self, response: &Response) -> Result<()> {
-        write_frame(&mut self.stream, &ServerFrame::Response(response.clone()))
+        write_frame(
+            &mut DeadlineIo::new(&mut self.stream, DEFAULT_DEADLINE),
+            &ServerFrame::Response(response.clone()),
+        )
     }
 }
 
@@ -163,17 +172,15 @@ pub struct Subscriber {
 
 impl Subscriber {
     fn new(mut stream: UnixStream) -> Result<Self> {
-        write_frame(&mut stream, &ServerFrame::Ack)?;
-        stream
-            .set_write_timeout(Some(DEFAULT_DEADLINE))
-            .map_err(Error::Io)?;
-
         let (outgoing, incoming) = mpsc::sync_channel::<Vec<u8>>(SUBSCRIBER_QUEUE_CAPACITY);
         thread::Builder::new()
             .name("spool-ipc-subscriber".to_string())
             .spawn(move || {
                 while let Ok(frame) = incoming.recv() {
-                    if stream.write_all(&frame).is_err() {
+                    if DeadlineIo::new(&mut stream, DEFAULT_DEADLINE)
+                        .write_all(&frame)
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -226,19 +233,24 @@ impl Server {
         let listener = UnixListener::bind(&paths.socket).map_err(map_bind_error)?;
         std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))
             .map_err(Error::Io)?;
+        listener.set_nonblocking(true).map_err(Error::Io)?;
+        let (wakeup, shutdown_signal) = UnixStream::pair().map_err(Error::Io)?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let (sender, incoming) = mpsc::channel();
         let thread_shutdown = Arc::clone(&shutdown);
         let accept_thread = thread::Builder::new()
             .name("spool-ipc-listener".to_string())
-            .spawn(move || accept_connections(&listener, &sender, &thread_shutdown))
+            .spawn(move || {
+                accept_connections(&listener, &sender, &thread_shutdown, &shutdown_signal);
+            })
             .map_err(Error::Io)?;
 
         Ok(Self {
             incoming,
             guard: ServerGuard {
                 shutdown,
+                wakeup,
                 socket_path: paths.socket,
                 accept_thread: Some(accept_thread),
                 _instance_lock: instance_lock,
@@ -279,6 +291,7 @@ impl Server {
 /// Keeps singleton ownership and the listener alive.
 pub struct ServerGuard {
     shutdown: Arc<AtomicBool>,
+    wakeup: UnixStream,
     socket_path: PathBuf,
     accept_thread: Option<JoinHandle<()>>,
     _instance_lock: InstanceLock,
@@ -310,7 +323,7 @@ impl Incoming {
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        _ = UnixStream::connect(&self.socket_path);
+        _ = self.wakeup.shutdown(std::net::Shutdown::Both);
         if let Some(thread) = self.accept_thread.take() {
             _ = thread.join();
         }
@@ -322,8 +335,33 @@ fn accept_connections(
     listener: &UnixListener,
     sender: &mpsc::Sender<Result<Delivery>>,
     shutdown: &AtomicBool,
+    shutdown_signal: &UnixStream,
 ) {
     loop {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: shutdown_signal.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let status = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+        if status < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            _ = sender.send(Err(Error::Io(error)));
+            break;
+        }
+        if descriptors[1].revents != 0 || shutdown.load(Ordering::Acquire) {
+            break;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 if shutdown.load(Ordering::Acquire) {
@@ -337,7 +375,11 @@ fn accept_connections(
                         _ = sender.send(delivery);
                     });
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
             Err(error) => {
                 _ = sender.send(Err(Error::Io(error)));
                 break;
@@ -346,24 +388,30 @@ fn accept_connections(
     }
 }
 
-fn read_delivery(mut stream: UnixStream) -> Result<Delivery> {
-    verify_peer(&stream)?;
-    stream
-        .set_read_timeout(Some(HANDSHAKE_DEADLINE))
-        .map_err(Error::Io)?;
-    stream
-        .set_write_timeout(Some(DEFAULT_DEADLINE))
-        .map_err(Error::Io)?;
+fn read_delivery(stream: UnixStream) -> Result<Delivery> {
+    read_delivery_with_deadline(stream, HANDSHAKE_DEADLINE)
+}
 
-    let frame: ClientFrame = read_frame(&mut stream)?;
+fn read_delivery_with_deadline(mut stream: UnixStream, timeout: Duration) -> Result<Delivery> {
+    verify_peer(&stream)?;
+    // BSD accept inherits the listener's nonblocking flag.
+    stream.set_nonblocking(false).map_err(Error::Io)?;
+
+    let mut io = DeadlineIo::new(&mut stream, timeout);
+    let frame: ClientFrame = read_frame(&mut io)?;
+    io.remaining().map_err(map_io_error)?;
     if frame.version != PROTOCOL_VERSION {
         let message = format!(
             "protocol version {} is unsupported; daemon expects {PROTOCOL_VERSION}",
             frame.version
         );
-        _ = write_frame(&mut stream, &ServerFrame::Error(message.clone()));
+        _ = write_frame(&mut io, &ServerFrame::Error(message.clone()));
         return Err(Error::Protocol(message));
     }
+    if matches!(frame.mode, RequestMode::Subscribe) {
+        write_frame(&mut io, &ServerFrame::Ack)?;
+    }
+    drop(io);
 
     Ok(match frame.mode {
         RequestMode::Send => Delivery {
@@ -388,9 +436,12 @@ fn read_delivery(mut stream: UnixStream) -> Result<Delivery> {
 }
 
 /// A single-exchange client connection.
+///
+/// Each exchange shares one deadline across its request and response.
 #[derive(Debug)]
 pub struct Client {
     stream: UnixStream,
+    timeout: Duration,
 }
 
 impl Client {
@@ -411,11 +462,10 @@ impl Client {
         validate_client_socket(&path)?;
         let stream = connect_with_timeout(&path, deadline)?;
         verify_peer(&stream)?;
-        stream.set_read_timeout(Some(deadline)).map_err(Error::Io)?;
-        stream
-            .set_write_timeout(Some(deadline))
-            .map_err(Error::Io)?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            timeout: deadline,
+        })
     }
 
     /// Sends a command and waits until the daemon has accepted it.
@@ -425,8 +475,7 @@ impl Client {
     /// Returns an error when the request cannot be framed, transferred, or
     /// acknowledged within the deadline.
     pub fn send(mut self, request: &Request) -> Result<()> {
-        self.write_request(RequestMode::Send, request)?;
-        match read_frame::<ServerFrame>(&mut self.stream)? {
+        match self.exchange(RequestMode::Send, request)? {
             ServerFrame::Ack => Ok(()),
             ServerFrame::Error(message) => Err(Error::Remote(message)),
             other => Err(unexpected_server_frame("acknowledgement", &other)),
@@ -440,8 +489,7 @@ impl Client {
     /// Returns an error when the request cannot be transferred, the daemon
     /// rejects it, or the response deadline expires.
     pub fn call(mut self, request: &Request) -> Result<Response> {
-        self.write_request(RequestMode::Call, request)?;
-        match read_frame::<ServerFrame>(&mut self.stream)? {
+        match self.exchange(RequestMode::Call, request)? {
             ServerFrame::Response(response) => Ok(response),
             ServerFrame::Error(message) => Err(Error::Remote(message)),
             other => Err(unexpected_server_frame("response", &other)),
@@ -455,8 +503,7 @@ impl Client {
     /// Returns an error when the subscription handshake is rejected or does
     /// not complete within the deadline.
     pub fn subscribe(mut self, request: &Request) -> Result<EventStream> {
-        self.write_request(RequestMode::Subscribe, request)?;
-        match read_frame::<ServerFrame>(&mut self.stream)? {
+        match self.exchange(RequestMode::Subscribe, request)? {
             ServerFrame::Ack => {
                 self.stream.set_read_timeout(None).map_err(Error::Io)?;
                 Ok(EventStream {
@@ -471,15 +518,19 @@ impl Client {
         }
     }
 
-    fn write_request(&mut self, mode: RequestMode, request: &Request) -> Result<()> {
+    fn exchange(&mut self, mode: RequestMode, request: &Request) -> Result<ServerFrame> {
+        let mut io = DeadlineIo::new(&mut self.stream, self.timeout);
         write_frame(
-            &mut self.stream,
+            &mut io,
             &ClientFrame {
                 version: PROTOCOL_VERSION,
                 mode,
                 request: request.clone(),
             },
-        )
+        )?;
+        let frame = read_frame(&mut io)?;
+        io.remaining().map_err(map_io_error)?;
+        Ok(frame)
     }
 }
 
@@ -809,6 +860,105 @@ fn current_uid() -> libc::uid_t {
     unsafe { libc::geteuid() }
 }
 
+// Socket timeouts apply to individual syscalls. Keep one budget across the
+// frame header, payload, retries, and both directions of a client exchange.
+struct DeadlineIo<'a> {
+    stream: &'a mut UnixStream,
+    started: Instant,
+    timeout: Duration,
+}
+
+impl<'a> DeadlineIo<'a> {
+    fn new(stream: &'a mut UnixStream, timeout: Duration) -> Self {
+        Self {
+            stream,
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn remaining(&self) -> io::Result<Duration> {
+        let remaining = self.timeout.saturating_sub(self.started.elapsed());
+        if remaining.is_zero() {
+            Err(io::ErrorKind::TimedOut.into())
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    fn wait(&self, events: libc::c_short) -> io::Result<()> {
+        self.stream.set_nonblocking(true)?;
+        loop {
+            let remaining = self.remaining()?;
+            let timeout = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
+            let mut descriptor = libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            let status = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
+            if status > 0 {
+                self.remaining()?;
+                return Ok(());
+            }
+            if status < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for DeadlineIo<'_> {
+    fn drop(&mut self) {
+        _ = self.stream.set_nonblocking(false);
+    }
+}
+
+impl Read for DeadlineIo<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            self.wait(libc::POLLIN)?;
+            match self.stream.read(buffer) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                result => {
+                    self.remaining()?;
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+impl Write for DeadlineIo<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        loop {
+            self.wait(libc::POLLOUT)?;
+            match self.stream.write(buffer) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                result => {
+                    self.remaining()?;
+                    return result;
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<()> {
     let frame = encode_frame(value)?;
     writer.write_all(&frame).map_err(map_io_error)
@@ -984,6 +1134,61 @@ mod tests {
     }
 
     #[test]
+    fn server_shutdown_does_not_depend_on_the_published_socket_path() {
+        let name = name("shutdown-renamed");
+        let server = Server::bind(&name).expect("bind fixture");
+        let moved_path = server.socket_path().with_extension("moved");
+        std::fs::rename(server.socket_path(), &moved_path).expect("move fixture socket");
+        let (stopped, received) = mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            drop(server);
+            stopped.send(()).expect("report shutdown");
+        });
+
+        let result = received.recv_timeout(Duration::from_secs(2));
+        // Wake the old path-dependent accept loop before asserting, so a
+        // regression cannot leave this test's listener thread blocked.
+        if result.is_err() {
+            drop(UnixStream::connect(&moved_path).expect("wake moved fixture listener"));
+        }
+        shutdown.join().expect("shutdown thread");
+        std::fs::remove_file(moved_path).expect("remove moved fixture socket");
+        assert!(
+            result.is_ok(),
+            "shutdown waited for an unrelated socket path"
+        );
+    }
+
+    #[test]
+    fn a_handshake_restores_blocking_mode_on_an_accepted_stream() {
+        let (stream, mut peer) = UnixStream::pair().expect("fixture pair");
+        stream
+            .set_nonblocking(true)
+            .expect("inherited listener mode");
+        write_frame(
+            &mut peer,
+            &ClientFrame {
+                version: PROTOCOL_VERSION,
+                mode: RequestMode::Call,
+                request: Request::Query(StateQueryKind::State),
+            },
+        )
+        .expect("queue request");
+
+        let reply = read_delivery(stream)
+            .expect("delivery")
+            .reply
+            .expect("reply");
+        let flags = unsafe { libc::fcntl(reply.stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "read accepted socket flags");
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "handshake I/O must honor timeouts"
+        );
+    }
+
+    #[test]
     fn concurrent_startup_has_exactly_one_winner() {
         const CONTENDERS: usize = 20;
 
@@ -1102,7 +1307,158 @@ mod tests {
     }
 
     #[test]
+    fn a_trickled_query_response_cannot_extend_the_exchange_deadline() {
+        let timeout = Duration::from_millis(100);
+        let (stream, mut peer) = UnixStream::pair().expect("fixture pair");
+        stream
+            .set_read_timeout(Some(timeout))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(timeout))
+            .expect("write timeout");
+        peer.set_read_timeout(Some(DEFAULT_DEADLINE))
+            .expect("peer read timeout");
+        peer.set_write_timeout(Some(DEFAULT_DEADLINE))
+            .expect("peer write timeout");
+        let peer = thread::spawn(move || {
+            let _: ClientFrame = read_frame(&mut peer).expect("request");
+            let frame = encode_frame(&ServerFrame::Error("x".repeat(32))).expect("response");
+            for byte in frame {
+                thread::sleep(Duration::from_millis(10));
+                if peer.write_all(&[byte]).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let result = Client { stream, timeout }.call(&Request::Query(StateQueryKind::State));
+        peer.join().expect("finite peer thread");
+        assert!(
+            matches!(result, Err(Error::TimedOut)),
+            "trickled response exceeded the total deadline: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_trickled_handshake_cannot_extend_its_deadline() {
+        let timeout = Duration::from_millis(100);
+        let (stream, mut peer) = UnixStream::pair().expect("fixture pair");
+        peer.set_write_timeout(Some(DEFAULT_DEADLINE))
+            .expect("peer write timeout");
+        let frame = encode_frame(&ClientFrame {
+            version: PROTOCOL_VERSION,
+            mode: RequestMode::Call,
+            request: Request::Query(StateQueryKind::State),
+        })
+        .expect("request");
+        assert!(frame.len() > 5, "fixture must take more than 100ms to send");
+        let peer = thread::spawn(move || {
+            for byte in frame {
+                thread::sleep(Duration::from_millis(20));
+                if peer.write_all(&[byte]).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let result = read_delivery_with_deadline(stream, timeout);
+        peer.join().expect("finite peer thread");
+        assert!(
+            matches!(result, Err(Error::TimedOut)),
+            "trickled handshake exceeded the total deadline: {result:?}"
+        );
+    }
+
+    #[test]
+    fn partial_io_and_changing_direction_do_not_restart_the_deadline() {
+        let (mut stream, mut peer) = UnixStream::pair().expect("fixture pair");
+        peer.write_all(&[1, 2]).expect("queue readable bytes");
+        let mut io = DeadlineIo::new(&mut stream, DEFAULT_DEADLINE);
+        io.read_exact(&mut [0]).expect("first partial read");
+        io.write_all(&[3]).expect("first partial write");
+
+        // Advance the shared clock deterministically, with both sockets ready.
+        io.started = Instant::now()
+            .checked_sub(io.timeout)
+            .expect("fixture clock can be backdated");
+        assert_eq!(
+            io.read(&mut [0]).expect_err("expired read").kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            io.write(&[4]).expect_err("expired write").kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn a_full_socket_cannot_extend_the_write_deadline() {
+        let (mut stream, _peer) = UnixStream::pair().expect("fixture pair");
+        stream.set_nonblocking(true).expect("fill without blocking");
+        let mut queued = 0;
+        loop {
+            match stream.write(&[0; 4096]) {
+                Ok(count) => {
+                    assert!(count > 0, "fixture write made progress");
+                    queued += count;
+                    assert!(queued <= MAX_FRAME_BYTES, "fixture buffer must be bounded");
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill fixture socket: {error}"),
+            }
+        }
+
+        let result = DeadlineIo::new(&mut stream, Duration::from_millis(30)).write_all(&[1]);
+        assert_eq!(
+            result.expect_err("blocked write").kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn an_idle_subscription_outlives_its_handshake_deadline() {
+        let timeout = Duration::from_millis(100);
+        let (stream, mut peer) = UnixStream::pair().expect("fixture pair");
+        peer.set_read_timeout(Some(DEFAULT_DEADLINE))
+            .expect("peer read timeout");
+        peer.set_write_timeout(Some(DEFAULT_DEADLINE))
+            .expect("peer write timeout");
+        write_frame(&mut peer, &ServerFrame::Ack).expect("queue acknowledgement");
+        let mut events = Client { stream, timeout }
+            .subscribe(&Request::Subscribe { raw: false })
+            .expect("subscribe");
+        assert_eq!(events.stream.read_timeout().expect("read timeout"), None);
+        let _: ClientFrame = read_frame(&mut peer).expect("request");
+        let event = StateEvent::DisplayChanged {
+            display_id: Some(7),
+        };
+        let outgoing = event.clone();
+        let peer = thread::spawn(move || {
+            thread::sleep(timeout * 2);
+            write_frame(&mut peer, &ServerFrame::Event(outgoing)).expect("event");
+        });
+
+        let result = events.recv_blocking();
+        peer.join().expect("finite peer thread");
+        assert_eq!(result.expect("event after idle"), event);
+    }
+
+    #[test]
     fn an_incompatible_protocol_version_fails_fast() {
+        assert_protocol_version_rejected(PROTOCOL_VERSION + 1);
+    }
+
+    #[test]
+    fn the_flat_window_set_protocol_is_rejected_before_dispatch() {
+        assert_protocol_version_rejected(2);
+    }
+
+    #[test]
+    fn the_unbound_layout_operations_protocol_is_rejected_before_dispatch() {
+        assert_protocol_version_rejected(3);
+    }
+
+    fn assert_protocol_version_rejected(version: u16) {
         let name = name("version");
         let server = Server::bind(&name).expect("bind");
         let path = EndpointPaths::new(&name).socket;
@@ -1113,7 +1469,7 @@ mod tests {
         write_frame(
             &mut stream,
             &ClientFrame {
-                version: PROTOCOL_VERSION + 1,
+                version,
                 mode: RequestMode::Call,
                 request: Request::Query(StateQueryKind::State),
             },
