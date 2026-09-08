@@ -478,7 +478,7 @@ fn focus_by_step(
             active_display.bounds(),
         )
     } else {
-        active_strip.all_windows()
+        windows.navigable_strip(active_strip).all_windows()
     };
 
     if let Some(entity) = focus_step_target(step, focused_entity, &ordered) {
@@ -491,6 +491,7 @@ fn focus_by_step(
 
 fn focus_from_native_fullscreen(
     direction: Option<&Direction>,
+    windows: &Windows,
     active_display: &ActiveDisplay,
     workspaces: &Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     commands: &mut Commands,
@@ -515,11 +516,45 @@ fn focus_from_native_fullscreen(
                 .iter()
                 .find_map(|(strip, _, _)| (strip.id() == *workspace_id).then_some(strip))
         });
-    if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
+    if let Some(entity) = strip.and_then(|strip| {
+        windows
+            .navigable_strip(strip)
+            .last()
+            .ok()
+            .and_then(|col| col.top())
+    }) {
         debug!("fullscreen: swap raising {entity}");
         commands.focus_entity(entity, true);
     }
     true
+}
+
+fn entry_focus_target(direction: &Direction, strip: &LayoutStrip) -> Option<Entity> {
+    match direction {
+        Direction::East | Direction::First => strip.first().ok().and_then(|column| column.top()),
+        Direction::West | Direction::Last => strip.last().ok().and_then(|column| column.top()),
+        Direction::Nth(index) => strip.get(*index).ok().and_then(|column| column.top()),
+        Direction::North | Direction::South => None,
+    }
+}
+
+fn log_focus_navigation(
+    operation: &Operation,
+    focus: &FocusCoordinator,
+    origin: Entity,
+    retained: &LayoutStrip,
+    navigable: &LayoutStrip,
+    windows: &Windows,
+) {
+    debug!(target: "spool::navigation", ?operation, space_id = navigable.id(),
+        focus = ?focus.snapshot(), ?origin,
+        retained = ?retained.all_windows().into_iter().map(|entity| {
+            (entity, windows.get_parent_any(entity).map(|(window, _, _)| window.id()))
+        }).collect::<Vec<_>>(),
+        navigable = ?navigable.all_windows().into_iter().filter_map(|entity| {
+            windows.get(entity).map(|window| (entity, window.id()))
+        }).collect::<Vec<_>>(),
+        "focus navigation projection");
 }
 
 /// Handles the "focus" command, moving focus to a window in a specified direction.
@@ -551,10 +586,17 @@ fn command_move_focus(
         _ => return,
     };
 
-    let active_strip = active_display.active_strip();
+    let navigation_strip = windows.navigable_strip(active_display.active_strip());
+    let active_strip = &navigation_strip;
 
     // On a fullscreen space, west returns to the last column in the workspace.
-    if focus_from_native_fullscreen(direction, &active_display, &workspaces, &mut commands) {
+    if focus_from_native_fullscreen(
+        direction,
+        &windows,
+        &active_display,
+        &workspaces,
+        &mut commands,
+    ) {
         return;
     }
 
@@ -564,6 +606,15 @@ fn command_move_focus(
     else {
         return;
     };
+
+    log_focus_navigation(
+        operation,
+        &focus,
+        focused_entity,
+        active_display.active_strip(),
+        active_strip,
+        &windows,
+    );
 
     if let Operation::FocusStep(step) = operation {
         focus_by_step(
@@ -618,25 +669,24 @@ fn command_move_focus(
                     .find(|(strip, _, fullscreen)| {
                         fullscreen.is_some() && strip.id() != active_strip.id()
                     })
-                    .and_then(|(strip, _, _)| strip.get(0).ok().and_then(|col| col.top()))
+                    .and_then(|(strip, _, _)| {
+                        windows
+                            .navigable_strip(strip)
+                            .get(0)
+                            .ok()
+                            .and_then(|col| col.top())
+                    })
             })
             .flatten()
         })
     } else {
-        match direction {
-            Direction::East | Direction::First => {
-                active_strip.first().ok().and_then(|col| col.top())
-            }
-            Direction::West | Direction::Last => active_strip.last().ok().and_then(|col| col.top()),
-            Direction::Nth(index) => active_strip
-                .get(*index)
-                .ok()
-                .and_then(|column| column.top()),
-            Direction::North | Direction::South => None,
-        }
+        entry_focus_target(direction, active_strip)
     };
 
     if let Some(entity) = candidate {
+        debug!(target: "spool::navigation", ?operation,
+            target_window = ?windows.get(entity).map(|window| window.id()),
+            "focus navigation target");
         commands.focus_entity(entity, true);
         // Requested focus is already authoritative navigation state. Project
         // its target into the layout immediately so a delayed or dropped AX

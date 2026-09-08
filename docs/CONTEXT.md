@@ -41,6 +41,9 @@ A retained request to tile after temporary capability or native-state uncertaint
 **Layout State**:
 The Spool-owned arrangement of tiled windows, including strip membership, column structure, ordering, and logical sizes.
 
+**Navigable Layout**:
+A read-only projection of a Space's retained layout containing available, visible tiled identities, with stack and tab structure preserved. Directional, first/last/numeric, and next/previous tiled focus use this projection; retained unavailable identities are restoration data, not navigation targets. Projection never deletes or reorders the original layout.
+
 **Desired Window Frame**:
 The final window geometry implied by the current Layout State. It is unaffected by animation progress or an unsuccessful macOS write.
 _Avoid_: Layout frame, target position

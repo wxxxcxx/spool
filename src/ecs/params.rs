@@ -334,6 +334,21 @@ impl<'a> TrackedWindowState<'a> {
 }
 
 impl Windows<'_, '_> {
+    /// Navigation is a projection of retained layout, not raw membership.
+    /// Removing ineligible members from a copy preserves stacks and tab order.
+    pub(crate) fn navigable_strip(&self, strip: &LayoutStrip) -> LayoutStrip {
+        let mut projected = strip.clone();
+        for entity in strip.all_windows() {
+            if !self
+                .get_tracked(entity)
+                .is_some_and(|(_, _, state)| state.is_tiled() && state.is_visible())
+            {
+                projected.remove(entity);
+            }
+        }
+        projected
+    }
+
     /// Retained source membership is not permission to mutate a layout while
     /// native reassignment owns its geometry and captured column structure.
     pub(crate) fn layout_is_writable(&self, entity: Entity) -> bool {
