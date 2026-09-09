@@ -183,8 +183,10 @@ Public query records and WindowSet records share their floating membership,
 Space visibility, and per-window projection. Their frame field reads only
 Observed geometry; a missing readback is represented as an absent frame, not
 as Presented or Desired geometry. Their output shapes differ (flat versus
-structured), but those facts do not. Bar's retained, read-only identities
-remain a separate presentation policy.
+structured), but those facts do not. Bar may retain a tracked identity for
+restoration while AX operations are unavailable; it never invents an icon for
+an unresolved native surface. Lifecycle reconciliation decides whether a
+retained identity still occupies a tile and icon.
 
 `WorkspaceSet.active` is per-display native visibility, not the global
 `ActiveWorkspaceMarker`. `DisplaySet.active` identifies the globally active

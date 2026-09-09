@@ -124,30 +124,19 @@ This does not relax focus or movement availability checks. Confirmed window
 destruction removes the tracked identity and its icon; the Bar does not retain
 a separate last-known snapshot of closed windows.
 
-Cold-start discovery can leave a native window without a tracked AX identity
-after the bounded startup scan. The Bar shows a read-only application icon for
-such a surface when its native ordered-window membership, ordinary nontransparent
-WindowServer layer, and known application bundle identity are available. These
-icons follow tracked windows in a stable process/window-ID order, including in
-collapsed decks. They do not invent tiled columns or floating status and cannot
-be focused or dragged. Clicking their Space still uses the normal Space action.
+Cold-start discovery can leave a native surface without a tracked AX identity
+after the bounded startup scan. Such surfaces remain discovery candidates, not
+Bar icons. Native membership, a known application bundle, and visible geometry
+alone do not establish an operable window. The Bar does not discover independent
+read-only icons or activate an application as a substitute for window focus.
 
-Read-only candidates use the Space-local ordered-window list (`0x2`), not the
-broad discovery list (`0x7`). A closed application window can retain a full-size,
-normal-layer, opaque WindowServer surface in the latter list without having any
-AX windows, as Calendar does. Such ordered-out surfaces are not fallback icons.
-This does not require a window to be on the current screen; inactive Spaces are
-still queried individually. Tracked windows retain their existing broad membership
-and visibility policy, including minimized windows.
-
-AX discovery replaces a read-only icon with the tracked window's real layout
-role without duplicating it. Surfaces already identified by AX, including ignored
-or retired windows, are excluded from fallback while their native IDs survive.
-Fallback is rebuilt from fresh native observations on Bar updates; it disappears
-on close or failed inventory/membership reads instead of retaining stale icons.
-The renderer performs no extra AX scans. Missing bundle identity or uncertain
-native metadata still means no fallback icon; read-only icons are not included
-in operational queries or Lua window sets.
+Once normal AX discovery admits the window, its tracked identity supplies both
+the Bar icon and its operational layout role. A Space with no tracked windows
+uses the empty placeholder, including before fullscreen-window discovery.
+Already tracked hidden, minimized, or temporarily withdrawn windows retain their
+existing lifecycle and restoration policy. A retained identity confirmed no
+longer presented loses its icon and tile slot through the shared lifecycle state.
+The renderer performs no extra AX scans.
 
 ## Configuration
 
@@ -249,9 +238,9 @@ mouse-event state path through release and cancellation. They do not create
 live native panels or operate the user's windows.
 Additional tests cover borderless, uniformly sized and aligned collapsed icons,
 interrupted transitions between collapsed and expanded stack geometry, unchanged
-single-window vertical geometry, cold-start read-only icons and their handoff
-to AX discovery, inventory failures, closed/ignored-surface cleanup, and exclusion
-from focus, drag and operational queries.
+single-window vertical geometry, exclusion of unresolved native surfaces until
+AX discovery, floating icon/focus agreement after identity recovery, inventory
+failures, and preservation of tracked identities on inactive Spaces.
 Live Space switching, drag gestures, multi-display behavior and
 the subjective animation/style review still require desktop acceptance; unit
 tests are not a substitute for that inspection.

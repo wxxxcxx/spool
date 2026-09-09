@@ -90,6 +90,10 @@ struct MockDisplayData {
 }
 
 /// The internal state of our "Virtual macOS".
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent simulated capabilities and inventory failure switches"
+)]
 struct MockStateInner {
     apps: HashMap<Pid, MockAppData>,
     windows: HashMap<WinID, MockWindowData>,
@@ -119,6 +123,7 @@ struct MockStateInner {
     associated_windows: HashMap<WinID, Vec<WinID>>,
     focus_requests: Vec<WinID>,
     window_server_inventory_available: bool,
+    presentation_inventory_available: bool,
     window_server_inventory_omissions: HashSet<WinID>,
     workspace_membership_scripts:
         HashMap<WorkspaceId, VecDeque<std::result::Result<Vec<WinID>, ()>>>,
@@ -184,6 +189,7 @@ impl MockState {
                 associated_windows: HashMap::new(),
                 focus_requests: Vec::new(),
                 window_server_inventory_available: true,
+                presentation_inventory_available: true,
                 window_server_inventory_omissions: HashSet::new(),
                 workspace_membership_scripts: HashMap::new(),
                 active_space_query_scripts: HashMap::new(),
@@ -542,6 +548,10 @@ impl MockState {
         self.inner.force_write().window_server_inventory_available = available;
     }
 
+    pub fn set_presentation_inventory_available(&self, available: bool) {
+        self.inner.force_write().presentation_inventory_available = available;
+    }
+
     pub fn omit_window_from_window_server_inventory(&self, id: WinID, omit: bool) {
         let mut inner = self.inner.force_write();
         if omit {
@@ -824,6 +834,16 @@ impl MockState {
         if let Some(window) = inner.windows.remove(&id) {
             inner.withdrawn_surfaces.insert(id, window);
         }
+    }
+
+    pub fn os_order_out_withdrawn_surface(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        let window = inner
+            .withdrawn_surfaces
+            .get_mut(&id)
+            .expect("withdrawn surface");
+        window.visible = false;
+        window.ordered_out = true;
     }
 
     /// Lets CoreGraphics catch up after an AX-withdrawn window is closed.
@@ -1565,23 +1585,14 @@ impl MockState {
         });
 
         let s = self.clone();
-        wm.expect_presentation_window_owners().returning(move || {
-            let inner = s.inner.force_read();
-            inner.window_server_inventory_available.then(|| {
-                inner
-                    .windows
-                    .iter()
-                    .chain(inner.withdrawn_surfaces.iter())
-                    .filter(|(id, _)| !inner.window_server_inventory_omissions.contains(id))
-                    .map(|(id, window)| (*id, window.pid))
-                    .collect()
-            })
-        });
-
-        let s = self.clone();
         wm.expect_presentation_windows_in_workspace()
             .returning(move |workspace_id| {
                 let inner = s.inner.force_read();
+                if !inner.presentation_inventory_available {
+                    return Err(Error::Generic(
+                        "mock presentation inventory unavailable".into(),
+                    ));
+                }
                 Ok(inner
                     .windows
                     .values()

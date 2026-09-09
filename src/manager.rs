@@ -373,10 +373,6 @@ pub trait WindowManagerApi: Send + Sync {
     /// its owning process, including off-screen and minimized windows.
     fn window_owners_in_session(&self) -> Option<HashMap<WinID, Pid>>;
 
-    /// Read-only icon candidates, never evidence for lifecycle or operations.
-    /// Unlike the lifecycle inventory, missing metadata excludes a surface.
-    fn presentation_window_owners(&self) -> Option<HashMap<WinID, Pid>>;
-
     /// Refreshes the per-window `WindowServer` notification subscription.
     fn request_window_notifications(&self, window_ids: &[WinID]) -> Result<()>;
 }
@@ -863,17 +859,6 @@ impl WindowManagerApi for WindowManagerOS {
         )
     }
 
-    fn presentation_window_owners(&self) -> Option<HashMap<WinID, Pid>> {
-        let options = CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements;
-        CGWindowListCopyWindowInfo(options, kCGNullWindowID).map(|info| {
-            let array = unsafe { info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
-            array
-                .iter()
-                .filter_map(|description| presentation_owner_from_description(&description))
-                .collect()
-        })
-    }
-
     fn request_window_notifications(&self, window_ids: &[WinID]) -> Result<()> {
         if crate::platform::macos_major_version() < 15 {
             return Ok(());
@@ -938,12 +923,6 @@ fn window_owner_from_description(
         return None;
     }
     Some((window_id, owner_pid))
-}
-
-fn presentation_owner_from_description(
-    description: &CFDictionary<CFString, CFNumber>,
-) -> Option<(WinID, Pid)> {
-    interactive_owner_from_description(description, false)
 }
 
 fn interactive_owner_from_description(
@@ -1276,28 +1255,6 @@ mod native_space_runtime_tests {
     }
 
     #[test]
-    fn presentation_inventory_accepts_only_ordinary_nontransparent_surfaces() {
-        assert_eq!(
-            presentation_owner_from_description(&window_description(42, 1000, 0, 1.0)),
-            Some((42, 1000))
-        );
-        for (layer, alpha) in [(3, 1.0), (101, 0.0), (0, 0.0), (0, -1.0), (0, f64::NAN)] {
-            assert_eq!(
-                presentation_owner_from_description(&window_description(42, 1000, layer, alpha)),
-                None
-            );
-        }
-        assert_eq!(
-            presentation_owner_from_description(&window_description(0, 1000, 0, 1.0)),
-            None
-        );
-        assert_eq!(
-            presentation_owner_from_description(&window_description(42, 0, 0, 1.0)),
-            None
-        );
-    }
-
-    #[test]
     fn missing_presentation_metadata_is_not_destructive_lifecycle_evidence() {
         let id = CFNumber::new_i32(42);
         let pid = CFNumber::new_i32(1000);
@@ -1305,7 +1262,7 @@ mod native_space_runtime_tests {
             &[unsafe { kCGWindowNumber }, unsafe { kCGWindowOwnerPID }],
             &[id.as_ref(), pid.as_ref()],
         );
-        assert_eq!(presentation_owner_from_description(&description), None);
+        assert_eq!(interactive_owner_from_description(&description, true), None);
         assert_eq!(
             window_owner_from_description(&description),
             Some((42, 1000))

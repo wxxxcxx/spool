@@ -8,9 +8,9 @@ use spool_shared_types::windowset::ColumnKind;
 use tracing::warn;
 
 use super::BarSnapshot;
-use super::model::{BarColumn, BarSpace, BarSurface, BarWindow};
+use super::model::{BarColumn, BarSpace, BarWindow};
 use crate::ecs::layout::{Column, LayoutStrip};
-use crate::ecs::reconcile::{WindowStateSync, WindowUnavailable};
+use crate::ecs::reconcile::WindowUnavailable;
 use crate::ecs::state::QueryStateParams;
 use crate::ecs::{Floating, FocusedMarker, WindowVisibility};
 use crate::manager::{Application, Window, WindowManager};
@@ -26,7 +26,7 @@ type BarWindows<'w, 's> = Query<
         &'static ChildOf,
         Has<Floating>,
         Has<FocusedMarker>,
-        Has<WindowUnavailable>,
+        Option<&'static WindowUnavailable>,
         Has<WindowVisibility>,
     ),
 >;
@@ -38,7 +38,6 @@ pub(crate) struct BarStateParams<'w, 's> {
     windows: BarWindows<'w, 's>,
     apps: Query<'w, 's, (Entity, &'static Application)>,
     window_manager: Res<'w, WindowManager>,
-    sync: Res<'w, WindowStateSync>,
 }
 
 impl BarStateParams<'_, '_> {
@@ -55,23 +54,6 @@ impl BarStateParams<'_, '_> {
             .iter()
             .filter_map(|(_, entity, _, floating, _, _, _)| floating.then_some(entity))
             .collect::<Vec<_>>();
-        let tracked = self
-            .windows
-            .iter()
-            .map(|(window, ..)| window.id())
-            .collect::<HashSet<_>>();
-        let owners = self
-            .window_manager
-            .presentation_window_owners()
-            .unwrap_or_default();
-        let applications = self
-            .apps
-            .iter()
-            .filter_map(|(entity, app)| {
-                let bundle = app.bundle_id().filter(|id| !id.is_empty())?;
-                Some((app.pid(), (entity, bundle)))
-            })
-            .collect::<HashMap<_, _>>();
         for display in &mut snapshot.displays {
             for space in &mut display.spaces {
                 let membership = self
@@ -85,52 +67,9 @@ impl BarStateParams<'_, '_> {
                         }
                     })
                     .ok();
-                // The broad membership list also contains retained, ordered-out
-                // surfaces (for example Calendar after its last window closes).
-                // A failed query is not evidence that tracked windows vanished.
-                let presented = match self
-                    .window_manager
-                    .presentation_windows_in_workspace(space.id)
-                {
-                    Ok(ids) => Some(ids.into_iter().collect::<HashSet<_>>()),
-                    Err(crate::errors::Error::NotFound(_)) => Some(HashSet::new()),
-                    Err(_) => None,
-                };
                 if let Some(strip) = strips.get(&space.id) {
-                    self.project_windows(
-                        space,
-                        strip,
-                        &floating,
-                        membership.as_ref(),
-                        presented.as_ref(),
-                    );
+                    self.project_windows(space, strip, &floating, membership.as_ref());
                 }
-                space.unresolved = membership
-                    .iter()
-                    .flatten()
-                    .filter_map(|id| {
-                        if tracked.contains(id)
-                            || !presented.as_ref().is_some_and(|ids| ids.contains(id))
-                        {
-                            return None;
-                        }
-                        let pid = *owners.get(id)?;
-                        let (entity, bundle_id) = applications.get(&pid)?;
-                        if self.sync.has_observed_ax_window(*entity, *id) {
-                            return None;
-                        }
-                        Some(BarSurface {
-                            id: *id,
-                            owner_pid: pid,
-                            bundle_id: bundle_id.clone(),
-                        })
-                    })
-                    .collect();
-                // WindowServer order is z-order, not layout order. Keep unresolved
-                // icons stable until real AX discovery supplies their layout role.
-                space
-                    .unresolved
-                    .sort_by_key(|surface| (surface.owner_pid, surface.id));
             }
         }
         Ok(snapshot)
@@ -142,7 +81,6 @@ impl BarStateParams<'_, '_> {
         strip: &LayoutStrip,
         floating: &[Entity],
         membership: Option<&HashSet<i32>>,
-        presented: Option<&HashSet<i32>>,
     ) {
         let known = space
             .windows()
@@ -158,9 +96,7 @@ impl BarStateParams<'_, '_> {
                             .get(*entity)
                             .is_ok_and(|(_, _, _, floating, _, _, _)| !floating)
                     })
-                    .filter_map(|entity| {
-                        self.window_record(entity, space.visible, &known, presented)
-                    })
+                    .filter_map(|entity| self.window_record(entity, space.visible, &known))
                     .collect::<Vec<_>>();
                 if windows.is_empty() {
                     return None;
@@ -202,7 +138,7 @@ impl BarStateParams<'_, '_> {
                     )
                 })
             })
-            .filter_map(|entity| self.window_record(entity, space.visible, &known, presented))
+            .filter_map(|entity| self.window_record(entity, space.visible, &known))
             .collect();
     }
 
@@ -211,23 +147,21 @@ impl BarStateParams<'_, '_> {
         entity: Entity,
         space_visible: bool,
         known: &HashMap<i32, BarWindow>,
-        presented: Option<&HashSet<i32>>,
     ) -> Option<BarWindow> {
         let (window, _, parent, _, focused, unavailable, hidden) = self.windows.get(entity).ok()?;
-        if unavailable
+        if unavailable.is_some()
             && self
                 .windows
                 .iter()
                 .any(|(other, _, _, _, _, unavailable, _)| {
-                    other.id() == window.id() && !unavailable
+                    other.id() == window.id() && unavailable.is_none()
                 })
         {
             return None;
         }
-        // Cmd-W may withdraw AX and order out a retained native surface without
-        // destroying its ID. Preserve its layout identity, not a phantom icon.
-        // Minimized/hidden windows and uncertain native queries retain icons.
-        if unavailable && !hidden && presented.is_some_and(|ids| !ids.contains(&window.id())) {
+        // Lifecycle reconciliation owns whether a retained identity still has a
+        // presentation slot. Bar and tiling must not classify absence separately.
+        if !hidden && unavailable.is_some_and(WindowUnavailable::excludes_from_layout_projection) {
             return None;
         }
         let (_, app) = self.apps.get(parent.parent()).ok()?;
@@ -241,8 +175,8 @@ impl BarStateParams<'_, '_> {
                 .get(&window.id())
                 .map(|window| window.title.clone())
                 .unwrap_or_default(),
-            focused: space_visible && focused && !unavailable,
-            visible: space_visible && !hidden && !unavailable,
+            focused: space_visible && focused && unavailable.is_none(),
+            visible: space_visible && !hidden && unavailable.is_none(),
         })
     }
 }
@@ -498,21 +432,28 @@ mod tests {
             window.visible = false;
             window.ordered_out = true;
         });
+        harness
+            .mock_state
+            .set_presentation_inventory_available(false);
         harness.mock_state.os_withdraw_window(0);
         harness.world().write_message(Event::SpaceChanged);
         harness.pump_frames(2);
+        let state = harness.world().run_system_once(snapshot).unwrap();
+        assert_eq!(original_space(&state).windows().count(), 1);
+        assert!(
+            !harness
+                .world()
+                .get::<WindowUnavailable>(entity)
+                .unwrap()
+                .excludes_from_layout_projection()
+        );
         harness
-            .world()
-            .run_system_once(move |state: BarStateParams| {
-                let known = HashMap::new();
-                assert!(state.window_record(entity, true, &known, None).is_some());
-                assert!(
-                    state
-                        .window_record(entity, true, &known, Some(&HashSet::new()))
-                        .is_none()
-                );
-            })
-            .unwrap();
+            .mock_state
+            .set_presentation_inventory_available(true);
+        harness.world().write_message(Event::SpaceChanged);
+        harness.pump_frames(2);
+        let state = harness.world().run_system_once(snapshot).unwrap();
+        assert_eq!(original_space(&state).windows().count(), 0);
     }
 
     #[test]
@@ -573,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_startup_surface_has_an_icon_before_activation_and_ax_discovery() {
+    fn unresolved_surface_stays_hidden_until_ax_discovery() {
         use crate::tests::{TEST_DISPLAY_ID, TEST_PROCESS_ID};
         use bevy::math::IRect;
 
@@ -605,13 +546,9 @@ mod tests {
             .unwrap();
         assert!(!space.visible);
         assert_eq!(space.windows().count(), 0);
-        assert_eq!(
-            space.unresolved,
-            vec![BarSurface {
-                id: 10,
-                owner_pid: TEST_PROCESS_ID,
-                bundle_id: "test".into(),
-            }]
+        assert!(
+            space.is_empty(),
+            "a native surface without AX identity is not a Bar window"
         );
         assert!(space.columns.is_empty() && space.floating.is_empty());
         assert!(
@@ -625,16 +562,16 @@ mod tests {
             layout
                 .items
                 .iter()
-                .filter(|item| matches!(item.kind, ItemKind::Surface { window_id: 10, .. }))
+                .filter(|item| matches!(item.kind, ItemKind::Window { window_id: 10, .. }))
                 .count(),
-            1
+            0
         );
         assert!(
-            !layout.items.iter().any(|item| matches!(
+            layout.items.iter().any(|item| matches!(
                 item.kind,
                 ItemKind::Placeholder { space_id } if space_id == other
             )),
-            "a known native surface must not render as an empty Space before AX discovery"
+            "an unresolved surface must not replace the empty Space placeholder"
         );
 
         // Reproduce the reported sequence without operating the user's desktop.
@@ -651,11 +588,81 @@ mod tests {
             .find(|space| space.id == other)
             .unwrap();
         assert!(space.visible);
-        assert!(space.unresolved.is_empty());
         assert_eq!(
             space.windows().map(|window| window.id).collect::<Vec<_>>(),
             vec![10]
         );
+    }
+
+    #[test]
+    fn floating_icon_and_focus_become_available_after_identity_discovery() {
+        use crate::config::{Config, MainOptions, WindowParams};
+        use crate::tests::TEST_PROCESS_ID;
+        use bevy::math::IRect;
+        use spool_shared_types::commands::{Action, Operation};
+
+        for operation in [Operation::FocusFloating, Operation::FocusOtherLayer] {
+            let mut floating = WindowParams::new("^Window 10$", None);
+            floating.floating = Some(true);
+            let config: Config = (MainOptions::default(), vec![floating]).into();
+            let mut harness = TestHarness::new()
+                .with_config(config)
+                .with_windows(1)
+                .with_focused_window(0);
+            drop(harness.mock_state.spawn_window(
+                TEST_PROCESS_ID,
+                TEST_WORKSPACE_ID,
+                10,
+                IRect::new(100, 100, 500, 400),
+            ));
+            harness.mock_state.os_withdraw_window(10);
+            // AlDente's AXWindows yields an application element, not a window ID.
+            harness
+                .mock_state
+                .set_application_inventory_complete(TEST_PROCESS_ID, false);
+            harness.pump_frames(15);
+            harness.mock_state.take_focus_requests();
+            harness.world().write_message(Event::ActionRequested {
+                action: Action::Window(operation.clone()),
+            });
+            harness.pump_frames(5);
+            assert!(harness.mock_state.take_focus_requests().is_empty());
+            assert_eq!(bar_window_ids(&mut harness), vec![0]);
+            assert!(
+                harness
+                    .world()
+                    .run_system_once(|windows: crate::ecs::params::Windows| windows
+                        .find(10)
+                        .is_none())
+                    .unwrap()
+            );
+
+            harness.mock_state.os_restore_withdrawn_window(10);
+            harness
+                .mock_state
+                .set_application_inventory_complete(TEST_PROCESS_ID, true);
+            harness.world().write_message(Event::SpaceChanged);
+            harness.pump_frames(15);
+            harness.mock_state.focus_window(0);
+            harness.pump_frames(5);
+            harness.mock_state.take_focus_requests();
+            let state = harness.world().run_system_once(snapshot).unwrap();
+            assert_eq!(
+                original_space(&state)
+                    .floating
+                    .iter()
+                    .map(|w| w.id)
+                    .collect::<Vec<_>>(),
+                vec![10]
+            );
+            harness.world().write_message(Event::ActionRequested {
+                action: Action::Window(operation),
+            });
+            harness.pump_frames(5);
+            assert!(harness.mock_state.take_focus_requests().contains(&10));
+            let entity = find_window_entity(10, harness.world());
+            assert!(harness.world().get::<FocusedMarker>(entity).is_some());
+        }
     }
 
     fn unresolved_fullscreen_harness() -> TestHarness {
@@ -685,7 +692,7 @@ mod tests {
             .mock_state
             .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, false);
         harness.pump_frames(15);
-        assert_eq!(unresolved_ids(&mut harness), vec![10]);
+        assert!(bar_window_ids(&mut harness).is_empty());
         harness
     }
 
@@ -700,7 +707,6 @@ mod tests {
         assert_eq!(space.kind, spool_shared_types::state::SpaceKind::Fullscreen);
         assert_eq!(space.visible, visible);
         assert_eq!(space.windows().map(|w| w.id).collect::<Vec<_>>(), vec![10]);
-        assert!(space.unresolved.is_empty());
         let layout = BarLayout::resolve(&state.displays[0], 1200.0, 0.0);
         assert_eq!(
             layout
@@ -796,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_fullscreen_icon_survives_delayed_ax_discovery() {
+    fn startup_fullscreen_icon_appears_after_delayed_ax_discovery() {
         use crate::ecs::topology::NativeTopology;
         use crate::tests::{TEST_DISPLAY_ID, TEST_PROCESS_ID};
 
@@ -806,7 +812,7 @@ mod tests {
             .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID + 1, true);
         harness.world().write_message(Event::SpaceChanged);
         harness.pump_frames(1);
-        assert_eq!(unresolved_ids(&mut harness), vec![10]);
+        assert!(bar_window_ids(&mut harness).is_empty());
         let generation = harness.world().resource::<NativeTopology>().generation();
 
         harness.mock_state.os_restore_withdrawn_window(10);
@@ -877,7 +883,7 @@ mod tests {
         harness
     }
 
-    fn unresolved_ids(harness: &mut TestHarness) -> Vec<i32> {
+    fn bar_window_ids(harness: &mut TestHarness) -> Vec<i32> {
         harness
             .world()
             .run_system_once(snapshot)
@@ -885,31 +891,31 @@ mod tests {
             .displays
             .iter()
             .flat_map(|display| &display.spaces)
-            .flat_map(|space| &space.unresolved)
-            .map(|surface| surface.id)
+            .flat_map(BarSpace::windows)
+            .map(|window| window.id)
             .collect()
     }
 
     #[test]
-    fn read_only_icons_are_stable_and_removed_on_close_or_failed_inventory() {
+    fn unresolved_surfaces_stay_hidden_across_close_and_failed_inventory() {
         let mut harness = unresolved_harness();
-        assert_eq!(unresolved_ids(&mut harness), vec![10, 11, 12]);
-        assert_eq!(unresolved_ids(&mut harness), vec![10, 11, 12]);
+        assert!(bar_window_ids(&mut harness).is_empty());
+        assert!(bar_window_ids(&mut harness).is_empty());
         harness.mock_state.os_settle_withdrawn_surface(11);
-        assert_eq!(unresolved_ids(&mut harness), vec![10, 12]);
+        assert!(bar_window_ids(&mut harness).is_empty());
         harness
             .mock_state
             .set_window_server_inventory_available(false);
-        assert!(unresolved_ids(&mut harness).is_empty());
+        assert!(bar_window_ids(&mut harness).is_empty());
         harness
             .mock_state
             .set_window_server_inventory_available(true);
-        assert_eq!(unresolved_ids(&mut harness), vec![10, 12]);
+        assert!(bar_window_ids(&mut harness).is_empty());
         harness
             .mock_state
             .script_workspace_membership_queries(TEST_WORKSPACE_ID + 1, [Err(())]);
-        assert!(unresolved_ids(&mut harness).is_empty());
-        assert_eq!(unresolved_ids(&mut harness), vec![10, 12]);
+        assert!(bar_window_ids(&mut harness).is_empty());
+        assert!(bar_window_ids(&mut harness).is_empty());
     }
 
     #[test]
@@ -932,7 +938,7 @@ mod tests {
         let manager = harness.world().resource::<WindowManager>();
         assert!(
             manager
-                .presentation_window_owners()
+                .window_owners_in_session()
                 .unwrap()
                 .contains_key(&10)
         );
@@ -948,15 +954,11 @@ mod tests {
                 .unwrap()
                 .contains(&10)
         );
-        assert_eq!(
-            unresolved_ids(&mut harness),
-            vec![11, 12],
-            "an ordered-out retained surface is not evidence of a user window"
-        );
+        assert!(bar_window_ids(&mut harness).is_empty());
     }
 
     #[test]
-    fn ignored_ax_identity_never_returns_as_a_read_only_icon() {
+    fn ignored_ax_identity_never_returns_as_a_bar_window() {
         use crate::tests::TEST_PROCESS_ID;
         let mut harness = unresolved_harness();
         harness.mock_state.os_restore_withdrawn_window(10);
@@ -967,16 +969,16 @@ mod tests {
             scope: crate::events::ReconcileScope::Application(TEST_PROCESS_ID),
         });
         harness.pump_frames(2);
-        assert_eq!(unresolved_ids(&mut harness), vec![11, 12]);
+        assert!(bar_window_ids(&mut harness).is_empty());
         // Removing AX access again must not reclassify a rejected window as new.
         harness.mock_state.os_withdraw_window(10);
         harness.world().write_message(Event::SpaceChanged);
         harness.pump_frames(2);
-        assert_eq!(unresolved_ids(&mut harness), vec![11, 12]);
+        assert!(bar_window_ids(&mut harness).is_empty());
     }
 
     #[test]
-    fn tracked_withdrawn_windows_are_not_duplicated_by_fallback() {
+    fn tracked_withdrawn_windows_keep_icons_without_exposing_unresolved_surfaces() {
         let mut harness = unresolved_harness();
         harness.mock_state.os_restore_withdrawn_window(10);
         harness.mock_state.activate_workspace(
@@ -995,7 +997,7 @@ mod tests {
         );
         harness.world().write_message(Event::SpaceChanged);
         harness.pump_frames(2);
-        assert_eq!(unresolved_ids(&mut harness), vec![11, 12]);
+        assert_eq!(bar_window_ids(&mut harness), vec![10]);
         let state = harness.world().run_system_once(snapshot).unwrap();
         let space = state.displays[0]
             .spaces
@@ -1006,18 +1008,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_owner_or_missing_bundle_has_no_read_only_icon() {
+    fn application_metadata_does_not_promote_unresolved_surfaces() {
         let mut harness = unresolved_harness();
         harness
             .mock_state
             .update_app(crate::tests::TEST_PROCESS_ID, |app| app.bundle_id.clear());
-        assert!(unresolved_ids(&mut harness).is_empty());
+        assert!(bar_window_ids(&mut harness).is_empty());
         harness
             .mock_state
             .update_app(crate::tests::TEST_PROCESS_ID, |app| {
                 app.bundle_id = "test".into();
             });
-        assert_eq!(unresolved_ids(&mut harness), vec![10, 11, 12]);
+        assert!(bar_window_ids(&mut harness).is_empty());
         let entities = harness
             .world()
             .query::<(Entity, &Application)>()
@@ -1027,6 +1029,6 @@ mod tests {
         for entity in entities {
             harness.world().entity_mut(entity).remove::<Application>();
         }
-        assert!(unresolved_ids(&mut harness).is_empty());
+        assert!(bar_window_ids(&mut harness).is_empty());
     }
 }

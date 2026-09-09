@@ -2423,6 +2423,34 @@ fn incomplete_ax_inventory_omission_keeps_a_live_window_tiled() {
 }
 
 #[test]
+fn inactive_ordered_out_surface_preserves_its_layout_projection() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.pump_frames(20);
+    let entity = find_window_entity(1, harness.world());
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID + 1, false);
+    harness.mock_state.update_window(1, |window| {
+        window.visible = false;
+        window.ordered_out = true;
+    });
+    harness.mock_state.os_withdraw_window(1);
+    harness
+        .world()
+        .write_message(crate::events::Event::SpaceChanged);
+    harness.pump_frames(20);
+    let unavailable = harness
+        .world()
+        .get::<crate::ecs::reconcile::WindowUnavailable>(entity)
+        .unwrap();
+    assert!(
+        !unavailable.excludes_from_layout_projection(),
+        "order-out on an inactive Space is not proof of a closed presentation"
+    );
+    assert_eq!(layout_window_ids(harness.world()), vec![0, 1, 2]);
+}
+
+#[test]
 fn space_change_ax_withdrawal_preserves_layout_order() {
     let mut harness = TestHarness::new().with_windows(3);
     harness.pump_frames(15);

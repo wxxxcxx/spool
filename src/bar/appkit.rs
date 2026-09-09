@@ -490,7 +490,7 @@ impl BarView {
                 )
                 .addClip();
                 match visual.item.kind {
-                    ItemKind::Window { .. } | ItemKind::Surface { .. } => self.draw_window(visual),
+                    ItemKind::Window { .. } => self.draw_window(visual),
                     ItemKind::Label { ordinal, .. } => draw_label(ordinal, visual, &preferences),
                     ItemKind::Placeholder { .. } => Self::draw_placeholder(visual),
                     ItemKind::Focus { .. } if pass == 0 => self.draw_focus(visual),
@@ -545,9 +545,7 @@ impl BarView {
     }
 
     fn draw_window(&self, visual: &VisualItem) {
-        let (ItemKind::Window { bundle_id, .. } | ItemKind::Surface { bundle_id, .. }) =
-            &visual.item.kind
-        else {
+        let ItemKind::Window { bundle_id, .. } = &visual.item.kind else {
             return;
         };
         draw_window_visual(visual, self.icon(bundle_id).as_deref());
@@ -978,13 +976,7 @@ fn window_at(layout: &BarLayout, point: NSPoint) -> Option<PlacedItem> {
         .items
         .iter()
         .rev()
-        .find(|item| {
-            matches!(
-                item.kind,
-                ItemKind::Window { .. } | ItemKind::Surface { .. }
-            ) && contains(item.rect, point)
-        })
-        .filter(|item| matches!(item.kind, ItemKind::Window { .. }))
+        .find(|item| matches!(item.kind, ItemKind::Window { .. }) && contains(item.rect, point))
         .cloned()
 }
 
@@ -1000,10 +992,8 @@ fn contains(rect: Rect, point: NSPoint) -> bool {
 }
 
 fn draw_window_visual(visual: &VisualItem, icon: Option<&NSImage>) {
-    let floating = match visual.item.kind {
-        ItemKind::Window { floating, .. } => floating,
-        ItemKind::Surface { .. } => false,
-        _ => return,
+    let ItemKind::Window { floating, .. } = visual.item.kind else {
+        return;
     };
     let rect = visual.item.rect;
     let decoration = visual.icon_decoration_opacity();
@@ -1202,54 +1192,6 @@ fn draw_symbol(name: &str, rect: NSRect, opacity: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn read_only_icons_never_focus_or_drag_a_window_during_animation() {
-        let (mut state, _) = drag_state();
-        state.pressed = None;
-        let space = &mut state.display.spaces[0];
-        space.unresolved = (20..25)
-            .map(|id| crate::bar::model::BarSurface {
-                id,
-                owner_pid: 1000,
-                bundle_id: "test".into(),
-            })
-            .collect();
-        state.relayout();
-        state
-            .motion
-            .advance(Instant::now() + Duration::from_secs(1));
-        for visible in [true, false, true] {
-            state.display.spaces[0].visible = visible;
-            state.relayout();
-            let now = Instant::now();
-            for millis in [0, 40, 120, 240] {
-                state.motion.advance(now + Duration::from_millis(millis));
-                let hits = state.motion.presented.interaction_layout(&state.layout);
-                for item in hits
-                    .items
-                    .iter()
-                    .filter(|item| matches!(item.kind, ItemKind::Surface { .. }))
-                {
-                    assert!(
-                        BarDrag::begin(item, &state.motion.presented, (item.rect.x, item.rect.y))
-                            .is_none()
-                    );
-                    let point = NSPoint::new(
-                        item.rect.x + item.rect.width / 2.0,
-                        item.rect.y + item.rect.height / 2.0,
-                    );
-                    assert!(window_at(&hits, point).is_none());
-                    assert!(matches!(
-                        state.press_at(point),
-                        Some(Action::FocusSpace { space_id: 10 }) | None
-                    ));
-                    assert!(state.pressed.is_none());
-                    assert!(state.release_drag(point, true).is_none());
-                }
-            }
-        }
-    }
 
     #[test]
     fn space_blank_padding_is_clickable_throughout_animation() {

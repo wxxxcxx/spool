@@ -39,7 +39,6 @@ pub(crate) fn update_bar(
                     space
                         .windows()
                         .map(|window| window.id)
-                        .chain(space.unresolved.iter().map(|surface| surface.id))
                         .map(move |id| (display.id, space.id, id))
                 })
             })

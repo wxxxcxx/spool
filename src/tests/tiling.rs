@@ -538,6 +538,102 @@ fn fixed_size_window_floats_instead_of_disturbing_the_tiled_strip() {
         ]);
 }
 
+#[test]
+fn closed_retained_surface_releases_its_tile_slot() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.pump_frames(20);
+    let before = window_x(harness.world(), 2) - window_x(harness.world(), 0);
+    assert_eq!(before, 2 * TEST_WINDOW_WIDTH);
+    harness.mock_state.update_window(1, |window| {
+        window.visible = false;
+        window.ordered_out = true;
+    });
+    harness.mock_state.os_withdraw_window(1);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(20);
+    assert_eq!(
+        window_x(harness.world(), 2) - window_x(harness.world(), 0),
+        TEST_WINDOW_WIDTH,
+        "a closed retained surface must not leave an empty tile slot"
+    );
+    let retained = find_window_entity(1, harness.world());
+    assert!(
+        harness
+            .world()
+            .query::<&LayoutStrip>()
+            .iter(harness.world())
+            .any(|strip| strip.contains(retained)),
+        "retained identity is restoration data, not an occupied slot"
+    );
+    let writes = harness.mock_state.frame_write_attempts(1);
+    harness.pump_frames(20);
+    assert_eq!(harness.mock_state.frame_write_attempts(1), writes);
+    harness.mock_state.os_restore_withdrawn_window(1);
+    harness.mock_state.update_window(1, |window| {
+        window.visible = true;
+        window.ordered_out = false;
+    });
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(20);
+    assert_eq!(find_window_entity(1, harness.world()), retained);
+    assert_eq!(
+        window_x(harness.world(), 1) - window_x(harness.world(), 0),
+        TEST_WINDOW_WIDTH
+    );
+    assert_eq!(
+        window_x(harness.world(), 2) - window_x(harness.world(), 0),
+        2 * TEST_WINDOW_WIDTH
+    );
+}
+
+#[test]
+fn retained_surface_slot_updates_after_delayed_order_out() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.pump_frames(20);
+    harness.mock_state.os_withdraw_window(1);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(5);
+    assert_eq!(
+        window_x(harness.world(), 2) - window_x(harness.world(), 0),
+        2 * TEST_WINDOW_WIDTH
+    );
+    harness.mock_state.os_order_out_withdrawn_surface(1);
+    // The heartbeat must upgrade an existing suspension even without a close event.
+    harness.pump_frames(30);
+    assert_eq!(
+        window_x(harness.world(), 2) - window_x(harness.world(), 0),
+        TEST_WINDOW_WIDTH
+    );
+}
+
+#[test]
+fn failed_presentation_observation_preserves_tile_until_recovery() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
+    harness.pump_frames(20);
+    harness
+        .mock_state
+        .set_presentation_inventory_available(false);
+    harness.mock_state.update_window(1, |window| {
+        window.visible = false;
+        window.ordered_out = true;
+    });
+    harness.mock_state.os_withdraw_window(1);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(20);
+    assert_eq!(
+        window_x(harness.world(), 2) - window_x(harness.world(), 0),
+        2 * TEST_WINDOW_WIDTH
+    );
+    harness
+        .mock_state
+        .set_presentation_inventory_available(true);
+    harness.pump_frames(30);
+    assert_eq!(
+        window_x(harness.world(), 2) - window_x(harness.world(), 0),
+        TEST_WINDOW_WIDTH
+    );
+}
+
 /// Closing a window while its application stays alive must free its slot in
 /// the strip. The AX element of such a window often keeps answering queries
 /// after the window is gone, which used to make `window_destroyed_trigger`

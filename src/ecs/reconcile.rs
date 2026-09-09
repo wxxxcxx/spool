@@ -64,30 +64,9 @@ pub(crate) struct WindowStateSync {
     window_observers: HashSet<Entity>,
     focus_absent: HashMap<Entity, FocusSnapshot>,
     retired_window_incarnations: HashSet<(Entity, WindowKey)>,
-    // Keep AX-known IDs while their native surfaces survive so presentation
-    // fallback cannot resurrect an ignored or retired window as "undiscovered".
-    ax_observed_windows: HashMap<Entity, HashSet<WinID>>,
 }
 
 impl WindowStateSync {
-    pub(crate) fn has_observed_ax_window(&self, application: Entity, id: WinID) -> bool {
-        self.ax_observed_windows
-            .get(&application)
-            .is_some_and(|ids| ids.contains(&id))
-    }
-
-    fn remember_ax_windows(
-        &mut self,
-        application: Entity,
-        pid: Pid,
-        identities: &[(WinID, WindowIncarnation)],
-        owners: &HashMap<WinID, Pid>,
-    ) {
-        let observed = self.ax_observed_windows.entry(application).or_default();
-        observed.retain(|id| owners.get(id) == Some(&pid));
-        observed.extend(identities.iter().map(|(id, _)| *id));
-    }
-
     pub(crate) fn forget_window(&mut self, entity: Entity) {
         self.frame_convergence.remove(&entity);
         self.window_observers.remove(&entity);
@@ -109,7 +88,6 @@ impl WindowStateSync {
     }
 
     fn forget_application(&mut self, application: Entity) {
-        self.ax_observed_windows.remove(&application);
         self.application_observers.remove(&application);
         self.application_ax_retries.remove(&application);
         self.focus_absent.remove(&application);
@@ -125,8 +103,6 @@ impl WindowStateSync {
         self.focus_absent.retain(|entity, _| live.contains(entity));
         self.retired_window_incarnations
             .retain(|(entity, _)| live.contains(entity));
-        self.ax_observed_windows
-            .retain(|entity, _| live.contains(entity));
     }
 
     fn tick(&mut self, delta: Duration) -> bool {
@@ -320,6 +296,7 @@ impl SyncRequest {
 #[derive(Default)]
 struct LifecycleAudit {
     window_server: Option<HashMap<WinID, Pid>>,
+    ax_absent: HashSet<Entity>,
     confirmed: HashSet<Entity>,
     retiring: HashSet<Entity>,
     actions: Vec<LifecycleAction>,
@@ -442,8 +419,8 @@ impl LifecycleAudit {
 }
 
 /// The AX window is no longer usable, but `CoreGraphics` has not yet confirmed
-/// that its surface left the screen. Such windows remain in Spool's declarative
-/// layout while being excluded from macOS reads, writes, and focus operations.
+/// that its identity was destroyed. Retained layout membership is restoration
+/// data; a confirmed non-presented surface no longer occupies a tile or Bar icon.
 #[derive(Component, Debug)]
 pub(crate) struct WindowUnavailable {
     confirmation: Timer,
@@ -493,6 +470,8 @@ pub(super) struct ReconcileState<'w, 's> {
     mission_control: Res<'w, MissionControlActive>,
     initializing: Option<Res<'w, Initializing>>,
     settling: Res<'w, WindowGeometrySettling>,
+    topology: Res<'w, super::topology::NativeTopology>,
+    native_moves: Query<'w, 's, (), bevy::ecs::query::With<super::native_space::NativeMoveOwner>>,
 }
 
 impl ReconcileState<'_, '_> {
@@ -534,9 +513,9 @@ impl ReconcileState<'_, '_> {
             }
             let can_probe = sync.application_ax_ready(app_entity)
                 && refresh_application_observer(app_entity, &mut app, sync);
-            let Some(owners) = &audit.window_server else {
+            if audit.window_server.is_none() {
                 continue;
-            };
+            }
             let inventory = can_probe
                 .then(|| refresh_application_inventory(app_entity, &app, config, sync))
                 .flatten();
@@ -550,7 +529,6 @@ impl ReconcileState<'_, '_> {
                 );
                 continue;
             };
-            sync.remember_ax_windows(app_entity, pid, &inventory.identities, owners);
             let buckets = inventory_buckets(inventory.identities, app_entity, sync);
             if !inventory.complete {
                 debug!(
@@ -597,8 +575,70 @@ impl ReconcileState<'_, '_> {
             sync.frame_convergence
                 .retain(|entity, _| live_windows.contains(entity));
         }
+        self.exclude_nonpresented_surfaces(&mut audit, window_manager);
         self.apply_lifecycle_actions(&mut audit, commands);
         audit
+    }
+
+    fn exclude_nonpresented_surfaces(
+        &mut self,
+        audit: &mut LifecycleAudit,
+        manager: &WindowManager,
+    ) {
+        if audit.ax_absent.is_empty() || self.mission_control.0 {
+            return;
+        }
+        let mut memberships = None;
+        let mut presented = HashMap::new();
+        for entity in std::mem::take(&mut audit.ax_absent) {
+            let Ok((
+                _,
+                window,
+                _,
+                unavailable,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                visibility,
+                (_, _, _, _, reassigned),
+            )) = self.windows.get_mut(entity)
+            else {
+                continue;
+            };
+            if visibility.is_some()
+                || reassigned
+                || self.native_moves.contains(entity)
+                || unavailable
+                    .as_deref()
+                    .is_some_and(WindowUnavailable::excludes_from_layout_projection)
+            {
+                continue;
+            }
+            let Ok(memberships) =
+                memberships.get_or_insert_with(|| self.topology.observe_memberships(manager))
+            else {
+                continue;
+            };
+            let Some(space) = memberships.unique_space(window.id()).filter(|space| {
+                self.topology.visible_display_for_space(*space).is_some()
+                    && !self.topology.is_fullscreen(*space)
+            }) else {
+                continue;
+            };
+            let ids = presented.entry(space).or_insert_with(|| {
+                match manager.presentation_windows_in_workspace(space) {
+                    Ok(ids) => Some(ids.into_iter().collect::<HashSet<_>>()),
+                    Err(Error::NotFound(_)) => Some(HashSet::new()),
+                    Err(_) => None,
+                }
+            });
+            if ids.as_ref().is_some_and(|ids| !ids.contains(&window.id())) {
+                request_suspension(audit, entity, unavailable.as_deref(), true);
+            }
+        }
     }
 
     fn apply_lifecycle_actions(&mut self, audit: &mut LifecycleAudit, commands: &mut Commands) {
@@ -1067,6 +1107,10 @@ fn audit_application_windows(
                     "incomplete AX inventory omitted a live WindowServer surface"
                 );
             }
+            (false, true) => {
+                audit.ax_absent.insert(entity);
+                request_suspension(audit, entity, unavailable.as_deref(), false);
+            }
             _ => {
                 request_suspension(audit, entity, unavailable.as_deref(), !surface_present);
             }
@@ -1104,6 +1148,12 @@ fn request_suspension(
         || invalidate_layout_projection
             && unavailable.is_some_and(|state| !state.layout_projection_invalidated);
     if needs_transition {
+        if let Some(LifecycleAction::Suspend(_, invalidate)) = audit.actions.iter_mut().find(
+            |action| matches!(action, LifecycleAction::Suspend(target, _) if *target == entity),
+        ) {
+            *invalidate |= invalidate_layout_projection;
+            return;
+        }
         audit.actions.push(LifecycleAction::Suspend(
             entity,
             invalidate_layout_projection,

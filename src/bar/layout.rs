@@ -1,7 +1,6 @@
 use spool_shared_types::commands::Placement;
 use spool_shared_types::state::SpaceKind;
 
-use super::model::BarSurface as UnresolvedSurface;
 use super::model::{BarColumn, BarDisplay, BarSpace, BarWindow};
 use super::toolbar::TOOLBAR_WIDTH;
 
@@ -255,9 +254,6 @@ impl PlacedItem {
         match self.kind {
             ItemKind::Window {
                 fullscreen: true, ..
-            }
-            | ItemKind::Surface {
-                fullscreen: true, ..
             } => {
                 let size = (rect.width / 2.0).min(9.0);
                 Some(Rect {
@@ -274,14 +270,6 @@ impl PlacedItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ItemKind {
-    Surface {
-        window_id: i32,
-        owner_pid: i32,
-        space_id: u64,
-        bundle_id: String,
-        collapsed: bool,
-        fullscreen: bool,
-    },
     Label {
         space_id: u64,
         ordinal: u32,
@@ -498,8 +486,7 @@ fn space_width(space: &BarSpace, metrics: &BarMetrics) -> f64 {
         .iter()
         .map(|column| column_icon_size(column, metrics) + metrics.icon_gap)
         .sum::<f64>();
-    let floating = count(space.floating.len() + space.unresolved.len())
-        * (metrics.icon_size + metrics.icon_gap);
+    let floating = count(space.floating.len()) * (metrics.icon_size + metrics.icon_gap);
     let separator = if !space.columns.is_empty() && !space.floating.is_empty() {
         metrics.item_gap - metrics.icon_gap
     } else {
@@ -557,12 +544,6 @@ fn collapsed_deck(space: &BarSpace) -> Vec<CollapsedIcon> {
     space
         .windows()
         .map(|window| collapsed_window_kind(space, window))
-        .chain(
-            space
-                .unresolved
-                .iter()
-                .map(|surface| surface_kind(space, surface, true)),
-        )
         .take(4)
         .enumerate()
         .map(|(index, kind)| CollapsedIcon {
@@ -663,29 +644,6 @@ fn place_expanded(space: &BarSpace, rect: Rect, metrics: &BarMetrics, items: &mu
         });
         x += metrics.icon_size + metrics.icon_gap;
     }
-    for surface in &space.unresolved {
-        items.push(PlacedItem {
-            rect: Rect {
-                x,
-                y: rect.y + (rect.height - metrics.icon_size) / 2.0,
-                width: metrics.icon_size,
-                height: metrics.icon_size,
-            },
-            kind: surface_kind(space, surface, false),
-        });
-        x += metrics.icon_size + metrics.icon_gap;
-    }
-}
-
-fn surface_kind(space: &BarSpace, surface: &UnresolvedSurface, collapsed: bool) -> ItemKind {
-    ItemKind::Surface {
-        window_id: surface.id,
-        owner_pid: surface.owner_pid,
-        space_id: space.id,
-        bundle_id: surface.bundle_id.clone(),
-        collapsed,
-        fullscreen: space.kind == SpaceKind::Fullscreen,
-    }
 }
 
 fn collapsed_window_kind(space: &BarSpace, window: &BarWindow) -> ItemKind {
@@ -769,7 +727,6 @@ pub(super) mod tests {
                     focused: false,
                     columns: Vec::new(),
                     floating: Vec::new(),
-                    unresolved: Vec::new(),
                 },
                 BarSpace {
                     id: 11,
@@ -790,7 +747,6 @@ pub(super) mod tests {
                         },
                     ],
                     floating: vec![window(4, false)],
-                    unresolved: Vec::new(),
                 },
                 BarSpace {
                     id: 12,
@@ -804,69 +760,8 @@ pub(super) mod tests {
                         windows: vec![window(5, false), window(6, false), window(7, false)],
                     }],
                     floating: Vec::new(),
-                    unresolved: Vec::new(),
                 },
             ],
-        }
-    }
-
-    #[test]
-    fn unresolved_surfaces_use_real_icon_decks_without_inventing_columns() {
-        let mut display = display();
-        display.spaces.truncate(1);
-        display.spaces[0].unresolved = (20..26)
-            .map(|id| UnresolvedSurface {
-                id,
-                owner_pid: 1000,
-                bundle_id: format!("com.example.{id}"),
-            })
-            .collect();
-        for visible in [false, true] {
-            display.spaces[0].visible = visible;
-            display.spaces[0].kind = SpaceKind::Fullscreen;
-            let layout = BarLayout::resolve(&display, 1200.0, 0.0);
-            assert!(!layout.items.iter().any(|item| matches!(
-                item.kind,
-                ItemKind::Window { .. }
-                    | ItemKind::ColumnDrop { .. }
-                    | ItemKind::Placeholder { .. }
-                    | ItemKind::Focus { .. }
-            )));
-            let icons = layout
-                .items
-                .iter()
-                .filter(|item| matches!(item.kind, ItemKind::Surface { .. }))
-                .collect::<Vec<_>>();
-            assert_eq!(icons.len(), if visible { 6 } else { 4 });
-            let mut ids = Vec::new();
-            for icon in &icons {
-                let ItemKind::Surface {
-                    window_id,
-                    ref bundle_id,
-                    collapsed,
-                    ..
-                } = icon.kind
-                else {
-                    unreachable!()
-                };
-                ids.push(window_id);
-                assert_eq!(bundle_id, &format!("com.example.{window_id}"));
-                assert_eq!(collapsed, !visible);
-                assert!(icon.fullscreen_badge_rect().is_some());
-                assert!(icon.rect.x >= 0.0 && icon.rect.x + icon.rect.width <= layout.width);
-            }
-            assert_eq!(
-                ids,
-                if visible {
-                    vec![20, 21, 22, 23, 24, 25]
-                } else {
-                    vec![23, 22, 21, 20]
-                }
-            );
-            for pair in icons.windows(2) {
-                assert!((pair[0].rect.x - pair[1].rect.x).abs() >= 5.0);
-                assert!((pair[0].rect.y - pair[1].rect.y).abs() < f64::EPSILON);
-            }
         }
     }
 

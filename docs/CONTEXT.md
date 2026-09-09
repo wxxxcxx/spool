@@ -12,6 +12,11 @@ _Avoid_: Managed window
 A transient or system window that Spool deliberately does not track, such as a menu or system panel.
 _Avoid_: Unmanaged window
 
+**Unresolved Surface**:
+A native WindowServer surface without an admitted AX window identity. It remains
+a discovery candidate, not a Bar icon, floating window, or focus target. Discovery
+must establish the identity before presentation and operations can include it.
+
 **Tiled Window**:
 A tracked window that occupies a position in a Space's layout strip.
 _Avoid_: Managed window
@@ -43,6 +48,9 @@ The Spool-owned arrangement of tiled windows, including strip membership, column
 
 **Navigable Layout**:
 A read-only projection of a Space's retained layout containing available, visible tiled identities, with stack and tab structure preserved. Directional, first/last/numeric, and next/previous tiled focus use this projection; retained unavailable identities are restoration data, not navigation targets. Projection never deletes or reorders the original layout.
+
+**Retained Presentation Slot**:
+A temporarily inaccessible identity may keep its layout structure for recovery without occupying a tile or Bar icon. Lifecycle reconciliation excludes that presentation slot when a complete AX inventory omits the identity and its uniquely known, visible user Space no longer presents it. Unknown queries, inactive Spaces, and native transitions do not establish that absence. Bar and tiling consume the same exclusion state; renewed AX availability restores the original slot.
 
 **Desired Window Frame**:
 The final window geometry implied by the current Layout State. It is unaffected by animation progress or an unsuccessful macOS write.
