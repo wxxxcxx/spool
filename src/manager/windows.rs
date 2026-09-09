@@ -1004,7 +1004,11 @@ impl WindowApi for WindowOS {
     fn raise_without_focus(&self) {
         let element_ref = self.ax_element.as_ptr();
         let action = CFString::from_static_str(kAXRaiseAction);
-        unsafe { AXUIElementPerformAction(element_ref, &action) };
+        let _ = unsafe { AXUIElementPerformAction(element_ref, &action) }
+            .to_result(function_name!())
+            .inspect_err(|error| {
+                warn!(window_id = self.id(), %error, "unable to raise window without focus");
+            });
     }
 
     fn pid(&self) -> Result<Pid> {

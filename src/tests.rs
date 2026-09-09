@@ -12,6 +12,7 @@ mod native_move;
 mod native_space_projection;
 mod navigation;
 mod session_restore;
+mod stacking;
 mod state;
 mod tabs;
 mod tiling;

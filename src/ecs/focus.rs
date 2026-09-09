@@ -17,12 +17,14 @@ use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, ObservedWindowFrame, PresentedWindowFrame, RaiseWindow, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ActiveWorkspaceMarker, RaiseWindow, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    StrayFocusEvent,
 };
 use crate::events::{Event, FocusObservation};
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
+
+mod stacking;
 
 #[derive(Default)]
 struct FocusOrder(Vec<Entity>);
@@ -429,12 +431,14 @@ pub struct FocusEventsPlugin;
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusCoordinator>();
+        app.init_resource::<stacking::TiledStackingState>();
         app.add_systems(
             PostUpdate,
             (
                 project_confirmed_focus,
                 autocenter_window_on_focus.after(super::systems::animate_resize_entities),
                 mouse_follows_focus.after(super::systems::animate_resize_entities),
+                stacking::reconcile_tiled_stacking.after(super::systems::commit_window_frame),
             )
                 .chain(),
         );
@@ -686,47 +690,15 @@ fn focus_window_trigger(
 
 fn raise_window_trigger(
     trigger: On<RaiseWindow>,
-    windows: Query<(
-        Entity,
-        &Window,
-        Option<&ObservedWindowFrame>,
-        Option<&PresentedWindowFrame>,
-    )>,
-    active_display: ActiveDisplay,
-    config: Res<Config>,
+    stacking: stacking::TiledStacking,
+    mut state: ResMut<stacking::TiledStackingState>,
 ) {
     let RaiseWindow { entity, with_strip } = *trigger.event();
-
-    let Ok((focus, window, _, _)) = windows.get(entity) else {
-        return;
-    };
-
     if with_strip {
-        let viewport = active_display.actual_bounds(&config);
-        let strip = active_display.active_strip();
-        strip
-            .all_windows()
-            .into_iter()
-            .filter_map(|entity| {
-                if entity == focus {
-                    None
-                } else {
-                    windows.get(entity).ok()
-                }
-            })
-            .filter(|(_, _, observed, presented)| {
-                observed
-                    .map(|frame| frame.0)
-                    .or_else(|| presented.map(|frame| frame.0))
-                    .is_some_and(|frame| viewport.intersect(frame).width() > 50)
-            })
-            .for_each(|(_, window, _, _)| {
-                window.raise_without_focus();
-            });
+        stacking.raise_strip(entity, &mut state, true);
+    } else {
+        stacking.raise_one(entity);
     }
-
-    // Raise the focused window last, because raised windows get OS focus events.
-    window.raise_without_focus();
 }
 
 pub(super) fn stray_focus_observer(

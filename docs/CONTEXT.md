@@ -49,6 +49,14 @@ The Spool-owned arrangement of tiled windows, including strip membership, column
 **Navigable Layout**:
 A read-only projection of a Space's retained layout containing available, visible tiled identities, with stack and tab structure preserved. Directional, first/last/numeric, and next/previous tiled focus use this projection; retained unavailable identities are restoration data, not navigation targets. Projection never deletes or reorders the original layout.
 
+**Tiled Stacking Order**:
+A derived bottom-to-top request order for the currently visible active Space.
+Eligible columns farther from confirmed tiled focus are raised first; ties use
+layout order, and the focused window is raised last. Edge slivers participate.
+Each native tab group contributes only its selected tab. Hidden, minimized,
+unavailable, floating, fullscreen, and migrating windows do not participate.
+Requests do not prove native z-order and never substitute for focus confirmation.
+
 **Retained Presentation Slot**:
 A temporarily inaccessible identity may keep its layout structure for recovery without occupying a tile or Bar icon. Lifecycle reconciliation excludes that presentation slot when a complete AX inventory omits the identity and its uniquely known, visible user Space no longer presents it. Unknown queries, inactive Spaces, and native transitions do not establish that absence. Bar and tiling consume the same exclusion state; renewed AX availability restores the original slot.
 

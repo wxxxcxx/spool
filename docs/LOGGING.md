@@ -68,6 +68,13 @@ can still use the requested or last navigation window while AX focus resolves.
 
 ### Capture steps
 
+For overlapping edge windows, the focus diagnostic category emits
+`tiled_stacking_requested_bottom_to_top` with a Space ID and window IDs in
+request order, only when a new order or explicit tiled-layer raise is requested.
+`unable to raise window without focus` reports an AX failure and window ID.
+Neither a successful AX return nor the request-order log proves WindowServer
+z-order; verify left/right edge hits across applications on the desktop.
+
 For stale Bar icons, enable `spool::bar=debug` on the daemon. The
 `bar_window_identities` record lists `(display_id, space_id, window_id)` only
 when that list changes. It includes read-only fallback icons but no titles.

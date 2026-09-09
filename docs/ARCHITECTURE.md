@@ -431,6 +431,14 @@ the shared visible-Space predicate also gates follow completion.
 
 ## 5. Architectural Invariants
 
+- **Tiled stacking:** `ecs/focus/stacking.rs` derives far-to-near column order
+  from confirmed focus and retained layout, filtering operational eligibility
+  without selecting a different native tab. Explicit tiled-layer raises share
+  the same plan. Unchanged plans do not repeat AX raises; Mission Control,
+  native fullscreen, unknown visible Space, swiping, startup, and exit defer
+  automatic ordering. Floating or untracked focus never raises the tiled tier.
+  AX raises remain best-effort; cross-application edge hit testing requires
+  native desktop acceptance, not only a mock request-order assertion.
 - **Main Thread Only:** Any interaction with `objc2`, `AppKit`, or `Accessibility` APIs **must** occur on the main thread.
 - **Split ownership:** ECS is the source of truth for tiling inside a Space. macOS is the source of truth for Space topology, visibility, and window membership; private operations must be reconciled from OS state before ECS converges.
 - **Single-direction geometry:** Layout State writes Desired; animation writes Presented; the macOS bridge writes Observed. No projection writes backward into an earlier layer.

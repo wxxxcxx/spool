@@ -122,6 +122,7 @@ struct MockStateInner {
     native_space_intents: Vec<crate::manager::NativeSpaceIntent>,
     associated_windows: HashMap<WinID, Vec<WinID>>,
     focus_requests: Vec<WinID>,
+    raise_requests: Vec<WinID>,
     window_server_inventory_available: bool,
     presentation_inventory_available: bool,
     window_server_inventory_omissions: HashSet<WinID>,
@@ -188,6 +189,7 @@ impl MockState {
                 native_space_intents: Vec::new(),
                 associated_windows: HashMap::new(),
                 focus_requests: Vec::new(),
+                raise_requests: Vec::new(),
                 window_server_inventory_available: true,
                 presentation_inventory_available: true,
                 window_server_inventory_omissions: HashSet::new(),
@@ -348,6 +350,10 @@ impl MockState {
 
     pub(crate) fn take_focus_requests(&self) -> Vec<WinID> {
         std::mem::take(&mut self.inner.force_write().focus_requests)
+    }
+
+    pub(crate) fn take_raise_requests(&self) -> Vec<WinID> {
+        std::mem::take(&mut self.inner.force_write().raise_requests)
     }
 
     fn request_focus(&self, id: WinID) {
@@ -1236,7 +1242,10 @@ impl MockState {
 
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
-        mw.expect_raise_without_focus().return_const(());
+        let s = self.clone();
+        mw.expect_raise_without_focus().returning(move || {
+            s.inner.force_write().raise_requests.push(id);
+        });
         let s = self.clone();
         mw.expect_focus_without_raise()
             .returning(move |_psn, _focused_window, _focused_psn| {
