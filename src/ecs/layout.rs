@@ -110,6 +110,7 @@ type RepositionedWindows<'w, 's> = Populated<
         &'static Bounds,
         Option<&'static mut DesiredWindowFrame>,
         Option<&'static mut PresentedWindowFrame>,
+        Option<&'static super::tiled_visibility::ParkedTile>,
     ),
     (
         Or<(Changed<LayoutPosition>, Changed<Bounds>)>,
@@ -133,6 +134,8 @@ type ReshuffleMarkers<'w, 's> = Query<
     (
         With<ReshuffleAroundMarker>,
         Without<WindowSpaceReassignmentPending>,
+        Without<super::tiled_visibility::ParkedTile>,
+        Without<super::tiled_visibility::RestoringTile>,
     ),
 >;
 
@@ -143,6 +146,8 @@ type EnsureVisibleMarkers<'w, 's> = Query<
     (
         With<EnsureVisibleMarker>,
         Without<WindowSpaceReassignmentPending>,
+        Without<super::tiled_visibility::ParkedTile>,
+        Without<super::tiled_visibility::RestoringTile>,
     ),
 >;
 
@@ -222,6 +227,7 @@ impl Plugin for LayoutEventsPlugin {
                 // sits in the active strip regardless of its real display.
                 (
                     super::window_frame::apply_window_frame_requests,
+                    super::tiled_visibility::release_detached,
                     display_viewport_changed,
                     layout_sizes_changed,
                     layout_strip_changed,
@@ -229,6 +235,7 @@ impl Plugin for LayoutEventsPlugin {
                     ensure_visible_in_strip,
                     position_layout_strips,
                     position_layout_windows,
+                    super::tiled_visibility::finish_restore,
                 )
                     .chain()
                     .after(super::systems::finish_setup)
@@ -1748,8 +1755,16 @@ fn position_layout_windows(
         );
     }
 
-    for (entity, window, layout_position, mut position, bounds, mut desired, mut presented) in
-        positioned_windows
+    for (
+        entity,
+        window,
+        layout_position,
+        mut position,
+        bounds,
+        mut desired,
+        mut presented,
+        parked,
+    ) in positioned_windows
     {
         let Some(context) = strip_contexts.get(&entity) else {
             continue;
@@ -1765,10 +1780,27 @@ fn position_layout_windows(
         let Ok(vertical_move_threshold) = u32::try_from(i64::from(viewport_size.y) * 8 / 10) else {
             continue;
         };
+        // Keep logical positions untouched: parking only replaces the physical
+        // projection, using the same sliver geometry as strip overflow.
+        let mut projection = *context;
+        let mut layout_origin = layout_position.0;
+        if let Some(parked) = parked {
+            projection.strip_position.x = 0;
+            projection.swiping = false;
+            let Some(x) = (match parked.side {
+                super::tiled_visibility::ParkingSide::Left => {
+                    viewport.min.x.checked_sub(bounds.0.x)
+                }
+                super::tiled_visibility::ParkingSide::Right => Some(viewport.max.x),
+            }) else {
+                continue;
+            };
+            layout_origin.x = x;
+        }
         let Some(frame) = projected_window_frame(
-            layout_position.0,
+            layout_origin,
             bounds.0,
-            *context,
+            projection,
             viewport,
             window.horizontal_padding(),
             &config,

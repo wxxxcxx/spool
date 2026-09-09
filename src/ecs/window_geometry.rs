@@ -149,6 +149,7 @@ type GeometryWindows<'w, 's> = Query<
         Without<LayoutStrip>,
         Without<WindowUnavailable>,
         Without<WindowSpaceReassignmentPending>,
+        Without<super::tiled_visibility::ParkedTile>,
     ),
 >;
 
@@ -258,6 +259,7 @@ type SettledWindows<'w, 's> = Query<
         Without<LayoutStrip>,
         Without<WindowUnavailable>,
         Without<WindowSpaceReassignmentPending>,
+        Without<super::tiled_visibility::ParkedTile>,
     ),
 >;
 

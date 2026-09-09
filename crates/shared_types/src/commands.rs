@@ -294,8 +294,10 @@ pub enum Operation {
     /// Focuses the other tiled/floating tier, raising it as part of focus.
     FocusOtherLayer,
     /// Focuses the next or previous window in the current tiled/floating tier.
-    /// Kept at the end so existing postcard discriminants remain stable.
+    /// Append new operations below this variant to preserve postcard discriminants.
     FocusStep(FocusStep),
+    /// Parks/restores the current Space's tiled windows at the screen edge.
+    ToggleTiledVisibility,
 }
 
 /// Defines operations that can be performed on the mouse.

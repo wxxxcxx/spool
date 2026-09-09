@@ -168,7 +168,25 @@ spool.bind("alt+shift+h", spool.action.window.move_west)
 spool.bind("alt+minus", spool.action.window.shrink_width)
 spool.bind("alt+equal", spool.action.window.grow_width)
 spool.bind("alt+s", spool.action.window.toggle_stack)
+spool.bind("alt+v", spool.action.window.toggle_tiled_visibility)
 ```
+
+`toggle_tiled_visibility` parks the current Space's tiled windows at the screen
+edge using the existing off-screen sliver projection. It does not minimize
+windows or hide their applications. Columns to the left/right of the focused
+tile park on the corresponding edge. The focused column (including its stacks
+and tabs) parks at the nearer edge, choosing left on a tie. With floating focus,
+the most recently focused eligible tile in this Space is the reference; with
+no tiled focus history, each window uses its nearer edge. Directions are captured
+when hiding and do not change with subsequent focus changes.
+A second invocation restores the windows
+parked by this action; columns, stacks and tab order remain in the layout.
+Floating windows, other Spaces, and windows already hidden or minimized are
+excluded. Windows opened afterward remain visible. Parked tiles are excluded
+from navigation and border/dim overlays. Closing or changing a parked window's
+layout ownership releases its parking state.
+
+The equivalent CLI action is `spool action window toggle tiled-visibility`.
 
 ### Spaces
 

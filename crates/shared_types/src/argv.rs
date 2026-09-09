@@ -146,6 +146,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "toggle" => match argument()? {
             "floating" => Operation::ToggleFloating,
             "stack" => Operation::ToggleStack,
+            "tiled-visibility" => Operation::ToggleTiledVisibility,
             _ => return Err(err()),
         },
         "equalize" => Operation::Equalize,
@@ -255,6 +256,7 @@ impl Operation {
             Operation::Snap => owned(&["snap"]),
             Operation::FocusFloating => owned(&["focus", "floating"]),
             Operation::FocusTiled => owned(&["focus", "tiled"]),
+            Operation::ToggleTiledVisibility => owned(&["toggle", "tiled-visibility"]),
         }
     }
 }
@@ -316,6 +318,7 @@ mod tests {
             Action::Quit,
             Action::Restart,
             Action::PrintState,
+            Action::Window(Operation::ToggleTiledVisibility),
             Action::ReconcileWindows,
             Action::MissionControl,
             Action::ShowDesktop,

@@ -15,6 +15,7 @@ mod session_restore;
 mod stacking;
 mod state;
 mod tabs;
+mod tiled_visibility;
 mod tiling;
 mod window_frame_architecture;
 mod window_policy;

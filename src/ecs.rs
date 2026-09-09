@@ -69,6 +69,7 @@ pub mod script_state;
 pub mod scroll;
 pub mod state;
 pub(crate) mod systems;
+pub(crate) mod tiled_visibility;
 pub(crate) mod topology;
 mod triggers;
 pub mod window_frame;
@@ -288,6 +289,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
 
 /// Registers all the event triggers for the window manager.
 pub fn register_triggers(app: &mut bevy::app::App) {
+    app.add_observer(tiled_visibility::added)
+        .add_observer(tiled_visibility::removed);
     app.add_systems(
         Update,
         (

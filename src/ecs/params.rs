@@ -307,11 +307,13 @@ pub struct Windows<'w, 's> {
     >,
     positions: WindowPlacements<'w, 's>,
     reassigned: ReassignedWindows<'w, 's>,
+    parked: Query<'w, 's, (), With<super::tiled_visibility::ParkedTile>>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct TrackedWindowState<'a> {
     floating: bool,
+    parked: bool,
     visibility: Option<&'a WindowVisibility>,
 }
 
@@ -325,7 +327,7 @@ impl<'a> TrackedWindowState<'a> {
     }
 
     pub fn is_visible(self) -> bool {
-        self.visibility.is_none()
+        self.visibility.is_none() && !self.parked
     }
 
     pub fn visibility(self) -> Option<&'a WindowVisibility> {
@@ -381,6 +383,7 @@ impl Windows<'_, '_> {
             entity,
             TrackedWindowState {
                 floating,
+                parked: self.parked.contains(entity),
                 visibility,
             },
         ))
@@ -473,7 +476,10 @@ impl Windows<'_, '_> {
         self.available
             .iter()
             .find_map(|(window, entity, _, floating, visibility)| {
-                (!floating && visibility.is_none() && window.id() == window_id)
+                (!floating
+                    && visibility.is_none()
+                    && !self.parked.contains(entity)
+                    && window.id() == window_id)
                     .then_some((window, entity))
             })
     }
@@ -492,7 +498,8 @@ impl Windows<'_, '_> {
         self.available
             .iter()
             .filter_map(|(window, entity, childof, floating, visibility)| {
-                (!floating && visibility.is_none()).then_some((window, entity, childof))
+                (!floating && visibility.is_none() && !self.parked.contains(entity))
+                    .then_some((window, entity, childof))
             })
     }
 

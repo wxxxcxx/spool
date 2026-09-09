@@ -135,6 +135,9 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
                 Operation::FocusFloating => commands.run_system_cached(command_focus_floating),
                 Operation::FocusTiled => commands.run_system_cached(command_focus_tiled),
                 Operation::FocusOtherLayer => commands.run_system_cached(command_focus_other_layer),
+                Operation::ToggleTiledVisibility => {
+                    commands.run_system_cached(crate::ecs::tiled_visibility::toggle);
+                }
             },
             Action::Mouse(MouseMove::ToNextDisplay) => {
                 commands.run_system_cached_with(focus_other_display, (None, DisplayTarget::Next));
@@ -706,7 +709,7 @@ fn command_move_focus(
     }
 }
 
-fn command_focus_floating(
+pub(crate) fn command_focus_floating(
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
@@ -731,10 +734,11 @@ fn command_focus_floating(
 
 fn command_focus_tiled(
     active_display: ActiveDisplay,
+    windows: Windows,
     focus: Res<FocusCoordinator>,
     mut commands: Commands,
 ) {
-    let active_strip = active_display.active_strip();
+    let active_strip = windows.navigable_strip(active_display.active_strip());
     let workspace_id = active_strip.id();
 
     let target = focus
@@ -761,7 +765,7 @@ fn command_focus_other_layer(
     mut commands: Commands,
 ) {
     let display_bounds = active_display.bounds();
-    let active_strip = active_display.active_strip();
+    let active_strip = &windows.navigable_strip(active_display.active_strip());
     let workspace_id = active_strip.id();
 
     let visible_floats =

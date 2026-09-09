@@ -177,6 +177,7 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
         ("focus_tiled", Operation::FocusTiled),
         ("focus_floating", Operation::FocusFloating),
         ("focus_other_layer", Operation::FocusOtherLayer),
+        ("toggle_tiled_visibility", Operation::ToggleTiledVisibility),
         ("move_west", Operation::Move(Direction::West)),
         ("move_east", Operation::Move(Direction::East)),
         ("move_north", Operation::Move(Direction::North)),
@@ -413,6 +414,7 @@ mod tests {
             spool.action.window.focus_next()
             spool.action.window.shrink_height()
             spool.action.window.balance()
+            spool.action.window.toggle_tiled_visibility()
             spool.action.space.move_window({ window_id = 42, space_id = 123, follow = false })
         ")
         .unwrap();
@@ -427,6 +429,7 @@ mod tests {
                     direction: ResizeDirection::Shrink,
                 }),
                 Action::Window(Operation::Balance),
+                Action::Window(Operation::ToggleTiledVisibility),
                 Action::MoveWindowToSpace {
                     window_id: 42,
                     space_id: 123,
