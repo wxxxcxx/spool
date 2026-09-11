@@ -41,6 +41,27 @@ const DRAG_RELEASE_GRACE: Duration = Duration::from_millis(250);
 /// blink, which is what makes a hovered control feel alive.
 const BREATH_PERIOD: f64 = 1.8;
 
+/// Which part of the pulse is animated. The animation's key is its key path, so
+/// adding and removing a pulse can never disagree about what to look for.
+const PULSE_SHADOW: &str = "shadowOpacity";
+const PULSE_OPACITY: &str = "opacity";
+const PULSE_SCALE: &str = "transform.scale";
+const PULSE_SCALE_Y: &str = "transform.scale.y";
+
+/// How a hovered control breathes.
+///
+/// `Pulse` lifts the halo vertically as well as brightening it, so the
+/// collapsed Bar looks like it is drawing breath; `Bloom` only brightens it.
+/// Both are Core Animation, so neither costs a main-thread frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Both mechanisms are kept: the prototype picks between them.
+enum Breath {
+    Bloom,
+    Pulse,
+}
+/// The mechanism the prototype settled on.
+const BREATH: Breath = Breath::Pulse;
+
 /// Width of the collapse handle at either end of the Bar.
 const END_ZONE: f64 = 24.0;
 /// Bottom-corner radius of the collapsed capsule / tab.
@@ -496,20 +517,22 @@ impl BarView {
     ///
     /// A shadow-only layer whose path is the collapsed shape, so the bloom hugs
     /// the capsule or the tab rather than a bounding box. It breathes only
-    /// while the pointer is on the collapsed Bar.
+    /// while the pointer is on the collapsed Bar, and it is anchored at the top
+    /// so a pulse grows downwards off the screen edge.
     fn sync_glow(&self) {
         let (collapsed, hovered, rect, radius, notched) = {
             let state = self.ivars().state.borrow();
             let panel = state.panel_rect();
             let notched = state.surface.notch;
+            let rect = super::placement::collapsed_rect(
+                (panel.width, panel.height),
+                notched,
+                state.hovered,
+            );
             (
                 state.chrome.progress() < 0.01,
                 state.hovered,
-                super::placement::collapsed_rect(
-                    (panel.width, panel.height),
-                    notched,
-                    state.hovered,
-                ),
+                rect,
                 if notched.is_some() {
                     CAPSULE_RADIUS
                 } else {
@@ -518,37 +541,50 @@ impl BarView {
                 notched.is_some(),
             )
         };
+        let view_height = self.bounds().size.height;
+        let parent = self.layer();
         let mut glow = self.ivars().glow.borrow_mut();
         let layer = glow.get_or_insert_with(|| {
             let layer = CALayer::new();
             layer.setShadowColor(Some(&NSColor::whiteColor().CGColor()));
             layer.setShadowOffset(NSSize::new(0.0, 0.0));
             layer.setShadowRadius(if notched { 9.0 } else { 6.0 });
+            // The anchor is the shape's top edge, so scaling grows it downwards
+            // from the screen edge and never lifts it off the top.
+            layer.setAnchorPoint(NSPoint::new(0.5, 0.0));
             layer.setOpacity(0.0);
-            if let Some(parent) = self.layer() {
+            if let Some(parent) = &parent {
                 parent.addSublayer(&layer);
             }
             layer
         });
-        layer.setFrame(ns_rect(rect));
-        {
-            let path = chrome_path(
-                rect,
-                radius,
-                if notched {
-                    super::placement::CAPSULE_FLARE
-                } else {
-                    0.0
-                },
-            );
-            layer.setShadowPath(Some(&path.CGPath()));
+        if let Some(parent) = &parent {
+            layer.setFrame(sublayer_rect(parent, view_height, rect));
         }
+        let path = chrome_path(
+            rect,
+            radius,
+            if notched {
+                super::placement::CAPSULE_FLARE
+            } else {
+                0.0
+            },
+        );
+        layer.setShadowPath(Some(&path.CGPath()));
         if collapsed && hovered {
-            breathe(layer, "shadowOpacity", 0.06, 0.4, BREATH_PERIOD);
-            breathe(layer, "transform.scale", 1.0, 1.05, BREATH_PERIOD);
+            breathe(layer, PULSE_SHADOW, 0.06, 0.4, BREATH_PERIOD);
+            if BREATH == Breath::Pulse {
+                breathe(
+                    layer,
+                    PULSE_SCALE_Y,
+                    1.0,
+                    breath_reach(rect.height),
+                    BREATH_PERIOD,
+                );
+            }
             layer.setOpacity(1.0);
         } else {
-            settle(&*layer, 0.0);
+            settle(layer);
         }
     }
 
@@ -557,28 +593,39 @@ impl BarView {
     /// symbol on top.
     fn sync_highlights(&self, controls: &[toolbar::ToolbarButton], origin: f64) {
         let hover_button = self.ivars().state.borrow().hover_button.clone();
+        let view_height = self.bounds().size.height;
+        let parent = self.layer();
         let mut highlights = self.ivars().highlights.borrow_mut();
         while highlights.len() < controls.len() {
             let layer = CALayer::new();
             layer.setBackgroundColor(Some(&NSColor::whiteColor().CGColor()));
             layer.setCornerRadius(6.0);
             layer.setOpacity(0.0);
-            if let Some(parent) = self.layer() {
+            if let Some(parent) = &parent {
                 parent.addSublayer(&layer);
             }
             highlights.push(layer);
         }
-        for (layer, control) in highlights.iter().zip(controls) {
+        for (index, layer) in highlights.iter().enumerate() {
+            let Some(control) = controls.get(index) else {
+                // A configuration change can take a button away; its highlight
+                // must not be left behind.
+                settle(layer);
+                continue;
+            };
             let rect = Rect {
                 x: control.rect.x + origin,
                 ..control.rect
             };
-            layer.setFrame(ns_rect(rect));
+            if let Some(parent) = &parent {
+                layer.setFrame(sublayer_rect(parent, view_height, rect));
+            }
             if hover_button.as_ref() == Some(&control.action) {
-                breathe(layer, "opacity", 0.07, 0.17, BREATH_PERIOD);
-                breathe(layer, "transform.scale", 1.0, 1.04, BREATH_PERIOD);
+                breathe(layer, PULSE_OPACITY, 0.07, 0.17, BREATH_PERIOD);
+                breathe(layer, PULSE_SCALE, 1.0, 1.04, BREATH_PERIOD);
+                layer.setOpacity(0.07);
             } else {
-                settle(layer, 0.0);
+                settle(layer);
             }
         }
     }
@@ -1268,11 +1315,32 @@ fn breathe(layer: &CALayer, key_path: &str, from: f64, to: f64, period: f64) {
 }
 
 /// Stops every pulse on a layer and rests it.
-fn settle(layer: &CALayer, opacity: f32) {
-    layer.removeAnimationForKey(&NSString::from_str("shadowOpacity"));
-    layer.removeAnimationForKey(&NSString::from_str("opacity"));
-    layer.removeAnimationForKey(&NSString::from_str("transform.scale"));
-    layer.setOpacity(opacity);
+fn settle(layer: &CALayer) {
+    for key in [PULSE_SHADOW, PULSE_OPACITY, PULSE_SCALE, PULSE_SCALE_Y] {
+        layer.removeAnimationForKey(&NSString::from_str(key));
+    }
+    layer.setOpacity(0.0);
+}
+
+/// Maps a viewport rect into a sublayer's own coordinate space.
+///
+/// A flipped view's layer is normally flipped with it, but that is the layer's
+/// business rather than the view's, so this asks instead of assuming.
+fn sublayer_rect(parent: &CALayer, height: f64, rect: Rect) -> NSRect {
+    if parent.isGeometryFlipped() {
+        ns_rect(rect)
+    } else {
+        NSRect::new(
+            NSPoint::new(rect.x, height - rect.y - rect.height),
+            NSSize::new(rect.width, rect.height),
+        )
+    }
+}
+
+/// How far a halo of this height can stretch without leaving the band: a
+/// six-point tab can afford to double, a menu-bar-height capsule cannot.
+fn breath_reach(height: f64) -> f64 {
+    (1.0 + 3.0 / height.max(1.0)).clamp(1.0, 1.35)
 }
 
 /// Sets the alpha every later drawing operation is composited with.

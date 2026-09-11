@@ -1,0 +1,480 @@
+<!doctype html>
+<!--
+  PROTOTYPE — throwaway. Not production code, no tests, no persistence.
+
+  Question: how should the bar's collapse/hover motion *feel*, and what shape
+  should the collapsed bar be on a notched vs a plain screen? The complaints:
+    - the collapse/expand transition stutters (a blurred NSPanel is moved and
+      resized every frame);
+    - the toolbar buttons look crude;
+    - hovering the buttons and the collapsed bar should "breathe";
+    - the notched collapsed shape should have an S-shaped side profile, and the
+      plain tab has no visible rounding at all;
+    - hovering the collapsed tab moves the rectangle.
+
+  Run: ./run.sh   (or: open index.html)
+  Keys: ←/→ preset · space collapse/expand · h force hover
+
+  Read it as three answers, not one:
+    1. SHAPE  — pick a notched shape and a plain shape (?sn=, ?sp=). Every
+                candidate is drawn twice: whole, and zoomed ~5x on its left end
+                so the fillets can actually be judged.
+    2. BREATH — pulse / bloom / heartbeat, plus period and amplitude.
+    3. MOTION — the collapse/expand curve and duration, with the curve plotted.
+
+  The URL always carries the current settings; send it back and its numbers are
+  what gets folded into src/bar/appkit.rs.
+
+  ALREADY IN THE CODE (shipped in 0d11101, so it is the baseline to compare
+  against rather than a question):
+    - the panel never moves: the chrome morphs inside a still menu-bar band, so
+      the transition no longer stutters. The prototype's morph timing is the
+      real one (240ms ease-out, from the frame on screen).
+    - the shape hangs from the top edge, so hover only grows it downwards.
+    - notched collapsed shape: concave shoulders (flare 9pt) + bottom radius
+      12pt — that is candidate B below. Plain tab: 120x6, bottom radius h/2.
+    - hover breathes via Core Animation: 1.8s, halo shadow opacity 0.06..0.4
+      plus a 5% scale, and a 0.07..0.17 highlight under the pointer's button.
+  STILL OPEN (what this page is for): which shape, which breathing mechanism,
+  and the period/amplitude/curve numbers.
+-->
+<meta charset="utf-8">
+<title>PROTOTYPE — bar polish</title>
+<style>
+  :root { --ink:#e8e8ea; --dim:#9a9aa2; --panel:#1b1b1f; --line:#33333a; --accent:#0a84ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 24px 100px; background:#101013; color:var(--ink);
+         font:13px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  h1 { font-size:15px; font-weight:600; margin:0 0 6px; }
+  h2 { font-size:12px; font-weight:600; margin:30px 0 10px; color:var(--dim);
+       text-transform:uppercase; letter-spacing:.08em; }
+  p.lede { margin:0 0 8px; color:var(--dim); max-width:80ch; }
+  code { font:11px/1.4 ui-monospace, "SF Mono", Menlo, monospace; color:#c8c8d0; }
+  b { font-weight:600; }
+
+  .grid { display:flex; flex-wrap:wrap; gap:20px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+          padding:14px; flex:1 1 400px; min-width:360px; }
+  .card h3 { margin:0 0 10px; font-size:12px; font-weight:600; color:var(--dim); }
+
+  .screen { position:relative; height:96px; border-radius:10px; overflow:hidden;
+            background:radial-gradient(120% 140% at 20% -20%, #2b3a55 0%, #171a24 55%, #0e1016 100%);
+            box-shadow:inset 0 0 0 1px #2a2a31; }
+  .notch { position:absolute; top:0; left:50%; transform:translateX(-50%); background:#000;
+           border-radius:0 0 5px 5px; z-index:3; }
+  .blur { position:absolute; top:0; left:0; right:0; background:rgba(8,8,10,.72);
+          -webkit-backdrop-filter:blur(18px) saturate(1.4); backdrop-filter:blur(18px) saturate(1.4);
+          display:flex; align-items:center; z-index:2; }
+  .shape { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:2; }
+  .hit { position:absolute; top:0; z-index:4; cursor:pointer; }
+  .spills { display:flex; align-items:center; gap:6px; padding:0 8px; }
+  .spill { height:16px; border-radius:4px; background:rgba(255,255,255,.08); }
+  .spill.on { background:rgba(10,132,255,.28); box-shadow:inset 0 0 0 1px rgba(10,132,255,.5); }
+  .tb { position:relative; display:grid; place-items:center; color:rgba(255,255,255,.9); }
+  .tb .hl { position:absolute; inset:0; border-radius:6px; background:#fff; opacity:0; }
+  .tb svg { position:relative; }
+
+  .row { display:flex; align-items:center; gap:10px; margin:9px 0 0; flex-wrap:wrap; }
+  .row label { color:var(--dim); min-width:76px; }
+  input[type=range] { width:150px; accent-color:var(--accent); }
+  select, button { background:#23232a; color:var(--ink); border:1px solid var(--line);
+                   border-radius:7px; padding:4px 8px; font:inherit; }
+  button:hover { background:#2c2c35; }
+  .readout { font:11px/1.6 ui-monospace, Menlo, monospace; color:#a9a9b4; margin-top:7px; }
+
+  .scale { display:flex; flex-wrap:wrap; gap:14px; }
+  .scale figure { margin:0; background:#141418; border:1px solid var(--line); border-radius:10px; padding:8px; }
+  .scale figcaption { font-size:11px; color:var(--ink); margin-top:8px; }
+  .scale figcaption span { color:var(--dim); }
+
+  #switcher { position:fixed; left:50%; bottom:18px; transform:translateX(-50%);
+              display:flex; align-items:center; gap:12px; background:#f4f4f6; color:#14141a;
+              border-radius:999px; padding:8px 14px; box-shadow:0 10px 30px rgba(0,0,0,.5);
+              z-index:99; font-weight:600; }
+  #switcher button { background:#e2e2e7; color:#14141a; border:0; border-radius:999px; width:28px; height:28px; font-size:15px; }
+  #switcher .key { font:11px ui-monospace, Menlo, monospace; color:#5b5b66; font-weight:400; }
+  #url { margin-top:10px; font:11px ui-monospace, Menlo, monospace; color:#7f7f8a; word-break:break-all; }
+</style>
+
+<h1>PROTOTYPE — bar 折叠/hover 动效打磨</h1>
+<p class="lede">
+  底部切换三组预设（<code>←/→</code>）。每个预设把「形状 + 呼吸方式 + 折叠曲线」打包成一种手感；
+  下面的形状标尺（整体 + <b>左端 5× 放大</b>）和滑杆可以逐项覆盖预设。<b>URL 实时反映当前设置</b>，
+  调好后把 URL 发回来。按键：<code>←/→</code> 预设 · <code>空格</code> 折叠/展开 · <code>h</code> 强制 hover。
+</p>
+
+<h2>1 · 形状候选 — 刘海屏（整体 / 左端 5×）</h2>
+<div class="scale" id="scaleN"></div>
+<h2>1b · 形状候选 — 普通屏（整体 / 左端 5×）</h2>
+<div class="scale" id="scaleP"></div>
+
+<h2>2 · 模拟屏幕（hover 看呼吸）</h2>
+<div class="grid">
+  <div class="card">
+    <h3>刘海屏 · 折叠态</h3>
+    <div class="screen" id="screenN">
+      <div class="notch" id="notchN"></div>
+      <div class="blur" id="blurN"></div>
+      <svg class="shape" id="svgN"></svg>
+      <div class="hit" id="hitN"></div>
+    </div>
+    <div class="readout" id="readN"></div>
+  </div>
+  <div class="card">
+    <h3>普通屏 · 折叠态</h3>
+    <div class="screen" id="screenP">
+      <div class="blur" id="blurP"></div>
+      <svg class="shape" id="svgP"></svg>
+      <div class="hit" id="hitP"></div>
+    </div>
+    <div class="readout" id="readP"></div>
+  </div>
+</div>
+
+<h2>3 · 工具栏按钮（2× 放大，hover 它们）</h2>
+<div class="grid">
+  <div class="card">
+    <h3>新 — 符号按 point size / weight 渲染，圆角呼吸高亮</h3>
+    <div class="screen" id="screenX" style="height:64px"></div>
+  </div>
+  <div class="card">
+    <h3>旧 — 24pt 拉伸图标 + bezel 边框（现在代码里的样子）</h3>
+    <div class="screen" id="screenO" style="height:64px"></div>
+  </div>
+</div>
+
+<h2>4 · 参数</h2>
+<div class="card">
+  <div class="row"><label>刘海形状</label><select id="selN"></select>
+    <label>普通屏形状</label><select id="selP"></select></div>
+  <div class="row"><label>呼吸方式</label><select id="selB"></select>
+    <label>折叠曲线</label><select id="selC"></select></div>
+  <div class="row"><label>呼吸周期</label><input type="range" id="rngPeriod" min="900" max="3000" step="50">
+    <span class="readout" id="outPeriod"></span></div>
+  <div class="row"><label>呼吸幅度</label><input type="range" id="rngAmp" min="0" max="4" step="0.1">
+    <span class="readout" id="outAmp"></span></div>
+  <div class="row"><button id="btnPlay">播放折叠 / 展开</button><button id="btnReset">恢复预设默认</button></div>
+  <svg id="curve" width="260" height="86" style="margin-top:12px"></svg>
+  <div id="url"></div>
+</div>
+
+<div id="switcher">
+  <button id="prev">‹</button><span id="label">A —</span><button id="next">›</button>
+  <span class="key">←/→ · space · h</span>
+</div>
+
+<script>
+// ── settings ────────────────────────────────────────────────────────────────
+const SHAPES = {
+  bottom:  'A · 平头，仅下部圆角',
+  sfillet: 'B · S 形侧影：上部内凹扩散 + 下部外圆角',
+  capsule: 'C · 全圆角胶囊，悬浮离顶边',
+  shoulder:'D · 四角大圆角，贴顶边',
+};
+const PLAIN_SHAPES = {
+  square: 'A · 直角',
+  r3:     'B · 圆角 3pt',
+  r5:     'C · 圆角 5pt',
+  capsule:'D · 半高圆角（胶囊）',
+};
+const BREATHS = {
+  pulse:     'pulse — 形状自身轻微起伏',
+  bloom:     'bloom — 形状不动，光晕呼吸',
+  heartbeat: 'heartbeat — 双拍心跳（快进慢出）',
+  none:      'none — 只有一次性 hover 反馈',
+};
+const CURVES = {
+  ease:   '240ms ease-out（现状）',
+  spring: '320ms 弹簧，轻微过冲',
+  smooth: '420ms Apple smooth（无过冲）',
+};
+const PRESETS = {
+  A: { name:'Notch extension',   sn:'sfillet',  sp:'r5',      br:'pulse',     cv:'spring', period:1800, amp:1.6 },
+  B: { name:'Floating capsule',  sn:'capsule',  sp:'capsule', br:'bloom',     cv:'smooth', period:2200, amp:2.2 },
+  C: { name:'Heartbeat tab',     sn:'shoulder', sp:'r3',      br:'heartbeat', cv:'ease',   period:1500, amp:1.2 },
+};
+const DURATION = { ease:240, spring:320, smooth:420 };
+
+const q = new URLSearchParams(location.search);
+const S = {
+  preset: (q.get('variant') || 'A').toUpperCase(),
+  sn: q.get('sn'), sp: q.get('sp'), br: q.get('br'), cv: q.get('cv'),
+  period: q.get('period') ? +q.get('period') : null,
+  amp: q.get('amp') ? +q.get('amp') : null,
+  collapsed: q.get('state') !== 'expanded',
+  hover: q.get('hover') === '1',
+};
+if (!PRESETS[S.preset]) S.preset = 'A';
+function eff() {
+  const p = PRESETS[S.preset];
+  return { sn:S.sn||p.sn, sp:S.sp||p.sp, br:S.br||p.br, cv:S.cv||p.cv,
+           period:S.period ?? p.period, amp:S.amp ?? p.amp };
+}
+
+// ── curves ──────────────────────────────────────────────────────────────────
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+const smooth  = t => t * t * (3 - 2 * t);
+const spring  = t => 1 - Math.pow(1 - t, 3) * Math.cos(t * Math.PI * 1.35);
+const FN = { ease:easeOut, spring, smooth };
+const curveAt = (which, t) => FN[which](Math.min(Math.max(t, 0), 1));
+
+// ── geometry (mock points, 1:1 with the real bar) ───────────────────────────
+const NOTCH = { w:190, h:30 };   // a 1470pt screen's cutout, scaled to the mock
+const MARGIN = 26;               // black region extends this far past the cutout
+const BAND = 30;                 // menu-bar band height
+const PLAIN = { w:150, rest:9, hover:12 };
+const FLARE = 9;                 // concave top fillet of the S profile
+const RADIUS = 8;                // bottom fillet
+
+function shape(which, { x, w, h }) {
+  const r = RADIUS, f = FLARE;
+  switch (which) {
+    case 'bottom':
+      return `M${x},0 H${x+w} V${h-r} A${r},${r} 0 0 1 ${x+w-r},${h} H${x+r} A${r},${r} 0 0 1 ${x},${h-r} Z`;
+    case 'sfillet':
+      // concave shoulder at the screen edge, convex bottom: an S in profile
+      return `M${x-f},0 A${f},${f} 0 0 0 ${x},${f} V${h-r} A${r},${r} 0 0 1 ${x+r},${h} H${x+w-r} A${r},${r} 0 0 1 ${x+w},${h-r} V${f} A${f},${f} 0 0 0 ${x+w+f},0 Z`;
+    case 'capsule': {
+      const g = 3, rr = h / 2, y = g;
+      return `M${x+rr},${y} H${x+w-rr} A${rr},${rr} 0 0 1 ${x+w-rr},${y+h} H${x+rr} A${rr},${rr} 0 0 1 ${x+rr},${y} Z`;
+    }
+    case 'shoulder': {
+      const R = Math.min(12, w / 2);
+      return `M${x},0 V${h-R} A${R},${R} 0 0 0 ${x+R},${h} H${x+w-R} A${R},${R} 0 0 0 ${x+w},${h-R} V0 Z`;
+    }
+    default: return '';
+  }
+}
+function plainShape(which, { x, w, h }) {
+  switch (which) {
+    case 'square': return `M${x},0 H${x+w} V${h} H${x} Z`;
+    case 'capsule': { const r = h/2;
+      return `M${x+r},0 H${x+w-r} A${r},${r} 0 0 1 ${x+w-r},${h} H${x+r} A${r},${r} 0 0 1 ${x+r},0 Z`; }
+    case 'r3': return `M${x},0 H${x+w} V${h-3} A3,3 0 0 1 ${x+w-3},${h} H${x+3} A3,3 0 0 1 ${x},${h-3} Z`;
+    default:   return `M${x},0 H${x+w} V${h-5} A5,5 0 0 1 ${x+w-5},${h} H${x+5} A5,5 0 0 1 ${x},${h-5} Z`;
+  }
+}
+
+// ── DOM helpers ─────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const ICON_A = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linejoin="round">
+  <rect x="1.3" y="2.3" width="5.9" height="4.5" rx="1.2"/><rect x="8.8" y="2.3" width="5.9" height="4.5" rx="1.2"/>
+  <rect x="1.3" y="9.2" width="5.9" height="4.5" rx="1.2"/><rect x="8.8" y="9.2" width="5.9" height="4.5" rx="1.2"/></svg>`;
+const ICON_B = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linejoin="round">
+  <rect x="2" y="1.8" width="12" height="7" rx="1.4"/><path d="M2.6 11.4h10.8"/><path d="M2 14.2h12"/></svg>`;
+function spills(n, active) {
+  let out = '';
+  for (let i = 0; i < n; i++) out += `<span class="spill ${i===active?'on':''}" style="width:${i===active?34:22}px"></span>`;
+  return out;
+}
+
+// ── the mock ────────────────────────────────────────────────────────────────
+const view = { collapsed:S.collapsed, hover:{n:S.hover,p:S.hover,x:S.hover}, progress:S.collapsed?0:1,
+               from:S.collapsed?0:1, started:performance.now(), tb:S.hover ? 0 : null };
+
+function morph(now) {
+  const cfg = eff(), dur = DURATION[cfg.cv];
+  const target = view.collapsed ? 0 : 1;
+  const k = Math.min((now - view.started) / dur, 1);
+  view.progress = view.from + (target - view.from) * curveAt(cfg.cv, k);
+  if (k >= 1) view.from = view.progress;
+}
+const breathe = (now, period) => (Math.sin((now / period) * Math.PI * 2) + 1) / 2;
+
+function draw(now) {
+  const cfg = eff(), bt = breathe(now, cfg.period), p = Math.max(view.progress, 0.001);
+  const rise = t => cfg.br === 'pulse' ? cfg.amp * t
+                 : cfg.br === 'heartbeat' ? cfg.amp * Math.pow(t, 2.6) : 0;
+  const glow = on => cfg.br === 'bloom' ? 0.10 + 0.18 * bt : on ? 0.08 + 0.07 * bt : 0;
+
+  // ── notched: the band keeps its height, only the width morphs ──
+  {
+    const sW = $('screenN').clientWidth;
+    const capW = NOTCH.w + MARGIN * 2;
+    const w = capW + (sW - capW) * p;
+    const x = (sW - w) / 2;
+    const h = BAND + (p < 0.02 ? rise(bt) : 0);
+    const d = shape(cfg.sn, { x, w, h });
+    const g = glow(view.hover.n && p < 0.5);
+    $('svgN').innerHTML = `
+      <defs><filter id="gN" x="-40%" y="-80%" width="180%" height="260%">
+        <feGaussianBlur stdDeviation="6" result="b"/>
+        <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+      <path d="${d}" fill="#000" ${g?`filter="url(#gN)"`:''} opacity="${(0.9 + g).toFixed(3)}"/>
+      <path d="${d}" fill="none" stroke="rgba(255,255,255,${(0.05 + (view.hover.n?0.16*(0.35+0.65*bt):0)).toFixed(3)})"/>`;
+    const f = p * p;
+    const blur = $('blurN');
+    blur.style.cssText = `position:absolute;top:0;left:0;right:0;height:${BAND}px;background:rgba(8,8,10,.72);backdrop-filter:blur(18px) saturate(1.4);display:flex;align-items:center;opacity:${f.toFixed(3)};z-index:2;`;
+    blur.innerHTML = `<div class="spills">${spills(4, 1)}</div>`;
+    $('hitN').style.cssText = `left:${x-FLARE}px;width:${w+FLARE*2}px;height:${BAND+Math.max(rise(1),0)}px`;
+    $('readN').innerHTML = `shape=<b>${cfg.sn}</b> · capW=<b>${capW}</b>pt · h=<b>${h.toFixed(1)}</b>pt · hover=<b>${view.hover.n}</b> · breath=<b>${cfg.br}</b> · phase=<b>${bt.toFixed(2)}</b>`;
+  }
+
+  // ── plain: the height morphs from the band to the tab ──
+  {
+    const sW = $('screenP').clientWidth;
+    const w = PLAIN.w + (sW - PLAIN.w) * p;
+    const x = (sW - w) / 2;
+    const rest = view.hover.p ? PLAIN.hover : PLAIN.rest;
+    const h = rest + (BAND - rest) * p + (p < 0.02 ? rise(bt) : 0);
+    const d = plainShape(cfg.sp, { x, w, h });
+    const g = glow(view.hover.p && p < 0.5);
+    $('svgP').innerHTML = `
+      <defs><filter id="gP" x="-40%" y="-80%" width="180%" height="260%">
+        <feGaussianBlur stdDeviation="5" result="b"/>
+        <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+      <path d="${d}" fill="#000" ${g?`filter="url(#gP)"`:''}
+        opacity="${((cfg.br==='heartbeat'?0.7+0.3*Math.pow(bt,2.6):0.92) + g).toFixed(3)}"/>`;
+    const f = p * p;
+    const blur = $('blurP');
+    blur.style.cssText = `position:absolute;top:0;left:0;right:0;height:${BAND}px;background:rgba(8,8,10,.72);backdrop-filter:blur(18px) saturate(1.4);display:flex;align-items:center;opacity:${f.toFixed(3)};z-index:2;`;
+    blur.innerHTML = `<div class="spills">${spills(4, 1)}</div>`;
+    $('hitP').style.cssText = `left:${x}px;width:${w}px;height:${Math.max(PLAIN.hover + cfg.amp, 12)}px`;
+    $('readP').innerHTML = `shape=<b>${cfg.sp}</b> · resting=<b>${rest}</b>pt · h=<b>${h.toFixed(1)}</b>pt · hover=<b>${view.hover.p}</b> · phase=<b>${bt.toFixed(2)}</b>`;
+  }
+
+  // ── toolbar hover highlight (2x mock) ──
+  document.querySelectorAll('#screenX .tb').forEach((el, i) => {
+    const on = view.hover.x && view.tb === i;
+    const k = on ? (0.5 + 0.5 * Math.sin(now / 850 - Math.PI / 2)) : 0;
+    const hl = el.querySelector('.hl');
+    hl.style.opacity = (on ? 0.09 + 0.11 * k : 0).toFixed(3);
+    hl.style.transform = `scale(${(1 + 0.05 * k).toFixed(3)})`;
+    el.querySelector('svg').style.transform = `scale(${(on ? 1 + 0.05 * k : 1).toFixed(3)})`;
+    el.querySelector('svg').style.transition = 'transform 90ms linear';
+  });
+
+  $('url').textContent = location.href;
+}
+
+// ── shape scale with 5x insets ──────────────────────────────────────────────
+function buildScale() {
+  const cfg = eff();
+  const mk = (label, key, kind) => {
+    const W = 238, H = 50;                       // shape space is 260 x 46/18
+    const w = kind === 'n' ? NOTCH.w + MARGIN * 2 : PLAIN.w;
+    const x = (260 - w) / 2;
+    const h = kind === 'n' ? BAND : (key === 'capsule' ? 14 : 10);
+    const d = kind === 'n' ? shape(key, { x, w, h }) : plainShape(key, { x, w, h });
+    const notch = kind === 'n'
+      ? `<rect x="${(260-NOTCH.w)/2}" y="0" width="${NOTCH.w}" height="${NOTCH.h}" fill="#000"/>` : '';
+    const cropX = x - 10, cropW = 46;            // left end at ~5x
+    return `<figure>
+      <svg width="${W}" height="${H}" viewBox="0 0 260 ${kind==='n'?46:18}" preserveAspectRatio="none">
+        <rect x="0" y="0" width="260" height="${kind==='n'?46:18}" fill="#1a2130"/>
+        ${notch}<path d="${d}" fill="#000"/><path d="${d}" fill="none" stroke="rgba(255,255,255,.16)"/></svg>
+      <svg width="${W}" height="112" viewBox="${cropX} 0 ${cropW} ${kind==='n'?26:18}" preserveAspectRatio="none">
+        <rect x="${cropX - 40}" y="0" width="140" height="${kind==='n'?26:18}" fill="#1a2130"/>
+        ${kind==='n'?`<rect x="${(260-NOTCH.w)/2}" y="0" width="${NOTCH.w}" height="${NOTCH.h}" fill="#000"/>`:''}
+        <path d="${d}" fill="#000"/><path d="${d}" fill="none" stroke="rgba(255,255,255,.16)"/></svg>
+      <figcaption>${label} <span>· 左端 5×</span></figcaption></figure>`;
+  };
+  $('scaleN').innerHTML = Object.keys(SHAPES).map(k => mk(SHAPES[k], k, 'n')).join('');
+  $('scaleP').innerHTML = Object.keys(PLAIN_SHAPES).map(k => mk(PLAIN_SHAPES[k], k, 'p')).join('');
+}
+
+// ── toolbar mocks (2x) ──────────────────────────────────────────────────────
+function buildToolbars() {
+  const bar = (inner, style) => `<div class="blur" style="${style}">${inner}</div>`;
+  const cells = (icon, size, stroke) => `
+    <span class="tb" style="width:${size}px;height:${size}px;flex:0 0 ${size}px">
+      <span class="hl" style="border-radius:${Math.round(size/4)}px"></span>
+      <svg width="${size-6}" height="${size-6}" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+           stroke-width="${stroke}" stroke-linejoin="round">${icon}</svg></span>`;
+  const A = `<rect x="1.3" y="2.3" width="5.9" height="4.5" rx="1.2"/><rect x="8.8" y="2.3" width="5.9" height="4.5" rx="1.2"/>
+             <rect x="1.3" y="9.2" width="5.9" height="4.5" rx="1.2"/><rect x="8.8" y="9.2" width="5.9" height="4.5" rx="1.2"/>`;
+  const B = `<rect x="2" y="1.8" width="12" height="7" rx="1.4"/><path d="M2.6 11.4h10.8"/><path d="M2 14.2h12"/>`;
+  $('screenX').innerHTML = bar(
+    `<div style="display:flex;align-items:center;gap:20px;padding:0 20px">
+       ${cells(A, 44, 1.15)}${cells(B, 44, 1.15)}<span style="width:24px"></span>${spills(4,1)}</div>`,
+    'top:0;left:0;right:0;height:60px;opacity:1;z-index:2;border-radius:0');
+  $('screenO').innerHTML = bar(
+    `<div style="display:flex;align-items:center;gap:16px;padding:0 16px;color:rgba(255,255,255,.7)">
+       <span class="tb" style="width:48px;height:48px;flex:0 0 48px">
+         <svg width="44" height="44" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round">${A}</svg>
+         <span style="position:absolute;inset:2px;border:1px solid rgba(255,255,255,.35);border-radius:5px"></span></span>
+       <span class="tb" style="width:48px;height:48px;flex:0 0 48px">
+         <svg width="44" height="44" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round">${B}</svg>
+         <span style="position:absolute;inset:2px;border:1px solid rgba(255,255,255,.35);border-radius:5px"></span></span>
+       <span style="width:16px"></span><div class="spills">${spills(4,1)}</div></div>`,
+    'top:0;left:0;right:0;height:60px;opacity:1;z-index:2;border-radius:0;color:rgba(255,255,255,.7)');
+  document.querySelectorAll('#screenX .tb').forEach((el, i) => {
+    el.style.pointerEvents = 'auto';
+    el.addEventListener('mouseenter', () => { view.hover.x = true; view.tb = i; });
+    el.addEventListener('mouseleave', () => { view.tb = null; });
+  });
+}
+
+// ── controls ────────────────────────────────────────────────────────────────
+function fillSelect(el, map, value) {
+  el.innerHTML = Object.keys(map).map(k => `<option value="${k}" ${k===value?'selected':''}>${map[k]}</option>`).join('');
+}
+function drawCurve(cv) {
+  const svg = $('curve'), W = 260, H = 86, pad = 8;
+  let d = `M${pad},${H-pad}`;
+  for (let i = 0; i <= 80; i++) {
+    const t = i / 80, v = curveAt(cv, t);
+    d += ` L${(pad + t*(W-pad*2)).toFixed(1)},${(H-pad-v*(H-pad*2)*0.9).toFixed(1)}`;
+  }
+  svg.innerHTML = `<rect width="${W}" height="${H}" rx="8" fill="#17171c"/>
+    <path d="${d}" fill="none" stroke="#0a84ff" stroke-width="1.5"/>
+    <text x="${pad}" y="${H-2}" fill="#7f7f8a" font-size="9">${CURVES[cv]} · ${DURATION[cv]}ms</text>`;
+}
+function syncURL() {
+  const cfg = eff(), u = new URL(location.href);
+  u.searchParams.set('variant', S.preset);
+  u.searchParams.set('sn', cfg.sn); u.searchParams.set('sp', cfg.sp);
+  u.searchParams.set('br', cfg.br); u.searchParams.set('cv', cfg.cv);
+  u.searchParams.set('period', cfg.period); u.searchParams.set('amp', cfg.amp);
+  u.searchParams.set('state', view.collapsed ? 'collapsed' : 'expanded');
+  history.replaceState(null, '', u);
+}
+function refreshControls() {
+  const cfg = eff();
+  fillSelect($('selN'), SHAPES, cfg.sn);
+  fillSelect($('selP'), PLAIN_SHAPES, cfg.sp);
+  fillSelect($('selB'), BREATHS, cfg.br);
+  fillSelect($('selC'), CURVES, cfg.cv);
+  $('rngPeriod').value = cfg.period; $('outPeriod').textContent = cfg.period + 'ms';
+  $('rngAmp').value = cfg.amp; $('outAmp').textContent = cfg.amp.toFixed(1) + 'pt';
+  $('label').textContent = `${S.preset} — ${PRESETS[S.preset].name}`;
+  drawCurve(cfg.cv);
+  buildScale();
+}
+function play() { view.collapsed = !view.collapsed; view.from = view.progress; view.started = performance.now(); syncURL(); }
+function setPreset(k) {
+  S.preset = k; S.sn = S.sp = S.br = S.cv = null; S.period = S.amp = null;
+  view.collapsed = k !== 'A';
+  view.from = view.progress; view.started = performance.now();
+  refreshControls(); syncURL();
+}
+$('selN').onchange = e => { S.sn = e.target.value; refreshControls(); syncURL(); };
+$('selP').onchange = e => { S.sp = e.target.value; refreshControls(); syncURL(); };
+$('selB').onchange = e => { S.br = e.target.value; refreshControls(); syncURL(); };
+$('selC').onchange = e => { S.cv = e.target.value; refreshControls(); view.from = view.progress; view.started = performance.now(); syncURL(); };
+$('rngPeriod').oninput = e => { S.period = +e.target.value; refreshControls(); syncURL(); };
+$('rngAmp').oninput = e => { S.amp = +e.target.value; refreshControls(); syncURL(); };
+$('btnPlay').onclick = play;
+$('btnReset').onclick = () => { S.sn = S.sp = S.br = S.cv = null; S.period = S.amp = null; refreshControls(); syncURL(); };
+$('prev').onclick = () => setPreset({ A:'C', B:'A', C:'B' }[S.preset]);
+$('next').onclick = () => setPreset({ A:'B', B:'C', C:'A' }[S.preset]);
+
+for (const [id, key] of [['hitN','n'], ['hitP','p']]) {
+  const el = $(id);
+  el.addEventListener('mouseenter', () => { view.hover[key] = true; });
+  el.addEventListener('mouseleave', () => { view.hover[key] = false; });
+  el.addEventListener('click', play);
+}
+addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight') setPreset({ A:'B', B:'C', C:'A' }[S.preset]);
+  else if (e.key === 'ArrowLeft') setPreset({ A:'C', B:'A', C:'B' }[S.preset]);
+  else if (e.key === ' ') { e.preventDefault(); play(); }
+  else if (e.key === 'h') { view.hover.n = view.hover.p = !view.hover.n; }
+});
+
+$('notchN').style.cssText = `position:absolute;top:0;left:50%;transform:translateX(-50%);width:${NOTCH.w}px;height:${NOTCH.h}px;background:#000;border-radius:0 0 5px 5px;z-index:3;`;
+buildToolbars();
+refreshControls();
+
+requestAnimationFrame(function frame(now) { morph(now); draw(now); requestAnimationFrame(frame); });
+</script>

@@ -70,6 +70,27 @@ menus and status items, which is why the Bar takes that space instead.
   Animation layers rather than per-frame drawing: pulsing them from the frame
   loop would mean running the whole ECS at refresh rate, which costs about 45%
   of a core to animate a highlight.
+- The pulse's mechanism is one constant, `BREATH`: `Pulse` lifts the halo
+  vertically as well as brightening it, `Bloom` only brightens it. The reach is
+  derived from the shape's height, so a halo never stretches out of the band.
+
+### Tuning the feel
+
+`examples/bar_polish_prototype` (kept on the throwaway `prototype/bar-polish`
+branch, with a copy in the working tree) is the primary source for the shape
+and motion exploration; it renders every candidate and carries its settings in
+the URL. Its vocabulary maps onto the code like this:
+
+| Prototype | Code |
+| --- | --- |
+| `sn=sfillet` | `placement::CAPSULE_FLARE` > 0 |
+| `sn=bottom` / `sn=shoulder` | `CAPSULE_FLARE` = 0, with `CAPSULE_RADIUS` raised |
+| `sn=capsule` | a gap under the shape, i.e. `collapsed_rect` returning a `y > 0` |
+| `sp=r3` / `r5` / `capsule` | the plain tab's bottom radius in `chrome_path` |
+| `br=bloom` / `pulse` | `BREATH` |
+| `br=heartbeat` | the pulse's two halves given different curves |
+| `period`, `amp` | `BREATH_PERIOD`, and the range passed to `breathe` |
+| `cv=ease` / `spring` / `smooth` | `motion::DURATION` and `motion::ease_out` |
 - Every Space keeps a slot: the strip never scrolls, and no Space is dropped to
   make room. The focused Space takes whatever the others leave, up to its own
   content width; the rest keep the narrowest slot that still reads as that Space
