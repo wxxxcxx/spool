@@ -12,6 +12,7 @@ use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::topology::NativeTopology;
 use crate::ecs::{Initializing, MissionControlActive, NativeFullscreenMarker, Scrolling};
+use crate::manager::WindowManager;
 
 type PendingGeometry = Or<(
     With<crate::ecs::WindowFrameMotion>,
@@ -40,6 +41,7 @@ pub(super) struct TiledStacking<'w, 's> {
     active: ActiveDisplay<'w, 's>,
     topology: Res<'w, NativeTopology>,
     mission_control: Res<'w, MissionControlActive>,
+    window_manager: Res<'w, WindowManager>,
     initializing: Option<Res<'w, Initializing>>,
     exiting: Option<Res<'w, ExitInProgress>>,
     fullscreen: Query<'w, 's, (), With<NativeFullscreenMarker>>,
@@ -95,6 +97,25 @@ impl TiledStacking<'_, '_> {
         }
     }
 
+    /// Whether `WindowServer` already stacks the plan from bottom to top.
+    ///
+    /// `None` means the native order is unavailable or one of the plan's windows
+    /// is missing from it, in which case the caller must not skip the repair.
+    /// Front-to-back rank decreases as the desired order climbs, so a correct
+    /// native stacking is strictly decreasing along `bottom_to_top`.
+    fn native_order_matches(&self, plan: &StackingPlan) -> Option<bool> {
+        let order = self.window_manager.window_order_in_session()?;
+        let ranks = plan
+            .bottom_to_top
+            .iter()
+            .map(|&entity| {
+                let id = self.windows.get(entity)?.id();
+                order.iter().position(|(window_id, _)| *window_id == id)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(ranks.windows(2).all(|pair| pair[0] > pair[1]))
+    }
+
     pub(super) fn raise_strip(&self, focus: Entity, state: &mut TiledStackingState, force: bool) {
         let Some(mut plan) = self.plan(focus) else {
             state.last_requested = None;
@@ -120,6 +141,16 @@ impl TiledStacking<'_, '_> {
             return;
         }
         if plan.bottom_to_top.is_empty() {
+            state.last_requested = Some(plan);
+            return;
+        }
+        // `AXRaise` also rewrites the target application's key and main window,
+        // and can lift a background surface above the front application. When
+        // `WindowServer` already stacks the plan correctly, raising again would
+        // only pay those side effects, so record the plan and leave it alone.
+        if !force && self.native_order_matches(&plan) == Some(true) {
+            debug!(target: "spool::focus_diagnostics", space_id = self.active.active_strip().id(),
+                "tiled_stacking_already_correct");
             state.last_requested = Some(plan);
             return;
         }

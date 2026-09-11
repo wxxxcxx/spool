@@ -128,6 +128,7 @@ struct MockStateInner {
     focus_requests: Vec<WinID>,
     raise_requests: Vec<WinID>,
     window_server_inventory_available: bool,
+    window_order_in_session: Option<Vec<(WinID, Pid)>>,
     presentation_inventory_available: bool,
     window_server_inventory_omissions: HashSet<WinID>,
     workspace_membership_scripts:
@@ -200,6 +201,7 @@ impl MockState {
                 focus_requests: Vec::new(),
                 raise_requests: Vec::new(),
                 window_server_inventory_available: true,
+                window_order_in_session: None,
                 presentation_inventory_available: true,
                 window_server_inventory_omissions: HashSet::new(),
                 workspace_membership_scripts: HashMap::new(),
@@ -562,6 +564,10 @@ impl MockState {
 
     pub fn set_window_server_inventory_available(&self, available: bool) {
         self.inner.force_write().window_server_inventory_available = available;
+    }
+
+    pub(crate) fn set_window_order_in_session(&self, order: Vec<(WinID, Pid)>) {
+        self.inner.force_write().window_order_in_session = Some(order);
     }
 
     pub fn set_presentation_inventory_available(&self, available: bool) {
@@ -1593,6 +1599,9 @@ impl MockState {
     }
 
     fn mock_window_server_inventory(&self, wm: &mut MockWindowManagerApi) {
+        let state = self.clone();
+        wm.expect_window_order_in_session()
+            .returning(move || state.inner.force_read().window_order_in_session.clone());
         let s = self.clone();
         wm.expect_window_owners_in_session().returning(move || {
             let inner = s.inner.force_read();

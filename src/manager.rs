@@ -371,6 +371,13 @@ pub trait WindowManagerApi: Send + Sync {
     /// its owning process, including off-screen and minimized windows.
     fn window_owners_in_session(&self) -> Option<HashMap<WinID, Pid>>;
 
+    /// Current GUI session windows in `WindowServer` front-to-back order.
+    ///
+    /// Off-screen windows keep their relative position only loosely, so callers
+    /// may compare ranks of presented windows but must not treat an invisible
+    /// window as frontmost. `None` means the list is unavailable.
+    fn window_order_in_session(&self) -> Option<Vec<(WinID, Pid)>>;
+
     /// Refreshes the per-window `WindowServer` notification subscription.
     fn request_window_notifications(&self, window_ids: &[WinID]) -> Result<()>;
 }
@@ -851,6 +858,15 @@ impl WindowManagerApi for WindowManagerOS {
         )
     }
 
+    fn window_order_in_session(&self) -> Option<Vec<(WinID, Pid)>> {
+        // Only presented windows have a trustworthy relative position. `OptionAll`
+        // keeps minimized and off-Space windows in the list, where the measurement
+        // on macOS 26.6.2 places them ahead of every visible window.
+        window_order_matching(
+            CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        )
+    }
+
     fn request_window_notifications(&self, window_ids: &[WinID]) -> Result<()> {
         if crate::platform::macos_major_version() < 15 {
             return Ok(());
@@ -872,6 +888,10 @@ impl WindowManagerApi for WindowManagerOS {
 }
 
 fn window_owners_matching(options: CGWindowListOption) -> Option<HashMap<WinID, Pid>> {
+    window_order_matching(options).map(|windows| windows.into_iter().collect())
+}
+
+fn window_order_matching(options: CGWindowListOption) -> Option<Vec<(WinID, Pid)>> {
     CGWindowListCopyWindowInfo(options, kCGNullWindowID).map(|window_info| {
         let array = unsafe { window_info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
         array

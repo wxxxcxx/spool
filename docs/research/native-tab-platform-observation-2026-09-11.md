@@ -80,6 +80,32 @@ Mission Control、其他Space与显式抬升覆盖。尚未用最终构建实机
 应用这个例外。连续四次tab身份往返的回归断言同一entity及零raise请求。
 这是代码反馈路径的验证，红绿灯的修复后实机表现仍待重启最终构建复测。
 
+**2026-09-11 晚补充：**上段的“应用级激活副作用”已由实测确认，且直接
+排序路线被排除。对后台应用窗口执行 `AXRaise` 时前台应用不变，但目标
+应用自身的 `AXFocusedWindow` 与 `AXMainWindow` 会被改写；`SLSOrderWindow`
+在普通进程里对第三方窗口返回 `1000`、对自有窗口的 `above/below` 是返回
+`0` 的静默 no-op，只有 Dock scripting addition（需部分关闭 SIP）才可用。
+完整证据与结论见 [sls-order-window-research.md](sls-order-window-research.md)。
+
+据此，`window_order_in_session` 不再只是查询接口：`TiledStacking::raise_strip`
+在自动修正前读取已呈现窗口的 `WindowServer` 前后顺序，顺序与计划一致时
+整轮跳过 `AXRaise`（顺序不可用或不完整时回退到抬升），显式整层抬升不受
+影响。原来的 `window_order_in_session` 只有 trait、mock 与回归测试，没有
+消费者，回归因此是红的；消费者补齐后该回归通过。
+
+**实机复测（2026-09-11 22:40，macOS 26.6.2）：**重启到含该检查的构建后，
+在两个 Finder 窗口之间往返切换 15 次，日志中每次只出现
+`tiled_stacking_already_correct`，`tiled_stacking_requested_bottom_to_top`
+与 `tiled_stacking_completed`（含 `raise_us`）均为 0 次；用户确认红绿灯
+闪烁与 border 卡顿消失。对照此前同一操作的诊断日志（一次整层 raise
+`raise_us=35600`，紧接着 20.3ms 焦点查询），可见闪烁来自那次多余的
+`AXRaise`，而不是 tab 身份本身。
+
+仍有一个独立于排序的残留观测：首次切到 Finder 时出现一次冷启动 AX 查询
+`focused_window_query pid=836 query_us=55940`，同一查询随后只要 46µs。它
+位于焦点解析路径，本次未造成可见闪烁；若它与 border 动画重叠仍可能产生
+一次卡顿，属单独的性能问题，未在本次改动范围内。
+
 用户运行新版后，Finder 仍重复占列并在后台闪缩。只读 AX 快照只有一个
 标准窗口，daemon 查询却同时包含5944和5465。Finder 的 AXWindows 还返回
 无 WindowServer ID 的桌面 AXScrollArea；此前该元素使整个 inventory

@@ -69,6 +69,10 @@ Automatic repair only raises windows with overlapping observed rectangles on
 that display, with the confirmed focus last when repair is needed. Disjoint
 windows require no automatic AXRaise sweep; explicit layer raises still include
 the whole eligible strip. Known pending geometry defers automatic repair.
+Automatic repair also reads the presented `WindowServer` front-to-back order and
+skips the sweep when it already matches the plan, because `AXRaise` is an
+application action that also rewrites the target application's key and main
+window. An unavailable or incomplete native order falls back to raising.
 Eligible columns farther from confirmed tiled focus are raised first; ties use
 layout order, and the focused window is raised last. Edge slivers participate.
 Each native tab group contributes only its selected tab. Hidden, minimized,

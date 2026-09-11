@@ -81,7 +81,7 @@
 | 能力 | 可用路线与接口 | 限制 |
 | --- | --- | --- |
 | 激活应用 | 公开 `NSRunningApplication.activate(...)` | 是应用级请求，不保证某一个窗口成为 key；需要接着观察焦点状态。[A9] |
-| 置前某窗口 | AX `AXRaise` | 与键盘焦点、长期层级、应用激活不是同义词；动作要查支持情况。[A1][A2] |
+| 置前某窗口 | AX `AXRaise` | 与键盘焦点、长期层级、应用激活不是同义词；动作要查支持情况。本机实测：对后台应用的窗口调用会改变该应用自身的 `AXFocusedWindow`/`AXMainWindow`（前台应用不变），并可能把该窗口短暂置于前台应用窗口之上，见 [sls-order-window-research.md](sls-order-window-research.md)。[A1][A2] |
 | 聚焦具体窗口 | 应用激活 + 支持的 AX `AXMain`/焦点属性/raise 组合；PRIVATE `_SLPSSetFrontProcessWithOptions` + `SLPSPostEventRecordTo` | 公开组合需逐项检测，不是保证成功的单一 API。Rift/yabai 私有焦点路径有实际调用，仍结合 AX raise/状态检查。[R1][R2][Y1] |
 | 聚焦但不 raise | PRIVATE：yabai 的 process/event 路径 | 有独立实现，含针对应用的延迟 workaround；不能推导所有应用都支持焦点与层级完全解耦。[Y1] |
 | 读取当前焦点 | AX：系统/应用 focused/main 属性；PRIVATE `SLPSGetKeyFocusProcess` + connection/window 查询 | `AXMain` 不等于 key focus。Rift 私有查询是另一观测源，失败仍可能无结果。[A2][R2] |
@@ -115,7 +115,7 @@ yabai 快照的旧路径 workaround 判定覆盖 macOS 12.7+、13.6+、14.5+ 与
 
 | 能力 | 可用路径 | 必须保留的限制 |
 | --- | --- | --- |
-| 相对前后排序 | AX raise；SA `SLSOrderWindow` / group ordering；OWN AppKit order 方法 | raise、relative order、numeric level、key focus 是四个不同维度。[A2][A4][Y3] |
+| 相对前后排序 | AX raise；SA `SLSOrderWindow` / group ordering；OWN AppKit order 方法 | raise、relative order、numeric level、key focus 是四个不同维度。`SLSOrderWindow` 只在 Dock 注入路线可用：普通进程对第三方窗口返回 `1000`，对自有窗口的 `above/below` 是**返回 `0` 的静默 no-op**（macOS 26.6.2 实测，仅 `order=0/2` 的隐藏/恢复生效），见 [sls-order-window-research.md](sls-order-window-research.md)。[A2][A4][Y3] |
 | 第三方窗口层级 | SA：yabai 使用 `SLSSetWindowSubLevel(..., CGWindowLevelForKey(...))` | 这是在 Dock 上下文中的具体实现，不要误写成普通进程任意调用 `SLSSetWindowLevel` 即可。[Y3] |
 | 第三方窗口 alpha | SA `SLSSetWindowAlpha`，渐变由循环更新 | 不等于背景透明或鼠标穿透；当前所核对 yabai 路径没有无 SA 的等价回退。[Y3] |
 | 第三方窗口亮度/dim | PRIVATE `SLSSetWindowListBrightness` 有 Rift 客户端示例调用 | **示例证据**，不是 Rift 核心默认功能，也不是 alpha。未在本机实测，需单独验证目标窗口及系统能力。[R7] |

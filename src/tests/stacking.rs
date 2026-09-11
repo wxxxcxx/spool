@@ -4,6 +4,48 @@ use crate::ecs::{Floating, MissionControlActive, RaiseWindow};
 use crate::events::Event;
 
 #[test]
+fn native_correct_edge_overlap_does_not_raise_background_finder() {
+    use bevy::math::IRect;
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(1);
+    harness.pump_frames(30);
+    // Browser sliver overlaps left Finder by five pixels; right Finder is disjoint.
+    let frames = [
+        IRect::new(-400, 34, 9, 700),
+        IRect::new(4, 34, 500, 700),
+        IRect::new(500, 34, 1000, 700),
+    ];
+    for id in [2, 1, 2, 1] {
+        harness.mock_state.focus_window(id);
+        harness.pump_frames(30);
+        for (window_id, frame) in (0..3).zip(frames) {
+            let entity = find_window_entity(window_id, harness.world());
+            harness
+                .world()
+                .entity_mut(entity)
+                .insert(crate::ecs::ObservedWindowFrame(frame));
+            harness
+                .mock_state
+                .update_window(window_id, |window| window.frame = frame);
+        }
+        harness.mock_state.set_window_order_in_session(
+            [id, 3 - id, 0]
+                .into_iter()
+                .map(|id| (id, super::TEST_PROCESS_ID))
+                .collect(),
+        );
+        harness.world().resource_mut::<MissionControlActive>().0 = true;
+        harness.pump_frames(1);
+        harness.world().resource_mut::<MissionControlActive>().0 = false;
+        harness.mock_state.take_raise_requests();
+        harness.pump_frames(1);
+        assert!(
+            harness.mock_state.take_raise_requests().is_empty(),
+            "correct native occlusion must not raise the other Finder through a browser sliver"
+        );
+    }
+}
+
+#[test]
 fn switching_nonoverlapping_windows_does_not_raise_the_previous_window() {
     let mut harness = TestHarness::new().with_windows(2).with_focused_window(0);
     harness.pump_frames(30);
