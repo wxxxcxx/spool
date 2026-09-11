@@ -3,7 +3,9 @@ use std::time::Instant;
 use super::layout::{BarLayout, ItemKind, NotchSplit, PlacedItem, Rect};
 
 // Shared by Space resizing, deck movement and selection. No overshoot at clip edges.
-const DURATION: f64 = 0.24;
+/// Shared by Bar content motion and the panel's own collapse animation, so the
+/// two never disagree about how long a Bar transition takes.
+pub const DURATION: f64 = 0.24;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisualItem {
@@ -311,7 +313,13 @@ fn entry_rect(item: &VisualItem, frame: &Presentation) -> Rect {
     item.item.rect
 }
 
-fn lerp(from: f64, to: f64, t: f64) -> f64 {
+/// The Bar's ease-out. `t` is normalised elapsed time in `0..=1`.
+#[must_use]
+pub fn ease_out(t: f64) -> f64 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+pub(crate) fn lerp(from: f64, to: f64, t: f64) -> f64 {
     from + (to - from) * t
 }
 

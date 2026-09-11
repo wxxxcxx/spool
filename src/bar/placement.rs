@@ -95,6 +95,17 @@ pub fn collapsed_rect(screen: Rect, menu_height: f64, gap: Option<Rect>, hovered
     }
 }
 
+/// The rect the pointer must be inside for the collapsed Bar to count as
+/// hovered: the grown tab, not the resting one.
+///
+/// Hover is judged against this rather than against the panel as it currently
+/// is, so the tab growing under the pointer cannot drop the pointer out of
+/// hover and flip the Bar back and forth every frame.
+#[must_use]
+pub fn collapsed_hover_rect(screen: Rect, menu_height: f64, gap: Option<Rect>) -> Rect {
+    collapsed_rect(screen, menu_height, gap, true)
+}
+
 /// The physical camera cutout between the two auxiliary top areas, if the
 /// display has one.
 #[must_use]
@@ -231,6 +242,29 @@ mod tests {
         };
         let rect = collapsed_rect(screen, 34.0, Some(edge_gap), false);
         assert!(rect.x >= 0.0 && rect.x + rect.width <= 1470.0);
+    }
+
+    #[test]
+    fn the_collapsed_hover_rect_is_the_grown_bar() {
+        let screen = screen();
+        // The plain tab is judged by the box it grows into, so a growing tab
+        // never drops the pointer out of hover.
+        let hover = collapsed_hover_rect(screen, 24.0, None);
+        assert!((hover.height - PLAIN_TAB_HOVER_HEIGHT).abs() < f64::EPSILON);
+        assert!((hover.width - PLAIN_TAB_WIDTH).abs() < f64::EPSILON);
+        assert_eq!(hover, collapsed_rect(screen, 24.0, None, true));
+        // A cutout keeps its capsule size whether or not it is hovered, so
+        // there is nothing to grow into.
+        let gap = Rect {
+            x: 646.0,
+            y: 922.0,
+            width: 179.0,
+            height: 34.0,
+        };
+        assert_eq!(
+            collapsed_hover_rect(screen, 34.0, Some(gap)),
+            collapsed_rect(screen, 34.0, Some(gap), false)
+        );
     }
 
     #[test]

@@ -140,10 +140,12 @@ from the keyboard.
 ## Collapse
 
 The Bar covers the system menu bar while expanded, so collapsing is how the
-menu bar is handed back. Two handles sit at the very ends of the Bar; they are
-invisible until the pointer reaches that end, and a hidden handle ignores
-clicks. Collapsing is runtime-only presentation state: it is never written to
-disk and every Bar starts expanded.
+menu bar is handed back. Two chevron handles sit in the 24pt zone at each end
+of the Bar — where the system menu bar's own edge items were — and appear as
+soon as the pointer is anywhere on the Bar, so collapsing is discoverable
+without hunting for an edge. The handle under the pointer brightens; a hidden
+handle ignores clicks. Collapsing is runtime-only presentation state: it is
+never written to disk and every Bar starts expanded.
 
 - Collapse a notched display and the panel shrinks to a black capsule around the
   camera cutout: the cutout's own width plus 24pt on each side, menu-bar height,
@@ -152,6 +154,13 @@ disk and every Bar starts expanded.
   flush with the screen top, horizontally centred, its bottom corners rounded.
   Hovering grows it to 9pt as the click affordance, and a click anywhere on it
   expands the Bar again.
+- The panel itself eases between the expanded and collapsed rect over the same
+  240ms ease-out as the content, so collapsing reads as the Bar sliding into
+  the cutout rather than jumping. An interrupted transition restarts from the
+  frame on screen.
+- On a plain display the tab's hover is judged against the 9pt box it grows
+  into, never against its current height: otherwise a tab growing under the
+  pointer would drop the pointer out of hover and flip every frame.
 - Everything the Bar does not cover while collapsed is the normal macOS menu
   bar, so the Apple menu, application menus and status items work as usual.
 - `spool.action.bar.toggle_collapse` acts on the display that owns the active

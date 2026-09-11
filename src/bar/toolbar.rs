@@ -69,15 +69,6 @@ pub fn buttons(height: f64) -> [ToolbarButton; 2] {
     ]
 }
 
-pub fn separator(height: f64) -> Rect {
-    Rect {
-        x: TOOLBAR_WIDTH - 3.0,
-        y: (height - 14.0) / 2.0,
-        width: 1.0,
-        height: 14.0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,7 +86,7 @@ mod tests {
                     for button in &buttons {
                         assert!(button.rect.y >= 0.0);
                         assert!(button.rect.y + button.rect.height <= height);
-                        assert!(button.rect.x + button.rect.width < width - 3.0);
+                        assert!(button.rect.x + button.rect.width < TOOLBAR_WIDTH - 3.0);
                     }
                     if expected == 1 {
                         assert!(buttons[0].rect.x < 12.0);
@@ -117,7 +108,7 @@ mod tests {
                 assert!(!button.tooltip.is_empty());
                 assert!(button.rect.y >= 0.0);
                 assert!(button.rect.y + button.rect.height <= height);
-                assert!(button.rect.x + button.rect.width < separator(height).x);
+                assert!(button.rect.x + button.rect.width < TOOLBAR_WIDTH - 3.0);
             }
         }
     }

@@ -189,9 +189,11 @@ behind the Spaces and icons exactly as it does behind the menu bar itself.
 Collapse is runtime-only presentation state. `Action::ToggleBarCollapse` raises
 a one-shot `BarRequests` flag that the Bar's own schedule consumes on the next
 frame; the panel then shrinks to a capsule merged with the camera cutout, or to
-a small top-centred tab on a display without one. Nothing about it is persisted
-and every Bar starts expanded, so the collapsed state can never be restored
-into a session that did not ask for it.
+a small top-centred tab on a display without one. The panel's own rect eases
+between those two targets in `ChromeMotion`, which shares `BarMotion`'s 240ms
+ease-out: the window moves, while `BarMotion` keeps owning everything drawn
+inside it. Nothing about it is persisted and every Bar starts expanded, so the
+collapsed state can never be restored into a session that did not ask for it.
 
 ## 4. Key Data Entities
 
