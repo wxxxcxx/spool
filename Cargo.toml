@@ -105,6 +105,8 @@ objc2-app-kit = { version = "0.3", features = [
   "NSView",
   "NSWindow",
   "NSFont",
+  "NSFontDescriptor",
+  "objc2-core-foundation",
   "NSAttributedString",
   "NSParagraphStyle",
   "NSStringDrawing",
@@ -122,6 +124,9 @@ spool-shared-types = { workspace = true }
 spool-lua = { workspace = true, optional = true }
 objc2-quartz-core = { version = "0.3", features = [
   "CALayer",
+  "CAAnimation",
+  "CAMediaTimingFunction",
+  "CATransaction",
   "objc2-core-foundation",
   "objc2-core-graphics",
 ] }

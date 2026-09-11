@@ -62,7 +62,14 @@ menus and status items, which is why the Bar takes that space instead.
 - Expansion, collapse, icon movement and focus transitions share a 240ms
   ease-out policy in `src/bar/motion.rs`. Interrupted transitions begin at the
   last presented frame, and repeated snapshots do not restart motion. Content
-  is clipped to its Space and the display-bound Bar viewport.
+  is clipped to its Space and to the Bar's own chrome, so it wipes away with
+  the shape as the Bar collapses.
+- Hover breathes. The toolbar button under the pointer and the collapsed Bar
+  get a repeating 1.8s ease-in-out pulse — a translucent highlight under the
+  button's symbol, a soft halo around the collapsed shape. Both are Core
+  Animation layers rather than per-frame drawing: pulsing them from the frame
+  loop would mean running the whole ECS at refresh rate, which costs about 45%
+  of a core to animate a highlight.
 - Every Space keeps a slot: the strip never scrolls, and no Space is dropped to
   make room. The focused Space takes whatever the others leave, up to its own
   content width; the rest keep the narrowest slot that still reads as that Space
@@ -147,20 +154,28 @@ without hunting for an edge. The handle under the pointer brightens; a hidden
 handle ignores clicks. Collapsing is runtime-only presentation state: it is
 never written to disk and every Bar starts expanded.
 
-- Collapse a notched display and the panel shrinks to a black capsule around the
-  camera cutout: the cutout's own width plus 24pt on each side, menu-bar height,
-  bottom corners rounded, opaque. A small expand handle sits inside each end.
-- Collapse a display without a cutout and the panel shrinks to a 120x6pt tab
-  flush with the screen top, horizontally centred, its bottom corners rounded.
+- Collapse a notched display and the Bar's chrome becomes a black capsule
+  merged with the camera cutout: the cutout's own width plus 24pt on each side,
+  menu-bar height, opaque. Its bottom corners are rounded and its top corners
+  flare outwards into the display's edge with a concave shoulder, so the side
+  profile reads as an S rather than ending on a square corner. A small expand
+  handle sits inside each end.
+- Collapse a display without a cutout and it becomes a 120x6pt tab flush with
+  the screen top, horizontally centred, its bottom edge a visible semicircle.
   Hovering grows it to 9pt as the click affordance, and a click anywhere on it
   expands the Bar again.
-- The panel itself eases between the expanded and collapsed rect over the same
-  240ms ease-out as the content, so collapsing reads as the Bar sliding into
-  the cutout rather than jumping. An interrupted transition restarts from the
-  frame on screen.
+- The **window never moves**. The panel is the menu-bar band for its whole
+  life, and only the chrome drawn inside it morphs — that is what keeps the
+  transition smooth, because moving and resizing a blurred window every frame
+  makes the window server re-blur it every frame. An interrupted morph restarts
+  from the frame on screen.
+- While collapsed the panel still covers the band, so it ignores mouse events
+  everywhere except the tab: the Apple menu, application menus and status items
+  underneath keep working, and only the few points the tab occupies are ours.
 - On a plain display the tab's hover is judged against the 9pt box it grows
   into, never against its current height: otherwise a tab growing under the
-  pointer would drop the pointer out of hover and flip every frame.
+  pointer would drop the pointer out of hover and flip every frame. The shape
+  hangs from the top edge either way, so hover only ever grows it downwards.
 - Everything the Bar does not cover while collapsed is the normal macOS menu
   bar, so the Apple menu, application menus and status items work as usual.
 - `spool.action.bar.toggle_collapse` acts on the display that owns the active

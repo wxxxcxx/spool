@@ -19,6 +19,10 @@ use objc2_foundation::{
     NSArray, NSAttributedString, NSDictionary, NSNumber, NSPoint, NSRect, NSSize, NSString,
     ns_string,
 };
+use objc2_quartz_core::{
+    CABasicAnimation, CALayer, CAMediaTiming, CAMediaTimingFunction,
+    kCAMediaTimingFunctionEaseInEaseOut,
+};
 use spool_shared_types::commands::Action;
 use tracing::warn;
 
@@ -33,11 +37,14 @@ use super::toolbar;
 
 const DRAG_RELEASE_GRACE: Duration = Duration::from_millis(250);
 
+/// One breath, in seconds. Slow enough to read as breathing rather than as a
+/// blink, which is what makes a hovered control feel alive.
+const BREATH_PERIOD: f64 = 1.8;
+
 /// Width of the collapse handle at either end of the Bar.
 const END_ZONE: f64 = 24.0;
 /// Bottom-corner radius of the collapsed capsule / tab.
 const CAPSULE_RADIUS: f64 = 12.0;
-const TAB_RADIUS: f64 = 3.0;
 
 /// One end of the Bar's own chrome. While expanded these are the collapse
 /// handles; while collapsed they are the expand handles.
@@ -83,6 +90,8 @@ struct ViewState {
     hovered: bool,
     /// Which end of the Bar chrome the pointer is over, if any.
     hover: Option<BarEdge>,
+    /// Which toolbar button the pointer is over, if any.
+    hover_button: Option<Action>,
     /// Set when the panel's own rect must be recomputed: collapse and hover
     /// change the panel, not just its content.
     chrome_dirty: bool,
@@ -102,23 +111,77 @@ impl ViewState {
         now.saturating_duration_since(*released) >= DRAG_RELEASE_GRACE
     }
 
+    /// The whole menu-bar band, in viewport coordinates.
+    fn panel_rect(&self) -> Rect {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            width: self.surface.width,
+            height: self.layout.height,
+        }
+    }
+
+    /// The rect the pointer must be inside to count as hovering the Bar: the
+    /// whole band while expanded, the grown collapsed shape while collapsed.
+    ///
+    /// Hover is judged against the grown shape rather than the panel as it
+    /// currently is, so a tab growing under the pointer cannot drop the pointer
+    /// out of hover and flip the Bar back and forth every frame.
+    fn hover_box(&self) -> Rect {
+        let panel = self.panel_rect();
+        if !self.collapsed {
+            return panel;
+        }
+        super::placement::collapsed_hover_rect((panel.width, panel.height), self.surface.notch)
+    }
+
+    /// Where the Bar's own chrome is drawn, in viewport coordinates.
+    ///
+    /// Expanded it is the whole band, collapsed the capsule or the tab, and
+    /// every frame in between is the eased position between the two. The panel
+    /// itself never moves, which is what keeps the transition smooth and the
+    /// shape's top edge pinned to the top of the screen.
+    fn chrome_rect(&self) -> Rect {
+        let expanded = self.panel_rect();
+        let collapsed = super::placement::collapsed_rect(
+            (expanded.width, expanded.height),
+            self.surface.notch,
+            self.hovered,
+        );
+        let progress = self.chrome.progress();
+        Rect {
+            x: motion::lerp(collapsed.x, expanded.x, progress),
+            y: motion::lerp(collapsed.y, expanded.y, progress),
+            width: motion::lerp(collapsed.width, expanded.width, progress),
+            height: motion::lerp(collapsed.height, expanded.height, progress),
+        }
+    }
+
     /// Which end of the chrome a point grabs, if any. The handle is the whole
     /// height of that end, and a collapsed plain-screen tab is grabbable
     /// anywhere because it has no room for a separate handle.
-    fn edge_at(&self, point: (f64, f64), size: (f64, f64)) -> Option<BarEdge> {
-        if size.0 <= 0.0 || size.1 <= 0.0 || point.1 < 0.0 || point.1 > size.1 {
+    fn edge_at(&self, point: (f64, f64)) -> Option<BarEdge> {
+        let bounds = self.hover_box();
+        if bounds.width <= 0.0 || bounds.height <= 0.0 {
             return None;
         }
-        let zone = END_ZONE.min(size.0 / 2.0);
-        if point.0 >= 0.0 && point.0 <= zone {
+        if point.0 < bounds.x
+            || point.0 > bounds.x + bounds.width
+            || point.1 < bounds.y
+            || point.1 > bounds.y + bounds.height
+        {
+            return None;
+        }
+        let zone = END_ZONE.min(bounds.width / 2.0);
+        if point.0 <= bounds.x + zone {
             return Some(BarEdge::Left);
         }
-        if point.0 >= size.0 - zone && point.0 <= size.0 {
+        if point.0 >= bounds.x + bounds.width - zone {
             return Some(BarEdge::Right);
         }
         if self.collapsed && self.surface.notch.is_none() {
             // The tab is only a few points tall; everything on it expands.
-            return (point.0 >= 0.0 && point.0 <= size.0).then_some(BarEdge::Right);
+            return Some(BarEdge::Right);
         }
         None
     }
@@ -128,6 +191,7 @@ impl ViewState {
             return;
         }
         self.collapsed = collapsed;
+        self.chrome.set_target(!collapsed, Instant::now());
         self.chrome_dirty = true;
     }
 
@@ -135,10 +199,10 @@ impl ViewState {
         std::mem::take(&mut self.chrome_dirty)
     }
 
-    fn press_at(&mut self, point: NSPoint, size: (f64, f64)) -> Option<Action> {
+    fn press_at(&mut self, point: NSPoint) -> Option<Action> {
         self.pressed = None;
         self.release_observed_at = None;
-        if self.edge_at((point.x, point.y), size).is_some() {
+        if self.edge_at((point.x, point.y)).is_some() {
             // The handle toggles either way, but while expanded it only reacts
             // once it has been revealed: the hidden strip sits where the menu
             // bar's own controls used to be, and clicking an invisible button
@@ -146,6 +210,11 @@ impl ViewState {
             if self.collapsed || self.hovered {
                 self.set_collapsed(!self.collapsed);
             }
+            return None;
+        }
+        if self.collapsed {
+            // The rest of the band belongs to the menu bar underneath while the
+            // Bar is collapsed, so nothing else here is live.
             return None;
         }
         let hit_layout = self.motion.presented.interaction_layout(&self.layout);
@@ -263,6 +332,13 @@ struct BarViewIvars {
     state: RefCell<ViewState>,
     ghost: RefCell<Option<DragGhost>>,
     toolbar_buttons: RefCell<Vec<(Action, Retained<NSButton>)>>,
+    /// A soft halo around the collapsed Bar. Core Animation owns its pulse: the
+    /// render server animates it without waking the frame loop, which matters
+    /// because running the whole ECS continuously costs ~45% of a core.
+    glow: RefCell<Option<Retained<CALayer>>>,
+    /// One hover highlight per toolbar button, sitting under the button's own
+    /// view so the symbol draws on top of it.
+    highlights: RefCell<Vec<Retained<CALayer>>>,
 }
 
 define_class!(
@@ -299,11 +375,7 @@ define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
-            let size = {
-                let bounds = self.bounds();
-                (bounds.size.width, bounds.size.height)
-            };
-            let action = self.ivars().state.borrow_mut().press_at(point, size);
+            let action = self.ivars().state.borrow_mut().press_at(point);
             if let Some(action) = action {
                 self.dispatch(action);
             }
@@ -371,13 +443,25 @@ impl BarView {
         let mut buttons = self.ivars().toolbar_buttons.borrow_mut();
         for control in toolbar::buttons(self.bounds().size.height) {
             let tooltip = NSString::from_str(control.tooltip);
-            let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            let Some(symbol) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
                 &NSString::from_str(control.symbol),
                 Some(&tooltip),
             ) else {
                 warn!(symbol = control.symbol, "Bar toolbar symbol unavailable");
                 continue;
             };
+            // Menu-bar metrics: configure the symbol's own point size and
+            // weight instead of stretching one image into the whole button,
+            // which is what made the old buttons look coarse.
+            let point_size = (control.rect.width * 0.62).clamp(11.0, 16.0);
+            let configuration = NSImageSymbolConfiguration::configurationWithPointSize_weight(
+                point_size,
+                // NSFontWeightMedium; the constant needs a feature we do not enable.
+                0.23,
+            );
+            let image = symbol
+                .imageWithSymbolConfiguration(&configuration)
+                .unwrap_or(symbol);
             let action = match control.action {
                 Action::MissionControl => sel!(openMissionControl:),
                 Action::ShowDesktop => sel!(showDesktop:),
@@ -396,12 +480,106 @@ impl BarView {
             button.setBezelStyle(NSBezelStyle::AccessoryBarAction);
             button.setShowsBorderOnlyWhileMouseInside(true);
             button.setImageScaling(NSImageScaling::ScaleProportionallyDown);
-            button.setContentTintColor(Some(&color(1.0, 1.0, 1.0, 0.78)));
+            button.setContentTintColor(Some(&color(1.0, 1.0, 1.0, 0.92)));
+            // The hover highlight is drawn by the Bar itself, so the button
+            // contributes no bezel of its own.
+            button.setBordered(false);
             button.setRefusesFirstResponder(true);
             button.setToolTip(Some(&tooltip));
             button.setFrame(ns_rect(control.rect));
             self.addSubview(&button);
             buttons.push((control.action, button));
+        }
+    }
+
+    /// The collapsed Bar's hover halo.
+    ///
+    /// A shadow-only layer whose path is the collapsed shape, so the bloom hugs
+    /// the capsule or the tab rather than a bounding box. It breathes only
+    /// while the pointer is on the collapsed Bar.
+    fn sync_glow(&self) {
+        let (collapsed, hovered, rect, radius, notched) = {
+            let state = self.ivars().state.borrow();
+            let panel = state.panel_rect();
+            let notched = state.surface.notch;
+            (
+                state.chrome.progress() < 0.01,
+                state.hovered,
+                super::placement::collapsed_rect(
+                    (panel.width, panel.height),
+                    notched,
+                    state.hovered,
+                ),
+                if notched.is_some() {
+                    CAPSULE_RADIUS
+                } else {
+                    super::placement::PLAIN_TAB_HEIGHT / 2.0
+                },
+                notched.is_some(),
+            )
+        };
+        let mut glow = self.ivars().glow.borrow_mut();
+        let layer = glow.get_or_insert_with(|| {
+            let layer = CALayer::new();
+            layer.setShadowColor(Some(&NSColor::whiteColor().CGColor()));
+            layer.setShadowOffset(NSSize::new(0.0, 0.0));
+            layer.setShadowRadius(if notched { 9.0 } else { 6.0 });
+            layer.setOpacity(0.0);
+            if let Some(parent) = self.layer() {
+                parent.addSublayer(&layer);
+            }
+            layer
+        });
+        layer.setFrame(ns_rect(rect));
+        {
+            let path = chrome_path(
+                rect,
+                radius,
+                if notched {
+                    super::placement::CAPSULE_FLARE
+                } else {
+                    0.0
+                },
+            );
+            layer.setShadowPath(Some(&path.CGPath()));
+        }
+        if collapsed && hovered {
+            breathe(layer, "shadowOpacity", 0.06, 0.4, BREATH_PERIOD);
+            breathe(layer, "transform.scale", 1.0, 1.05, BREATH_PERIOD);
+            layer.setOpacity(1.0);
+        } else {
+            settle(&*layer, 0.0);
+        }
+    }
+
+    /// Places the per-button hover highlights and breathes the one under the
+    /// pointer. They are sublayers, so the button's own view still draws its
+    /// symbol on top.
+    fn sync_highlights(&self, controls: &[toolbar::ToolbarButton], origin: f64) {
+        let hover_button = self.ivars().state.borrow().hover_button.clone();
+        let mut highlights = self.ivars().highlights.borrow_mut();
+        while highlights.len() < controls.len() {
+            let layer = CALayer::new();
+            layer.setBackgroundColor(Some(&NSColor::whiteColor().CGColor()));
+            layer.setCornerRadius(6.0);
+            layer.setOpacity(0.0);
+            if let Some(parent) = self.layer() {
+                parent.addSublayer(&layer);
+            }
+            highlights.push(layer);
+        }
+        for (layer, control) in highlights.iter().zip(controls) {
+            let rect = Rect {
+                x: control.rect.x + origin,
+                ..control.rect
+            };
+            layer.setFrame(ns_rect(rect));
+            if hover_button.as_ref() == Some(&control.action) {
+                breathe(layer, "opacity", 0.07, 0.17, BREATH_PERIOD);
+                breathe(layer, "transform.scale", 1.0, 1.04, BREATH_PERIOD);
+            } else {
+                settle(layer, 0.0);
+            }
         }
     }
 
@@ -433,6 +611,8 @@ impl BarView {
                 button.setContentTintColor(Some(&tint));
             }
         }
+        self.sync_highlights(&controls, origin);
+        self.sync_glow();
     }
 
     fn cancel_drag(&self) {
@@ -463,6 +643,8 @@ impl BarView {
             events,
             ghost: RefCell::new(None),
             toolbar_buttons: RefCell::new(Vec::new()),
+            glow: RefCell::new(None),
+            highlights: RefCell::new(Vec::new()),
             state: RefCell::new(ViewState {
                 display,
                 motion: BarMotion::new(&layout, Instant::now()),
@@ -479,11 +661,13 @@ impl BarView {
                 collapsed: false,
                 hovered: false,
                 hover: None,
+                hover_button: None,
                 chrome_dirty: false,
-                chrome: ChromeMotion::new(Instant::now()),
+                chrome: ChromeMotion::new(true, Instant::now()),
             }),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        this.setWantsLayer(true);
         this.install_toolbar();
         this
     }
@@ -535,63 +719,94 @@ impl BarView {
 
     fn draw_bar(&self) {
         let bounds = self.bounds();
-        let (collapsed, hovered, hover, notched, preferences) = {
+        let (hovered, hover, preferences, chrome_rect, progress, notched, split, collapsed_radius) = {
             let state = self.ivars().state.borrow();
             (
-                state.collapsed,
                 state.hovered,
                 state.hover,
-                state.surface.notch.is_some(),
                 state.preferences.clone(),
+                state.chrome_rect(),
+                state.chrome.progress(),
+                state.surface.notch.is_some(),
+                state.motion.presented.split.clone(),
+                if state.surface.notch.is_some() {
+                    CAPSULE_RADIUS
+                } else {
+                    // A plain-screen tab is a pill whatever height it has, so
+                    // its rounding is unmistakable at six points tall.
+                    super::placement::PLAIN_TAB_HEIGHT / 2.0
+                },
             )
         };
-        if collapsed {
-            clear(bounds);
-            // A collapsed capsule keeps its handles on screen; they only
-            // brighten under the pointer.
-            Self::draw_collapsed(bounds, hovered, hover, notched);
-            return;
-        }
-        let background =
-            BarPreferences::rgba(&preferences.background_color, [0.08, 0.08, 0.09, 0.88]);
-        let border = BarPreferences::rgba(&preferences.border_color, [1.0, 1.0, 1.0, 0.16]);
-        let radius = preferences.corner_radius.clamp(0.0, 20.0);
         clear(bounds);
-        NSGraphicsContext::saveGraphicsState_class();
-        if let Some(split) = &self.ivars().state.borrow().motion.presented.split {
-            clip_notch(bounds, split.gap);
-        }
-        rounded_fill(bounds, radius, rgba(background));
+
+        // One shape morphs from the menu-bar band to the collapsed capsule or
+        // tab. Nothing here moves the window, so the blur behind it is only
+        // ever recomputed at the panel's fixed size.
+        let radius = motion::lerp(
+            collapsed_radius,
+            preferences.corner_radius.clamp(0.0, 20.0),
+            progress,
+        );
+        let flare = if notched {
+            motion::lerp(super::placement::CAPSULE_FLARE, 0.0, progress)
+        } else {
+            0.0
+        };
+        let path = chrome_path(chrome_rect, radius, flare);
+        let background = rgba(BarPreferences::rgba(
+            &preferences.background_color,
+            [0.08, 0.08, 0.09, 0.88],
+        ));
+        background.setFill();
+        path.fill();
         if preferences.border_width > 0.0 {
-            rounded_stroke(
-                bounds,
-                radius,
-                preferences.border_width.clamp(0.0, 4.0),
-                rgba(border),
-            );
+            let border = rgba(BarPreferences::rgba(
+                &preferences.border_color,
+                [1.0, 1.0, 1.0, 0.16],
+            ));
+            border.setStroke();
+            path.setLineWidth(preferences.border_width.clamp(0.0, 4.0));
+            path.stroke();
         }
 
-        let (frame, drag) = {
-            let state = self.ivars().state.borrow();
-            (
-                state.motion.presented.clone(),
-                state
-                    .pressed
-                    .clone()
-                    .filter(|drag| drag.active && state.can_move_windows),
-            )
-        };
-        self.draw_strip(&frame, drag.as_ref(), &preferences, bounds, radius);
-        NSGraphicsContext::restoreGraphicsState_class();
-        if hovered {
+        if progress > 0.01 {
+            let (frame, drag) = {
+                let state = self.ivars().state.borrow();
+                (
+                    state.motion.presented.clone(),
+                    state
+                        .pressed
+                        .clone()
+                        .filter(|drag| drag.active && state.can_move_windows),
+                )
+            };
+            // The content wipes away with the shape rather than being switched
+            // off, and stays inside it the whole way.
+            NSGraphicsContext::saveGraphicsState_class();
+            path.addClip();
+            if let Some(split) = &split {
+                clip_notch(bounds, split.gap);
+            }
+            set_alpha(progress);
+            self.draw_strip(&frame, drag.as_ref(), &preferences, bounds, radius);
+            NSGraphicsContext::restoreGraphicsState_class();
+        }
+
+        if progress < 1.0 {
+            // The collapsed capsule keeps an expand handle at each end; the
+            // pointer only brightens one of them. Without a cutout the tab has
+            // no room for them and the whole tab is the target.
+            if notched {
+                Self::draw_handles(ns_rect(chrome_rect), hover, true, 1.0 - progress);
+            }
+        } else if hovered {
             // Both handles appear together as soon as the pointer is on the
             // Bar, so collapsing is discoverable without hunting for an edge.
-            Self::draw_handles(bounds, hover, false);
+            Self::draw_handles(bounds, hover, false, 1.0);
         }
     }
 
-    /// Everything inside the panel: Spaces, icons, the focus accents, and the
-    /// insertion gap of an in-flight drag.
     fn draw_strip(
         &self,
         frame: &super::motion::Presentation,
@@ -672,7 +887,7 @@ impl BarView {
     /// `always` keeps them drawn without a pointer, which a collapsed capsule
     /// needs because it has no other affordance; the expanded Bar draws them
     /// only while it is hovered.
-    fn draw_handles(bounds: NSRect, hover: Option<BarEdge>, always: bool) {
+    fn draw_handles(bounds: NSRect, hover: Option<BarEdge>, always: bool, fade: f64) {
         // Square, so the symbol keeps its own aspect ratio, and centred in the
         // end zone that also holds its hit target.
         let side = (bounds.size.height - 4.0).clamp(8.0, 14.0);
@@ -696,33 +911,7 @@ impl BarView {
             } else {
                 0.45
             };
-            draw_symbol(edge.symbol(), rect, opacity);
-        }
-    }
-
-    /// The collapsed Bar draws no content at all: a black capsule merged with
-    /// the camera cutout, or a small tab on a plain display.
-    ///
-    /// Rounding only the bottom corners uses the panel's own edge as the clip:
-    /// the shape starts one radius above the view, so its top corners are
-    /// never drawn.
-    fn draw_collapsed(bounds: NSRect, hovered: bool, hover: Option<BarEdge>, notched: bool) {
-        let radius = if notched { CAPSULE_RADIUS } else { TAB_RADIUS };
-        let shape = NSRect::new(
-            NSPoint::new(bounds.origin.x, bounds.origin.y - radius),
-            NSSize::new(bounds.size.width, bounds.size.height + radius),
-        );
-        let fill = if notched || hovered {
-            // Opaque over the menu bar, and solid black once the tab is live.
-            NSColor::blackColor()
-        } else {
-            rgba([0.0, 0.0, 0.0, 0.92])
-        };
-        rounded_fill(shape, radius, fill);
-        if notched {
-            // The capsule is the only thing left on screen, so its handles are
-            // always drawn; the pointer only brightens one of them.
-            Self::draw_handles(bounds, hover, true);
+            draw_symbol(edge.symbol(), rect, opacity * fade);
         }
     }
 
@@ -931,123 +1120,200 @@ struct BarCapabilities {
     move_windows: bool,
 }
 
-/// The panel's own rect, eased between expanded and collapsed.
+/// How far the panel is between expanded and collapsed, eased over the same
+/// 240ms as Bar content motion.
 ///
-/// Content motion is [`BarMotion`]'s job; this only moves the window that holds
-/// it, so collapsing reads as the Bar sliding into the cutout rather than
-/// jumping between two sizes.
+/// The panel itself never moves: it always covers the menu-bar band, and this
+/// is what the chrome morphs against. Moving and resizing a blurred window
+/// every frame is what made the old transition stutter.
 #[derive(Debug)]
 struct ChromeMotion {
-    /// The rect currently on screen, or `None` before the first presentation.
-    presented: Option<Rect>,
-    from: Rect,
-    to: Rect,
+    /// 1 = expanded, 0 = collapsed.
+    progress: f64,
+    from: f64,
+    to: f64,
     started: Instant,
     active: bool,
 }
 
 impl ChromeMotion {
-    fn new(now: Instant) -> Self {
+    fn new(expanded: bool, now: Instant) -> Self {
+        let progress = if expanded { 1.0 } else { 0.0 };
         Self {
-            presented: None,
-            from: Rect::default(),
-            to: Rect::default(),
+            progress,
+            from: progress,
+            to: progress,
             started: now,
             active: false,
         }
+    }
+
+    fn progress(&self) -> f64 {
+        self.progress
     }
 
     fn is_active(&self) -> bool {
         self.active
     }
 
-    /// Presents `target`, easing toward it from whatever is on screen.
+    /// Starts moving toward the state `expanded` describes.
     ///
-    /// The first presentation snaps: there is no previous rect to move from,
-    /// and animating out of a default rect would look like a stray slide at
-    /// startup.
-    fn advance(&mut self, target: Rect, now: Instant) -> Rect {
-        let Some(presented) = self.presented else {
-            self.presented = Some(target);
-            self.to = target;
-            return target;
-        };
+    /// An interrupted transition restarts from the frame on screen rather than
+    /// from the other endpoint, so reversing mid-flight never jumps.
+    fn set_target(&mut self, expanded: bool, now: Instant) {
+        let target = if expanded { 1.0 } else { 0.0 };
+        if (self.to - target).abs() < f64::EPSILON {
+            return;
+        }
+        self.from = self.progress;
+        self.to = target;
+        self.started = now;
+        self.active = true;
+    }
+
+    /// Advances the morph and returns whether the chrome still needs drawing.
+    fn advance(&mut self, now: Instant) -> bool {
         if !self.active {
-            if target == self.to {
-                return presented;
-            }
-            self.from = presented;
-            self.to = target;
-            self.started = now;
-            self.active = true;
-        } else if target != self.to {
-            // Interrupted: continue from the last frame actually presented.
-            self.from = presented;
-            self.to = target;
-            self.started = now;
+            return false;
         }
         let elapsed = now.saturating_duration_since(self.started).as_secs_f64() / motion::DURATION;
-        let next = if elapsed >= 1.0 {
+        if elapsed >= 1.0 {
+            self.progress = self.to;
             self.active = false;
-            self.to
-        } else {
-            lerp_rect(self.from, self.to, motion::ease_out(elapsed))
-        };
-        self.presented = Some(next);
-        next
+            return true;
+        }
+        self.progress = motion::lerp(self.from, self.to, motion::ease_out(elapsed));
+        true
     }
 }
 
-fn lerp_rect(from: Rect, to: Rect, t: f64) -> Rect {
-    Rect {
-        x: motion::lerp(from.x, to.x, t),
-        y: motion::lerp(from.y, to.y, t),
-        width: motion::lerp(from.width, to.width, t),
-        height: motion::lerp(from.height, to.height, t),
+/// The Bar's own outline, in viewport coordinates.
+///
+/// `radius` rounds the bottom corners and `flare` turns the top ones into the
+/// concave shoulders that spread the black region into the display's top edge.
+/// With the two rounded opposite ways, the side profile reads as an S.
+fn chrome_path(rect: Rect, radius: f64, flare: f64) -> Retained<NSBezierPath> {
+    // Circular-arc approximation for a cubic Bezier quadrant.
+    const KAPPA: f64 = 0.552_284_749_8;
+    let left = rect.x;
+    let top = rect.y;
+    let right = rect.x + rect.width;
+    let bottom = rect.y + rect.height;
+    let r = radius.clamp(0.0, (rect.width / 2.0).min(rect.height));
+    let f = flare.clamp(0.0, (rect.width / 4.0).min(rect.height));
+    let path = NSBezierPath::bezierPath();
+    path.moveToPoint(NSPoint::new(left - f, top));
+    if f > 0.0 {
+        path.curveToPoint_controlPoint1_controlPoint2(
+            NSPoint::new(left, top + f),
+            NSPoint::new(left - f + f * KAPPA, top),
+            NSPoint::new(left, top + f - f * KAPPA),
+        );
+    } else {
+        path.lineToPoint(NSPoint::new(left, top));
+    }
+    if r > 0.0 {
+        path.lineToPoint(NSPoint::new(left, bottom - r));
+        path.curveToPoint_controlPoint1_controlPoint2(
+            NSPoint::new(left + r, bottom),
+            NSPoint::new(left, bottom - r + r * KAPPA),
+            NSPoint::new(left + r - r * KAPPA, bottom),
+        );
+        path.lineToPoint(NSPoint::new(right - r, bottom));
+        path.curveToPoint_controlPoint1_controlPoint2(
+            NSPoint::new(right, bottom - r),
+            NSPoint::new(right - r + r * KAPPA, bottom),
+            NSPoint::new(right, bottom - r + r * KAPPA),
+        );
+    } else {
+        path.lineToPoint(NSPoint::new(left, bottom));
+        path.lineToPoint(NSPoint::new(right, bottom));
+    }
+    if f > 0.0 {
+        path.lineToPoint(NSPoint::new(right, top + f));
+        path.curveToPoint_controlPoint1_controlPoint2(
+            NSPoint::new(right + f, top),
+            NSPoint::new(right, top + f - f * KAPPA),
+            NSPoint::new(right + f - f * KAPPA, top),
+        );
+    } else {
+        path.lineToPoint(NSPoint::new(right, top));
+    }
+    path.closePath();
+    path
+}
+
+/// Starts a repeating ease-in-out pulse on one animatable key, if it is not
+/// already running.
+///
+/// The animation is the whole effect: nothing recomputes it per frame, and the
+/// layer's model value stays at rest so removing the animation calms it.
+fn breathe(layer: &CALayer, key_path: &str, from: f64, to: f64, period: f64) {
+    let key = NSString::from_str(key_path);
+    if unsafe { layer.animationForKey(&key) }.is_some() {
+        return;
+    }
+    let animation = CABasicAnimation::animationWithKeyPath(Some(&NSString::from_str(key_path)));
+    unsafe {
+        animation.setFromValue(Some(&NSNumber::new_f64(from)));
+        animation.setToValue(Some(&NSNumber::new_f64(to)));
+        animation.setDuration(period / 2.0);
+        animation.setAutoreverses(true);
+        animation.setRepeatCount(f32::INFINITY);
+        animation.setTimingFunction(Some(&CAMediaTimingFunction::functionWithName(
+            kCAMediaTimingFunctionEaseInEaseOut,
+        )));
+        layer.addAnimation_forKey(&animation, Some(&key));
+    }
+}
+
+/// Stops every pulse on a layer and rests it.
+fn settle(layer: &CALayer, opacity: f32) {
+    layer.removeAnimationForKey(&NSString::from_str("shadowOpacity"));
+    layer.removeAnimationForKey(&NSString::from_str("opacity"));
+    layer.removeAnimationForKey(&NSString::from_str("transform.scale"));
+    layer.setOpacity(opacity);
+}
+
+/// Sets the alpha every later drawing operation is composited with.
+fn set_alpha(alpha: f64) {
+    if let Some(context) = objc2_app_kit::NSGraphicsContext::currentContext() {
+        objc2_core_graphics::CGContext::set_alpha(Some(&context.CGContext()), alpha);
     }
 }
 
 struct PanelRecord {
     window: Retained<NSPanel>,
     view: Retained<BarView>,
-    /// The expanded panel: exactly the menu-bar band.
+    /// The menu-material blur behind the content. It fades out as the Bar
+    /// collapses, but keeps its geometry: re-blurring a moving window every
+    /// frame is what used to stutter.
+    backdrop: Retained<NSVisualEffectView>,
+    /// The panel: exactly the menu-bar band, and only ever that.
     expanded: Rect,
-    /// The owning display, for centring a collapsed panel on it.
-    screen: Rect,
-    /// The camera cutout in screen coordinates, if the display has one.
-    gap: Option<Rect>,
 }
 
 impl PanelRecord {
+    /// Presents the current state: the panel keeps its rect, the chrome inside
+    /// it morphs.
     fn present(&self) {
-        let (collapsed, hovered) = {
-            let state = self.view.ivars().state.borrow();
-            (state.collapsed, state.hovered)
-        };
-        // Expanded, the panel is the menu-bar band and content never resizes
-        // it; collapsed, it shrinks to the capsule or the tab. Those two are
-        // the only targets, and the panel eases between them.
-        let target = if collapsed {
-            super::placement::collapsed_rect(self.screen, self.expanded.height, self.gap, hovered)
-        } else {
-            self.expanded
-        };
-        let frame = self
-            .view
-            .ivars()
-            .state
-            .borrow_mut()
-            .chrome
-            .advance(target, Instant::now());
-        // The backdrop must stay visible even when collapsed: the content view
-        // is its subview, so hiding it would hide the capsule or tab with it.
-        let rect = ns_rect(frame);
-        self.view.setFrameSize(rect.size);
-        self.view.layout_toolbar();
+        let progress = self.view.ivars().state.borrow().chrome.progress();
+        let rect = ns_rect(self.expanded);
         if self.window.frame() != rect {
             self.window.setFrame_display(rect, false);
         }
+        self.backdrop.setAlphaValue(progress);
+        self.view.layout_toolbar();
         self.view.setNeedsDisplay(true);
+    }
+
+    /// The menu bar underneath is only ours to block where the Bar is actually
+    /// drawn. While collapsed the panel still covers the band, so it lets
+    /// clicks through everywhere except the tab itself.
+    fn set_interactive(&self, interactive: bool) {
+        if self.window.ignoresMouseEvents() == interactive {
+            self.window.setIgnoresMouseEvents(!interactive);
+        }
     }
 }
 
@@ -1083,11 +1349,6 @@ impl BarManager {
                 move_windows: snapshot.can_move_windows,
             };
             let (expanded, surface, preferences) = screen_placement(screen, &self.preferences);
-            let gap = super::placement::notch_gap(
-                view_rect(screen.auxiliaryTopLeftArea()),
-                view_rect(screen.auxiliaryTopRightArea()),
-                expanded.height,
-            );
             let (window, view) = if let Some(record) = self.panels.get(&display.id) {
                 (record.window.clone(), record.view.clone())
             } else {
@@ -1099,15 +1360,14 @@ impl BarManager {
                     capabilities,
                     preferences.clone(),
                 );
-                let window = make_bar_panel(self.mtm, &view);
+                let (window, backdrop) = make_bar_panel(self.mtm, &view);
                 self.panels.insert(
                     display.id,
                     PanelRecord {
                         window: window.clone(),
                         view: view.clone(),
+                        backdrop,
                         expanded,
-                        screen: view_rect(screen.frame()),
-                        gap,
                     },
                 );
                 (window, view)
@@ -1116,8 +1376,6 @@ impl BarManager {
             window.setHasShadow(preferences.show_shadow);
             if let Some(record) = self.panels.get_mut(&display_id) {
                 record.expanded = expanded;
-                record.screen = view_rect(screen.frame());
-                record.gap = gap;
                 record.present();
             }
             window.orderFrontRegardless();
@@ -1167,33 +1425,50 @@ impl BarManager {
     /// without ever becoming the key window.
     fn update_hover(record: &PanelRecord) {
         let location = NSEvent::mouseLocation();
-        // While collapsed, hover is judged against the rect the tab grows to,
-        // not the rect it currently is: a panel that grows under the pointer
-        // would otherwise drop out of hover and flip every frame.
-        let frame = if record.view.ivars().state.borrow().collapsed {
-            ns_rect(super::placement::collapsed_hover_rect(
-                record.screen,
-                record.expanded.height,
-                record.gap,
-            ))
-        } else {
-            record.window.frame()
-        };
+        let frame = record.window.frame();
+        // The view is flipped and shares the panel's origin, so this is already
+        // the viewport space the chrome is laid out in.
         let local = (
             location.x - frame.origin.x,
             frame.origin.y + frame.size.height - location.y,
         );
-        let size = (frame.size.width, frame.size.height);
         let mut state = record.view.ivars().state.borrow_mut();
-        let hovered = local.0 >= 0.0
-            && local.1 >= 0.0
-            && local.0 <= size.0
-            && local.1 <= size.1
-            && size.0 > 0.0;
-        let hover = state.edge_at(local, size);
-        if hovered != state.hovered || hover != state.hover {
+        // While collapsed this is the rect the tab grows into, not the panel,
+        // so a panel that grows under the pointer cannot drop out of hover.
+        let box_ = state.hover_box();
+        let hovered = local.0 >= box_.x
+            && local.1 >= box_.y
+            && local.0 <= box_.x + box_.width
+            && local.1 <= box_.y + box_.height
+            && box_.width > 0.0;
+        let hover = if hovered { state.edge_at(local) } else { None };
+        // The toolbar buttons only exist for the expanded Bar.
+        let hover_button = if hovered && !state.collapsed {
+            let controls = toolbar::configured_buttons(
+                state.layout.height,
+                state.preferences.show_mission_control,
+                state.preferences.show_desktop,
+            );
+            controls
+                .iter()
+                .find(|control| {
+                    let rect = Rect {
+                        x: control.rect.x + state.motion.presented.toolbar_origin,
+                        ..control.rect
+                    };
+                    local.0 >= rect.x
+                        && local.0 <= rect.x + rect.width
+                        && local.1 >= rect.y
+                        && local.1 <= rect.y + rect.height
+                })
+                .map(|control| control.action.clone())
+        } else {
+            None
+        };
+        if hovered != state.hovered || hover != state.hover || hover_button != state.hover_button {
             state.hovered = hovered;
             state.hover = hover;
+            state.hover_button = hover_button;
             state.chrome_dirty = true;
         }
     }
@@ -1237,12 +1512,21 @@ impl BarManager {
                 (
                     state.motion.advance(now),
                     state.take_chrome_dirty(),
-                    state.chrome.is_active(),
+                    state.chrome.advance(now),
                 )
             };
             if changed || chrome_dirty || chrome_moving {
                 record.present();
             }
+            // Only the collapsed tab is ours; the rest of the band stays the
+            // menu bar's, so clicks there must reach it. The hover box is a
+            // little larger than the tab, which clears the flag before the
+            // pointer can reach it.
+            let interactive = {
+                let state = record.view.ivars().state.borrow();
+                !state.collapsed || state.hovered
+            };
+            record.set_interactive(interactive);
         }
     }
 }
@@ -1346,14 +1630,17 @@ fn make_bar_window(mtm: MainThreadMarker, view: &NSView) -> Retained<NSPanel> {
 
 /// The Bar's own panel: a Bar window whose content view is a menu-material
 /// backdrop, with the content riding on top of it and following on resize.
-fn make_bar_panel(mtm: MainThreadMarker, view: &NSView) -> Retained<NSPanel> {
+fn make_bar_panel(
+    mtm: MainThreadMarker,
+    view: &NSView,
+) -> (Retained<NSPanel>, Retained<NSVisualEffectView>) {
     let backdrop = make_backdrop(mtm, view.frame().size);
     view.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     view.setClipsToBounds(true);
     backdrop.addSubview(view);
-    make_bar_window(mtm, &backdrop)
+    (make_bar_window(mtm, &backdrop), backdrop)
 }
 
 fn screens_by_id(mtm: MainThreadMarker) -> HashMap<u32, Retained<NSScreen>> {
@@ -1698,13 +1985,10 @@ mod tests {
             let rect = state.motion.presented.space_rect(space_id).unwrap();
             for y in [1.0, state.layout.height - 1.0] {
                 let point = NSPoint::new(rect.x + rect.width / 2.0, y);
-                assert_eq!(
-                    state.press_at(point, (1200.0, 37.0)),
-                    Some(Action::FocusSpace { space_id })
-                );
+                assert_eq!(state.press_at(point), Some(Action::FocusSpace { space_id }));
                 assert!(state.pressed.is_none());
                 state.can_focus_spaces = false;
-                assert!(state.press_at(point, (1200.0, 37.0)).is_none());
+                assert!(state.press_at(point).is_none());
                 state.can_focus_spaces = true;
             }
         }
@@ -1716,7 +2000,7 @@ mod tests {
             .unwrap()
             .rect;
         let point = NSPoint::new(icon.x + 2.0, icon.y + 2.0);
-        assert!(state.press_at(point, (1200.0, 37.0)).is_none());
+        assert!(state.press_at(point).is_none());
         assert_eq!(state.pressed.as_ref().unwrap().window_id, 1);
         assert_eq!(
             state.release_drag(point, true),
@@ -1785,8 +2069,9 @@ mod tests {
                 collapsed: false,
                 hovered: false,
                 hover: None,
+                hover_button: None,
                 chrome_dirty: false,
-                chrome: ChromeMotion::new(Instant::now()),
+                chrome: ChromeMotion::new(true, Instant::now()),
             },
             point,
         )
@@ -1836,7 +2121,7 @@ mod tests {
                 .find(|item| matches!(item.kind, ItemKind::Window { window_id: 1, .. }))
                 .unwrap()
                 .rect;
-            state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0), (1200.0, 37.0));
+            state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0));
             let point = if cross_space {
                 let target = state.motion.presented.space_rect(10).unwrap();
                 NSPoint::new(target.x + target.width / 2.0, target.y + 2.0)
@@ -1896,7 +2181,7 @@ mod tests {
             .unwrap()
             .item
             .rect;
-        state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0), (1200.0, 37.0));
+        state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0));
         state.drag_to(point, true);
         assert!(!state.drag_release_expired(false, now + Duration::from_secs(2)));
     }
@@ -2159,89 +2444,106 @@ mod tests {
     }
 
     #[test]
-    fn collapsing_eases_the_panel_between_the_two_rects() {
+    fn collapsing_eases_the_chrome_between_the_two_states() {
         let now = Instant::now();
-        let mut chrome = ChromeMotion::new(now);
-        let expanded = Rect {
-            x: 0.0,
-            y: 922.0,
-            width: 1470.0,
-            height: 34.0,
-        };
-        let collapsed = Rect {
-            x: 622.0,
-            y: 922.0,
-            width: 227.0,
-            height: 34.0,
-        };
-        assert_eq!(
-            chrome.advance(expanded, now),
-            expanded,
-            "the first frame snaps"
-        );
-        assert!(!chrome.is_active());
-        assert_eq!(
-            chrome.advance(collapsed, now),
-            expanded,
-            "a change starts from what is on screen"
-        );
+        let mut chrome = ChromeMotion::new(true, now);
+        assert!((chrome.progress() - 1.0).abs() < f64::EPSILON);
+        assert!(!chrome.advance(now), "a settled panel does not redraw");
+        chrome.set_target(false, now);
         assert!(chrome.is_active(), "collapsing animates");
-        let half = chrome.advance(collapsed, now + Duration::from_millis(120));
+        assert!(chrome.advance(now), "the first frame still needs drawing");
+        chrome.advance(now + Duration::from_millis(120));
+        let half = chrome.progress();
+        assert!(half > 0.0 && half < 1.0, "mid-flight: {half}");
         assert!(
-            half.width < expanded.width && half.width > collapsed.width,
-            "the panel is between the two widths: {half:?}"
+            chrome.advance(now + Duration::from_millis(240)),
+            "the settling frame is drawn too"
         );
-        assert_eq!(
-            chrome.advance(collapsed, now + Duration::from_millis(240)),
-            collapsed
-        );
-        assert!(!chrome.is_active(), "the transition settles");
-        // An expand starts from where the panel already was, and interrupting
-        // it with a collapse continues from mid-flight rather than jumping.
-        let mid = chrome.advance(expanded, now + Duration::from_millis(300));
-        assert!(chrome.is_active());
-        assert_eq!(mid, collapsed, "the expand starts where the panel was");
-        let flying = chrome.advance(expanded, now + Duration::from_millis(360));
-        assert!(
-            flying.width > collapsed.width && flying.width < expanded.width,
-            "an expanding panel is between the two widths: {flying:?}"
-        );
-        let back = chrome.advance(collapsed, now + Duration::from_millis(370));
-        assert_eq!(back, flying, "an interrupted panel does not jump");
-        assert!(chrome.is_active());
-        assert_eq!(
-            chrome.advance(collapsed, now + Duration::from_millis(620)),
-            collapsed
-        );
+        assert!((chrome.progress() - 0.0).abs() < f64::EPSILON);
         assert!(!chrome.is_active());
+        assert!(!chrome.advance(now + Duration::from_millis(260)));
+
+        // Reversing mid-flight carries on from the frame on screen.
+        chrome.set_target(true, now + Duration::from_millis(300));
+        chrome.advance(now + Duration::from_millis(360));
+        let flying = chrome.progress();
+        assert!(flying > 0.0 && flying < 1.0, "expanding: {flying}");
+        chrome.set_target(false, now + Duration::from_millis(370));
+        assert!(
+            (chrome.progress() - flying).abs() < f64::EPSILON,
+            "an interrupted morph does not jump"
+        );
+        assert!(chrome.advance(now + Duration::from_millis(700)));
+        assert!((chrome.progress() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn the_collapsed_shape_keeps_its_top_edge_and_only_grows_downwards() {
+        let (mut state, _) = drag_state();
+        let band = state.panel_rect();
+        let expanded = state.chrome_rect();
+        assert_eq!(expanded, band, "expanded, the chrome is the whole band");
+
+        state.set_collapsed(true);
+        state
+            .chrome
+            .advance(Instant::now() + Duration::from_secs(1));
+        let collapsed = state.chrome_rect();
+        assert!(
+            (collapsed.y - band.y).abs() < f64::EPSILON,
+            "the top edge is pinned to the band"
+        );
+        assert!(
+            collapsed.width < band.width,
+            "the collapsed shape is narrower"
+        );
+
+        // Hovering grows the tab downwards: the top edge never moves, which is
+        // what used to make the rectangle appear to jump.
+        state.hovered = true;
+        let hovered = state.chrome_rect();
+        assert!((hovered.y - collapsed.y).abs() < f64::EPSILON);
+        assert!(hovered.height > collapsed.height, "hover grows the tab");
+        assert!((hovered.width - collapsed.width).abs() < f64::EPSILON);
     }
 
     #[test]
     fn the_bar_ends_toggle_collapse_and_the_middle_does_not() {
         let (mut state, _) = drag_state();
-        let size = (1200.0, 37.0);
+        let band = state.panel_rect();
         assert!(!state.collapsed, "every Bar starts expanded");
         // A hidden handle does not react: the strip sits where the menu bar's
         // own controls were, so an accidental click must not collapse the Bar.
-        assert!(state.press_at(NSPoint::new(2.0, 18.0), size).is_none());
+        assert!(state.press_at(NSPoint::new(2.0, 18.0)).is_none());
         assert!(!state.collapsed, "an unrevealed handle is inert");
         // Hovering anywhere on the Bar reveals both handles, so no edge hunting
         // is needed to reach them.
         state.hovered = true;
-        assert!(state.press_at(NSPoint::new(2.0, 18.0), size).is_none());
+        assert!(state.press_at(NSPoint::new(2.0, 18.0)).is_none());
         assert!(
             state.collapsed,
             "the revealed left handle collapses the Bar"
         );
         assert!(state.take_chrome_dirty(), "the panel must be rewritten");
-        // Collapsed handles are always live, so no reveal step is needed.
-        assert!(state.press_at(NSPoint::new(1198.0, 18.0), size).is_none());
-        assert!(!state.collapsed, "the right handle expands it again");
 
-        // A plain-screen tab is only a few points tall, so all of it expands.
+        // A plain-screen tab is only a few points tall, so all of it expands,
+        // and only it: the rest of the band belongs to the menu bar.
+        assert!(
+            state
+                .press_at(NSPoint::new(band.width / 2.0, 3.0))
+                .is_none()
+        );
+        assert!(!state.collapsed, "the tab expands the Bar again");
         state.set_collapsed(true);
-        assert!(state.press_at(NSPoint::new(600.0, 3.0), size).is_none());
-        assert!(!state.collapsed);
+        assert!(
+            state
+                .press_at(NSPoint::new(band.width - 4.0, 18.0))
+                .is_none()
+        );
+        assert!(
+            state.collapsed,
+            "the far end of the band is the menu bar's while collapsed"
+        );
     }
 
     #[test]
@@ -2254,12 +2556,89 @@ mod tests {
             height: 37.0,
         });
         state.set_collapsed(true);
-        let size = (227.0, 34.0);
+        let capsule = state.hover_box();
         // The black area between the handles is not a target: it is the notch.
-        assert!(state.press_at(NSPoint::new(110.0, 17.0), size).is_none());
+        assert!(
+            state
+                .press_at(NSPoint::new(capsule.x + capsule.width / 2.0, 17.0))
+                .is_none()
+        );
         assert!(state.collapsed, "the middle of the capsule stays collapsed");
-        assert!(state.press_at(NSPoint::new(3.0, 17.0), size).is_none());
+        assert!(
+            state
+                .press_at(NSPoint::new(capsule.x + 3.0, 17.0))
+                .is_none()
+        );
         assert!(!state.collapsed, "the left handle expands");
+    }
+
+    #[test]
+    fn the_collapsed_capsule_has_an_s_profile_and_the_tab_is_rounded() {
+        // Notched: the top corners flare into the screen edge (concave) and the
+        // bottom ones are rounded, so the side profile reads as an S.
+        let capsule = Rect {
+            x: 100.0,
+            y: 0.0,
+            width: 227.0,
+            height: 34.0,
+        };
+        let path = chrome_path(
+            capsule,
+            CAPSULE_RADIUS,
+            super::super::placement::CAPSULE_FLARE,
+        );
+        let bounds = view_rect(path.bounds());
+        assert!(
+            (bounds.width - (capsule.width + super::super::placement::CAPSULE_FLARE * 2.0)).abs()
+                < f64::EPSILON,
+            "the shoulders spread past the body: {bounds:?}"
+        );
+        assert!(
+            path.containsPoint(NSPoint::new(capsule.x + 0.5, 0.5)),
+            "the shoulder keeps the top corner black and flares outwards"
+        );
+        assert!(
+            !path.containsPoint(NSPoint::new(capsule.x - 6.5, 8.0)),
+            "the shoulder is concave: below the flare there is no black"
+        );
+        assert!(
+            !path.containsPoint(NSPoint::new(capsule.x + 0.5, capsule.height - 0.5)),
+            "the bottom-left corner is rounded"
+        );
+        assert!(
+            path.containsPoint(NSPoint::new(capsule.x + 20.0, capsule.height / 2.0)),
+            "the body is filled"
+        );
+
+        // A plain-screen tab is a pill, so its rounding is unmistakable.
+        let tab = Rect {
+            x: 900.0,
+            y: 0.0,
+            width: 120.0,
+            height: super::super::placement::PLAIN_TAB_HEIGHT,
+        };
+        let pill = chrome_path(tab, super::super::placement::PLAIN_TAB_HEIGHT / 2.0, 0.0);
+        assert!(pill.containsPoint(NSPoint::new(960.0, 3.0)));
+        assert!(
+            pill.containsPoint(NSPoint::new(tab.x + 0.4, 0.4)),
+            "the tab hangs from the screen edge, so its top stays flush"
+        );
+        assert!(
+            !pill.containsPoint(NSPoint::new(tab.x + 0.4, tab.height - 0.4)),
+            "its bottom edge is a visible semicircle, not a square end"
+        );
+
+        // Expanded, the band is flush with the screen edge and only its bottom
+        // corners are rounded.
+        let band = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1470.0,
+            height: 34.0,
+        };
+        let expanded = chrome_path(band, 10.0, 0.0);
+        assert!(expanded.containsPoint(NSPoint::new(0.5, 0.5)));
+        assert!(!expanded.containsPoint(NSPoint::new(0.5, band.height - 0.5)));
     }
 
     #[test]

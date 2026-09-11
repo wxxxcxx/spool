@@ -188,12 +188,17 @@ behind the Spaces and icons exactly as it does behind the menu bar itself.
 
 Collapse is runtime-only presentation state. `Action::ToggleBarCollapse` raises
 a one-shot `BarRequests` flag that the Bar's own schedule consumes on the next
-frame; the panel then shrinks to a capsule merged with the camera cutout, or to
-a small top-centred tab on a display without one. The panel's own rect eases
-between those two targets in `ChromeMotion`, which shares `BarMotion`'s 240ms
-ease-out: the window moves, while `BarMotion` keeps owning everything drawn
-inside it. Nothing about it is persisted and every Bar starts expanded, so the
-collapsed state can never be restored into a session that did not ask for it.
+frame; the chrome then morphs to a capsule merged with the camera cutout, or to
+a small top-centred tab on a display without one. `ChromeMotion` eases that
+morph over `BarMotion`'s 240ms, but it moves no window: the panel is the
+menu-bar band for its whole life and only what is drawn inside it changes, so
+the window server never re-blurs a moving window. While collapsed the panel
+ignores mouse events except over the tab, which hands the rest of the menu bar
+back without a second window. Hover pulses are Core Animation layers, not frame
+loop work: a window manager that wakes its whole ECS at refresh rate to animate
+a highlight spends ~45% of a core doing it. Nothing about collapse is persisted
+and every Bar starts expanded, so the collapsed state can never be restored
+into a session that did not ask for it.
 
 ## 4. Key Data Entities
 
