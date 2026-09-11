@@ -4,6 +4,22 @@ This document provides a high-level overview of Spool's architecture for contrib
 
 ## 1. High-Level Overview
 
+### Independent Native Window Identity
+
+New discovery produces ordinary layout windows, not application tab groups.
+`WindowApi::represented_window_id` encapsulates native chrome ownership: the
+macOS backend retains a unique direct `AXTabGroup` and reads its `AXWindow`
+owner, without enumerating or selecting tabs. Complete application inventory
+validates replacement targets. Reconciliation updates the existing entity's
+handle, preserving its layout slot and padding. Spawn-time bootstrap requires
+a unique publication transition, matching physical geometry, same user Space
+and live WindowServer ownership. Unpublished, nonpresented objects on a confirmed
+visible user Space are not new layout windows; offscreen visibility alone never
+excludes one. Ordinary geometry commits reject stale or unknown control targets.
+Legacy tab operations described below remain for compatibility, but automatic
+tab detection no longer creates these layouts. Live evidence and remaining
+acceptance are in `research/native-tab-platform-observation-2026-09-11.md`.
+
 Spool manages macOS windows as a **sliding strip** (inspired by Niri and PaperWM). The core design philosophy is **Data-Driven/ECS**: instead of managing windows as complex objects with internal state, we represent the "World" as a collection of simple data components (Windows, Displays, Workspaces) that are processed by systems.
 
 The primary problem Spool solves is providing a predictable, stable, and ergonomic tiling experience on macOS. By using Bevy's ECS, we gain:

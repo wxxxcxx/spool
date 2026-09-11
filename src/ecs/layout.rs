@@ -1222,11 +1222,22 @@ impl LayoutStrip {
     }
 
     pub fn tab_group(&self, entity: Entity) -> Option<Vec<Entity>> {
+        self.tab_group_members(entity).map(<[Entity]>::to_vec)
+    }
+
+    /// Native tabs retain individual identities but only the selected member
+    /// represents the physical window for ordinary geometry writes.
+    pub(crate) fn is_inactive_tab(&self, entity: Entity) -> bool {
+        self.tab_group_members(entity)
+            .is_some_and(|tabs| tabs.first() != Some(&entity))
+    }
+
+    fn tab_group_members(&self, entity: Entity) -> Option<&[Entity]> {
         self.columns.iter().find_map(|column| match column {
-            Column::Tabs(tabs) if tabs.contains(&entity) && tabs.len() > 1 => Some(tabs.clone()),
+            Column::Tabs(tabs) if tabs.contains(&entity) && tabs.len() > 1 => Some(tabs.as_slice()),
             Column::Stack(items) => items.iter().find_map(|item| match item {
                 StackItem::Tabs(tabs) if tabs.contains(&entity) && tabs.len() > 1 => {
-                    Some(tabs.clone())
+                    Some(tabs.as_slice())
                 }
                 StackItem::Single(_) | StackItem::Tabs(_) => None,
             }),

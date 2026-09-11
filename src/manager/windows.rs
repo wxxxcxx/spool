@@ -167,6 +167,9 @@ pub trait WindowApi: Send + Sync {
     fn default_floating(&self) -> bool;
     fn id(&self) -> WinID;
     fn incarnation(&self) -> WindowIncarnation;
+    /// Current native control target for this independently presented window.
+    /// The backend may retain shared chrome while the application changes its AX root.
+    fn represented_window_id(&self) -> Result<WinID>;
     fn frame(&self) -> IRect;
     fn element(&self) -> Option<CFRetained<AXUIWrapper>>;
     fn title(&self) -> Result<String>;
@@ -278,6 +281,7 @@ pub struct WindowOS {
     border_radius: OnceLock<Option<f64>>,
     pid: OnceLock<Result<Pid>>,
     app_reference: OnceLock<Option<CFRetained<AXUIWrapper>>>,
+    presentation_anchor: OnceLock<Option<CFRetained<AXUIWrapper>>>,
 
     /// The last title read off the element, cached because reading one is a
     /// synchronous cross-process call and many callers want it for every
@@ -394,6 +398,7 @@ impl WindowOS {
             border_radius: OnceLock::new(),
             pid: OnceLock::new(),
             app_reference: OnceLock::new(),
+            presentation_anchor: OnceLock::new(),
             title: RwLock::new(None),
         }
     }
@@ -768,6 +773,37 @@ impl WindowApi for WindowOS {
 
     fn incarnation(&self) -> WindowIncarnation {
         ax_window_incarnation(&self.ax_element)
+    }
+
+    fn represented_window_id(&self) -> Result<WinID> {
+        if self.presentation_anchor.get().is_none() {
+            let children = self
+                .ax_element
+                .get_attribute::<CFArray<AXUIWrapper>>(&CFString::from_static_str("AXChildren"))?;
+            let mut anchors = Vec::new();
+            for child in children.to_vec() {
+                if child.role()? == "AXTabGroup" {
+                    anchors.push(child);
+                }
+            }
+            if anchors.len() > 1 {
+                return Err(Error::InvalidWindow);
+            }
+            let _ = self.presentation_anchor.set(anchors.pop());
+        }
+        let Some(Some(anchor)) = self.presentation_anchor.get() else {
+            return Ok(self.id);
+        };
+        // Retain the chrome object, not a hash or a list of application tabs.
+        // AppKit reparents this object when the independently visible AX root changes.
+        let root = anchor.get_attribute::<AXUIWrapper>(&CFString::from_static_str("AXWindow"))?;
+        let mut pid = 0;
+        unsafe { accessibility_sys::AXUIElementGetPid(root.as_ptr(), &raw mut pid) }
+            .to_result(function_name!())?;
+        if pid != self.pid()? || root.role()? != "AXWindow" {
+            return Err(Error::InvalidWindow);
+        }
+        ax_window_id(root.as_ptr())
     }
 
     /// Returns the current frame (`CGRect`) of the window.

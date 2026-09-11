@@ -24,15 +24,15 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::reconcile::{WindowStateSync, WindowUnavailable};
 use crate::ecs::restore::{RestoreRetry, RestoredWindowPlacement};
-use crate::ecs::window_frame::DefaultWindowFrame;
+use crate::ecs::window_frame::{DefaultWindowFrame, WindowFrameCorrection};
 use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, FullscreenDefaultsDeferred,
     InitialWindowMarker, Initializing, LayoutPosition, ObservedWindowFrame, Position,
     PresentedWindowFrame, RepositionMarker, ResizeMarker, RestoreWindowState, RetilePending,
     Scrolling, SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio,
-    WindowDefaultsApplied, WindowDefaultsPending, WindowFrameMotion, WindowOwnershipChanged,
-    WindowProperties,
+    WindowDefaultsApplied, WindowDefaultsPending, WindowFrameCommitSuspended, WindowFrameMotion,
+    WindowOwnershipChanged, WindowProperties,
 };
 use crate::events::{DestroySource, Event, FocusObservation, FocusSource};
 use crate::manager::{
@@ -109,6 +109,10 @@ pub(super) struct SpawnWindowCtx<'w, 's> {
     restore: Option<Res<'w, crate::ecs::restore::SessionRestore>>,
     sync: ResMut<'w, WindowStateSync>,
     config: Res<'w, Config>,
+    window_manager: Res<'w, WindowManager>,
+    topology: Res<'w, super::topology::NativeTopology>,
+    targets: Query<'w, 's, &'static DesiredWindowFrame>,
+    representation_blocked: Query<'w, 's, (), RepresentationBlocked>,
     commands: Commands<'w, 's>,
 }
 
@@ -234,6 +238,11 @@ pub(super) fn front_switched_trigger(
             _ => continue,
         };
 
+        // AX focused UI elements are application-local. Background tab changes
+        // must not invalidate global focus and retrigger tiled layer raises.
+        if !front_switched && !app.is_frontmost() {
+            continue;
+        }
         debug!("resolving focused window for application: {app_name}");
         let generation = focus
             .observe(FocusSignal::Resolve {
@@ -1400,6 +1409,7 @@ fn reconcile_existing_window(
 ) -> Option<Window> {
     let window_id = window.id();
     let incarnation = window.incarnation();
+    window = adopt_window_representation(window, application, ctx)?;
     let Some((entity, existing, parent)) = ctx.windows.iter().find(|(_, existing, _)| {
         existing.id() == window_id && existing.incarnation() == incarnation
     }) else {
@@ -1420,6 +1430,172 @@ fn reconcile_existing_window(
     None
 }
 
+/// An application may replace its public AX root without creating another
+/// independently presented window. Keep layout identity out of that protocol.
+type RepresentationBlocked = bevy::ecs::query::Or<(
+    With<WindowSpaceReassignmentPending>,
+    With<super::native_space::NativeMoveOwner>,
+    With<WindowVisibility>,
+)>;
+
+fn replacement_source(
+    candidate: &mut Window,
+    application: Entity,
+    ctx: &mut SpawnWindowCtx,
+) -> Option<Entity> {
+    let id = candidate.id();
+    let existing: Vec<_> = ctx
+        .windows
+        .iter()
+        .filter(|(_, _, owner)| owner.parent() == application)
+        .collect();
+    if existing.is_empty() || existing.iter().any(|(_, window, _)| window.id() == id) {
+        return None;
+    }
+    let (_, app) = ctx.apps.get(application).ok()?;
+    let inventory = app.window_inventory(&ctx.config).ok()?;
+    if !inventory.complete
+        || !inventory
+            .identities
+            .contains(&(id, candidate.incarnation()))
+    {
+        return None;
+    }
+    let eligible: HashSet<_> = ctx
+        .windows
+        .iter()
+        .filter_map(|(entity, previous, owner)| {
+            (owner.parent() == application
+                && !ctx.representation_blocked.contains(entity)
+                && (previous
+                    .represented_window_id()
+                    .is_ok_and(|target| target == id)
+                    || !inventory
+                        .identities
+                        .iter()
+                        .any(|(published, _)| *published == previous.id())))
+            .then_some(entity)
+        })
+        .collect();
+    if eligible.is_empty() || candidate.try_is_full_screen().unwrap_or(true) {
+        return None;
+    }
+    // Geometry cannot disambiguate simultaneous new roots. Only bootstrap a
+    // one-to-one publication transition; retained native ownership is stronger.
+    let unpublished_targets = inventory
+        .identities
+        .iter()
+        .filter(|(published, _)| {
+            !ctx.windows.iter().any(|(_, window, owner)| {
+                owner.parent() == application && window.id() == *published
+            })
+        })
+        .count();
+    let frame = candidate.update_frame().ok()?;
+    let owners = ctx.window_manager.window_owners_in_session();
+    let memberships = ctx.topology.observe_memberships(&ctx.window_manager).ok();
+    let new_space = memberships
+        .as_ref()
+        .and_then(|memberships| memberships.unique_space(id));
+    let presented = new_space.and_then(|space| {
+        ctx.window_manager
+            .presentation_windows_in_workspace(space)
+            .ok()
+    });
+    let mut matches = ctx.windows.iter().filter(|(entity, previous, owner)| {
+        if !eligible.contains(entity)
+            || owner.parent() != application
+            || previous.id() == id
+            || previous.is_minimized()
+            || ctx.representation_blocked.contains(*entity)
+            || previous.try_is_full_screen().unwrap_or(true)
+        {
+            return false;
+        }
+        let represented = previous.represented_window_id();
+        if represented.is_ok_and(|target| target == id) {
+            return true;
+        }
+        // Bootstrap before shared native chrome existed. Require one uniquely
+        // withdrawn, still-live public root with the same physical rectangle.
+        unpublished_targets == 1
+            && !inventory
+                .identities
+                .iter()
+                .any(|(id, _)| *id == previous.id())
+            && owners
+                .as_ref()
+                .is_some_and(|owners| owners.get(&previous.id()) == Some(&app.pid()))
+            && new_space.is_some_and(|space| {
+                !ctx.topology.is_fullscreen(space)
+                    && memberships
+                        .as_ref()
+                        .and_then(|memberships| memberships.unique_space(previous.id()))
+                        == Some(space)
+            })
+            && presented
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&id) && !ids.contains(&previous.id()))
+            && {
+                let padding = bevy::math::IVec2::new(
+                    previous.horizontal_padding(),
+                    previous.vertical_padding(),
+                );
+                let observed = previous.frame();
+                IRect::from_corners(observed.min + padding, observed.max - padding) == frame
+            }
+    });
+    let (entity, _, _) = matches.next()?;
+    matches.next().is_none().then_some(entity)
+}
+
+fn adopt_window_representation(
+    mut candidate: Window,
+    application: Entity,
+    ctx: &mut SpawnWindowCtx,
+) -> Option<Window> {
+    let Some(entity) = replacement_source(&mut candidate, application, ctx) else {
+        return Some(candidate);
+    };
+    let Ok((_, previous, _)) = ctx.windows.get(entity) else {
+        return Some(candidate);
+    };
+    let id = candidate.id();
+    let horizontal = previous.horizontal_padding();
+    let vertical = previous.vertical_padding();
+    candidate.set_padding(crate::manager::WindowPadding::Horizontal(horizontal));
+    candidate.set_padding(crate::manager::WindowPadding::Vertical(vertical));
+    let _ = candidate.represented_window_id();
+    let Ok(frame) = candidate.update_frame() else {
+        return Some(candidate);
+    };
+    if let Ok((_, mut app)) = ctx.apps.get_mut(application) {
+        app.unobserve_window(previous);
+        _ = app
+            .observe_window(&candidate)
+            .inspect_err(|error| warn!(id, %error, "window representation observer failed"));
+    }
+    ctx.sync.forget_window(entity);
+    let target = ctx.targets.get(entity).map(|frame| frame.0).ok();
+    let mut commands = ctx.commands.entity(entity);
+    commands.insert((candidate, ObservedWindowFrame(frame)));
+    commands.remove::<(
+        WindowUnavailable,
+        RepositionMarker,
+        ResizeMarker,
+        WindowFrameMotion,
+        WindowFrameCommitSuspended,
+    )>();
+    if let Some(target) = target {
+        commands.insert(WindowFrameCorrection(target));
+    }
+    debug!(
+        ?entity,
+        id, "rebound independent window control target without changing layout"
+    );
+    None
+}
+
 type SpawnCandidateBuckets = HashMap<(Entity, WinID), HashSet<WindowIncarnation>>;
 
 fn collect_spawn_candidates(
@@ -1429,6 +1605,7 @@ fn collect_spawn_candidates(
 ) -> (Vec<(Entity, Window)>, SpawnCandidateBuckets) {
     let mut candidates = Vec::new();
     let mut buckets = SpawnCandidateBuckets::new();
+    let mut publications = HashMap::new();
 
     for window in new_windows {
         let window_id = window.id();
@@ -1450,6 +1627,36 @@ fn collect_spawn_candidates(
             trace!("unable to find application with pid {pid}.");
             continue;
         };
+        let publication = publications.entry(app_entity).or_insert_with(|| {
+            ctx.apps
+                .get(app_entity)
+                .ok()
+                .and_then(|(_, app)| app.window_inventory(&ctx.config).ok())
+                .filter(|inventory| inventory.complete)
+                .map(|inventory| inventory.identities.into_iter().collect::<HashSet<_>>())
+        });
+        if publication
+            .as_ref()
+            .is_some_and(|identities| !identities.contains(&(window_id, window.incarnation())))
+            && !window.is_minimized()
+            && let Ok(memberships) = ctx.topology.observe_memberships(&ctx.window_manager)
+            && let Some(space) = memberships.unique_space(window_id).filter(|space| {
+                ctx.topology.visible_display_for_space(*space).is_some()
+                    && !ctx.topology.is_fullscreen(*space)
+            })
+            && ctx
+                .window_manager
+                .presentation_windows_in_workspace(space)
+                .is_ok_and(|ids| !ids.contains(&window_id))
+        {
+            debug!(
+                window_id,
+                "not admitting an unpublished, nonpresented native object as a layout window"
+            );
+            continue;
+        }
+        // Capture opaque native chrome before the application changes its AX root.
+        let _ = window.represented_window_id();
         if ctx.sync.is_window_retired(app_entity, &window) {
             debug!(
                 window_id,

@@ -25,6 +25,20 @@ _Avoid_: Managed window
 A tracked window that belongs to a native Space but does not occupy a position in its layout strip.
 _Avoid_: Unmanaged window
 
+**Independent Window**:
+An application-owned outer frame represented by one ordinary layout entity.
+Native tab count, order, selection and internal layout belong to the application.
+The backend may retain native chrome to resolve a changing AX control target;
+reconciliation replaces that target on the same entity without adding a column.
+A one-to-one publication withdrawal may bootstrap continuity only with matching
+physical geometry, live process ownership and same-Space presentation evidence.
+Geometry or onscreen visibility alone is insufficient.
+
+**Legacy Tab Layout**:
+`Column::Tabs` and `StackItem::Tabs` remain supported for existing layout state.
+Their first eligible member represents the item; inactive members are not
+independently moved. New native window discovery does not create these groups.
+
 **Window Visibility**:
 Whether a tracked window is visible, minimized, or hidden. Visibility is independent of whether the window is tiled or floating.
 

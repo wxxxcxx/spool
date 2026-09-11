@@ -574,14 +574,6 @@ impl Config {
         self.options().horizontal_mouse_warp_offset.unwrap_or(0)
     }
 
-    pub fn native_tabs_enabled(&self) -> bool {
-        // Default is enabled.
-        !self
-            .options()
-            .disable_native_tabs
-            .is_some_and(|disabled| disabled)
-    }
-
     /// Enables the private, capability-probed Space control adapter.
     /// Off by default; observe-only Space state remains available.
     pub fn space_control_enabled(&self) -> bool {
@@ -755,11 +747,6 @@ pub struct MainOptions {
     /// Pixel distance used by grow/shrink actions for floating windows.
     pub floating_window_resize_step: Option<i32>,
 
-    /// Disable detection of native macOS tabs. When set, newly-spawned windows are
-    /// never auto-merged into a tab group with an existing same-app sibling.
-    /// Default: false.
-    pub disable_native_tabs: Option<bool>,
-
     /// Opts into private Space control when the running macOS exposes
     /// the required bridged operation. Never disables SIP or injects Dock.
     pub experimental_space_control: Option<bool>,
@@ -803,7 +790,6 @@ impl Default for MainOptions {
             window_resize_cycle: None,
             floating_window_move_step: None,
             floating_window_resize_step: None,
-            disable_native_tabs: None,
             experimental_space_control: None,
             space_switch_animation: None,
         }

@@ -195,7 +195,14 @@ pub(crate) fn observe_external_window_geometry(
         else {
             continue;
         };
-        if visibility.is_some() || moving || resizing || presenting {
+        if visibility.is_some()
+            || moving
+            || resizing
+            || presenting
+            || layout_strips
+                .iter()
+                .any(|strip| strip.is_inactive_tab(entity))
+        {
             continue;
         }
         let Ok(frame) = window.update_frame() else {
@@ -284,10 +291,9 @@ pub(crate) fn settle_external_window_geometry(
 ) {
     let mouse_held = mouse_held.iter().map(|marker| marker.0).collect();
     for (entity, pending) in settling.take_ready(time.elapsed(), &mouse_held) {
-        if strips
-            .iter()
-            .any(|(strip, _)| strip.is_fullscreen() && strip.contains(entity))
-        {
+        if strips.iter().any(|(strip, _)| {
+            (strip.is_fullscreen() && strip.contains(entity)) || strip.is_inactive_tab(entity)
+        }) {
             continue;
         }
         let floating = {

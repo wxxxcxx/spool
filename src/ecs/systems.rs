@@ -37,8 +37,7 @@ use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, FlashMessage, Floating,
     Initializing, LowPowerMode, MissionControlActive, ObservedWindowFrame, Position,
     PresentedWindowFrame, ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger,
-    SpawnCommandsExt, WidthRatio, WindowFrameCommitSuspended, WindowFrameMotion, WindowProperties,
-    WindowVisibility,
+    WidthRatio, WindowFrameCommitSuspended, WindowFrameMotion, WindowProperties, WindowVisibility,
 };
 use crate::events::{Event, FocusSource, InputEvent};
 use crate::manager::discovery::{DiscoveryOwner, WindowDiscovery};
@@ -1654,6 +1653,21 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
         if unavailable
             || (reassigning && transfer.is_none())
             || (default_frame.is_none() && defaults_pending)
+            || !window
+                .represented_window_id()
+                .is_ok_and(|id| id == window.id())
+        {
+            continue;
+        }
+        // An inactive native tab is an identity, not another physical window.
+        // Keep its logical targets, but never move/resize it independently as
+        // part of normal layout, animation, or drift correction.
+        if !floating
+            && default_frame.is_none()
+            && transfer.is_none()
+            && layout_strips
+                .iter()
+                .any(|(strip, _)| strip.is_inactive_tab(entity))
         {
             continue;
         }
@@ -1958,84 +1972,6 @@ pub(crate) fn window_creation_event(mut messages: MessageReader<Event>, mut comm
             .map(|window| Window::new(Box::new(window)))
         {
             commands.trigger(SpawnWindowTrigger::new(vec![window]));
-        }
-    }
-}
-
-pub(crate) fn detect_tabbed_windows(
-    created: Populated<(Entity, &ObservedWindowFrame, &ChildOf), Added<Window>>,
-    windows: Query<(Entity, &Window, &ObservedWindowFrame, &ChildOf), With<Window>>,
-    apps: Query<Entity, With<Application>>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    window_manager: Res<WindowManager>,
-    active_display: Single<&Display, With<ActiveDisplayMarker>>,
-    mut commands: Commands,
-) {
-    let display_bounds = active_display.bounds();
-    let Some(workspace_entities) = workspaces
-        .iter()
-        .find_map(|(strip, active)| active.then_some(strip.all_windows()))
-    else {
-        return;
-    };
-
-    for (entity, ObservedWindowFrame(frame), child) in created {
-        let Ok(app_entity) = apps.get(child.parent()) else {
-            continue;
-        };
-
-        // First find all the windows which have the same size and the same parent app.
-        // .. and in the same workspace.
-        let mut same_size = workspace_entities
-            .iter()
-            .filter_map(|e| windows.get(*e).ok())
-            .filter(|(leader, _, leader_frame, child)| {
-                *leader != entity
-                    && child.parent() == app_entity
-                    && leader_frame.0.size().chebyshev_distance(frame.size()) <= 1
-            })
-            .collect::<Vec<_>>();
-
-        // Now check whether any of these found windows have the same position?
-        let tabbed = same_size
-            .iter()
-            .find_map(|(leader, window, leader_frame, _)| {
-                // If the window has a positional match, it's tabbed!
-                (leader_frame.0.min.chebyshev_distance(frame.min) <= 1)
-                    .then_some((*leader, window.id()))
-            })
-            .or_else(|| {
-                // Otherwise if no windows were found by position, sort all the windows by distance
-                // and then pick the one which is currently offscreen.
-                // This heuristic relaxes the position matching, because the window is bumped into view.
-                same_size.sort_by_key(|(_, _, candidate_frame, _)| {
-                    frame.min.x.abs_diff(candidate_frame.0.min.x)
-                });
-                same_size
-                    .into_iter()
-                    .find_map(|(leader, window, leader_frame, _)| {
-                        let offscreen = !display_bounds.contains(leader_frame.0.min)
-                            || !display_bounds.contains(leader_frame.0.max);
-                        offscreen.then_some((leader, window.id()))
-                    })
-            });
-
-        if let Some((leader, leader_id)) = tabbed
-            && window_manager
-                .windows_on_screen()
-                .is_some_and(|ids| !ids.contains(&leader_id))
-            && let Some((mut strip, _)) =
-                workspaces.iter_mut().find(|strip| strip.0.contains(leader))
-            && strip.contains(leader)
-        {
-            debug!("Tabbed window detected: adding {entity} to leader {leader}");
-            if strip
-                .convert_to_tabs(leader, entity)
-                .inspect_err(|err| error!("Failed to convert to tabs: {err}"))
-                .is_ok()
-            {
-                commands.restore_focus_entity(entity, false);
-            }
         }
     }
 }

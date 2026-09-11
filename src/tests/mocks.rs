@@ -41,6 +41,8 @@ pub(crate) struct MockWindowData {
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) visible: bool,
     pub(crate) ordered_out: bool,
+    pub(crate) published: bool,
+    pub(crate) represented_window_id: Option<WinID>,
     pub(crate) role: String,
     pub(crate) subrole: String,
     pub(crate) identifier: String,
@@ -67,6 +69,8 @@ impl Default for MockWindowData {
             workspace_id: 0,
             visible: true,
             ordered_out: false,
+            published: true,
+            represented_window_id: None,
             role: "AXWindow".to_string(),
             subrole: "AXStandardWindow".to_string(),
             identifier: "testid".to_string(),
@@ -146,6 +150,7 @@ struct MockStateInner {
     rejected_frame_writes: HashSet<WinID>,
     progressive_frame_writes: HashSet<WinID>,
     frame_write_attempts: HashMap<WinID, u32>,
+    position_write_attempts: HashMap<WinID, u32>,
     resize_write_attempts: HashMap<WinID, u32>,
     frame_write_readback_failures: HashMap<WinID, u32>,
     frame_update_failures: HashMap<WinID, u32>,
@@ -160,6 +165,10 @@ fn application_inventory_omits(inner: &MockStateInner, pid: Pid, window_id: WinI
     inner
         .omitted_application_inventory_windows
         .contains(&(pid, window_id))
+        || inner
+            .windows
+            .get(&window_id)
+            .is_some_and(|window| !window.published)
 }
 
 #[derive(Clone)]
@@ -212,6 +221,7 @@ impl MockState {
                 rejected_frame_writes: HashSet::new(),
                 progressive_frame_writes: HashSet::new(),
                 frame_write_attempts: HashMap::new(),
+                position_write_attempts: HashMap::new(),
                 resize_write_attempts: HashMap::new(),
                 frame_write_readback_failures: HashMap::new(),
                 frame_update_failures: HashMap::new(),
@@ -692,6 +702,15 @@ impl MockState {
             .unwrap_or_default()
     }
 
+    pub fn position_write_attempts(&self, id: WinID) -> u32 {
+        self.inner
+            .force_read()
+            .position_write_attempts
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn resize_write_attempts(&self, id: WinID) -> u32 {
         self.inner
             .force_read()
@@ -968,6 +987,15 @@ impl MockState {
                 .is_some_and(|window| window.default_floating)
         });
         mw.expect_incarnation().return_const(incarnation);
+        let s = self.clone();
+        mw.expect_represented_window_id().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|window| window.represented_window_id.unwrap_or(id))
+                .ok_or(Error::InvalidWindow)
+        });
 
         let s = self.clone();
         mw.expect_is_resizable().returning(move || {
@@ -1015,6 +1043,7 @@ impl MockState {
         let s_move = self.clone();
         mw.expect_reposition().returning(move |origin| {
             let mut inner = s_move.inner.force_write();
+            *inner.position_write_attempts.entry(id).or_default() += 1;
             let frame = if let Some(w) = inner.windows.get_mut(&id) {
                 let size = w.frame.size();
                 w.frame.min = origin;
@@ -1317,7 +1346,7 @@ impl MockState {
                         .force_read()
                         .windows
                         .get(id)
-                        .is_some_and(|window| window.role != "AXUnknown")
+                        .is_some_and(|window| window.role != "AXUnknown" && window.published)
                 })
                 .map(|id| s.create_window(id))
                 .collect()
@@ -1404,7 +1433,9 @@ impl MockState {
             let inner = s.inner.force_read();
             let identity = (window.id(), window.incarnation());
             Ok(inner.windows.values().any(|candidate| {
-                candidate.pid == pid && (candidate.id, candidate.incarnation) == identity
+                candidate.pid == pid
+                    && candidate.published
+                    && (candidate.id, candidate.incarnation) == identity
             }) || inner.stale_window_ids.get(&window.id()) == Some(&pid)
                 && inner.stale_window_incarnations.get(&window.id()) == Some(&window.incarnation()))
         });
@@ -1562,20 +1593,6 @@ impl MockState {
     }
 
     fn mock_window_server_inventory(&self, wm: &mut MockWindowManagerApi) {
-        let s = self.clone();
-        wm.expect_windows_on_screen().returning(move || {
-            let inner = s.inner.force_read();
-            let windows = inner
-                .windows
-                .iter()
-                .chain(inner.withdrawn_surfaces.iter())
-                .filter(|(id, _)| !inner.window_server_inventory_omissions.contains(id))
-                .filter_map(|(id, window)| window.visible.then_some(id))
-                .copied()
-                .collect::<Vec<_>>();
-            Some(windows)
-        });
-
         let s = self.clone();
         wm.expect_window_owners_in_session().returning(move || {
             let inner = s.inner.force_read();

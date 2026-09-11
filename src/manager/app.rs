@@ -60,6 +60,18 @@ pub static AX_WINDOW_NOTIFICATIONS: LazyLock<Vec<&str>> = LazyLock::new(|| {
     ]
 });
 
+fn inventory_window_identity(
+    role: Result<String>,
+    identity: impl FnOnce() -> Result<(WinID, WindowIncarnation)>,
+) -> Result<Option<(WinID, WindowIncarnation)>> {
+    // Finder includes its desktop AXScrollArea in AXWindows. It is not a
+    // missing window identity and must not poison the complete snapshot.
+    if role? != "AXWindow" {
+        return Ok(None);
+    }
+    identity().map(Some)
+}
+
 #[automock]
 pub trait ApplicationApi: Send + Sync {
     /// Returns the process ID of the application.
@@ -270,13 +282,22 @@ impl ApplicationApi for ApplicationOS {
         let mut candidates = Vec::new();
         let mut complete = true;
         for element in self.element.windows()? {
-            let Ok(window_id) = ax_window_id(element.as_ptr()).inspect_err(|error| {
+            let identity = inventory_window_identity(element.role(), || {
+                Ok((
+                    ax_window_id(element.as_ptr())?,
+                    ax_window_incarnation(&element),
+                ))
+            });
+            let Ok(identity) = identity.inspect_err(|error| {
                 debug!(%error, "unable to identify one AX window inventory element");
             }) else {
                 complete = false;
                 continue;
             };
-            identities.push((window_id, ax_window_incarnation(&element)));
+            let Some(identity) = identity else {
+                continue;
+            };
+            identities.push(identity);
             if let Ok(window) = WindowOS::new_with_config(&element, config, bundle_id) {
                 candidates.push(Window::new(Box::new(window)));
             }
@@ -816,6 +837,33 @@ impl AxObserverHandler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finder_desktop_does_not_make_window_inventory_incomplete() {
+        let desktop = super::inventory_window_identity(Ok("AXScrollArea".into()), || {
+            Err(crate::errors::Error::InvalidWindow)
+        });
+        assert!(
+            matches!(desktop, Ok(None)),
+            "non-window desktop is not a failed window identity"
+        );
+    }
+
+    #[test]
+    fn unreadable_window_identity_still_makes_inventory_incomplete() {
+        let window = super::inventory_window_identity(Ok("AXWindow".into()), || {
+            Err(crate::errors::Error::InvalidWindow)
+        });
+        assert!(window.is_err());
+    }
+
+    #[test]
+    fn unreadable_role_does_not_silently_discard_a_window() {
+        let result =
+            super::inventory_window_identity(Err(crate::errors::Error::InvalidWindow), || {
+                Ok((42, 1))
+            });
+        assert!(result.is_err());
+    }
     use std::{
         collections::HashMap,
         io::{self, Write},

@@ -28,7 +28,9 @@ use crate::ecs::{
 };
 use crate::errors::Error;
 use crate::events::{Event, FocusSource, ReconcileScope};
-use crate::manager::{Application, Window, WindowManager, app::ApplicationWindowInventory};
+use crate::manager::{
+    Application, Window, WindowManager, WindowPadding, app::ApplicationWindowInventory,
+};
 use crate::platform::{Pid, WinID, WindowIncarnation};
 
 const CONFIRMATION_DELAY: Duration = Duration::from_millis(250);
@@ -256,6 +258,13 @@ impl SyncRequest {
                     }
                     ReconcileScope::All => request.all = true,
                 },
+                Event::WindowFocused(observation) => {
+                    if let Some(pid) = observation.pid {
+                        request.pids.insert(pid);
+                    } else {
+                        request.all = true;
+                    }
+                }
                 Event::WindowMoved { window_id, .. } | Event::WindowResized { window_id, .. } => {
                     request.frame_ids.insert(*window_id);
                 }
@@ -475,6 +484,7 @@ pub(super) struct ReconcileState<'w, 's> {
 }
 
 impl ReconcileState<'_, '_> {
+    #[allow(clippy::too_many_lines)]
     fn audit_lifecycle(
         &mut self,
         request: &SyncRequest,
@@ -519,7 +529,7 @@ impl ReconcileState<'_, '_> {
             let inventory = can_probe
                 .then(|| refresh_application_inventory(app_entity, &app, config, sync))
                 .flatten();
-            let Some(inventory) = inventory else {
+            let Some(mut inventory) = inventory else {
                 suspend_windows_missing_from_window_server(
                     app_entity,
                     pid,
@@ -529,6 +539,18 @@ impl ReconcileState<'_, '_> {
                 );
                 continue;
             };
+            if inventory.complete && !self.mission_control.0 {
+                refresh_window_representations(
+                    app_entity,
+                    &mut app,
+                    &mut inventory,
+                    &mut self.windows,
+                    &self.native_moves,
+                    sync,
+                    &audit,
+                    commands,
+                );
+            }
             let buckets = inventory_buckets(inventory.identities, app_entity, sync);
             if !inventory.complete {
                 debug!(
@@ -874,14 +896,25 @@ impl ReconcileState<'_, '_> {
 
             let native_fullscreen = native_fullscreen_windows.contains(&entity)
                 || window.try_is_full_screen().unwrap_or(true);
-            if native_fullscreen {
+            let inactive_tab = !floating
+                && self
+                    .workspaces
+                    .iter()
+                    .any(|strip| strip.is_inactive_tab(entity));
+            if native_fullscreen || inactive_tab {
                 sync.frame_convergence.remove(&entity);
+            }
+            if inactive_tab {
+                commands
+                    .entity(entity)
+                    .remove::<(WindowFrameCorrection, WindowFrameCommitSuspended)>();
             }
             let can_adopt_frame = visibility.is_none()
                 && !repositioning
                 && !resizing
                 && !presenting
                 && !native_fullscreen
+                && !inactive_tab
                 && !self.settling.contains(entity);
             if !floating && can_adopt_frame {
                 let target = desired.0;
@@ -918,6 +951,104 @@ impl ReconcileState<'_, '_> {
                 );
             }
         }
+    }
+}
+
+/// Follow an explicitly retained native chrome owner before the lifecycle audit
+/// interprets changed AX roots as independent window births/deaths.
+#[allow(clippy::too_many_arguments)]
+fn refresh_window_representations(
+    application: Entity,
+    app: &mut Application,
+    inventory: &mut ApplicationWindowInventory,
+    windows: &mut Query<ReconcileWindowData>,
+    native_moves: &Query<(), bevy::ecs::query::With<super::native_space::NativeMoveOwner>>,
+    sync: &mut WindowStateSync,
+    audit: &LifecycleAudit,
+    commands: &mut Commands,
+) {
+    let targets = windows
+        .iter()
+        .filter_map(|(entity, window, owner, ..)| {
+            (owner.parent() == application && !native_moves.contains(entity))
+                .then(|| window.represented_window_id().ok())
+                .flatten()
+                .filter(|target| *target != window.id())
+                .map(|target| (entity, target))
+        })
+        .collect::<Vec<_>>();
+    for &(entity, target) in &targets {
+        if targets.iter().filter(|(_, id)| *id == target).count() != 1
+            || inventory
+                .identities
+                .iter()
+                .filter(|(id, _)| *id == target)
+                .count()
+                != 1
+            || !audit.contains_window(target, app.pid())
+            || windows.iter().any(|(other, window, owner, ..)| {
+                other != entity && owner.parent() == application && window.id() == target
+            })
+        {
+            continue;
+        }
+        let Some(index) = inventory
+            .candidates
+            .iter()
+            .position(|window| window.id() == target)
+        else {
+            continue;
+        };
+        let Ok((
+            _,
+            mut previous,
+            _,
+            _,
+            _,
+            _,
+            desired,
+            _,
+            _,
+            _,
+            visibility,
+            (_, _, _, _, reassigned),
+        )) = windows.get_mut(entity)
+        else {
+            continue;
+        };
+        if reassigned
+            || visibility.is_some()
+            || sync.is_window_retired(application, &inventory.candidates[index])
+        {
+            continue;
+        }
+        let candidate = &mut inventory.candidates[index];
+        candidate.set_padding(WindowPadding::Horizontal(previous.horizontal_padding()));
+        candidate.set_padding(WindowPadding::Vertical(previous.vertical_padding()));
+        let Ok(frame) = candidate.update_frame() else {
+            continue;
+        };
+        let _ = candidate.represented_window_id();
+        app.unobserve_window(&previous);
+        _ = app
+            .observe_window(candidate)
+            .inspect_err(|error| warn!(target, %error, "representation observer failed"));
+        *previous = inventory.candidates.swap_remove(index);
+        sync.forget_window(entity);
+        commands
+            .entity(entity)
+            .insert((ObservedWindowFrame(frame), WindowFrameCorrection(desired.0)))
+            .remove::<(
+                WindowUnavailable,
+                RepositionMarker,
+                ResizeMarker,
+                WindowFrameMotion,
+                WindowFrameCommitSuspended,
+            )>();
+        debug!(
+            ?entity,
+            target, "refreshed independent window native control target"
+        );
     }
 }
 

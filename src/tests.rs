@@ -3,6 +3,7 @@ mod display;
 mod display_commands;
 mod exit_restore;
 mod harness;
+mod independent_windows;
 mod interaction;
 #[cfg(feature = "lua")]
 mod layout_ops;

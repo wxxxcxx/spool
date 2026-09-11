@@ -23,6 +23,7 @@
 
 - [Window exclusion policy: DockDoor and AltTab](research/window-exclusion-policy.md)
 - [Window tiling policy: yabai, AeroSpace and Rift](research/window-tiling-policy.md)
+- [Native tabs as one layout window](research/native-tab-platform-observation-2026-09-11.md)
 - [macOS window capability matrix](research/macos-window-capability-matrix.md)
 - [macOS window properties](research/macos-window-properties.md)
 - [macOS window control backends](research/macos-window-control-backends.md)

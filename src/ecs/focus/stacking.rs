@@ -78,6 +78,9 @@ impl TiledStacking<'_, '_> {
         if let Some((window, _, state)) = self.windows.get_tracked(entity)
             && state.is_visible()
             && self.windows.layout_is_writable(entity)
+            && window
+                .represented_window_id()
+                .is_ok_and(|id| id == window.id())
         {
             window.raise_without_focus();
         }

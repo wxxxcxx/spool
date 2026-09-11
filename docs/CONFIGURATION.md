@@ -48,7 +48,6 @@ General behavior settings for the window manager.
 | `floating_window_move_step` | Integer (px) | `20` | Distance a floating window moves for each directional `window move` action. |
 | `floating_window_resize_step` | Integer (px) | `40` | Width or height change applied to a floating window for each grow/shrink action. |
 | `mouse_resize_modifier` | String | *None* | If enabled allows window resizing using mouse movement. For example `cmd + shift` will allow resizing of the window when holding those keys. Proximity of the pointer to left or right window edge determines which side will be adjusted. |
-| `disable_native_tabs` | Boolean | `false` | If enabled, Spool will not auto-merge a newly-spawned window into a tab group with an existing same-app sibling that shares its frame. Use this if you find unrelated windows being grouped together. |
 | `experimental_space_control` | Boolean | `false` | Enables capability-probed private Space control. The current backend may focus a Space on the active display or move windows to a user Space; create/delete remain unavailable. This never injects into Dock and does not require disabling SIP. |
 | `space_switch_animation` | Boolean | `true` | Uses the native Mission Control animation when focusing a Space. Requires macOS's “Move left/right a space” shortcuts to be enabled. When disabled, Spool uses the instant high-velocity gesture path. |
 

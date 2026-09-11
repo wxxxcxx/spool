@@ -145,15 +145,13 @@ pub fn register_systems(app: &mut bevy::app::App) {
             .next()
             .is_none_or(|marker| !marker.is_user_swiping)
     };
-    let native_tabs_enabled =
-        |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
     let bar_dirty =
         |layout_changed: Query<(), Changed<LayoutStrip>>,
          native_space_changed: ChangedNativeSpaces,
          visible_space_gained: Query<(), Added<native_space::VisibleNativeSpaceMarker>>,
          focus_gained: Query<(), Added<FocusedMarker>>,
          floating_gained: Query<(), Added<Floating>>,
-         window_gained: Query<(), Added<Window>>,
+         window_gained: Query<(), Changed<Window>>,
          display_changed: Query<(), Changed<Display>>,
          config: Option<Res<Config>>,
          mut visible_space_lost: RemovedComponents<native_space::VisibleNativeSpaceMarker>,
@@ -205,7 +203,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 defaults::refresh_default_retries.after(native_space::reconcile_native_spaces),
                 triggers::apply_window_defaults,
                 systems::commit_default_window_frames,
-                systems::detect_tabbed_windows.run_if(native_tabs_enabled),
                 triggers::apply_window_positions,
                 triggers::retry_pending_retiles,
             )

@@ -367,8 +367,6 @@ pub trait WindowManagerApi: Send + Sync {
 
     fn dim_windows(&self, windows: &[WinID], level: f32);
 
-    fn windows_on_screen(&self) -> Option<Vec<WinID>>;
-
     /// Returns every `WindowServer` window in the current GUI session with
     /// its owning process, including off-screen and minimized windows.
     fn window_owners_in_session(&self) -> Option<HashMap<WinID, Pid>>;
@@ -847,12 +845,6 @@ impl WindowManagerApi for WindowManagerOS {
         .inspect_err(|err| debug!("{err}"));
     }
 
-    fn windows_on_screen(&self) -> Option<Vec<WinID>> {
-        let options =
-            CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
-        window_ids_matching(options)
-    }
-
     fn window_owners_in_session(&self) -> Option<HashMap<WinID, Pid>> {
         window_owners_matching(
             CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements,
@@ -877,19 +869,6 @@ impl WindowManagerApi for WindowManagerOS {
         }
         .to_result(function_name!())
     }
-}
-
-fn window_ids_matching(options: CGWindowListOption) -> Option<Vec<WinID>> {
-    CGWindowListCopyWindowInfo(options, kCGNullWindowID).map(|window_info| {
-        let array = unsafe { window_info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
-        array
-            .iter()
-            .filter_map(|dict| {
-                dict.get(unsafe { kCGWindowNumber })
-                    .and_then(|id| id.as_i32())
-            })
-            .collect::<Vec<_>>()
-    })
 }
 
 fn window_owners_matching(options: CGWindowListOption) -> Option<HashMap<WinID, Pid>> {

@@ -4,6 +4,44 @@ use crate::ecs::{Floating, MissionControlActive, RaiseWindow};
 use crate::events::Event;
 
 #[test]
+fn background_ax_focus_events_do_not_restart_tiled_stacking() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(2);
+    harness.pump_frames(30);
+    let pid = super::TEST_PROCESS_ID + 1;
+    harness
+        .mock_state
+        .spawn_app(pid, "background.test", "Background");
+    harness.mock_state.update_app(pid, |app| {
+        app.is_frontmost = false;
+        app.focused_window_id = Some(99);
+    });
+    let app = harness.mock_state.create_application(pid);
+    harness.world().spawn(app);
+    harness.mock_state.take_raise_requests();
+    let focused = find_window_entity(2, harness.world());
+    for _ in 0..10 {
+        harness
+            .world()
+            .write_message(Event::FocusRevalidationRequested {
+                pid,
+                source: crate::events::FocusSource::AccessibilityUiElement,
+            });
+        harness.pump_frames(2);
+        assert!(
+            harness
+                .world()
+                .get::<crate::ecs::FocusedMarker>(focused)
+                .is_some(),
+            "background app-local focus must not invalidate global focus"
+        );
+    }
+    assert!(
+        harness.mock_state.take_raise_requests().is_empty(),
+        "background AX notifications must not repeat tiled raises"
+    );
+}
+
+#[test]
 fn confirmed_tiled_focus_raises_columns_from_far_to_near() {
     let mut harness = TestHarness::new().with_windows(5).with_focused_window(0);
     harness.pump_frames(20);
@@ -16,6 +54,26 @@ fn confirmed_tiled_focus_raises_columns_from_far_to_near() {
     );
     harness.pump_frames(20);
     assert!(harness.mock_state.take_raise_requests().is_empty());
+}
+
+#[test]
+fn tiled_raise_does_not_select_a_dormant_native_identity() {
+    let mut harness = TestHarness::new().with_windows(3).with_focused_window(2);
+    harness.pump_frames(30);
+    harness
+        .mock_state
+        .update_window(0, |window| window.represented_window_id = Some(1));
+    harness.mock_state.take_raise_requests();
+    let entity = find_window_entity(2, harness.world());
+    harness.world().trigger(RaiseWindow {
+        entity,
+        with_strip: true,
+    });
+    assert_eq!(
+        harness.mock_state.take_raise_requests(),
+        vec![1, 2],
+        "raising a stale native root can select its tab and reenter the focus loop"
+    );
 }
 
 #[test]
