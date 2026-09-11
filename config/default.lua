@@ -12,11 +12,6 @@ spool.setup {
     default_keeping_you_awake = { bundle_id = "info.marcel-dierkes.KeepingYouAwake", floating = true, priority = -100 },
   },
   bar = {
-    embed_in_menu_bar = true,
-    height = 0, -- 0 follows each screen's menu-bar height.
-    top_offset = 0,
-    max_width = 0, -- 0 uses the available screen region.
-    screen_padding = 12,
     notch_side = "balanced", -- "balanced", "left", or "right" on notched screens.
     icon_size = 0, -- 0 fits the available height, up to 20pt.
     vertical_padding = 3,

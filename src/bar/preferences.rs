@@ -15,12 +15,10 @@ pub enum NotchSide {
 #[serde(default)]
 #[allow(clippy::struct_excessive_bools)] // Independent user-facing visibility/style switches.
 pub struct BarPreferences {
-    pub embed_in_menu_bar: bool,
-    /// Zero selects the screen's menu-bar height (34 points in floating mode).
+    /// Resolved from the observed menu bar, never from configuration: the Bar
+    /// takes over the menu bar, so the band decides how tall it is.
+    #[serde(skip)]
     pub height: f64,
-    pub top_offset: f64,
-    pub max_width: f64,
-    pub screen_padding: f64,
     pub notch_side: NotchSide,
     /// Zero fits the icon to the available height and vertical padding.
     pub icon_size: f64,
@@ -49,11 +47,7 @@ pub struct BarPreferences {
 impl Default for BarPreferences {
     fn default() -> Self {
         Self {
-            embed_in_menu_bar: true,
             height: 0.0,
-            top_offset: 0.0,
-            max_width: 0.0,
-            screen_padding: 12.0,
             notch_side: NotchSide::Balanced,
             icon_size: 0.0,
             vertical_padding: 3.0,
@@ -84,10 +78,6 @@ impl BarPreferences {
     #[cfg(feature = "lua")]
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
-            ("height", self.height),
-            ("top_offset", self.top_offset),
-            ("max_width", self.max_width),
-            ("screen_padding", self.screen_padding),
             ("icon_size", self.icon_size),
             ("vertical_padding", self.vertical_padding),
             ("horizontal_padding", self.horizontal_padding),
@@ -106,51 +96,18 @@ impl BarPreferences {
         Ok(())
     }
 
+    /// Resolves the band height onto the preferences. The Bar is flush with the
+    /// menu bar, so this is the only place its height comes from.
+    #[must_use]
     pub fn for_menu_height(&self, menu_height: f64) -> Self {
-        let mut resolved = self.clone();
-        let menu_height = menu_height.clamp(18.0, 64.0);
-        let limit = if self.embed_in_menu_bar {
-            menu_height
-        } else {
-            64.0
-        };
-        resolved.top_offset = self.top_offset.clamp(
-            0.0,
-            if self.embed_in_menu_bar {
-                (limit - 18.0).max(0.0)
-            } else {
-                64.0
-            },
-        );
-        let available = limit
-            - if self.embed_in_menu_bar {
-                resolved.top_offset
-            } else {
-                0.0
-            };
-        let desired = if self.height > 0.0 {
-            self.height
-        } else if self.embed_in_menu_bar {
-            menu_height
-        } else {
-            34.0
-        };
-        resolved.height = desired.clamp(18.0, available);
-        resolved
+        Self {
+            height: menu_height.clamp(18.0, 64.0),
+            ..self.clone()
+        }
     }
 
     pub fn toolbar_width(&self) -> f64 {
         super::toolbar::width(self.show_mission_control, self.show_desktop)
-    }
-
-    pub fn width_limit(&self, available: f64) -> f64 {
-        if self.max_width > 0.0 {
-            self.max_width
-                .max(self.toolbar_width() + 38.0)
-                .min(available)
-        } else {
-            available
-        }
     }
 
     #[must_use]
@@ -232,25 +189,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_height_and_offset_cannot_extend_below_menu_bar() {
-        for menu_height in [22.0, 24.0, 37.0] {
-            for requested in [0.0, 18.0, 34.0, 64.0, 200.0] {
-                for offset in [0.0, 2.0, 200.0] {
-                    let preferences = BarPreferences {
-                        height: requested,
-                        top_offset: offset,
-                        icon_size: 100.0,
-                        ..Default::default()
-                    }
-                    .for_menu_height(menu_height);
-                    let metrics = preferences.metrics();
-                    assert!(preferences.height + preferences.top_offset <= menu_height);
-                    assert!(
-                        (metrics.icon_size + 2.0 * metrics.vertical_padding - preferences.height)
-                            .abs()
-                            < f64::EPSILON
-                    );
+    fn the_menu_bar_decides_the_height_and_the_content_still_fits() {
+        for menu_height in [22.0, 24.0, 34.0, 37.0, 64.0] {
+            for requested in [0.0, 18.0, 200.0] {
+                let preferences = BarPreferences {
+                    height: requested,
+                    icon_size: 100.0,
+                    ..Default::default()
                 }
+                .for_menu_height(menu_height);
+                let metrics = preferences.metrics();
+                assert!(
+                    (preferences.height - menu_height.clamp(18.0, 64.0)).abs() < f64::EPSILON,
+                    "configuration cannot override the band"
+                );
+                assert!(
+                    (metrics.icon_size + 2.0 * metrics.vertical_padding - preferences.height).abs()
+                        < f64::EPSILON
+                );
             }
         }
     }
@@ -270,34 +226,6 @@ mod tests {
         assert!(
             (automatic.icon_size + automatic.vertical_padding * 2.0 - 37.0).abs() < f64::EPSILON
         );
-    }
-
-    #[test]
-    fn floating_mode_allows_taller_bars_and_custom_top_gap() {
-        let preferences = BarPreferences {
-            embed_in_menu_bar: false,
-            height: 40.0,
-            top_offset: 8.0,
-            ..Default::default()
-        }
-        .for_menu_height(24.0);
-        assert!((preferences.height - 40.0).abs() < f64::EPSILON);
-        assert!((preferences.top_offset - 8.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn width_limit_respects_screen_and_keeps_controls_usable() {
-        for available in [20.0, 200.0, 1200.0] {
-            for requested in [0.0, 10.0, 500.0, 10000.0] {
-                let preferences = BarPreferences {
-                    max_width: requested,
-                    ..Default::default()
-                };
-                let width = preferences.width_limit(available);
-                assert!(width <= available);
-                assert!(width >= (preferences.toolbar_width() + 38.0).min(available));
-            }
-        }
     }
 
     #[test]

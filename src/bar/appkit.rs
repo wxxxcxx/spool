@@ -8,11 +8,12 @@ use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSAttributedStringNSStringDrawing, NSBackingStoreType, NSBezelStyle, NSBezierPath, NSButton,
-    NSButtonType, NSColor, NSCompositingOperation, NSEvent, NSFont, NSGraphicsContext, NSImage,
-    NSImageScaling, NSImageSymbolConfiguration, NSLineBreakMode, NSMainMenuWindowLevel,
-    NSMutableParagraphStyle, NSPanel, NSRunningApplication, NSScreen, NSStatusBar, NSTextAlignment,
-    NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSAttributedStringNSStringDrawing, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle,
+    NSBezierPath, NSButton, NSButtonType, NSColor, NSCompositingOperation, NSEvent, NSFont,
+    NSGraphicsContext, NSImage, NSImageScaling, NSImageSymbolConfiguration, NSLineBreakMode,
+    NSMainMenuWindowLevel, NSMutableParagraphStyle, NSPanel, NSRunningApplication, NSScreen,
+    NSStatusBar, NSTextAlignment, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSDictionary, NSNumber, NSPoint, NSRect, NSSize, NSString,
@@ -27,7 +28,7 @@ use super::drag::{BarDrag, DropTarget};
 use super::layout::{BarLayout, BarMetrics, BarSurface, ItemKind, PlacedItem, Rect};
 use super::model::{BarDisplay, BarSnapshot};
 use super::motion::{BarMotion, VisualItem};
-use super::preferences::{BarPreferences, NotchSide};
+use super::preferences::BarPreferences;
 use super::toolbar;
 
 const DRAG_RELEASE_GRACE: Duration = Duration::from_millis(250);
@@ -745,17 +746,9 @@ struct PanelRecord {
 
 impl PanelRecord {
     fn present(&self) {
-        let state = self.view.ivars().state.borrow();
-        let frame = &state.motion.presented;
-        let dragging = state.pressed.as_ref().is_some_and(|drag| drag.active);
-        // Compact previews preserve their origin; split panels stay notch-anchored.
-        let rect = ns_rect(super::placement::panel_frame(
-            self.available_frame,
-            frame.width,
-            frame.height,
-            (dragging && state.surface.notch.is_none()).then(|| self.window.frame().origin.x),
-        ));
-        drop(state);
+        // The panel is the menu-bar band: content never resizes it. Collapse
+        // changes this rect, and that is the only thing that does.
+        let rect = ns_rect(self.available_frame);
         self.view.setFrameSize(rect.size);
         self.view.layout_toolbar();
         if self.window.frame() != rect {
@@ -907,38 +900,36 @@ fn screen_placement(
     preferences: &BarPreferences,
 ) -> (Rect, BarSurface, BarPreferences) {
     let frame = view_rect(screen.frame());
-    let safe_top = screen.safeAreaInsets().top;
     let menu_height = super::placement::menu_height(
         frame,
         view_rect(screen.visibleFrame()),
-        safe_top,
+        screen.safeAreaInsets().top,
         NSStatusBar::systemStatusBar().thickness(),
     );
     let preferences = preferences.for_menu_height(menu_height);
-    let has_notch = safe_top > 0.0 && preferences.top_offset < safe_top;
-    if has_notch && preferences.notch_side == NotchSide::Balanced {
-        let region = super::placement::available_region(frame, menu_height, None, &preferences);
-        if let Some((region, surface)) = super::placement::balanced_region(
-            region,
-            view_rect(screen.auxiliaryTopLeftArea()),
-            view_rect(screen.auxiliaryTopRightArea()),
-            &preferences,
-        ) {
-            return (region, surface, preferences);
-        }
-    }
-    let notch_side = has_notch.then(|| {
-        view_rect(match preferences.notch_side {
-            NotchSide::Left => screen.auxiliaryTopLeftArea(),
-            NotchSide::Right | NotchSide::Balanced => screen.auxiliaryTopRightArea(),
-        })
-    });
-    let region = super::placement::available_region(frame, menu_height, notch_side, &preferences);
-    let surface = BarSurface {
-        width: preferences.width_limit(region.width),
-        notch: None,
+    let panel = super::placement::panel_rect(frame, menu_height);
+    let gap = super::placement::notch_gap(
+        view_rect(screen.auxiliaryTopLeftArea()),
+        view_rect(screen.auxiliaryTopRightArea()),
+        menu_height,
+    );
+    (panel, super::placement::surface(panel, gap), preferences)
+}
+
+/// A menu-material backdrop the content draws on top of, so the Bar blurs what
+/// is behind it exactly the way the menu bar it replaces does.
+fn make_backdrop(mtm: MainThreadMarker, size: NSSize) -> Retained<NSVisualEffectView> {
+    let backdrop: Retained<NSVisualEffectView> = unsafe {
+        msg_send![
+            NSVisualEffectView::alloc(mtm),
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), size)
+        ]
     };
-    (region, surface, preferences)
+    backdrop.setMaterial(NSVisualEffectMaterial::Menu);
+    backdrop.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+    // The menu bar always looks active, and this panel is never the key window.
+    backdrop.setState(NSVisualEffectState::Active);
+    backdrop
 }
 
 fn make_bar_window(mtm: MainThreadMarker, view: &NSView) -> Retained<NSPanel> {
@@ -967,7 +958,14 @@ fn make_bar_window(mtm: MainThreadMarker, view: &NSView) -> Retained<NSPanel> {
             | NSWindowCollectionBehavior::FullScreenAuxiliary
             | NSWindowCollectionBehavior::IgnoresCycle,
     );
-    window.setContentView(Some(view));
+    // The backdrop is the content view so it tracks the window on resize; the
+    // Bar view rides on top of it and follows by autoresizing.
+    let backdrop = make_backdrop(mtm, size);
+    view.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    backdrop.addSubview(view);
+    window.setContentView(Some(&backdrop));
     unsafe { window.setReleasedWhenClosed(true) };
     window
 }

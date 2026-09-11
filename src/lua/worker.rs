@@ -757,7 +757,7 @@ mod tests {
         );
 
         for invalid in [
-            "spool.setup { bar = { height = 'invalid' } }",
+            "spool.setup { bar = { corner_radius = 'invalid' } }",
             "spool.setup { bar = { show_workspace_labels = true } }; error('abort reload')",
             "spool.setup { swipe = { sensitivity = 0/0 }, options = { sliver_width = 99 } }",
         ] {

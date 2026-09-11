@@ -1829,12 +1829,12 @@ mod lua_setup_tests {
     #[test]
     fn bar_settings_share_configuration_and_reset_when_omitted() {
         let config = config_from_source(
-            "return { options = { sliver_width = 9 }, bar = { show_workspace_labels = false, height = 40 } }",
+            "return { options = { sliver_width = 9 }, bar = { show_workspace_labels = false, icon_size = 18 } }",
         );
         let shared = config.clone();
         assert!(!shared.bar_preferences().show_workspace_labels);
         assert_eq!(shared.bar_preferences().background_color, "#00000000");
-        assert!((shared.bar_preferences().height - 40.0).abs() < f64::EPSILON);
+        assert!((shared.bar_preferences().icon_size - 18.0).abs() < f64::EPSILON);
         config.replace_inner_from(&config_from_source("return {}"));
         assert_eq!(
             shared.bar_preferences(),
@@ -1852,7 +1852,7 @@ mod lua_setup_tests {
             .unwrap();
         assert!(config_from_lua(&lua, value).is_err());
         for source in [
-            "return { bar = { height = 0/0 } }",
+            "return { bar = { corner_radius = 0/0 } }",
             "return { bar = { icon_size = math.huge } }",
         ] {
             let value = lua.load(source).eval().unwrap();
@@ -1934,21 +1934,43 @@ mod lua_setup_tests {
     fn bar_customization_is_loaded_through_lua() {
         let config = config_from_source(
             r##"return { bar = {
-            embed_in_menu_bar = false, height = 40, top_offset = 8,
-            max_width = 900, screen_padding = 20, notch_side = "left",
+            notch_side = "left",
             icon_size = 20, label_font_size = 13, foreground_color = "#112233FF",
             inactive_workspace_color = "#00000010", workspace_corner_radius = 6,
             show_mission_control = false, show_desktop = true,
         } }"##,
         );
         let preferences = config.bar_preferences();
-        assert!(!preferences.embed_in_menu_bar);
         assert!(!preferences.show_mission_control);
         assert!(preferences.show_desktop);
         assert_eq!(preferences.foreground_color, "#112233FF");
         assert_eq!(preferences.inactive_workspace_color, "#00000010");
-        assert!((preferences.height - 40.0).abs() < f64::EPSILON);
         assert!((preferences.toolbar_width() - 38.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn retired_bar_geometry_keys_are_ignored_rather_than_rejected() {
+        // The Bar now takes over the menu bar, so these keys have no meaning.
+        // An existing init.lua that still sets them must keep loading.
+        let config = config_from_source(
+            r"return { bar = {
+            embed_in_menu_bar = false, height = 40, top_offset = 8,
+            max_width = 900, screen_padding = 20, show_workspace_labels = false,
+        } }",
+        );
+        let preferences = config.bar_preferences();
+        assert!(!preferences.show_workspace_labels);
+        assert!(
+            preferences.height.abs() < f64::EPSILON,
+            "height comes from the menu bar"
+        );
+        assert_eq!(
+            preferences,
+            crate::bar::BarPreferences {
+                show_workspace_labels: false,
+                ..crate::bar::BarPreferences::default()
+            }
+        );
     }
 
     #[test]

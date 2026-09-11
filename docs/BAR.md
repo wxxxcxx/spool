@@ -6,18 +6,18 @@ world that owns window layout. It is part of the `spool` process; there is no
 
 ## Presentation
 
-By default the Bar is flush with the screen top and fits within that display's
-menu-bar height, with a transparent background, no outer border, and no shadow.
-Notched displays default to a fixed transparent spacer over the camera cutout,
-with 6pt clearance on each side. Spaces remain in native order: the first half
-(rounded up) is on the left, the rest on the right. Creation, deletion, or native
-reordering recomputes this split; window counts, focus, and collapse never do.
-Each side scrolls independently under the pointer without changing Bar height.
-A Space is never split across the notch, and clipped content has no hit/drop targets.
-Compact groups sit near the spacer; ordinary displays remain centered.
+The Bar *is* the menu bar band on each display: exactly as wide and as tall as
+the menu bar, flush with the screen top, with no inset and no rounding. It draws
+its content on a menu-material blur backdrop, so it looks like the menu bar it
+covers, and it deliberately covers the system menu bar while expanded.
+On a notched display the physical camera cutout is respected exactly: Spaces
+remain in native order, the first half (rounded up) is placed on its left and
+the rest on its right, and no Space is ever split across it. Creation, deletion
+or native reordering recomputes that split; window counts and focus never do.
+Clipped content has no hit or drop targets.
 This is still a nonactivating panel, not an
 `NSStatusItem`: macOS does not reserve horizontal space for it among application
-menus and status items. Use the width limit and notch side to avoid crowded areas.
+menus and status items, which is why the Bar takes that space instead.
 
 - Every native Space on the display is listed in its current macOS order.
 - Each Space is clickable over its full height, including the blank padding
@@ -165,11 +165,6 @@ contains every Bar setting:
 spool.setup {
   options = {},
   bar = {
-    embed_in_menu_bar = true,
-    height = 0, -- 0 follows each screen's menu-bar height.
-    top_offset = 0,
-    max_width = 0, -- 0 uses the available screen region.
-    screen_padding = 12,
     notch_side = "balanced", -- "balanced", "left", or "right" on notched screens.
     icon_size = 0, -- 0 fits the available height, up to 20pt.
     vertical_padding = 3,
@@ -204,12 +199,7 @@ separate Bar config file or file polling in the renderer.
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `embed_in_menu_bar` | `true` | Constrain height and top offset to the menu-bar band. Set false for a floating Bar. |
-| `height` | `0` | Auto per-display menu height; in floating mode auto means 34pt. Explicit heights are clamped to the available band (18-64pt). |
-| `top_offset` | `0` | Gap below the screen top in points. Embedded mode clamps it so the Bar still fits inside the menu bar. |
-| `max_width` | `0` | Auto available width, or a point limit. Small values are raised enough to retain toolbar controls; screen bounds always win. |
-| `screen_padding` | `12` | Horizontal inset from the available screen/notch region. |
-| `notch_side` | `"balanced"` | Count-balanced groups on both sides, or explicit `"left"` / `"right"` safe region. In balanced mode `max_width` includes the spacer and is raised when necessary to leave usable lanes. |
+| `notch_side` | `"balanced"` | How the Space group is placed around the camera cutout. `"balanced"` splits it by count, `"left"` / `"right"` keep it on that side. |
 | `icon_size` | `0` | Auto fit up to 20pt, or an explicit point size. Smaller icons stay vertically centered without reducing Bar height. |
 | `label_font_size` | `11` | Numeric label size (8-20pt); text is also bounded by its actual icon lane. |
 | `foreground_color` | `"auto"` | System appearance's label color, or an RGB/RGBA hex color for labels and toolbar symbols. |
@@ -218,24 +208,14 @@ separate Bar config file or file polling in the renderer.
 | `show_mission_control` | `true` | Show the Mission Control button. |
 | `show_desktop` | `true` | Show the Show Desktop button. Hidden buttons release their width. |
 
-Existing spacing, outer background/border, shadow, selection color, focus ring,
-and label-visibility settings remain available. All lengths use logical points,
-not physical Retina pixels. Non-finite numeric values reject the reload.
+The Bar is the menu bar band: it is exactly as wide and as tall as the menu bar
+on each display, so its geometry is not configurable. `embed_in_menu_bar`,
+`height`, `top_offset`, `max_width` and `screen_padding` are therefore retired;
+an `init.lua` that still sets them keeps loading and the keys are ignored.
 
-For a floating style, merge these values into the same `bar` table:
-
-```lua
-embed_in_menu_bar = false,
-height = 34,
-top_offset = 4,
-background_color = "#151517E0",
-border_width = 1,
-corner_radius = 8,
-show_shadow = true,
-```
-
-Existing `init.lua` values are not overwritten. To adopt the new embedded defaults,
-remove old Bar overrides or update them from `config/default.lua`.
+Existing spacing, background/border, shadow, selection color, focus ring and
+label-visibility settings remain available. All lengths use logical points, not
+physical Retina pixels. Non-finite numeric values reject the reload.
 
 ## Validation Boundary
 

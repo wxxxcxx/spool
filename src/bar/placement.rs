@@ -1,6 +1,15 @@
-use super::layout::{BarSurface, Rect};
-use super::preferences::BarPreferences;
+//! Where the Bar lives: the menu-bar band, and nothing else.
+//!
+//! The Bar used to be a free-floating panel whose width and inset came from
+//! configuration. It now takes over the menu bar exactly, so placement is one
+//! rect plus the camera cutout the content has to work around.
 
+use super::layout::{BarSurface, Rect};
+
+/// The menu-bar band's height for one screen.
+///
+/// The top inset of the visible frame is the menu bar plus, on a notched
+/// display, the safe area; the larger of the two observations wins.
 pub fn menu_height(screen: Rect, visible: Rect, safe_top: f64, fallback: f64) -> f64 {
     let inset = screen.y + screen.height - visible.y - visible.height;
     let observed = inset.max(safe_top);
@@ -11,185 +20,135 @@ pub fn menu_height(screen: Rect, visible: Rect, safe_top: f64, fallback: f64) ->
     }
 }
 
-pub fn available_region(
-    screen: Rect,
-    menu_height: f64,
-    notch_side: Option<Rect>,
-    preferences: &BarPreferences,
-) -> Rect {
-    let horizontal = notch_side
-        .filter(|side| side.width > 0.0 && side.height > 0.0)
-        .map_or(screen, |side| side.intersection(screen));
-    let padding = preferences
-        .screen_padding
-        .clamp(0.0, (horizontal.width / 2.0 - 1.0).max(0.0));
-    let top = screen.y + screen.height - preferences.top_offset;
-    let height = if preferences.embed_in_menu_bar {
-        menu_height - preferences.top_offset
-    } else {
-        screen.height - preferences.top_offset
-    };
+/// The Bar's panel: the full width of its display, the menu-bar height, flush
+/// with the screen top. No inset, no rounding — it *is* the menu bar band.
+#[must_use]
+pub fn panel_rect(screen: Rect, menu_height: f64) -> Rect {
+    let height = menu_height.clamp(1.0, screen.height.max(1.0));
     Rect {
-        x: horizontal.x + padding,
-        y: top - height,
-        width: (horizontal.width - 2.0 * padding).max(1.0),
-        height: height.max(1.0),
-    }
-}
-
-pub fn panel_frame(screen: Rect, width: f64, height: f64, drag_x: Option<f64>) -> Rect {
-    let width = width.min(screen.width).max(1.0);
-    let x = drag_x
-        .unwrap_or(screen.x + (screen.width - width) / 2.0)
-        .clamp(screen.x, screen.x + screen.width - 1.0);
-    let width = width.min(screen.x + screen.width - x);
-    let height = height.min(screen.height).max(1.0);
-    Rect {
-        x,
+        x: screen.x,
         y: screen.y + screen.height - height,
-        width,
+        width: screen.width.max(1.0),
         height,
     }
 }
 
-// The native auxiliary regions, not the content midpoint, anchor the spacer.
-pub fn balanced_region(
-    region: Rect,
-    left: Rect,
-    right: Rect,
-    preferences: &BarPreferences,
-) -> Option<(Rect, BarSurface)> {
-    let start = left.x + left.width - 6.0;
-    let end = right.x + 6.0;
-    let minimum_lane = preferences.toolbar_width() + 38.0;
-    if left.width <= 0.0
-        || right.width <= 0.0
-        || end <= start
-        || start - region.x < minimum_lane
-        || region.x + region.width - end < minimum_lane
-    {
-        return None;
+/// The drawing surface for a panel, with the camera cutout marked in
+/// panel-local coordinates.
+///
+/// A display without a cutout gets a single run of Spaces; one with a cutout
+/// gets two lanes, one on each side of `gap`.
+#[must_use]
+pub fn surface(panel: Rect, gap: Option<Rect>) -> BarSurface {
+    BarSurface {
+        width: panel.width,
+        notch: gap.filter(|gap| gap.width > 0.0).map(|gap| Rect {
+            x: gap.x - panel.x,
+            y: 0.0,
+            width: gap.width,
+            height: panel.height,
+        }),
     }
-    let width = preferences
-        .width_limit(region.width)
-        .max(end - start + 2.0 * minimum_lane)
-        .min(region.width);
-    let x = ((start + end - width) / 2.0).clamp(region.x, region.x + region.width - width);
-    let region = Rect { x, width, ..region };
-    Some((
-        region,
-        BarSurface {
-            width,
-            notch: Some(Rect {
-                x: start - x,
-                y: 0.0,
-                width: end - start,
-                height: preferences.height,
-            }),
-        },
-    ))
+}
+
+/// The physical camera cutout between the two auxiliary top areas, if the
+/// display has one.
+#[must_use]
+pub fn notch_gap(left: Rect, right: Rect, menu_height: f64) -> Option<Rect> {
+    let start = left.x + left.width;
+    (left.width > 0.0 && right.width > 0.0 && right.x > start).then_some(Rect {
+        x: start,
+        y: 0.0,
+        width: right.x - start,
+        height: menu_height,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn balanced_spacer_tracks_physical_notch_on_offset_displays_and_width_limits() {
-        for origin in [-1800.0, 0.0, 2560.0] {
-            for max_width in [0.0, 120.0, 600.0, 4000.0] {
-                let preferences = BarPreferences {
-                    max_width,
-                    ..BarPreferences::default()
-                }
-                .for_menu_height(37.0);
-                let screen = Rect {
-                    x: origin,
-                    y: -982.0,
-                    width: 1512.0,
-                    height: 982.0,
-                };
-                let left = Rect {
-                    x: origin,
-                    y: -37.0,
-                    width: 660.0,
-                    height: 37.0,
-                };
-                let right = Rect {
-                    x: origin + 850.0,
-                    width: 662.0,
-                    ..left
-                };
-                let region = available_region(screen, 37.0, None, &preferences);
-                let (region, surface) = balanced_region(region, left, right, &preferences).unwrap();
-                let frame = panel_frame(region, surface.width, 37.0, None);
-                let gap = surface.notch.unwrap();
-                assert!((frame.x + gap.x - origin - 654.0).abs() < f64::EPSILON);
-                assert!((gap.width - 202.0).abs() < f64::EPSILON);
-                assert!(gap.x >= preferences.toolbar_width() + 38.0);
-                assert!(surface.width - gap.x - gap.width >= 38.0);
-                assert!(frame.x >= screen.x && frame.x + frame.width <= screen.x + screen.width);
-                assert!((frame.y + frame.height).abs() < f64::EPSILON);
-            }
+    fn screen() -> Rect {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1470.0,
+            height: 956.0,
         }
     }
 
     #[test]
-    fn default_bar_is_flush_with_screen_top_and_inside_menu_bar() {
-        for (y, menu_height) in [(0.0, 22.0), (1080.0, 24.0), (-900.0, 37.0)] {
-            let screen = Rect {
-                x: -1920.0,
-                y,
-                width: 1920.0,
-                height: 1080.0,
-            };
-            let preferences = BarPreferences::default().for_menu_height(menu_height);
-            let metrics = preferences.metrics();
-            let region = available_region(screen, menu_height, None, &preferences);
-            let frame = panel_frame(
-                region,
-                400.0,
-                metrics.icon_size + metrics.vertical_padding * 2.0,
-                None,
-            );
-            assert!(
-                (frame.y + frame.height - y - 1080.0).abs() < f64::EPSILON,
-                "top gap: {}",
-                y + 1080.0 - frame.y - frame.height
-            );
-            assert!(
-                frame.height <= menu_height,
-                "height {} exceeds menu bar",
-                frame.height
-            );
+    fn the_panel_is_exactly_the_menu_bar_band() {
+        for menu_height in [22.0, 24.0, 34.0, 37.0] {
+            let frame = panel_rect(screen(), menu_height);
+            assert!((frame.x - 0.0).abs() < f64::EPSILON, "flush with the left");
+            assert!((frame.width - 1470.0).abs() < f64::EPSILON, "full width");
             assert!((frame.height - menu_height).abs() < f64::EPSILON);
+            assert!(
+                (frame.y + frame.height - 956.0).abs() < f64::EPSILON,
+                "flush with the screen top"
+            );
         }
     }
 
     #[test]
-    fn notch_region_and_drag_never_escape_the_owning_display() {
-        let screen = Rect {
-            x: 100.0,
-            y: -1000.0,
-            width: 1512.0,
-            height: 982.0,
+    fn an_offset_display_keeps_its_own_band() {
+        // A second display above and to the right of the primary one.
+        let other = Rect {
+            x: 1470.0,
+            y: 200.0,
+            width: 1920.0,
+            height: 1080.0,
         };
-        let right = Rect {
-            x: 930.0,
-            y: -55.0,
-            width: 682.0,
-            height: 37.0,
+        let frame = panel_rect(other, 24.0);
+        assert!((frame.x - 1470.0).abs() < f64::EPSILON);
+        assert!((frame.width - 1920.0).abs() < f64::EPSILON);
+        assert!((frame.y - 1256.0).abs() < f64::EPSILON);
+        assert!((frame.y + frame.height - 1280.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn the_cutout_is_reported_in_panel_local_coordinates() {
+        let screen = screen();
+        let panel = panel_rect(screen, 34.0);
+        let left = Rect {
+            x: 0.0,
+            y: 922.0,
+            width: 646.0,
+            height: 34.0,
         };
-        let preferences = BarPreferences::default().for_menu_height(37.0);
-        let region = available_region(screen, 37.0, Some(right), &preferences);
-        assert!(region.x >= right.x);
-        for drag_x in [None, Some(-10000.0), Some(10000.0)] {
-            let frame = panel_frame(region, 1000.0, 64.0, drag_x);
-            assert!(frame.x >= region.x);
-            assert!(frame.x + frame.width <= region.x + region.width);
-            assert!((frame.y + frame.height + 18.0).abs() < f64::EPSILON);
-            assert!(frame.height <= 37.0);
-        }
+        let right = Rect { x: 825.0, ..left };
+        let gap = notch_gap(left, right, 34.0).expect("a notched display");
+        assert!((gap.x - 646.0).abs() < f64::EPSILON);
+        assert!((gap.width - 179.0).abs() < f64::EPSILON);
+
+        let layout_surface = surface(panel, Some(gap));
+        assert!((layout_surface.width - 1470.0).abs() < f64::EPSILON);
+        let cutout = layout_surface.notch.expect("the cutout survives");
+        assert!((cutout.x - 646.0).abs() < f64::EPSILON, "panel x is 0 here");
+        assert!((cutout.height - 34.0).abs() < f64::EPSILON);
+
+        // An offset panel shifts the cutout with it.
+        let offset_panel = Rect { x: 100.0, ..panel };
+        let offset_cutout = surface(offset_panel, Some(gap)).notch.unwrap();
+        assert!((offset_cutout.x - 546.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_display_without_auxiliary_areas_has_no_cutout() {
+        let menu_height = 24.0;
+        assert!(notch_gap(Rect::default(), Rect::default(), menu_height).is_none());
+        // Overlapping auxiliary areas are not a cutout either.
+        let left = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 500.0,
+            height: menu_height,
+        };
+        let overlapping = Rect { x: 400.0, ..left };
+        assert!(notch_gap(left, overlapping, menu_height).is_none());
+        let zero = surface(panel_rect(screen(), menu_height), Some(Rect::default()));
+        assert!(zero.notch.is_none(), "a zero-width gap is not a cutout");
     }
 
     #[test]

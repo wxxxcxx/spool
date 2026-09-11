@@ -417,6 +417,6 @@ for all defaults and [config/default.lua](../config/default.lua) for the generat
 ```lua
 spool.setup {
   options = {},
-  bar = { show_workspace_labels = false, height = 0 },
+  bar = { show_workspace_labels = false },
 }
 ```
