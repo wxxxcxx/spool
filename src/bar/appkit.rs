@@ -549,8 +549,8 @@ impl BarView {
             layer.setShadowColor(Some(&NSColor::whiteColor().CGColor()));
             layer.setShadowOffset(NSSize::new(0.0, 0.0));
             layer.setShadowRadius(if notched { 9.0 } else { 6.0 });
-            // The anchor is the shape's top edge, so scaling grows it downwards
-            // from the screen edge and never lifts it off the top.
+            // The anchor is the band's top edge, which is also the shape's, so
+            // a pulse grows downwards and never lifts the shape off the screen.
             layer.setAnchorPoint(NSPoint::new(0.5, 0.0));
             layer.setOpacity(0.0);
             if let Some(parent) = &parent {
@@ -558,9 +558,25 @@ impl BarView {
             }
             layer
         });
-        if let Some(parent) = &parent {
-            layer.setFrame(sublayer_rect(parent, view_height, rect));
+        // The halo layer spans the whole view so the shape's path — which is in
+        // viewport coordinates, like everything else the Bar draws — lands where
+        // it is drawn. A shadow path is in the layer's own space, so a layer the
+        // size of the shape would double the offset.
+        let Some(parent) = parent else {
+            return;
+        };
+        if !parent.isGeometryFlipped() {
+            // A flipped view flips its layer too, which is what the viewport
+            // coordinates assume. Anything else needs the path mirrored, and a
+            // mirrored halo is worse than none, so say so once and sit it out.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                warn!("Bar view layer is not geometry flipped; collapsed halo disabled");
+            });
+            settle(layer);
+            return;
         }
+        layer.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), self.bounds().size));
         let path = chrome_path(
             rect,
             radius,
@@ -573,14 +589,9 @@ impl BarView {
         layer.setShadowPath(Some(&path.CGPath()));
         if collapsed && hovered {
             breathe(layer, PULSE_SHADOW, 0.06, 0.4, BREATH_PERIOD);
-            if BREATH == Breath::Pulse {
-                breathe(
-                    layer,
-                    PULSE_SCALE_Y,
-                    1.0,
-                    breath_reach(rect.height),
-                    BREATH_PERIOD,
-                );
+            let reach = breath_reach(rect.height, view_height);
+            if BREATH == Breath::Pulse && reach > 1.0 {
+                breathe(layer, PULSE_SCALE_Y, 1.0, reach, BREATH_PERIOD);
             }
             layer.setOpacity(1.0);
         } else {
@@ -1337,10 +1348,14 @@ fn sublayer_rect(parent: &CALayer, height: f64, rect: Rect) -> NSRect {
     }
 }
 
-/// How far a halo of this height can stretch without leaving the band: a
-/// six-point tab can afford to double, a menu-bar-height capsule cannot.
-fn breath_reach(height: f64) -> f64 {
-    (1.0 + 3.0 / height.max(1.0)).clamp(1.0, 1.35)
+/// How far a halo of this height can stretch before it leaves the band.
+///
+/// A six-point tab has most of the menu bar to grow into; a capsule merged with
+/// the cutout fills the band already and can only brighten, not grow. A few
+/// points is plenty either way: this is a breath, not a bounce.
+fn breath_reach(height: f64, band: f64) -> f64 {
+    let room = (band - height).clamp(0.0, 3.0);
+    (1.0 + room / height.max(1.0)).clamp(1.0, 1.35)
 }
 
 /// Sets the alpha every later drawing operation is composited with.
@@ -2707,6 +2722,22 @@ mod tests {
         let expanded = chrome_path(band, 10.0, 0.0);
         assert!(expanded.containsPoint(NSPoint::new(0.5, 0.5)));
         assert!(!expanded.containsPoint(NSPoint::new(0.5, band.height - 0.5)));
+    }
+
+    #[test]
+    fn a_breath_never_leaves_the_band() {
+        // A six-point tab has room to grow; a capsule that already fills the
+        // band can only brighten, so its scale is left at rest.
+        let tab = breath_reach(6.0, 31.0);
+        assert!(tab > 1.0 && tab <= 1.35, "tab reach: {tab}");
+        assert!(
+            tab * 6.0 - 6.0 >= 1.5,
+            "a breath is visible: {}pt",
+            tab * 6.0 - 6.0
+        );
+        assert!((breath_reach(34.0, 34.0) - 1.0).abs() < f64::EPSILON);
+        // A clipped band still cannot push the shape past its own edge.
+        assert!(breath_reach(9.0, 8.0) >= 1.0);
     }
 
     #[test]

@@ -71,8 +71,12 @@ menus and status items, which is why the Bar takes that space instead.
   loop would mean running the whole ECS at refresh rate, which costs about 45%
   of a core to animate a highlight.
 - The pulse's mechanism is one constant, `BREATH`: `Pulse` lifts the halo
-  vertically as well as brightening it, `Bloom` only brightens it. The reach is
-  derived from the shape's height, so a halo never stretches out of the band.
+  vertically as well as brightening it, `Bloom` only brightens it. How far a
+  halo may stretch comes from the room the shape has left inside the band, so a
+  six-point tab breathes and a capsule that already fills the menu bar only
+  brightens. The halo layer spans the whole panel because a shadow path lives in
+  its own layer's coordinates: a layer the size of the shape would double the
+  offset and paint the halo off-screen.
 
 ### Tuning the feel
 
