@@ -117,20 +117,21 @@ impl Presentation {
             .intersection(lane)
     }
 
-    pub fn scroll_lane(&self, point: (f64, f64)) -> Option<usize> {
+    /// Whether a point falls on the Space strip rather than the fixed toolbar
+    /// or the notch spacer. Spaces scroll inside their own slots now, so this
+    /// is only a validity test for gestures.
+    #[must_use]
+    pub fn over_space_strip(&self, point: (f64, f64)) -> bool {
         if point.0 < self.content_left
             || point.0 > self.width
             || point.1 < 0.0
             || point.1 > self.height
         {
-            return None;
+            return false;
         }
         match &self.split {
-            Some(split) if point.0 >= split.gap.x && point.0 <= split.gap.x + split.gap.width => {
-                None
-            }
-            Some(split) if point.0 > split.gap.x => Some(1),
-            _ => Some(0),
+            Some(split) => point.0 < split.gap.x || point.0 > split.gap.x + split.gap.width,
+            None => true,
         }
     }
 
@@ -327,6 +328,7 @@ fn interpolate(from: &VisualItem, to: &VisualItem, t: f64) -> VisualItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::time::Duration;
 
     fn layout(x: f64) -> BarLayout {
@@ -336,6 +338,7 @@ mod tests {
             content_width: 200.0 + x,
             content_left: 0.0,
             split: None,
+            spans: Vec::new(),
             items: vec![
                 PlacedItem {
                     rect: Rect {
@@ -370,7 +373,7 @@ mod tests {
     fn toolbar_visibility_and_screen_height_update_clip_regions_immediately() {
         let display = crate::bar::layout::tests::display();
         let now = Instant::now();
-        let initial = BarLayout::resolve(&display, 800.0, 0.0);
+        let initial = BarLayout::resolve(&display, 800.0);
         let mut motion = BarMotion::new(&initial, now);
         for (height, mission_control, desktop) in [
             (22.0, false, false),
@@ -383,8 +386,12 @@ mod tests {
                 ..Default::default()
             }
             .for_menu_height(height);
-            let target =
-                BarLayout::resolve_with_metrics(&display, 800.0, 50.0, preferences.metrics());
+            let target = BarLayout::resolve_with_metrics(
+                &display,
+                800.0,
+                &mut HashMap::new(),
+                preferences.metrics(),
+            );
             motion.retarget(&target, now);
             assert!(!motion.is_active());
             assert!((motion.presented.height - height).abs() < f64::EPSILON);
@@ -441,10 +448,10 @@ mod tests {
     fn space_switch_interpolates_decks_and_clips_every_frame() {
         let now = Instant::now();
         let mut display = crate::bar::layout::tests::display();
-        let initial = BarLayout::resolve(&display, 160.0, 0.0);
+        let initial = BarLayout::resolve(&display, 160.0);
         display.spaces[1].visible = false;
         display.spaces[2].visible = true;
-        let target = BarLayout::resolve(&display, 160.0, 0.0);
+        let target = BarLayout::resolve(&display, 160.0);
         let mut motion = BarMotion::new(&initial, now);
         motion.retarget(&target, now);
         for millis in [0, 30, 80, 140, 240] {
@@ -463,10 +470,10 @@ mod tests {
     fn hit_testing_uses_presented_positions_and_excludes_departed_windows() {
         let now = Instant::now();
         let mut display = crate::bar::layout::tests::display();
-        let initial = BarLayout::resolve(&display, 1200.0, 0.0);
+        let initial = BarLayout::resolve(&display, 1200.0);
         display.spaces[1].columns.swap(0, 1);
         display.spaces[1].floating.clear();
-        let target = BarLayout::resolve(&display, 1200.0, 0.0);
+        let target = BarLayout::resolve(&display, 1200.0);
         let mut motion = BarMotion::new(&initial, now);
         motion.retarget(&target, now);
         motion.advance(now + Duration::from_millis(70));
@@ -505,11 +512,11 @@ mod tests {
         let mut extra = display.spaces[1].columns[1].clone();
         extra.windows[0].id = 8;
         display.spaces[1].columns.push(extra);
-        let initial = BarLayout::resolve(&display, 1200.0, 0.0);
+        let initial = BarLayout::resolve(&display, 1200.0);
         let mut motion = BarMotion::new(&initial, now);
         let original = motion.presented.clone();
         display.spaces[1].visible = false;
-        let collapsed = BarLayout::resolve(&display, 1200.0, 0.0);
+        let collapsed = BarLayout::resolve(&display, 1200.0);
         motion.retarget(&collapsed, now);
         for millis in [0, 30, 70, 120, 240] {
             motion.advance(now + Duration::from_millis(millis));
@@ -538,11 +545,11 @@ mod tests {
     fn stack_collapse_and_interrupted_expansion_converge_to_target_geometry() {
         let now = Instant::now();
         let mut display = crate::bar::layout::tests::display();
-        let expanded = BarLayout::resolve(&display, 1200.0, 0.0);
+        let expanded = BarLayout::resolve(&display, 1200.0);
         let mut motion = BarMotion::new(&expanded, now);
         let original = motion.presented.clone();
         display.spaces[1].visible = false;
-        let collapsed = BarLayout::resolve(&display, 1200.0, 0.0);
+        let collapsed = BarLayout::resolve(&display, 1200.0);
         let target = Presentation::from_layout(&collapsed);
         motion.retarget(&collapsed, now);
         for millis in [0, 30, 70, 120, 240] {
@@ -610,7 +617,7 @@ mod tests {
     #[test]
     fn collapsed_icons_have_no_backing_or_outline_but_expanded_stacks_keep_theirs() {
         let mut display = crate::bar::layout::tests::display();
-        let layout = BarLayout::resolve(&display, 1200.0, 0.0);
+        let layout = BarLayout::resolve(&display, 1200.0);
         let frame = Presentation::from_layout(&layout);
         let stack = frame
             .items
@@ -619,7 +626,7 @@ mod tests {
             .unwrap();
         assert!(stack.icon_decoration_opacity() > 0.0);
         display.spaces[1].visible = false;
-        let layout = BarLayout::resolve(&display, 1200.0, 0.0);
+        let layout = BarLayout::resolve(&display, 1200.0);
         let frame = Presentation::from_layout(&layout);
         for visual in &frame.items {
             if matches!(
@@ -638,10 +645,10 @@ mod tests {
     fn collapsing_never_reintroduces_dark_backing_during_motion() {
         let now = Instant::now();
         let mut display = crate::bar::layout::tests::display();
-        let expanded = BarLayout::resolve(&display, 1200.0, 0.0);
+        let expanded = BarLayout::resolve(&display, 1200.0);
         let mut motion = BarMotion::new(&expanded, now);
         display.spaces[1].visible = false;
-        motion.retarget(&BarLayout::resolve(&display, 1200.0, 0.0), now);
+        motion.retarget(&BarLayout::resolve(&display, 1200.0), now);
         for millis in [0, 30, 100, 240] {
             motion.advance(now + Duration::from_millis(millis));
             for visual in &motion.presented.items {

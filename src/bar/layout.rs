@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use spool_shared_types::commands::Placement;
 use spool_shared_types::state::SpaceKind;
 
@@ -86,6 +88,25 @@ pub struct BarLayout {
     pub content_left: f64,
     pub split: Option<NotchSplit>,
     pub items: Vec<PlacedItem>,
+    /// One slot per Space: its allocated rect and the width its content wants.
+    /// Interaction and scrolling need both, since a slot may be narrower.
+    pub spans: Vec<SpaceSpan>,
+}
+
+/// A Space's allocated slot, and the width its icons actually need.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpaceSpan {
+    pub space_id: u64,
+    pub rect: Rect,
+    pub content_width: f64,
+}
+
+impl SpaceSpan {
+    /// How far this Space can scroll inside its own slot.
+    #[must_use]
+    pub fn max_scroll(&self) -> f64 {
+        (self.content_width - self.rect.width).max(0.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -152,8 +173,12 @@ mod notch_tests {
     }
 
     fn assert_balanced(display: &BarDisplay) {
-        let layout =
-            BarLayout::resolve_surface(display, surface(), &mut [0.0; 2], BarMetrics::default());
+        let layout = BarLayout::resolve_surface(
+            display,
+            surface(),
+            &mut HashMap::new(),
+            BarMetrics::default(),
+        );
         let split = layout.split.as_ref().unwrap();
         let left = display.spaces.len().div_ceil(2);
         assert_eq!(
@@ -181,7 +206,7 @@ mod notch_tests {
     }
 
     #[test]
-    fn width_does_not_change_membership_and_scroll_is_independent() {
+    fn width_does_not_change_membership_and_space_scroll_is_independent() {
         let mut display = tests::display();
         display.spaces[2].visible = true;
         for id in 100..140 {
@@ -191,47 +216,73 @@ mod notch_tests {
             window.id += 100;
             display.spaces[2].floating.push(window);
         }
-        let initial =
-            BarLayout::resolve_surface(&display, surface(), &mut [0.0; 2], BarMetrics::default());
-        for lane in 0..2 {
-            let mut scroll = [0.0; 2];
-            scroll[lane] = f64::MAX;
-            let scrolled =
-                BarLayout::resolve_surface(&display, surface(), &mut scroll, BarMetrics::default());
-            assert!(scroll[lane] > 0.0);
-            assert_eq!(initial.split, scrolled.split);
-            for (a, b) in initial.items.iter().zip(&scrolled.items) {
-                let is_left = matches!(
-                    a.kind,
-                    ItemKind::Space {
-                        space_id: 10 | 11,
-                        ..
-                    } | ItemKind::Window {
-                        space_id: 10 | 11,
-                        ..
-                    } | ItemKind::Label {
-                        space_id: 10 | 11,
-                        ..
-                    } | ItemKind::Placeholder { space_id: 10 | 11 }
-                        | ItemKind::Focus { space_id: 10 | 11 }
-                        | ItemKind::ColumnDrop {
-                            space_id: 10 | 11,
-                            ..
-                        }
-                );
-                if is_left != (lane == 0) {
-                    assert_eq!(a.rect, b.rect);
-                }
+        let initial = BarLayout::resolve_surface(
+            &display,
+            surface(),
+            &mut HashMap::new(),
+            BarMetrics::default(),
+        );
+
+        // Every Space keeps a slot, so overflow now scrolls inside a Space
+        // rather than moving the whole lane.
+        let left = initial
+            .spans
+            .iter()
+            .find(|span| span.rect.x < 220.0 && span.max_scroll() > 0.0)
+            .expect("a left-lane Space must overflow its slot");
+        let mut scroll = HashMap::new();
+        scroll.insert(left.space_id, f64::MAX);
+        let scrolled =
+            BarLayout::resolve_surface(&display, surface(), &mut scroll, BarMetrics::default());
+
+        assert!(
+            scroll[&left.space_id] > 0.0,
+            "scrolling is clamped to the real overflow"
+        );
+        assert_eq!(initial.split, scrolled.split);
+        for (a, b) in initial.items.iter().zip(&scrolled.items) {
+            let same_space = space_of(&a.kind) == Some(left.space_id);
+            let fixed = matches!(
+                a.kind,
+                ItemKind::Space { .. } | ItemKind::Label { .. } | ItemKind::Placeholder { .. }
+            );
+            if !same_space || fixed {
+                assert_eq!(a.rect, b.rect, "only the scrolled Space's icons move");
             }
         }
+        assert!(
+            initial
+                .items
+                .iter()
+                .zip(&scrolled.items)
+                .any(|(a, b)| space_of(&a.kind) == Some(left.space_id) && a.rect != b.rect),
+            "the scrolled Space's icons actually moved"
+        );
+
         for space in &mut display.spaces {
             space.visible = !space.visible;
             space.focused = !space.focused;
             space.floating.clear();
         }
-        let changed =
-            BarLayout::resolve_surface(&display, surface(), &mut [0.0; 2], BarMetrics::default());
+        let changed = BarLayout::resolve_surface(
+            &display,
+            surface(),
+            &mut HashMap::new(),
+            BarMetrics::default(),
+        );
         assert_eq!(initial.split, changed.split);
+    }
+
+    fn space_of(kind: &ItemKind) -> Option<u64> {
+        match kind {
+            ItemKind::Space { space_id, .. }
+            | ItemKind::Window { space_id, .. }
+            | ItemKind::Label { space_id, .. }
+            | ItemKind::Placeholder { space_id }
+            | ItemKind::Focus { space_id }
+            | ItemKind::ColumnDrop { space_id, .. } => Some(*space_id),
+            ItemKind::Grip => None,
+        }
     }
 }
 
@@ -239,6 +290,22 @@ mod notch_tests {
 pub struct PlacedItem {
     pub rect: Rect,
     pub kind: ItemKind,
+}
+
+impl ItemKind {
+    /// The Space this item belongs to, if any. The move handle has none.
+    #[must_use]
+    pub fn space_id(&self) -> Option<u64> {
+        match self {
+            Self::Space { space_id, .. }
+            | Self::Window { space_id, .. }
+            | Self::Label { space_id, .. }
+            | Self::Placeholder { space_id }
+            | Self::Focus { space_id }
+            | Self::ColumnDrop { space_id, .. } => Some(*space_id),
+            Self::Grip => None,
+        }
+    }
 }
 
 impl PlacedItem {
@@ -313,17 +380,23 @@ pub enum ItemKind {
 }
 
 impl BarLayout {
+    /// How far the Space `space_id` can scroll inside its own slot.
+    #[must_use]
+    pub fn max_space_scroll(&self, space_id: u64) -> f64 {
+        self.spans
+            .iter()
+            .find(|span| span.space_id == space_id)
+            .map_or(0.0, SpaceSpan::max_scroll)
+    }
+
     pub fn resolve_surface(
         display: &BarDisplay,
         surface: BarSurface,
-        scroll: &mut [f64; 2],
+        space_scroll: &mut HashMap<u64, f64>,
         metrics: BarMetrics,
     ) -> Self {
         let Some(gap) = surface.notch else {
-            let layout = Self::resolve_with_metrics(display, surface.width, scroll[0], metrics);
-            scroll[0] = scroll[0].clamp(0.0, (layout.content_width - layout.width).max(0.0));
-            scroll[1] = 0.0;
-            return layout;
+            return Self::resolve_with_metrics(display, surface.width, space_scroll, metrics);
         };
         // Membership depends only on native order/count, never on rendered widths.
         let boundary = display.spaces.len().div_ceil(2);
@@ -333,27 +406,33 @@ impl BarLayout {
             spaces: right_spaces,
             ..display.clone()
         };
-        let mut a = Self::resolve_with_metrics(&left, gap.x, scroll[0], metrics);
+        let mut a = Self::resolve_with_metrics(&left, gap.x, space_scroll, metrics);
         let right_x = gap.x + gap.width;
         let b = Self::resolve_with_metrics(
             &right,
             surface.width - right_x,
-            scroll[1],
+            space_scroll,
             BarMetrics {
                 toolbar_width: 0.0,
                 ..metrics
             },
         );
-        scroll[0] = scroll[0].clamp(0.0, (a.content_width - a.width).max(0.0));
-        scroll[1] = scroll[1].clamp(0.0, (b.content_width - b.width).max(0.0));
-        // Compact content hugs the spacer; overflowing content uses the full lane.
+        // Compact content hugs the spacer; a lane whose Spaces are all at their
+        // minimum leaves the leftover against the notch.
         let left_offset = (gap.x - a.width).max(0.0);
         for item in &mut a.items {
             item.rect.x += left_offset;
         }
+        for span in &mut a.spans {
+            span.rect.x += left_offset;
+        }
         a.items.extend(b.items.into_iter().map(|mut item| {
             item.rect.x += right_x;
             item
+        }));
+        a.spans.extend(b.spans.into_iter().map(|mut span| {
+            span.rect.x += right_x;
+            span
         }));
         a.width = surface.width;
         a.content_width += gap.width + b.content_width;
@@ -366,15 +445,20 @@ impl BarLayout {
 
     #[cfg(test)]
     #[must_use]
-    pub fn resolve(display: &BarDisplay, max_width: f64, scroll_x: f64) -> Self {
-        Self::resolve_with_metrics(display, max_width, scroll_x, BarMetrics::default())
+    pub fn resolve(display: &BarDisplay, max_width: f64) -> Self {
+        Self::resolve_with_metrics(
+            display,
+            max_width,
+            &mut HashMap::new(),
+            BarMetrics::default(),
+        )
     }
 
     #[must_use]
     pub fn resolve_with_metrics(
         display: &BarDisplay,
         max_width: f64,
-        scroll_x: f64,
+        space_scroll: &mut HashMap<u64, f64>,
         metrics: BarMetrics,
     ) -> Self {
         let body_height = metrics.icon_size;
@@ -385,23 +469,29 @@ impl BarLayout {
             .iter()
             .map(|space| space_width(space, &metrics))
             .collect::<Vec<_>>();
-        let content_width = metrics.toolbar_width
-            + metrics.horizontal_padding * 2.0
-            + widths.iter().sum::<f64>()
-            + count(widths.len().saturating_sub(1)) * metrics.item_gap;
-        let width = content_width.min(max_width.max(1.0));
-        let max_scroll = (content_width - width).max(0.0);
-        let scroll_x = scroll_x.clamp(0.0, max_scroll);
-        let mut x = metrics.toolbar_width + metrics.horizontal_padding - scroll_x;
+        let minimums = display
+            .spaces
+            .iter()
+            .map(|space| space_min_width(space, &metrics))
+            .collect::<Vec<_>>();
+        let gaps = count(display.spaces.len().saturating_sub(1)) * metrics.item_gap;
+        let available =
+            (max_width - metrics.toolbar_width - metrics.horizontal_padding * 2.0 - gaps).max(0.0);
+        let allocated = allocate_space_widths(&display.spaces, &widths, &minimums, available);
+
+        let mut x = metrics.toolbar_width + metrics.horizontal_padding;
         let mut items = Vec::new();
+        let mut spans = Vec::new();
 
         items.extend(grip_item(&metrics, height));
 
-        for (space, space_width) in display.spaces.iter().zip(widths) {
+        for (space, (content_width, allocated)) in
+            display.spaces.iter().zip(widths.iter().zip(&allocated))
+        {
             let space_rect = Rect {
                 x,
                 y: metrics.vertical_padding,
-                width: space_width,
+                width: *allocated,
                 height: body_height,
             };
             items.push(PlacedItem {
@@ -419,37 +509,21 @@ impl BarLayout {
                     fullscreen: space.kind == SpaceKind::Fullscreen,
                 },
             });
-            if metrics.label_width > 0.0 {
-                items.push(PlacedItem {
-                    rect: Rect {
-                        x: space_rect.x + 3.0,
-                        width: metrics.label_width,
-                        ..space_rect
-                    },
-                    kind: ItemKind::Label {
-                        space_id: space.id,
-                        ordinal: space.ordinal,
-                    },
-                });
-            }
-            if space.is_empty() {
-                let content = content_rect(space_rect, &metrics);
-                items.push(PlacedItem {
-                    rect: Rect {
-                        x: content.x + (content.width - metrics.icon_size) / 2.0,
-                        y: content.y + (content.height - metrics.icon_size) / 2.0,
-                        width: metrics.icon_size,
-                        height: metrics.icon_size,
-                    },
-                    kind: ItemKind::Placeholder { space_id: space.id },
-                });
-            }
-            if space.visible {
-                place_expanded(space, space_rect, &metrics, &mut items);
-            } else {
-                place_collapsed(space, space_rect, &metrics, &mut items);
-            }
-            x += space_width + metrics.item_gap;
+            // Icons scroll inside the slot; the label and placeholder identify
+            // the Space and stay put.
+            let scroll = space_scroll.entry(space.id).or_insert(0.0);
+            *scroll = scroll.clamp(0.0, (content_width - allocated).max(0.0));
+            let scrolled = Rect {
+                x: space_rect.x - *scroll,
+                ..space_rect
+            };
+            place_space_content(space, space_rect, scrolled, &metrics, &mut items);
+            spans.push(SpaceSpan {
+                space_id: space.id,
+                rect: space_rect,
+                content_width: *content_width,
+            });
+            x += allocated + metrics.item_gap;
         }
 
         let focus = items
@@ -469,6 +543,12 @@ impl BarLayout {
             .collect::<Vec<_>>();
         items.extend(focus);
 
+        let content_width = metrics.toolbar_width
+            + metrics.horizontal_padding * 2.0
+            + allocated.iter().sum::<f64>()
+            + gaps;
+        let width = content_width.min(max_width.max(1.0));
+
         Self {
             width,
             height,
@@ -476,7 +556,100 @@ impl BarLayout {
             content_left: metrics.toolbar_width.min(width),
             split: None,
             items,
+            spans,
         }
+    }
+}
+
+/// Hands every Space a slot wide enough to be seen.
+///
+/// The focused Space takes what is left after the others keep their minimum,
+/// which is what makes an expanded Space wide without pushing its neighbours
+/// out of the Bar. When even the minimums do not fit, every Space keeps an
+/// equal share and scrolls inside it: a Space is never dropped to make room.
+fn allocate_space_widths(
+    spaces: &[BarSpace],
+    contents: &[f64],
+    minimums: &[f64],
+    available: f64,
+) -> Vec<f64> {
+    if spaces.is_empty() {
+        return Vec::new();
+    }
+    if available <= 0.0 {
+        return vec![0.0; spaces.len()];
+    }
+    let active = spaces
+        .iter()
+        .position(|space| space.focused)
+        .or_else(|| spaces.iter().position(|space| space.visible))
+        .unwrap_or(0);
+    let others: f64 = minimums
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != active)
+        .map(|(_, minimum)| *minimum)
+        .sum();
+    let room = available - others;
+    if room >= minimums[active] {
+        let mut allocated = minimums.to_vec();
+        allocated[active] = contents[active].clamp(minimums[active], room);
+        return allocated;
+    }
+    let share = available / count(spaces.len());
+    vec![share; spaces.len()]
+}
+
+/// The narrowest a Space may be while still showing what it is: a collapsed
+/// Space keeps its whole deck, an expanded one keeps its label and one icon.
+fn space_min_width(space: &BarSpace, metrics: &BarMetrics) -> f64 {
+    if !space.visible {
+        return space_width(space, metrics);
+    }
+    label_extent(metrics) + 6.0 + metrics.icon_size
+}
+
+/// One Space's fixed parts and its scrolling icons.
+///
+/// `slot` is the allocated rect that clips and identifies the Space; `scrolled`
+/// is that same rect moved left by the Space's own scroll offset, so the icons
+/// inside it slide while the label and placeholder stay put.
+fn place_space_content(
+    space: &BarSpace,
+    slot: Rect,
+    scrolled: Rect,
+    metrics: &BarMetrics,
+    items: &mut Vec<PlacedItem>,
+) {
+    if metrics.label_width > 0.0 {
+        items.push(PlacedItem {
+            rect: Rect {
+                x: slot.x + 3.0,
+                width: metrics.label_width.min(slot.width),
+                ..slot
+            },
+            kind: ItemKind::Label {
+                space_id: space.id,
+                ordinal: space.ordinal,
+            },
+        });
+    }
+    if space.is_empty() {
+        let content = content_rect(slot, metrics);
+        items.push(PlacedItem {
+            rect: Rect {
+                x: content.x + (content.width - metrics.icon_size) / 2.0,
+                y: content.y + (content.height - metrics.icon_size) / 2.0,
+                width: metrics.icon_size,
+                height: metrics.icon_size,
+            },
+            kind: ItemKind::Placeholder { space_id: space.id },
+        });
+    }
+    if space.visible {
+        place_expanded(space, scrolled, metrics, items);
+    } else {
+        place_collapsed(space, scrolled, metrics, items);
     }
 }
 
@@ -787,7 +960,7 @@ pub(super) mod tests {
 
     #[test]
     fn expanded_space_places_stack_members_vertically_and_columns_horizontally() {
-        let layout = BarLayout::resolve(&display(), 1200.0, 0.0);
+        let layout = BarLayout::resolve(&display(), 1200.0);
         let windows = layout
             .items
             .iter()
@@ -809,7 +982,7 @@ pub(super) mod tests {
 
     #[test]
     fn collapsed_space_keeps_a_bounded_ordered_icon_deck() {
-        let layout = BarLayout::resolve(&display(), 1200.0, 0.0);
+        let layout = BarLayout::resolve(&display(), 1200.0);
         let deck = layout
             .items
             .iter()
@@ -855,7 +1028,8 @@ pub(super) mod tests {
             };
             let mut display = display();
             display.spaces[1].visible = false;
-            let layout = BarLayout::resolve_with_metrics(&display, 1200.0, 0.0, metrics);
+            let layout =
+                BarLayout::resolve_with_metrics(&display, 1200.0, &mut HashMap::new(), metrics);
             let icons = layout
                 .items
                 .iter()
@@ -881,7 +1055,7 @@ pub(super) mod tests {
             display.spaces[2].floating.push(window(8, false));
             // A fullscreen column in an ordinary Space is not native fullscreen.
             display.spaces[1].columns[0].kind = ColumnKind::Fullscreen;
-            let layout = BarLayout::resolve(&display, 1200.0, 0.0);
+            let layout = BarLayout::resolve(&display, 1200.0);
             let mut marked_windows = 0;
             for item in &layout.items {
                 match item.kind {
@@ -925,7 +1099,7 @@ pub(super) mod tests {
                     let layout = BarLayout::resolve_with_metrics(
                         &display,
                         1200.0,
-                        0.0,
+                        &mut HashMap::new(),
                         BarMetrics {
                             icon_size,
                             label_width,
@@ -942,7 +1116,7 @@ pub(super) mod tests {
                     let ordinary = BarLayout::resolve_with_metrics(
                         &display,
                         1200.0,
-                        0.0,
+                        &mut HashMap::new(),
                         BarMetrics {
                             icon_size,
                             label_width,
@@ -965,22 +1139,176 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn layout_clamps_scroll_to_content_width() {
+    fn the_focused_space_takes_the_room_the_others_leave() {
         let display = display();
-        let layout = BarLayout::resolve(&display, 90.0, f64::MAX);
-        assert!((layout.width - 90.0).abs() < f64::EPSILON);
+        let layout = BarLayout::resolve(&display, 900.0);
+        let span = |space_id: u64| {
+            layout
+                .spans
+                .iter()
+                .find(|span| span.space_id == space_id)
+                .expect("every Space keeps a slot")
+        };
+        // Space 11 is focused, so it gets what the other two minimums leave,
+        // capped by its own content.
+        let others: f64 = display
+            .spaces
+            .iter()
+            .filter(|space| !space.focused)
+            .map(|space| super::space_min_width(space, &BarMetrics::default()))
+            .sum();
+        let available = 900.0 - {
+            let metrics = BarMetrics::default();
+            metrics.toolbar_width
+                + metrics.horizontal_padding * 2.0
+                + count(display.spaces.len() - 1) * metrics.item_gap
+        };
+        let focused = span(11);
+        assert!(
+            (focused.rect.width - focused.content_width.min(available - others)).abs() < 0.001,
+            "the focused Space takes the remainder, up to its content"
+        );
+        for space in display.spaces.iter().filter(|space| !space.focused) {
+            let span = span(space.id);
+            assert!(
+                (span.rect.width - super::space_min_width(space, &BarMetrics::default())).abs()
+                    < 0.001,
+                "an unfocused Space keeps its minimum"
+            );
+        }
+        // The whole strip fits: nothing is pushed off the Bar.
+        let total: f64 = layout.spans.iter().map(|span| span.rect.width).sum();
+        assert!(total <= available + 0.001);
+        assert!(
+            layout
+                .spans
+                .iter()
+                .all(|span| span.rect.x + span.rect.width <= layout.width + 0.001)
+        );
+    }
+
+    #[test]
+    fn an_expanded_space_scrolls_inside_its_slot_without_moving_the_others() {
+        let mut display = display();
+        for id in 20..40 {
+            let mut window = window(id, false);
+            window.id = id;
+            display.spaces[1].floating.push(window);
+        }
+        let mut scroll = HashMap::new();
+        let initial =
+            BarLayout::resolve_with_metrics(&display, 700.0, &mut scroll, BarMetrics::default());
+        let focused = initial
+            .spans
+            .iter()
+            .find(|span| span.space_id == 11)
+            .expect("focused slot");
+        assert!(focused.max_scroll() > 0.0, "the focused content overflows");
+
+        scroll.insert(11, f64::MAX);
+        let scrolled =
+            BarLayout::resolve_with_metrics(&display, 700.0, &mut scroll, BarMetrics::default());
+        assert!((scroll[&11] - focused.max_scroll()).abs() < 0.001);
+        for span in &scrolled.spans {
+            let before = initial
+                .spans
+                .iter()
+                .find(|candidate| candidate.space_id == span.space_id)
+                .expect("slot");
+            assert_eq!(
+                before.rect, span.rect,
+                "scrolling never moves a slot itself"
+            );
+        }
+        let icon_x = |layout: &BarLayout| {
+            layout
+                .items
+                .iter()
+                .filter(|item| matches!(item.kind, ItemKind::Window { space_id: 11, .. }))
+                .map(|item| item.rect.x)
+                .fold(f64::INFINITY, f64::min)
+        };
+        assert!(
+            icon_x(&scrolled) < icon_x(&initial),
+            "the focused icons moved left inside their slot"
+        );
+        let other_x = |layout: &BarLayout, space_id: u64| {
+            layout
+                .items
+                .iter()
+                .filter(|item| item.kind.space_id() == Some(space_id))
+                .map(|item| item.rect.x)
+                .fold(f64::INFINITY, f64::min)
+        };
+        assert!(
+            (other_x(&initial, 12) - other_x(&scrolled, 12)).abs() < f64::EPSILON,
+            "an unscrolled Space keeps its icons where they were"
+        );
+    }
+
+    #[test]
+    fn minimums_that_do_not_fit_degrade_to_equal_slots() {
+        let mut display = display();
+        for space in &mut display.spaces {
+            space.visible = true;
+            for id in 100..140 {
+                let mut w = window(id, false);
+                w.id = id;
+                space.floating.push(w);
+            }
+        }
+        let layout = BarLayout::resolve_with_metrics(
+            &display,
+            260.0,
+            &mut HashMap::new(),
+            BarMetrics::default(),
+        );
+        assert_eq!(layout.spans.len(), display.spaces.len());
+        let first = layout.spans[0].rect.width;
+        assert!(first > 0.0, "no Space may be dropped to make room");
+        for span in &layout.spans {
+            assert!(
+                (span.rect.width - first).abs() < 0.001,
+                "every Space gets the same share when nothing fits"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_bar_keeps_every_space_and_clamps_their_own_scroll() {
+        let display = display();
+        // Far too narrow for the content: every Space must still get a slot,
+        // and the overflow is absorbed inside each slot instead of moving the
+        // strip off the left edge.
+        let mut scroll = HashMap::new();
+        for space in &display.spaces {
+            scroll.insert(space.id, f64::MAX);
+        }
+        let layout =
+            BarLayout::resolve_with_metrics(&display, 240.0, &mut scroll, BarMetrics::default());
+        assert!((layout.width - 240.0).abs() < f64::EPSILON);
+        assert_eq!(
+            layout.spans.len(),
+            display.spaces.len(),
+            "no Space may be dropped to make room"
+        );
+        for span in &layout.spans {
+            assert!(span.rect.width > 0.0, "every Space keeps a visible slot");
+            assert!(span.rect.x >= layout.content_left - f64::EPSILON);
+            assert!(scroll[&span.space_id] <= span.max_scroll() + f64::EPSILON);
+        }
         let leftmost = layout
             .items
             .iter()
             .filter(|item| matches!(item.kind, ItemKind::Space { .. }))
             .map(|item| item.rect.x)
             .fold(f64::INFINITY, f64::min);
-        assert!(leftmost < 0.0);
+        assert!(leftmost >= 0.0, "slots never leave the Bar");
     }
 
     #[test]
     fn collapsed_deck_exposes_at_least_five_pixels_per_layer_in_paint_order() {
-        let layout = BarLayout::resolve(&display(), 1200.0, 0.0);
+        let layout = BarLayout::resolve(&display(), 1200.0);
         let deck = layout
             .items
             .iter()
@@ -1006,11 +1334,11 @@ pub(super) mod tests {
     #[test]
     fn hiding_labels_reclaims_width_in_collapsed_spaces_too() {
         let display = display();
-        let visible = BarLayout::resolve(&display, 1200.0, 0.0);
+        let visible = BarLayout::resolve(&display, 1200.0);
         let hidden = BarLayout::resolve_with_metrics(
             &display,
             1200.0,
-            0.0,
+            &mut HashMap::new(),
             BarMetrics {
                 label_width: 0.0,
                 ..BarMetrics::default()
@@ -1021,7 +1349,7 @@ pub(super) mod tests {
 
     #[test]
     fn every_deck_layer_has_visible_pixels_after_later_cards_are_painted() {
-        let layout = BarLayout::resolve(&display(), 1200.0, 0.0);
+        let layout = BarLayout::resolve(&display(), 1200.0);
         let deck = layout
             .items
             .iter()
@@ -1051,7 +1379,8 @@ pub(super) mod tests {
                     ..BarMetrics::default()
                 };
                 let display = display();
-                let layout = BarLayout::resolve_with_metrics(&display, 1200.0, 0.0, metrics);
+                let layout =
+                    BarLayout::resolve_with_metrics(&display, 1200.0, &mut HashMap::new(), metrics);
                 let labels = layout
                     .items
                     .iter()
@@ -1095,7 +1424,7 @@ pub(super) mod tests {
         let layout = BarLayout::resolve_with_metrics(
             &display,
             1200.0,
-            0.0,
+            &mut HashMap::new(),
             BarMetrics {
                 label_width: 0.0,
                 ..BarMetrics::default()
@@ -1132,7 +1461,7 @@ pub(super) mod tests {
         let layout = BarLayout::resolve_with_metrics(
             &display(),
             1200.0,
-            0.0,
+            &mut HashMap::new(),
             BarMetrics {
                 label_width: 0.0,
                 ..BarMetrics::default()
@@ -1165,7 +1494,7 @@ pub(super) mod tests {
             let mut display = display();
             display.spaces[1].columns[0].windows =
                 (1..=members).map(|id| window(id, false)).collect();
-            let layout = BarLayout::resolve(&display, 1200.0, 0.0);
+            let layout = BarLayout::resolve(&display, 1200.0);
             assert!((layout.height - 34.0).abs() < f64::EPSILON);
             let windows = layout
                 .items
@@ -1198,9 +1527,11 @@ pub(super) mod tests {
                     label_width,
                     ..BarMetrics::default()
                 };
-                let expanded = BarLayout::resolve_with_metrics(&display, 1200.0, 0.0, metrics);
+                let expanded =
+                    BarLayout::resolve_with_metrics(&display, 1200.0, &mut HashMap::new(), metrics);
                 display.spaces[1].visible = false;
-                let collapsed = BarLayout::resolve_with_metrics(&display, 1200.0, 0.0, metrics);
+                let collapsed =
+                    BarLayout::resolve_with_metrics(&display, 1200.0, &mut HashMap::new(), metrics);
                 for item in &collapsed.items {
                     let ItemKind::Window {
                         window_id,
@@ -1231,7 +1562,7 @@ pub(super) mod tests {
             let mut display = display();
             display.spaces[1].columns[0].windows =
                 (1..=3).map(|id| window(id, focused == Some(id))).collect();
-            let layout = BarLayout::resolve(&display, 1200.0, 0.0);
+            let layout = BarLayout::resolve(&display, 1200.0);
             let ids = layout
                 .items
                 .iter()

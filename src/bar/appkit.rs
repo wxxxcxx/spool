@@ -40,7 +40,7 @@ struct ViewState {
     layout: BarLayout,
     motion: BarMotion,
     surface: BarSurface,
-    scroll: [f64; 2],
+    space_scroll: HashMap<u64, f64>,
     can_focus_spaces: bool,
     can_move_windows: bool,
     pressed: Option<BarDrag>,
@@ -149,7 +149,7 @@ impl ViewState {
         self.layout = BarLayout::resolve_surface(
             preview.as_ref().unwrap_or(&self.display),
             self.surface,
-            &mut self.scroll,
+            &mut self.space_scroll,
             metrics,
         );
         self.motion.retarget(&self.layout, Instant::now());
@@ -348,15 +348,24 @@ define_class!(
         fn scroll_wheel(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             let mut state = self.ivars().state.borrow_mut();
-            let Some(lane) = state.motion.presented.scroll_lane((point.x, point.y)) else {
+            // Scrolling belongs to the Space under the pointer: a slot narrower
+            // than its content scrolls inside itself, and every other Space
+            // keeps its place.
+            let hit_layout = state.motion.presented.interaction_layout(&state.layout);
+            let Some(space_id) = space_at(&hit_layout, point) else {
                 return;
             };
+            let max_scroll = state.layout.max_space_scroll(space_id);
+            if max_scroll <= 0.0 {
+                return;
+            }
             let delta = if event.scrollingDeltaX().abs() > event.scrollingDeltaY().abs() {
                 event.scrollingDeltaX()
             } else {
                 event.scrollingDeltaY()
             };
-            state.scroll[lane] = (state.scroll[lane] + delta).max(0.0);
+            let offset = state.space_scroll.entry(space_id).or_insert(0.0);
+            *offset = (*offset + delta).clamp(0.0, max_scroll);
             state.relayout();
             drop(state);
             self.setNeedsDisplay(true);
@@ -442,7 +451,7 @@ impl BarView {
         let (surface, preferences) =
             apply_panel_size(surface, preferences, site.panel, site.display);
         let metrics = display_metrics(&display, &preferences);
-        let layout = BarLayout::resolve_surface(&display, surface, &mut [0.0; 2], metrics);
+        let layout = BarLayout::resolve_surface(&display, surface, &mut HashMap::new(), metrics);
         let frame = ns_rect(Rect {
             width: layout.width,
             height: layout.height,
@@ -457,7 +466,7 @@ impl BarView {
                 motion: BarMotion::new(&layout, Instant::now()),
                 layout,
                 surface,
-                scroll: [0.0; 2],
+                space_scroll: HashMap::new(),
                 can_focus_spaces: capabilities.focus_spaces,
                 can_move_windows: capabilities.move_windows,
                 pressed: None,
@@ -1162,8 +1171,28 @@ fn window_at(layout: &BarLayout, point: NSPoint) -> Option<PlacedItem> {
         .items
         .iter()
         .rev()
-        .find(|item| matches!(item.kind, ItemKind::Window { .. }) && contains(item.rect, point))
+        .find(|item| {
+            matches!(item.kind, ItemKind::Window { .. })
+                && contains(item.rect, point)
+                && inside_space_slot(layout, item, point)
+        })
         .cloned()
+}
+
+/// Icons scrolled out of their Space are clipped on screen, so a point in a
+/// neighbouring slot must not hit them through their raw geometry.
+fn inside_space_slot(layout: &BarLayout, item: &PlacedItem, point: NSPoint) -> bool {
+    let Some(space_id) = item.kind.space_id() else {
+        return true;
+    };
+    layout
+        .items
+        .iter()
+        .find_map(|candidate| match candidate.kind {
+            ItemKind::Space { space_id: id, .. } if id == space_id => Some(candidate.rect),
+            _ => None,
+        })
+        .is_none_or(|slot| contains(slot, point))
 }
 
 fn space_at(layout: &BarLayout, point: NSPoint) -> Option<u64> {
@@ -1404,11 +1433,11 @@ mod tests {
     fn space_blank_padding_is_clickable_throughout_animation() {
         let display = crate::bar::layout::tests::display();
         let now = Instant::now();
-        let initial = BarLayout::resolve(&display, 1200.0, 0.0);
+        let initial = BarLayout::resolve(&display, 1200.0);
         let mut motion = BarMotion::new(&initial, now);
         let mut expanded = display.clone();
         expanded.spaces[2].visible = true;
-        let target = BarLayout::resolve(&expanded, 1200.0, 0.0);
+        let target = BarLayout::resolve(&expanded, 1200.0);
         motion.retarget(&target, now);
         for millis in [0, 30, 120, 240] {
             motion.advance(now + std::time::Duration::from_millis(millis));
@@ -1453,7 +1482,12 @@ mod tests {
         let display = crate::bar::layout::tests::display();
         for height in [22.0, 24.0, 37.0] {
             let prefs = BarPreferences::default().for_menu_height(height);
-            let layout = BarLayout::resolve_with_metrics(&display, 1200.0, 0.0, prefs.metrics());
+            let layout = BarLayout::resolve_with_metrics(
+                &display,
+                1200.0,
+                &mut HashMap::new(),
+                prefs.metrics(),
+            );
             let motion = BarMotion::new(&layout, Instant::now());
             let hits = motion.presented.interaction_layout(&layout);
             for item in &layout.items {
@@ -1512,7 +1546,12 @@ mod tests {
             show_workspace_labels: false,
             ..BarPreferences::default()
         };
-        let layout = BarLayout::resolve_with_metrics(&display, 1200.0, 0.0, preferences.metrics());
+        let layout = BarLayout::resolve_with_metrics(
+            &display,
+            1200.0,
+            &mut HashMap::new(),
+            preferences.metrics(),
+        );
         let motion = BarMotion::new(&layout, Instant::now());
         let item = layout
             .items
@@ -1548,7 +1587,7 @@ mod tests {
                     width: 1200.0,
                     notch: None,
                 },
-                scroll: [0.0; 2],
+                space_scroll: HashMap::new(),
                 can_focus_spaces: true,
                 can_move_windows: true,
                 pressed,
@@ -1688,8 +1727,8 @@ mod tests {
     fn toolbar_has_no_space_or_window_hit_targets_during_scroll_animation() {
         let display = crate::bar::layout::tests::display();
         let now = Instant::now();
-        let initial = BarLayout::resolve(&display, 150.0, 0.0);
-        let target = BarLayout::resolve(&display, 150.0, f64::MAX);
+        let initial = BarLayout::resolve(&display, 150.0);
+        let target = BarLayout::resolve(&display, 150.0);
         let mut motion = BarMotion::new(&initial, now);
         motion.retarget(&target, now);
         for millis in [0, 30, 120, 240] {
@@ -1723,10 +1762,31 @@ mod tests {
             }),
         };
         let now = Instant::now();
-        let initial =
-            BarLayout::resolve_surface(&display, surface, &mut [0.0; 2], BarMetrics::default());
+        let initial = BarLayout::resolve_surface(
+            &display,
+            surface,
+            &mut HashMap::new(),
+            BarMetrics::default(),
+        );
         let mut motion = BarMotion::new(&initial, now);
-        for mut scroll in [[f64::MAX, 0.0], [0.0, f64::MAX], [f64::MAX; 2]] {
+        // A Space on each side of the notch scrolls inside its own slot; the
+        // notch itself stays dead either way.
+        let left = initial
+            .spans
+            .iter()
+            .find(|span| span.rect.x < 180.0)
+            .map(|span| span.space_id);
+        let right = initial
+            .spans
+            .iter()
+            .rev()
+            .find(|span| span.rect.x > 320.0)
+            .map(|span| span.space_id);
+        for scrolled in [left, right, None] {
+            let mut scroll = HashMap::new();
+            if let Some(space_id) = scrolled {
+                scroll.insert(space_id, f64::MAX);
+            }
             let target =
                 BarLayout::resolve_surface(&display, surface, &mut scroll, BarMetrics::default());
             motion.retarget(&target, now);
@@ -1735,7 +1795,7 @@ mod tests {
                 let frame = &motion.presented;
                 let hits = frame.interaction_layout(&target);
                 for x in [181.0, 250.0, 319.0] {
-                    assert!(frame.scroll_lane((x, 17.0)).is_none());
+                    assert!(!frame.over_space_strip((x, 17.0)));
                     assert!(window_at(&hits, NSPoint::new(x, 17.0)).is_none());
                     assert!(space_at(&hits, NSPoint::new(x, 17.0)).is_none());
                 }
@@ -1754,8 +1814,12 @@ mod tests {
             }
         }
         display.spaces.remove(0);
-        let target =
-            BarLayout::resolve_surface(&display, surface, &mut [0.0; 2], BarMetrics::default());
+        let target = BarLayout::resolve_surface(
+            &display,
+            surface,
+            &mut HashMap::new(),
+            BarMetrics::default(),
+        );
         motion.retarget(&target, now);
         assert!(
             !motion.is_active(),
@@ -1836,16 +1900,77 @@ mod tests {
             }
             assert!(state.release_drag(point, scenario != 0).is_none());
             assert!(state.pressed.is_none());
+            let mut scroll = state.space_scroll.clone();
             assert_eq!(
                 state.layout,
                 BarLayout::resolve_with_metrics(
                     &state.display,
                     1200.0,
-                    state.scroll[0],
+                    &mut scroll,
                     state.preferences.metrics()
                 )
             );
         }
+    }
+
+    #[test]
+    fn scrolled_icons_are_not_hittable_outside_their_space() {
+        let mut display = crate::bar::layout::tests::display();
+        let template = display.spaces[1].floating[0].clone();
+        for id in 20..40 {
+            let mut window = template.clone();
+            window.id = id;
+            display.spaces[1].floating.push(window);
+        }
+        let mut scroll = HashMap::new();
+        scroll.insert(11, 60.0);
+        let layout =
+            BarLayout::resolve_with_metrics(&display, 700.0, &mut scroll, BarMetrics::default());
+        let slot = layout
+            .spans
+            .iter()
+            .find(|span| span.space_id == 11)
+            .expect("focused slot")
+            .rect;
+        let escaped = layout
+            .items
+            .iter()
+            .find(|item| {
+                matches!(item.kind, ItemKind::Window { space_id: 11, .. }) && item.rect.x < slot.x
+            })
+            .expect("an icon is scrolled out of its slot");
+        let outside = NSPoint::new(
+            escaped.rect.x + 1.0,
+            escaped.rect.y + escaped.rect.height / 2.0,
+        );
+        assert!(outside.x < slot.x, "the probe point is left of the slot");
+        let hit = window_at(&layout, outside);
+        assert_ne!(
+            hit.as_ref().and_then(|item| item.kind.space_id()),
+            Some(11),
+            "a clipped icon must not be hit through its raw rect"
+        );
+
+        let visible = layout
+            .items
+            .iter()
+            .find(|item| {
+                matches!(item.kind, ItemKind::Window { space_id: 11, .. })
+                    && item.rect.x >= slot.x
+                    && item.rect.x + item.rect.width <= slot.x + slot.width
+            })
+            .expect("an icon remains inside the slot");
+        assert!(
+            window_at(
+                &layout,
+                NSPoint::new(
+                    visible.rect.x + 1.0,
+                    visible.rect.y + visible.rect.height / 2.0
+                )
+            )
+            .is_some(),
+            "icons inside the slot stay hittable"
+        );
     }
 
     #[test]
@@ -1870,13 +1995,13 @@ mod tests {
     fn overlapping_stack_hit_testing_follows_focused_paint_layer() {
         let mut display = crate::bar::layout::tests::display();
         let now = Instant::now();
-        let initial = BarLayout::resolve(&display, 1200.0, 0.0);
+        let initial = BarLayout::resolve(&display, 1200.0);
         let mut motion = BarMotion::new(&initial, now);
         for (step, focused) in [Some(2), None, Some(1)].into_iter().enumerate() {
             for window in &mut display.spaces[1].columns[0].windows {
                 window.focused = focused == Some(window.id);
             }
-            let target = BarLayout::resolve(&display, 1200.0, 0.0);
+            let target = BarLayout::resolve(&display, 1200.0);
             let start = now + std::time::Duration::from_millis(u64::try_from(step).unwrap() * 100);
             motion.retarget(&target, start);
             motion.advance(start + std::time::Duration::from_millis(50));

@@ -173,7 +173,7 @@ impl BarDrag {
     ) {
         if !self.active
             || !can_move
-            || frame.scroll_lane(self.pointer).is_none()
+            || !frame.over_space_strip(self.pointer)
             || !self.is_valid(display)
         {
             self.target = None;
@@ -408,7 +408,7 @@ mod tests {
 
     fn setup() -> (BarDisplay, BarLayout, BarDrag) {
         let display = crate::bar::layout::tests::display();
-        let layout = BarLayout::resolve(&display, 1200.0, 0.0);
+        let layout = BarLayout::resolve(&display, 1200.0);
         let frame = BarMotion::new(&layout, Instant::now()).presented;
         let item = layout
             .items
@@ -444,7 +444,7 @@ mod tests {
         let preview = drag.preview_display(&display);
         assert_eq!(preview.spaces[1].columns[0].windows[0].id, 3);
         assert_eq!(preview.spaces[1].columns[1], display.spaces[1].columns[0]);
-        let next = BarLayout::resolve(&preview, 1200.0, 0.0);
+        let next = BarLayout::resolve(&preview, 1200.0);
         let x = |layout: &BarLayout| {
             layout
                 .items
@@ -460,25 +460,25 @@ mod tests {
     }
 
     #[test]
-    fn toolbar_rejects_even_a_scrolled_insertion_gap_under_the_pointer() {
+    fn toolbar_rejects_a_drop_pointer_over_the_fixed_buttons() {
         let (display, _, mut drag) = setup();
         drag.active = true;
         drag.target = Some(DropTarget::Column {
             anchor: 3,
             placement: Placement::After,
         });
-        let preview = drag.preview_display(&display);
-        // Narrow viewport and far-right scrolling put the pending gap behind
-        // the fixed toolbar. Its raw geometry must not keep a drop alive there.
-        let layout = BarLayout::resolve(&preview, 170.0, f64::MAX);
+        let layout = BarLayout::resolve(&display, 1200.0);
         let frame = BarMotion::new(&layout, Instant::now()).presented;
-        let gap = drag.gap_rect(&frame).unwrap();
-        let point = (gap.x + gap.width / 2.0, gap.y + gap.height / 2.0);
-        assert!(point.0 >= 0.0 && point.0 < frame.content_left);
-        drag.move_pointer(point);
-        drag.update_target(&display, &frame.interaction_layout(&layout), &frame, true);
-        assert!(drag.target.is_none());
-        assert!(drag.action().is_none());
+        // The grip and the two buttons are not part of the Space strip.
+        for x in [2.0, frame.content_left / 2.0, frame.content_left - 1.0] {
+            drag.move_pointer((x, 17.0));
+            drag.update_target(&display, &frame.interaction_layout(&layout), &frame, true);
+            assert!(
+                drag.target.is_none(),
+                "pointer at {x} must not keep a target"
+            );
+            assert!(drag.action().is_none());
+        }
     }
 
     #[test]
@@ -507,7 +507,7 @@ mod tests {
             placement: Placement::After,
         });
         assert_eq!(drag.target, expected);
-        let layout = BarLayout::resolve(&drag.preview_display(&display), 1200.0, 0.0);
+        let layout = BarLayout::resolve(&drag.preview_display(&display), 1200.0);
         motion.retarget(&layout, now);
         for millis in [0, 30, 70, 120, 240, 400] {
             motion.advance(now + std::time::Duration::from_millis(millis));
@@ -605,7 +605,7 @@ mod tests {
         let mut second = display.spaces[1].floating[0].clone();
         second.id = 8;
         display.spaces[1].floating.push(second);
-        let layout = BarLayout::resolve(&display, 1200.0, 0.0);
+        let layout = BarLayout::resolve(&display, 1200.0);
         let frame = BarMotion::new(&layout, Instant::now()).presented;
         let item = layout
             .items

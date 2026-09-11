@@ -57,8 +57,17 @@ menus and status items. Use the width limit and notch side to avoid crowded area
   ease-out policy in `src/bar/motion.rs`. Interrupted transitions begin at the
   last presented frame, and repeated snapshots do not restart motion. Content
   is clipped to its Space and the display-bound Bar viewport.
-- When the complete Space strip is wider than the display, scrolling over the
-  Bar moves the horizontal viewport.
+- Every Space keeps a slot: the strip never scrolls, and no Space is dropped to
+  make room. The focused Space takes whatever the others leave, up to its own
+  content width; the rest keep the narrowest slot that still reads as that Space
+  (a collapsed Space keeps its whole deck, an expanded one its label and one
+  icon). When even those minimums do not fit, every Space takes an equal share.
+- A Space whose icons do not fit its slot scrolls inside the slot: the icons
+  slide under the label, the label and the slot stay where they are, and
+  scrolling one Space never moves another. Scrolling is bound to the Space under
+  the pointer and clamped to that Space's real overflow, so an unscrollable
+  Space ignores the wheel. Icons scrolled out of the slot are clipped, and hit
+  testing follows: nothing can be clicked through a neighbouring slot.
 
 ## Interaction
 
