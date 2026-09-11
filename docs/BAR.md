@@ -121,10 +121,34 @@ The same overview actions are available outside the Bar:
 ```sh
 spool action mission-control
 spool action show-desktop
+spool action bar toggle-collapse
 ```
 
-Lua configuration and client scripts can use `spool.action.mission_control()` and
-`spool.action.show_desktop()`. They can also be passed as functions to `spool.bind`.
+Lua configuration and client scripts can use `spool.action.mission_control()`,
+`spool.action.show_desktop()` and `spool.action.bar.toggle_collapse()`. They can
+also be passed as functions to `spool.bind`; `spool.bind("alt+shift+space",
+spool.action.bar.toggle_collapse)` is the usual way to reach the collapsed Bar
+from the keyboard.
+
+## Collapse
+
+The Bar covers the system menu bar while expanded, so collapsing is how the
+menu bar is handed back. Two handles sit at the very ends of the Bar; they are
+invisible until the pointer reaches that end, and a hidden handle ignores
+clicks. Collapsing is runtime-only presentation state: it is never written to
+disk and every Bar starts expanded.
+
+- Collapse a notched display and the panel shrinks to a black capsule around the
+  camera cutout: the cutout's own width plus 24pt on each side, menu-bar height,
+  bottom corners rounded, opaque. A small expand handle sits inside each end.
+- Collapse a display without a cutout and the panel shrinks to a 120x6pt tab
+  flush with the screen top, horizontally centred, its bottom corners rounded.
+  Hovering grows it to 9pt as the click affordance, and a click anywhere on it
+  expands the Bar again.
+- Everything the Bar does not cover while collapsed is the normal macOS menu
+  bar, so the Apple menu, application menus and status items work as usual.
+- `spool.action.bar.toggle_collapse` acts on the display that owns the active
+  Space, leaving other displays alone.
 
 ## Window Identity
 

@@ -341,6 +341,11 @@ pub enum Action {
     DeleteSpace {
         space_id: u64,
     },
+    /// Collapses or expands the Bar on the active display.
+    ///
+    /// Runtime-only presentation state: it is never persisted and every Bar
+    /// starts expanded.
+    ToggleBarCollapse,
     /// Quits the window manager application.
     Quit,
     /// Restarts the window manager service.

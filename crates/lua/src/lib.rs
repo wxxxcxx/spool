@@ -99,6 +99,13 @@ pub fn install(lua: &Lua, spool: &Table, dispatch: &Dispatch) -> Result<()> {
         verb(lua, dispatch, Action::MissionControl)?,
     )?;
     action.set("show_desktop", verb(lua, dispatch, Action::ShowDesktop)?)?;
+
+    let bar = lua.create_table()?;
+    bar.set(
+        "toggle_collapse",
+        verb(lua, dispatch, Action::ToggleBarCollapse)?,
+    )?;
+    action.set("bar", bar)?;
     spool.set("action", action)?;
 
     // spool.match{ app = …, bundle = …, title = …, floating = … }

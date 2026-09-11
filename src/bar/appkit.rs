@@ -33,7 +33,31 @@ use super::toolbar;
 
 const DRAG_RELEASE_GRACE: Duration = Duration::from_millis(250);
 
+/// Width of the collapse handle at either end of the Bar.
+const END_ZONE: f64 = 24.0;
+/// Bottom-corner radius of the collapsed capsule / tab.
+const CAPSULE_RADIUS: f64 = 12.0;
+const TAB_RADIUS: f64 = 3.0;
+
+/// One end of the Bar's own chrome. While expanded these are the collapse
+/// handles; while collapsed they are the expand handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BarEdge {
+    Left,
+    Right,
+}
+
+impl BarEdge {
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Left => "\u{2039}",
+            Self::Right => "\u{203a}",
+        }
+    }
+}
+
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // Independent capability/style flags.
 struct ViewState {
     display: BarDisplay,
     layout: BarLayout,
@@ -47,6 +71,14 @@ struct ViewState {
     floating_order: HashMap<u64, Vec<i32>>,
     icons: HashMap<String, Retained<NSImage>>,
     preferences: BarPreferences,
+    /// Runtime-only collapse state: every Bar starts expanded and nothing
+    /// persists this.
+    collapsed: bool,
+    /// Which end of the Bar chrome the pointer is over, if any.
+    hover: Option<BarEdge>,
+    /// Set when the panel's own rect must be recomputed: collapse and hover
+    /// change the panel, not just its content.
+    chrome_dirty: bool,
 }
 
 impl ViewState {
@@ -61,9 +93,52 @@ impl ViewState {
         now.saturating_duration_since(*released) >= DRAG_RELEASE_GRACE
     }
 
-    fn press_at(&mut self, point: NSPoint) -> Option<Action> {
+    /// Which end of the chrome a point grabs, if any. The handle is the whole
+    /// height of that end, and a collapsed plain-screen tab is grabbable
+    /// anywhere because it has no room for a separate handle.
+    fn edge_at(&self, point: (f64, f64), size: (f64, f64)) -> Option<BarEdge> {
+        if size.0 <= 0.0 || size.1 <= 0.0 || point.1 < 0.0 || point.1 > size.1 {
+            return None;
+        }
+        let zone = END_ZONE.min(size.0 / 2.0);
+        if point.0 >= 0.0 && point.0 <= zone {
+            return Some(BarEdge::Left);
+        }
+        if point.0 >= size.0 - zone && point.0 <= size.0 {
+            return Some(BarEdge::Right);
+        }
+        if self.collapsed && self.surface.notch.is_none() {
+            // The tab is only a few points tall; everything on it expands.
+            return (point.0 >= 0.0 && point.0 <= size.0).then_some(BarEdge::Right);
+        }
+        None
+    }
+
+    fn set_collapsed(&mut self, collapsed: bool) {
+        if self.collapsed == collapsed {
+            return;
+        }
+        self.collapsed = collapsed;
+        self.chrome_dirty = true;
+    }
+
+    fn take_chrome_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.chrome_dirty)
+    }
+
+    fn press_at(&mut self, point: NSPoint, size: (f64, f64)) -> Option<Action> {
         self.pressed = None;
         self.release_observed_at = None;
+        if let Some(edge) = self.edge_at((point.x, point.y), size) {
+            // The handle toggles either way, but while expanded it only reacts
+            // once it has been revealed: the hidden strip sits where the menu
+            // bar's own controls used to be, and clicking an invisible button
+            // must not collapse the Bar by accident.
+            if self.collapsed || self.hover == Some(edge) {
+                self.set_collapsed(!self.collapsed);
+            }
+            return None;
+        }
         let hit_layout = self.motion.presented.interaction_layout(&self.layout);
         if let Some(item) = window_at(&hit_layout, point)
             && let ItemKind::Window { space_id, .. } = item.kind
@@ -215,7 +290,11 @@ define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
-            let action = self.ivars().state.borrow_mut().press_at(point);
+            let size = {
+                let bounds = self.bounds();
+                (bounds.size.width, bounds.size.height)
+            };
+            let action = self.ivars().state.borrow_mut().press_at(point, size);
             if let Some(action) = action {
                 self.dispatch(action);
             }
@@ -376,6 +455,9 @@ impl BarView {
                 floating_order: HashMap::new(),
                 icons: HashMap::new(),
                 preferences,
+                collapsed: false,
+                hover: None,
+                chrome_dirty: false,
             }),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -430,7 +512,20 @@ impl BarView {
 
     fn draw_bar(&self) {
         let bounds = self.bounds();
-        let preferences = self.ivars().state.borrow().preferences.clone();
+        let (collapsed, hover, notched, preferences) = {
+            let state = self.ivars().state.borrow();
+            (
+                state.collapsed,
+                state.hover,
+                state.surface.notch.is_some(),
+                state.preferences.clone(),
+            )
+        };
+        if collapsed {
+            clear(bounds);
+            Self::draw_collapsed(bounds, hover, notched);
+            return;
+        }
         let background =
             BarPreferences::rgba(&preferences.background_color, [0.08, 0.08, 0.09, 0.88]);
         let border = BarPreferences::rgba(&preferences.border_color, [1.0, 1.0, 1.0, 0.16]);
@@ -460,6 +555,25 @@ impl BarView {
                     .filter(|drag| drag.active && state.can_move_windows),
             )
         };
+        self.draw_strip(&frame, drag.as_ref(), &preferences, bounds, radius);
+        if preferences.toolbar_width() > 0.0 {
+            let mut separator = toolbar::separator(bounds.size.height);
+            separator.x = preferences.toolbar_width() - 3.0;
+            rounded_fill(ns_rect(separator), 0.5, color(1.0, 1.0, 1.0, 0.16));
+        }
+        NSGraphicsContext::restoreGraphicsState_class();
+    }
+
+    /// Everything inside the panel: Spaces, icons, the focus accents, and the
+    /// insertion gap of an in-flight drag.
+    fn draw_strip(
+        &self,
+        frame: &super::motion::Presentation,
+        drag: Option<&BarDrag>,
+        preferences: &BarPreferences,
+        bounds: NSRect,
+        radius: f64,
+    ) {
         NSGraphicsContext::saveGraphicsState_class();
         NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, radius, radius).addClip();
         // Scrolling and dragging belong only to the Space viewport, never the fixed buttons.
@@ -480,7 +594,7 @@ impl BarView {
         // Keep the moving fill below icons and its indicator above opaque decks.
         for pass in 0..3 {
             for visual in &frame.items {
-                if drag.as_ref().is_some_and(|drag| drag.hides(visual)) {
+                if drag.is_some_and(|drag| drag.hides(visual)) {
                     continue;
                 }
                 if matches!(visual.item.kind, ItemKind::Space { .. })
@@ -501,7 +615,7 @@ impl BarView {
                 .addClip();
                 match visual.item.kind {
                     ItemKind::Window { .. } => self.draw_window(visual),
-                    ItemKind::Label { ordinal, .. } => draw_label(ordinal, visual, &preferences),
+                    ItemKind::Label { ordinal, .. } => draw_label(ordinal, visual, preferences),
                     ItemKind::Placeholder { .. } => Self::draw_placeholder(visual),
                     ItemKind::Focus { .. } if pass == 0 => self.draw_focus(visual),
                     ItemKind::Focus { .. } => self.draw_focus_indicator(visual),
@@ -511,7 +625,7 @@ impl BarView {
             }
         }
         if let Some(drag) = drag
-            && let Some(gap) = drag.gap_rect(&frame)
+            && let Some(gap) = drag.gap_rect(frame)
         {
             let gap = gap.intersection(frame.viewport(drag.target_space()));
             if gap.width > 0.0 {
@@ -525,12 +639,50 @@ impl BarView {
             }
         }
         NSGraphicsContext::restoreGraphicsState_class();
-        if preferences.toolbar_width() > 0.0 {
-            let mut separator = toolbar::separator(bounds.size.height);
-            separator.x = preferences.toolbar_width() - 3.0;
-            rounded_fill(ns_rect(separator), 0.5, color(1.0, 1.0, 1.0, 0.16));
+    }
+
+    /// The collapsed Bar draws no content at all: a black capsule merged with
+    /// the camera cutout, or a small tab on a plain display.
+    ///
+    /// Rounding only the bottom corners uses the panel's own edge as the clip:
+    /// the shape starts one radius above the view, so its top corners are
+    /// never drawn.
+    fn draw_collapsed(bounds: NSRect, hover: Option<BarEdge>, notched: bool) {
+        let radius = if notched { CAPSULE_RADIUS } else { TAB_RADIUS };
+        let shape = NSRect::new(
+            NSPoint::new(bounds.origin.x, bounds.origin.y - radius),
+            NSSize::new(bounds.size.width, bounds.size.height + radius),
+        );
+        let fill = if notched || hover.is_some() {
+            // Opaque over the menu bar, and solid black once the tab is live.
+            NSColor::blackColor()
+        } else {
+            rgba([0.0, 0.0, 0.0, 0.92])
+        };
+        rounded_fill(shape, radius, fill);
+        if !notched {
+            return;
         }
-        NSGraphicsContext::restoreGraphicsState_class();
+        for edge in [BarEdge::Left, BarEdge::Right] {
+            let rect = NSRect::new(
+                NSPoint::new(
+                    if edge == BarEdge::Left {
+                        0.0
+                    } else {
+                        bounds.size.width - END_ZONE
+                    },
+                    0.0,
+                ),
+                NSSize::new(END_ZONE, bounds.size.height),
+            );
+            let opacity = if hover == Some(edge) { 1.0 } else { 0.55 };
+            draw_text(
+                edge.symbol(),
+                rect,
+                13.0,
+                NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, opacity),
+            );
+        }
     }
 
     fn draw_space(&self, visual: &VisualItem, viewport: Rect) {
@@ -741,14 +893,36 @@ struct BarCapabilities {
 struct PanelRecord {
     window: Retained<NSPanel>,
     view: Retained<BarView>,
-    available_frame: Rect,
+    backdrop: Retained<NSVisualEffectView>,
+    /// The expanded panel: exactly the menu-bar band.
+    expanded: Rect,
+    /// The owning display, for centring a collapsed panel on it.
+    screen: Rect,
+    /// The camera cutout in screen coordinates, if the display has one.
+    gap: Option<Rect>,
 }
 
 impl PanelRecord {
     fn present(&self) {
-        // The panel is the menu-bar band: content never resizes it. Collapse
-        // changes this rect, and that is the only thing that does.
-        let rect = ns_rect(self.available_frame);
+        let (collapsed, hover) = {
+            let state = self.view.ivars().state.borrow();
+            (state.collapsed, state.hover)
+        };
+        // Expanded, the panel is the menu-bar band and content never resizes
+        // it; collapsed, it shrinks to the capsule or the tab. Those two are
+        // the only things that move it.
+        let frame = if collapsed {
+            super::placement::collapsed_rect(
+                self.screen,
+                self.expanded.height,
+                self.gap,
+                hover.is_some(),
+            )
+        } else {
+            self.expanded
+        };
+        let rect = ns_rect(frame);
+        self.backdrop.setHidden(collapsed);
         self.view.setFrameSize(rect.size);
         self.view.layout_toolbar();
         if self.window.frame() != rect {
@@ -789,8 +963,12 @@ impl BarManager {
                 focus_spaces: snapshot.can_focus_spaces,
                 move_windows: snapshot.can_move_windows,
             };
-            let (available_frame, surface, preferences) =
-                screen_placement(screen, &self.preferences);
+            let (expanded, surface, preferences) = screen_placement(screen, &self.preferences);
+            let gap = super::placement::notch_gap(
+                view_rect(screen.auxiliaryTopLeftArea()),
+                view_rect(screen.auxiliaryTopRightArea()),
+                expanded.height,
+            );
             let (window, view) = if let Some(record) = self.panels.get(&display.id) {
                 (record.window.clone(), record.view.clone())
             } else {
@@ -802,13 +980,16 @@ impl BarManager {
                     capabilities,
                     preferences.clone(),
                 );
-                let window = make_bar_window(self.mtm, &view);
+                let (window, backdrop) = make_bar_panel(self.mtm, &view);
                 self.panels.insert(
                     display.id,
                     PanelRecord {
                         window: window.clone(),
                         view: view.clone(),
-                        available_frame,
+                        backdrop,
+                        expanded,
+                        screen: view_rect(screen.frame()),
+                        gap,
                     },
                 );
                 (window, view)
@@ -816,7 +997,9 @@ impl BarManager {
             view.update(display, surface, capabilities, preferences.clone());
             window.setHasShadow(preferences.show_shadow);
             if let Some(record) = self.panels.get_mut(&display_id) {
-                record.available_frame = available_frame;
+                record.expanded = expanded;
+                record.screen = view_rect(screen.frame());
+                record.gap = gap;
                 record.present();
             }
             window.orderFrontRegardless();
@@ -832,6 +1015,54 @@ impl BarManager {
         });
     }
 
+    /// Collapses or expands the Bar on the display the user is working on.
+    ///
+    /// Runtime-only: nothing persists this and every Bar starts expanded.
+    pub fn toggle_collapse(&mut self) {
+        let Some(display_id) = self.active_display() else {
+            return;
+        };
+        let Some(record) = self.panels.get_mut(&display_id) else {
+            return;
+        };
+        {
+            let mut state = record.view.ivars().state.borrow_mut();
+            let collapsed = !state.collapsed;
+            state.set_collapsed(collapsed);
+        }
+        record.present();
+    }
+
+    /// The display the active Space lives on, or the only Bar there is.
+    fn active_display(&self) -> Option<u32> {
+        self.panels
+            .iter()
+            .find(|(_, record)| record.view.ivars().state.borrow().display.active)
+            .map(|(display_id, _)| *display_id)
+            .or_else(|| self.panels.keys().copied().min())
+    }
+
+    /// Reveals the end handles under the pointer.
+    ///
+    /// Pointer position comes from the system rather than from tracking areas:
+    /// the panel is a small strip above the menu bar and can be hovered
+    /// without ever becoming the key window.
+    fn update_hover(record: &PanelRecord) {
+        let location = NSEvent::mouseLocation();
+        let frame = record.window.frame();
+        let local = (
+            location.x - frame.origin.x,
+            frame.origin.y + frame.size.height - location.y,
+        );
+        let size = (frame.size.width, frame.size.height);
+        let mut state = record.view.ivars().state.borrow_mut();
+        let hover = state.edge_at(local, size);
+        if hover != state.hover {
+            state.hover = hover;
+            state.chrome_dirty = true;
+        }
+    }
+
     pub fn is_animating(&self) -> bool {
         self.panels.values().any(|record| {
             let state = record.view.ivars().state.borrow();
@@ -842,6 +1073,7 @@ impl BarManager {
     pub fn animate(&mut self) {
         let now = Instant::now();
         for record in self.panels.values() {
+            Self::update_hover(record);
             let dragging = record
                 .view
                 .ivars()
@@ -864,7 +1096,8 @@ impl BarManager {
                 }
             }
             let changed = record.view.ivars().state.borrow_mut().motion.advance(now);
-            if changed {
+            let chrome = record.view.ivars().state.borrow_mut().take_chrome_dirty();
+            if changed || chrome {
                 record.present();
             }
         }
@@ -958,16 +1191,23 @@ fn make_bar_window(mtm: MainThreadMarker, view: &NSView) -> Retained<NSPanel> {
             | NSWindowCollectionBehavior::FullScreenAuxiliary
             | NSWindowCollectionBehavior::IgnoresCycle,
     );
-    // The backdrop is the content view so it tracks the window on resize; the
-    // Bar view rides on top of it and follows by autoresizing.
-    let backdrop = make_backdrop(mtm, size);
+    window.setContentView(Some(view));
+    unsafe { window.setReleasedWhenClosed(true) };
+    window
+}
+
+/// The Bar's own panel: a Bar window whose content view is a menu-material
+/// backdrop, with the content riding on top of it and following on resize.
+fn make_bar_panel(
+    mtm: MainThreadMarker,
+    view: &NSView,
+) -> (Retained<NSPanel>, Retained<NSVisualEffectView>) {
+    let backdrop = make_backdrop(mtm, view.frame().size);
     view.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     backdrop.addSubview(view);
-    window.setContentView(Some(&backdrop));
-    unsafe { window.setReleasedWhenClosed(true) };
-    window
+    (make_bar_window(mtm, &backdrop), backdrop)
 }
 
 fn screens_by_id(mtm: MainThreadMarker) -> HashMap<u32, Retained<NSScreen>> {
@@ -1309,10 +1549,13 @@ mod tests {
             let rect = state.motion.presented.space_rect(space_id).unwrap();
             for y in [1.0, state.layout.height - 1.0] {
                 let point = NSPoint::new(rect.x + rect.width / 2.0, y);
-                assert_eq!(state.press_at(point), Some(Action::FocusSpace { space_id }));
+                assert_eq!(
+                    state.press_at(point, (1200.0, 37.0)),
+                    Some(Action::FocusSpace { space_id })
+                );
                 assert!(state.pressed.is_none());
                 state.can_focus_spaces = false;
-                assert!(state.press_at(point).is_none());
+                assert!(state.press_at(point, (1200.0, 37.0)).is_none());
                 state.can_focus_spaces = true;
             }
         }
@@ -1324,7 +1567,7 @@ mod tests {
             .unwrap()
             .rect;
         let point = NSPoint::new(icon.x + 2.0, icon.y + 2.0);
-        assert!(state.press_at(point).is_none());
+        assert!(state.press_at(point, (1200.0, 37.0)).is_none());
         assert_eq!(state.pressed.as_ref().unwrap().window_id, 1);
         assert_eq!(
             state.release_drag(point, true),
@@ -1388,6 +1631,9 @@ mod tests {
                 floating_order: HashMap::new(),
                 icons: HashMap::new(),
                 preferences,
+                collapsed: false,
+                hover: None,
+                chrome_dirty: false,
             },
             point,
         )
@@ -1437,7 +1683,7 @@ mod tests {
                 .find(|item| matches!(item.kind, ItemKind::Window { window_id: 1, .. }))
                 .unwrap()
                 .rect;
-            state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0));
+            state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0), (1200.0, 37.0));
             let point = if cross_space {
                 let target = state.motion.presented.space_rect(10).unwrap();
                 NSPoint::new(target.x + target.width / 2.0, target.y + 2.0)
@@ -1497,7 +1743,7 @@ mod tests {
             .unwrap()
             .item
             .rect;
-        state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0));
+        state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0), (1200.0, 37.0));
         state.drag_to(point, true);
         assert!(!state.drag_release_expired(false, now + Duration::from_secs(2)));
     }
@@ -1750,6 +1996,50 @@ mod tests {
             .is_some(),
             "icons inside the slot stay hittable"
         );
+    }
+
+    #[test]
+    fn the_bar_ends_toggle_collapse_and_the_middle_does_not() {
+        let (mut state, _) = drag_state();
+        let size = (1200.0, 37.0);
+        assert!(!state.collapsed, "every Bar starts expanded");
+        // A hidden handle does not react: the strip sits where the menu bar's
+        // own controls were, so an accidental click must not collapse the Bar.
+        assert!(state.press_at(NSPoint::new(2.0, 18.0), size).is_none());
+        assert!(!state.collapsed, "an unrevealed handle is inert");
+        state.hover = Some(BarEdge::Left);
+        assert!(state.press_at(NSPoint::new(2.0, 18.0), size).is_none());
+        assert!(
+            state.collapsed,
+            "the revealed left handle collapses the Bar"
+        );
+        assert!(state.take_chrome_dirty(), "the panel must be rewritten");
+        // Collapsed handles are always live, so no reveal step is needed.
+        assert!(state.press_at(NSPoint::new(1198.0, 18.0), size).is_none());
+        assert!(!state.collapsed, "the right handle expands it again");
+
+        // A plain-screen tab is only a few points tall, so all of it expands.
+        state.set_collapsed(true);
+        assert!(state.press_at(NSPoint::new(600.0, 3.0), size).is_none());
+        assert!(!state.collapsed);
+    }
+
+    #[test]
+    fn a_collapsed_capsule_only_expands_from_its_own_handles() {
+        let (mut state, _) = drag_state();
+        state.surface.notch = Some(Rect {
+            x: 500.0,
+            y: 0.0,
+            width: 180.0,
+            height: 37.0,
+        });
+        state.set_collapsed(true);
+        let size = (227.0, 34.0);
+        // The black area between the handles is not a target: it is the notch.
+        assert!(state.press_at(NSPoint::new(110.0, 17.0), size).is_none());
+        assert!(state.collapsed, "the middle of the capsule stays collapsed");
+        assert!(state.press_at(NSPoint::new(3.0, 17.0), size).is_none());
+        assert!(!state.collapsed, "the left handle expands");
     }
 
     #[test]

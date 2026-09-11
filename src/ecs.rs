@@ -276,6 +276,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .chain(),
             (
                 crate::bar::update_bar.run_if(bar_dirty.or_eager(on_timer(Duration::from_secs(1)))),
+                crate::bar::apply_bar_requests,
                 crate::bar::animate_bar,
             )
                 .chain(),

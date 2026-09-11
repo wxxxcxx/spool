@@ -45,6 +45,7 @@ pub fn parse_action(argv: &[&str]) -> Result<Action> {
         "reconcile-windows" => Action::ReconcileWindows,
         "mission-control" if argv.len() == 1 => Action::MissionControl,
         "show-desktop" if argv.len() == 1 => Action::ShowDesktop,
+        "bar" => parse_bar_action(&argv[1..])?,
         "window" => parse_window_action(&argv[1..])?,
         "space" => parse_space_action(&argv[1..])?,
         "mouse" => Action::Mouse(parse_mouse_move(&argv[1..])?),
@@ -159,6 +160,13 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
 }
 
 /// Parses a mouse action (e.g. `["nextdisplay"]`).
+fn parse_bar_action(argv: &[&str]) -> Result<Action> {
+    match *argv.first().unwrap_or(&"") {
+        "toggle-collapse" => Ok(Action::ToggleBarCollapse),
+        _ => Err(ParseError::new(format!("invalid bar action '{argv:?}'"))),
+    }
+}
+
 fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
     match *argv.first().unwrap_or(&"") {
         "nextdisplay" => Ok(MouseMove::ToNextDisplay),
@@ -224,6 +232,7 @@ impl Action {
             Action::ReconcileWindows => vec!["reconcile-windows".to_string()],
             Action::MissionControl => vec!["mission-control".to_string()],
             Action::ShowDesktop => vec!["show-desktop".to_string()],
+            Action::ToggleBarCollapse => vec!["bar".to_string(), "toggle-collapse".to_string()],
             Action::Lua(_)
             | Action::Layout(_)
             | Action::ReorderColumn { .. }

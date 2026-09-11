@@ -8,7 +8,7 @@ mod preferences;
 mod state;
 mod toolbar;
 
-use bevy::ecs::system::{Local, NonSendMut, Res};
+use bevy::ecs::system::{Local, NonSendMut, Res, ResMut};
 
 pub use appkit::BarManager;
 use model::BarSnapshot;
@@ -49,6 +49,36 @@ pub(crate) fn update_bar(
         }
     }
     bar.update(snapshot, config.bar_preferences());
+}
+
+/// A Bar-side request raised by an action and applied on the next frame.
+///
+/// The action bus cannot touch the Bar directly: `BarManager` is a non-send
+/// `AppKit` resource and Bar updates run in their own chain. A one-shot flag
+/// keeps the action path free of platform types and still lands within a frame.
+#[derive(bevy::ecs::resource::Resource, Default)]
+pub struct BarRequests {
+    toggle_collapse: bool,
+}
+
+impl BarRequests {
+    pub fn request_toggle_collapse(&mut self) {
+        self.toggle_collapse = true;
+    }
+}
+
+/// Applies queued Bar requests on the frame they arrive, so a keybinding does
+/// not wait for the Bar's own refresh cadence.
+pub(crate) fn apply_bar_requests(
+    bar: Option<NonSendMut<BarManager>>,
+    mut requests: ResMut<BarRequests>,
+) {
+    if !std::mem::take(&mut requests.toggle_collapse) {
+        return;
+    }
+    if let Some(mut bar) = bar {
+        bar.toggle_collapse();
+    }
 }
 
 pub(crate) fn animate_bar(bar: Option<NonSendMut<BarManager>>) {

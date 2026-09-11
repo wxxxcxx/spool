@@ -88,6 +88,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // Empty store so the mock harness and saveless runs still have one to
     // answer from; the real app overwrites it from disk.
     app.init_resource::<crate::ecs::script_state::ScriptStateStore>();
+    app.init_resource::<crate::bar::BarRequests>();
     app.add_systems(PreUpdate, crate::ecs::script_state::script_state_handler);
     app.add_systems(
         PreUpdate,
@@ -176,6 +177,7 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
                 commands
                     .run_system_cached_with(command_system_overview, SystemOverview::ShowDesktop);
             }
+            Action::ToggleBarCollapse => commands.run_system_cached(command_toggle_bar_collapse),
             // Lua execution is asynchronous; its returned plan enters this queue later.
             Action::Lua(_) => {}
         }
@@ -223,6 +225,11 @@ fn command_reorder_column(
         commands.reshuffle_around(entity);
         commands.ensure_visible(entity);
     }
+}
+
+/// Queues the Bar toggle; the Bar applies it on its next frame.
+fn command_toggle_bar_collapse(mut requests: ResMut<crate::bar::BarRequests>) {
+    requests.request_toggle_collapse();
 }
 
 fn reconcile_windows_handler(mut commands: Commands) {
