@@ -472,6 +472,13 @@ written atomically to `spool/state.json` in the XDG state directory
 (`~/.local/state/spool/state.json` on a default macOS setup) and is loaded
 during Bevy app setup.
 
+The Bar keeps its own presentation state beside it. `src/bar/geometry.rs` stores
+the panel geometry the user set by hand in `spool/bar-state.json`, keyed by
+`CGDirectDisplayID`, on the same periodic and exit saves as the layout state. It
+is versioned separately because window topology and Bar placement have nothing
+to say to each other, and an unreadable or incompatible file only returns the
+Bar to its automatic placement.
+
 Periodic and exit saves require a complete current native display/Space catalog
 before extracting the snapshot. A retained ECS projection is useful during an
 observation failure but is not evidence that a new durable snapshot is trustworthy;
