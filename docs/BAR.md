@@ -10,11 +10,17 @@ The Bar *is* the menu bar band on each display: exactly as wide and as tall as
 the menu bar, flush with the screen top, with no inset and no rounding. It draws
 its content on a menu-material blur backdrop, so it looks like the menu bar it
 covers, and it deliberately covers the system menu bar while expanded.
-On a notched display the physical camera cutout is respected exactly: Spaces
-remain in native order, the first half (rounded up) is placed on its left and
-the rest on its right, and no Space is ever split across it. Creation, deletion
-or native reordering recomputes that split; window counts and focus never do.
-Clipped content has no hit or drop targets.
+The fixed Mission Control / Show Desktop buttons and the Spaces are one group,
+and the group gathers toward the middle: a display without a camera cutout
+centres it, and a notched display puts it either side of the cutout with both
+halves hugging it, so the leftover whitespace falls at the outer ends and need
+not be equal. On a notched display the group is split by count, with the fixed
+buttons counting as one item, so the cutout takes the first `ceil((n + 1) / 2)`
+items on its left and the rest on its right; `notch_side = "left"` or
+`"right"` keeps every Space on one side instead. Spaces remain in native order
+and none is ever split across the cutout. Creation, deletion or native
+reordering recomputes the split; window counts and focus never do. Clipped
+content has no hit or drop targets.
 This is still a nonactivating panel, not an
 `NSStatusItem`: macOS does not reserve horizontal space for it among application
 menus and status items, which is why the Bar takes that space instead.
@@ -77,10 +83,11 @@ menus and status items, which is why the Bar takes that space instead.
   geometry recorded against a larger or differently arranged display cannot strand
   the Bar off-screen. Deleting the file, or double-clicking the handle, restores
   automatic placement.
-- Two fixed icon buttons at the left open Mission Control and toggle Show Desktop.
-  Native buttons provide hover tooltips and click feedback without taking keyboard
-  focus. The Space strip scrolls and clips independently to their right; neither
-  button is a window-drag target. They also work in observe-only Space mode.
+- Two fixed icon buttons lead the group and open Mission Control and toggle Show
+  Desktop. Native buttons provide hover tooltips and click feedback without
+  taking keyboard focus. The Space strip scrolls and clips independently to
+  their right; neither button is a window-drag target, and both move with the
+  group they lead. They also work in observe-only Space mode.
 - Both buttons dispatch the shared `Action::MissionControl` / `Action::ShowDesktop`
   through the same command handler and WindowManager API as CLI and keybindings.
   The platform submits the system app bundle to Launch Services with `/usr/bin/open -n`

@@ -107,7 +107,7 @@ spool.bind("alt+3", function(ws)
 end)
 ```
 
-Action functions live under the singular `spool.action` namespace. The main groups are `spool.action.window`, `spool.action.space`, and `spool.action.mouse`; lifecycle actions such as `spool.action.quit` and `spool.action.restart` live directly on it. Command strings remain available through the explicit `spool.run(...)` escape hatch, not as bind handlers. `spool.setup.bindings` is intentionally unsupported.
+Action functions live under the singular `spool.action` namespace. The main groups are `spool.action.window`, `spool.action.space`, `spool.action.mouse`, and `spool.action.bar` (which collapses or expands the Bar on the active display); lifecycle actions such as `spool.action.quit` and `spool.action.restart` live directly on it. Command strings remain available through the explicit `spool.run(...)` escape hatch, not as bind handlers. `spool.setup.bindings` is intentionally unsupported.
 
 ### Reloading
 

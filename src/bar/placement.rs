@@ -5,6 +5,7 @@
 //! rect plus the camera cutout the content has to work around.
 
 use super::layout::{BarSurface, Rect};
+use super::preferences::NotchSide;
 
 /// The menu-bar band's height for one screen.
 ///
@@ -39,7 +40,7 @@ pub fn panel_rect(screen: Rect, menu_height: f64) -> Rect {
 /// A display without a cutout gets a single run of Spaces; one with a cutout
 /// gets two lanes, one on each side of `gap`.
 #[must_use]
-pub fn surface(panel: Rect, gap: Option<Rect>) -> BarSurface {
+pub fn surface(panel: Rect, gap: Option<Rect>, bias: NotchSide) -> BarSurface {
     BarSurface {
         width: panel.width,
         notch: gap.filter(|gap| gap.width > 0.0).map(|gap| Rect {
@@ -48,6 +49,7 @@ pub fn surface(panel: Rect, gap: Option<Rect>) -> BarSurface {
             width: gap.width,
             height: panel.height,
         }),
+        bias,
     }
 }
 
@@ -164,7 +166,7 @@ mod tests {
         assert!((gap.x - 646.0).abs() < f64::EPSILON);
         assert!((gap.width - 179.0).abs() < f64::EPSILON);
 
-        let layout_surface = surface(panel, Some(gap));
+        let layout_surface = surface(panel, Some(gap), NotchSide::Balanced);
         assert!((layout_surface.width - 1470.0).abs() < f64::EPSILON);
         let cutout = layout_surface.notch.expect("the cutout survives");
         assert!((cutout.x - 646.0).abs() < f64::EPSILON, "panel x is 0 here");
@@ -172,7 +174,9 @@ mod tests {
 
         // An offset panel shifts the cutout with it.
         let offset_panel = Rect { x: 100.0, ..panel };
-        let offset_cutout = surface(offset_panel, Some(gap)).notch.unwrap();
+        let offset_cutout = surface(offset_panel, Some(gap), NotchSide::Balanced)
+            .notch
+            .unwrap();
         assert!((offset_cutout.x - 546.0).abs() < f64::EPSILON);
     }
 
@@ -189,7 +193,11 @@ mod tests {
         };
         let overlapping = Rect { x: 400.0, ..left };
         assert!(notch_gap(left, overlapping, menu_height).is_none());
-        let zero = surface(panel_rect(screen(), menu_height), Some(Rect::default()));
+        let zero = surface(
+            panel_rect(screen(), menu_height),
+            Some(Rect::default()),
+            NotchSide::Balanced,
+        );
         assert!(zero.notch.is_none(), "a zero-width gap is not a cutout");
     }
 

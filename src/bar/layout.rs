@@ -4,7 +4,20 @@ use spool_shared_types::commands::Placement;
 use spool_shared_types::state::SpaceKind;
 
 use super::model::{BarColumn, BarDisplay, BarSpace, BarWindow};
+use super::preferences::NotchSide;
 use super::toolbar::TOOLBAR_WIDTH;
+
+/// Where a group of Bar items sits inside the width it was given.
+///
+/// The two notch lanes use `End` and `Start` so both hug the camera cutout; a
+/// display without a cutout centres its single group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BarAlign {
+    Start,
+    #[default]
+    Center,
+    End,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -82,6 +95,9 @@ pub struct BarLayout {
     pub width: f64,
     pub height: f64,
     pub content_width: f64,
+    /// Where the fixed toolbar buttons start. The group they lead is aligned,
+    /// not pinned, so this moves with it.
+    pub toolbar_origin: f64,
     pub content_left: f64,
     pub split: Option<NotchSplit>,
     pub items: Vec<PlacedItem>,
@@ -110,6 +126,8 @@ impl SpaceSpan {
 pub struct BarSurface {
     pub width: f64,
     pub notch: Option<Rect>,
+    /// How the Space group is distributed around the cutout.
+    pub bias: NotchSide,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,6 +165,7 @@ mod notch_tests {
                 width: 160.0,
                 height: 34.0,
             }),
+            bias: NotchSide::Balanced,
         }
     }
 
@@ -169,6 +188,94 @@ mod notch_tests {
         }
     }
 
+    #[test]
+    fn a_display_without_a_cutout_centres_the_whole_group() {
+        let display = tests::display();
+        for width in [400.0, 900.0, 1470.0] {
+            let layout = BarLayout::resolve(&display, width);
+            let group = layout.content_width;
+            assert!(
+                (layout.toolbar_origin - (width - group) / 2.0).abs() < 0.001,
+                "the toolbar leads a centred group at {width}pt"
+            );
+            let left_margin = layout.toolbar_origin;
+            let right_margin = width - (layout.toolbar_origin + group);
+            assert!(
+                (left_margin - right_margin).abs() < 0.001,
+                "both outer margins are equal at {width}pt"
+            );
+            // The strip starts where the toolbar lane ends.
+            let metrics = BarMetrics::default();
+            assert!(
+                (layout.content_left - (layout.toolbar_origin + metrics.toolbar_width)).abs()
+                    < 0.001
+            );
+        }
+    }
+
+    #[test]
+    fn notch_lanes_hug_the_cutout_and_split_by_count() {
+        let display = tests::display();
+        let metrics = BarMetrics::default();
+        let layout = BarLayout::resolve_surface(&display, surface(), &mut HashMap::new(), metrics);
+        let split = layout.split.as_ref().expect("a notched surface");
+        // The toolbar counts as one item: ceil((3 + 1) / 2) = 2 on the left,
+        // which is the toolbar plus one Space.
+        assert_eq!(split.left_spaces.len(), 1);
+        assert_eq!(split.left_spaces, vec![display.spaces[0].id]);
+
+        let right_ids = display.spaces[1..]
+            .iter()
+            .map(|space| space.id)
+            .collect::<Vec<_>>();
+        let left_edge = |ids: &[u64], right: bool| {
+            layout
+                .items
+                .iter()
+                .filter(|item| ids.contains(&item.kind.space_id()))
+                .map(|item| {
+                    if right {
+                        item.rect.x + item.rect.width
+                    } else {
+                        item.rect.x
+                    }
+                })
+                .fold(if right { 0.0 } else { f64::INFINITY }, |a, b| {
+                    if right { a.max(b) } else { a.min(b) }
+                })
+        };
+        let left_group = left_edge(&split.left_spaces, true);
+        assert!(
+            split.gap.x - left_group >= 0.0
+                && split.gap.x - left_group <= metrics.horizontal_padding + 0.001,
+            "the left group ends against the cutout"
+        );
+        let right_group = left_edge(&right_ids, false);
+        assert!(
+            right_group - (split.gap.x + split.gap.width) >= -0.001,
+            "the right group starts against the cutout"
+        );
+    }
+
+    #[test]
+    fn notch_side_can_keep_every_space_on_one_side() {
+        let display = tests::display();
+        for (bias, left_spaces) in [
+            (NotchSide::Left, display.spaces.len()),
+            (NotchSide::Right, 0),
+        ] {
+            let mut notch_surface = surface();
+            notch_surface.bias = bias;
+            let layout = BarLayout::resolve_surface(
+                &display,
+                notch_surface,
+                &mut HashMap::new(),
+                BarMetrics::default(),
+            );
+            assert_eq!(layout.split.unwrap().left_spaces.len(), left_spaces);
+        }
+    }
+
     fn assert_balanced(display: &BarDisplay) {
         let layout = BarLayout::resolve_surface(
             display,
@@ -177,7 +284,9 @@ mod notch_tests {
             BarMetrics::default(),
         );
         let split = layout.split.as_ref().unwrap();
-        let left = display.spaces.len().div_ceil(2);
+        // The split is by count, and the fixed toolbar counts as one item, so
+        // the left lane takes one fewer Space than half the items.
+        let left = (display.spaces.len() + 1).div_ceil(2).saturating_sub(1);
         assert_eq!(
             split.left_spaces,
             display.spaces[..left]
@@ -185,7 +294,11 @@ mod notch_tests {
                 .map(|s| s.id)
                 .collect::<Vec<_>>()
         );
-        assert!(left.abs_diff(display.spaces.len() - left) <= 1);
+        let right = display.spaces.len() - left;
+        assert!(
+            (left + 1).abs_diff(right) <= 1,
+            "toolbar and Spaces balance"
+        );
         let ordered_ids = layout
             .items
             .iter()
@@ -225,8 +338,8 @@ mod notch_tests {
         let left = initial
             .spans
             .iter()
-            .find(|span| span.rect.x < 220.0 && span.max_scroll() > 0.0)
-            .expect("a left-lane Space must overflow its slot");
+            .find(|span| span.max_scroll() > 0.0)
+            .expect("a Space must overflow its slot");
         let mut scroll = HashMap::new();
         scroll.insert(left.space_id, f64::MAX);
         let scrolled =
@@ -378,19 +491,37 @@ impl BarLayout {
         metrics: BarMetrics,
     ) -> Self {
         let Some(gap) = surface.notch else {
-            return Self::resolve_with_metrics(display, surface.width, space_scroll, metrics);
+            return Self::resolve_with_metrics(
+                display,
+                surface.width,
+                space_scroll,
+                metrics,
+                BarAlign::Center,
+            );
         };
-        // Membership depends only on native order/count, never on rendered widths.
-        let boundary = display.spaces.len().div_ceil(2);
+        // Split by count, with the fixed toolbar counting as one item, so the
+        // cut only moves when the Space count does: the first
+        // ceil((spaces + 1) / 2) items go left, the rest right. `notch_side`
+        // can override that by keeping every Space on one side.
+        let boundary = match surface.bias {
+            NotchSide::Balanced => display
+                .spaces
+                .len()
+                .saturating_sub(display.spaces.len().div_ceil(2)),
+            NotchSide::Left => display.spaces.len(),
+            NotchSide::Right => 0,
+        };
         let mut left = display.clone();
         let right_spaces = left.spaces.split_off(boundary);
         let right = BarDisplay {
             spaces: right_spaces,
             ..display.clone()
         };
-        let mut a = Self::resolve_with_metrics(&left, gap.x, space_scroll, metrics);
+        // Both lanes hug the camera cutout: the left group is right-aligned
+        // inside its lane, the right group left-aligned in its own.
+        let mut a = Self::resolve_with_metrics(&left, gap.x, space_scroll, metrics, BarAlign::End);
         let right_x = gap.x + gap.width;
-        let b = Self::resolve_with_metrics(
+        let mut b = Self::resolve_with_metrics(
             &right,
             surface.width - right_x,
             space_scroll,
@@ -398,26 +529,19 @@ impl BarLayout {
                 toolbar_width: 0.0,
                 ..metrics
             },
+            BarAlign::Start,
         );
-        // Compact content hugs the spacer; a lane whose Spaces are all at their
-        // minimum leaves the leftover against the notch.
-        let left_offset = (gap.x - a.width).max(0.0);
-        for item in &mut a.items {
-            item.rect.x += left_offset;
-        }
-        for span in &mut a.spans {
-            span.rect.x += left_offset;
-        }
-        a.items.extend(b.items.into_iter().map(|mut item| {
+        for item in &mut b.items {
             item.rect.x += right_x;
-            item
-        }));
-        a.spans.extend(b.spans.into_iter().map(|mut span| {
+        }
+        for span in &mut b.spans {
             span.rect.x += right_x;
-            span
-        }));
+        }
+        a.items.extend(b.items);
+        a.spans.extend(b.spans);
         a.width = surface.width;
         a.content_width += gap.width + b.content_width;
+        a.toolbar_origin = a.toolbar_origin.min(gap.x);
         a.split = Some(NotchSplit {
             gap,
             left_spaces: left.spaces.iter().map(|space| space.id).collect(),
@@ -433,6 +557,7 @@ impl BarLayout {
             max_width,
             &mut HashMap::new(),
             BarMetrics::default(),
+            BarAlign::Center,
         )
     }
 
@@ -442,6 +567,7 @@ impl BarLayout {
         max_width: f64,
         space_scroll: &mut HashMap<u64, f64>,
         metrics: BarMetrics,
+        align: BarAlign,
     ) -> Self {
         let body_height = metrics.icon_size;
         let height = body_height + metrics.vertical_padding * 2.0;
@@ -461,7 +587,20 @@ impl BarLayout {
             (max_width - metrics.toolbar_width - metrics.horizontal_padding * 2.0 - gaps).max(0.0);
         let allocated = allocate_space_widths(&display.spaces, &widths, &minimums, available);
 
-        let mut x = metrics.toolbar_width + metrics.horizontal_padding;
+        // The toolbar and the Spaces are one group: it is aligned inside the
+        // width it was given rather than pinned to the left edge.
+        let group_width = metrics.toolbar_width
+            + metrics.horizontal_padding * 2.0
+            + allocated.iter().sum::<f64>()
+            + count(allocated.len().saturating_sub(1)) * metrics.item_gap;
+        let slack = (max_width - group_width).max(0.0);
+        let start = match align {
+            BarAlign::Start => 0.0,
+            BarAlign::Center => slack / 2.0,
+            BarAlign::End => slack,
+        };
+
+        let mut x = start + metrics.toolbar_width + metrics.horizontal_padding;
         let mut items = Vec::new();
         let mut spans = Vec::new();
 
@@ -523,17 +662,15 @@ impl BarLayout {
             .collect::<Vec<_>>();
         items.extend(focus);
 
-        let content_width = metrics.toolbar_width
-            + metrics.horizontal_padding * 2.0
-            + allocated.iter().sum::<f64>()
-            + gaps;
-        let width = content_width.min(max_width.max(1.0));
-
+        // `content_width` is the group; the layout's width is the panel it
+        // sits in, which for the Bar is always the whole menu bar band.
+        let width = max_width.max(1.0);
         Self {
             width,
             height,
-            content_width,
-            content_left: metrics.toolbar_width.min(width),
+            content_width: group_width,
+            toolbar_origin: start,
+            content_left: (start + metrics.toolbar_width).min(width),
             split: None,
             items,
             spans,
@@ -995,8 +1132,13 @@ pub(super) mod tests {
             };
             let mut display = display();
             display.spaces[1].visible = false;
-            let layout =
-                BarLayout::resolve_with_metrics(&display, 1200.0, &mut HashMap::new(), metrics);
+            let layout = BarLayout::resolve_with_metrics(
+                &display,
+                1200.0,
+                &mut HashMap::new(),
+                metrics,
+                BarAlign::Center,
+            );
             let icons = layout
                 .items
                 .iter()
@@ -1072,6 +1214,7 @@ pub(super) mod tests {
                             label_width,
                             ..BarMetrics::default()
                         },
+                        BarAlign::Center,
                     );
                     let space = layout
                         .items
@@ -1089,6 +1232,7 @@ pub(super) mod tests {
                             label_width,
                             ..BarMetrics::default()
                         },
+                        BarAlign::Center,
                     );
                     assert!((layout.content_width - ordinary.content_width).abs() < f64::EPSILON);
                     assert_eq!(layout.items.len(), ordinary.items.len());
@@ -1163,8 +1307,13 @@ pub(super) mod tests {
             display.spaces[1].floating.push(window);
         }
         let mut scroll = HashMap::new();
-        let initial =
-            BarLayout::resolve_with_metrics(&display, 700.0, &mut scroll, BarMetrics::default());
+        let initial = BarLayout::resolve_with_metrics(
+            &display,
+            700.0,
+            &mut scroll,
+            BarMetrics::default(),
+            BarAlign::Center,
+        );
         let focused = initial
             .spans
             .iter()
@@ -1173,8 +1322,13 @@ pub(super) mod tests {
         assert!(focused.max_scroll() > 0.0, "the focused content overflows");
 
         scroll.insert(11, f64::MAX);
-        let scrolled =
-            BarLayout::resolve_with_metrics(&display, 700.0, &mut scroll, BarMetrics::default());
+        let scrolled = BarLayout::resolve_with_metrics(
+            &display,
+            700.0,
+            &mut scroll,
+            BarMetrics::default(),
+            BarAlign::Center,
+        );
         assert!((scroll[&11] - focused.max_scroll()).abs() < 0.001);
         for span in &scrolled.spans {
             let before = initial
@@ -1229,6 +1383,7 @@ pub(super) mod tests {
             200.0,
             &mut HashMap::new(),
             BarMetrics::default(),
+            BarAlign::Center,
         );
         assert_eq!(layout.spans.len(), display.spaces.len());
         let first = layout.spans[0].rect.width;
@@ -1251,8 +1406,13 @@ pub(super) mod tests {
         for space in &display.spaces {
             scroll.insert(space.id, f64::MAX);
         }
-        let layout =
-            BarLayout::resolve_with_metrics(&display, 240.0, &mut scroll, BarMetrics::default());
+        let layout = BarLayout::resolve_with_metrics(
+            &display,
+            240.0,
+            &mut scroll,
+            BarMetrics::default(),
+            BarAlign::Center,
+        );
         assert!((layout.width - 240.0).abs() < f64::EPSILON);
         assert_eq!(
             layout.spans.len(),
@@ -1310,6 +1470,7 @@ pub(super) mod tests {
                 label_width: 0.0,
                 ..BarMetrics::default()
             },
+            BarAlign::Center,
         );
         assert!(visible.content_width - hidden.content_width >= 3.0 * 24.0);
     }
@@ -1346,8 +1507,13 @@ pub(super) mod tests {
                     ..BarMetrics::default()
                 };
                 let display = display();
-                let layout =
-                    BarLayout::resolve_with_metrics(&display, 1200.0, &mut HashMap::new(), metrics);
+                let layout = BarLayout::resolve_with_metrics(
+                    &display,
+                    1200.0,
+                    &mut HashMap::new(),
+                    metrics,
+                    BarAlign::Center,
+                );
                 let labels = layout
                     .items
                     .iter()
@@ -1396,6 +1562,7 @@ pub(super) mod tests {
                 label_width: 0.0,
                 ..BarMetrics::default()
             },
+            BarAlign::Center,
         );
         let space = layout
             .items
@@ -1433,6 +1600,7 @@ pub(super) mod tests {
                 label_width: 0.0,
                 ..BarMetrics::default()
             },
+            BarAlign::Center,
         );
         let space = layout
             .items
@@ -1494,11 +1662,21 @@ pub(super) mod tests {
                     label_width,
                     ..BarMetrics::default()
                 };
-                let expanded =
-                    BarLayout::resolve_with_metrics(&display, 1200.0, &mut HashMap::new(), metrics);
+                let expanded = BarLayout::resolve_with_metrics(
+                    &display,
+                    1200.0,
+                    &mut HashMap::new(),
+                    metrics,
+                    BarAlign::Center,
+                );
                 display.spaces[1].visible = false;
-                let collapsed =
-                    BarLayout::resolve_with_metrics(&display, 1200.0, &mut HashMap::new(), metrics);
+                let collapsed = BarLayout::resolve_with_metrics(
+                    &display,
+                    1200.0,
+                    &mut HashMap::new(),
+                    metrics,
+                    BarAlign::Center,
+                );
                 for item in &collapsed.items {
                     let ItemKind::Window {
                         window_id,

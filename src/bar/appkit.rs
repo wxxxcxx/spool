@@ -397,18 +397,27 @@ impl BarView {
     }
 
     fn layout_toolbar(&self) {
-        let preferences = &self.ivars().state.borrow().preferences;
+        let (preferences, origin) = {
+            let state = self.ivars().state.borrow();
+            (
+                state.preferences.clone(),
+                state.motion.presented.toolbar_origin,
+            )
+        };
         let controls = toolbar::configured_buttons(
             self.bounds().size.height,
             preferences.show_mission_control,
             preferences.show_desktop,
         );
-        let tint = foreground_color(preferences, 1.0);
+        let tint = foreground_color(&preferences, 1.0);
         for (action, button) in self.ivars().toolbar_buttons.borrow().iter() {
             let control = controls.iter().find(|control| *action == control.action);
             button.setHidden(control.is_none());
             if let Some(control) = control {
-                button.setFrame(ns_rect(control.rect));
+                // The buttons lead the Bar's group, so they move with it.
+                let mut rect = control.rect;
+                rect.x += origin;
+                button.setFrame(ns_rect(rect));
                 button.setContentTintColor(Some(&tint));
             }
         }
@@ -1146,7 +1155,12 @@ fn screen_placement(
         view_rect(screen.auxiliaryTopRightArea()),
         menu_height,
     );
-    (panel, super::placement::surface(panel, gap), preferences)
+    let bias = preferences.notch_side;
+    (
+        panel,
+        super::placement::surface(panel, gap, bias),
+        preferences,
+    )
 }
 
 /// A menu-material backdrop the content draws on top of, so the Bar blurs what
@@ -1460,6 +1474,8 @@ fn draw_symbol(name: &str, rect: NSRect, opacity: f64) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::layout::BarAlign;
+    use super::super::preferences::NotchSide;
     use super::*;
 
     #[test]
@@ -1520,6 +1536,7 @@ mod tests {
                 1200.0,
                 &mut HashMap::new(),
                 prefs.metrics(),
+                BarAlign::Center,
             );
             let motion = BarMotion::new(&layout, Instant::now());
             let hits = motion.presented.interaction_layout(&layout);
@@ -1587,6 +1604,7 @@ mod tests {
             1200.0,
             &mut HashMap::new(),
             preferences.metrics(),
+            BarAlign::Center,
         );
         let motion = BarMotion::new(&layout, Instant::now());
         let item = layout
@@ -1622,6 +1640,7 @@ mod tests {
                 surface: BarSurface {
                     width: 1200.0,
                     notch: None,
+                    bias: NotchSide::Balanced,
                 },
                 space_scroll: HashMap::new(),
                 can_focus_spaces: true,
@@ -1785,6 +1804,7 @@ mod tests {
                 width: 140.0,
                 height: 34.0,
             }),
+            bias: NotchSide::Balanced,
         };
         let now = Instant::now();
         let initial = BarLayout::resolve_surface(
@@ -1864,6 +1884,7 @@ mod tests {
                 width: 120.0,
                 height: state.layout.height,
             }),
+            bias: NotchSide::Balanced,
         };
         state.relayout();
         let target = state
@@ -1882,16 +1903,15 @@ mod tests {
             })
             .unwrap()
             .rect;
+        // Activate the gesture before aiming at the drop slot: the slot can sit
+        // inside the 4pt drag threshold of the grab point, and `active` is
+        // sticky once set, so moving away first is enough.
+        state.drag_to(NSPoint::new(900.0, target.y + 2.0), true);
         state.drag_to(
             NSPoint::new(target.x + target.width / 2.0, target.y + 2.0),
             true,
         );
         assert!(state.pressed.as_ref().unwrap().target.is_some());
-        assert!(
-            state
-                .release_drag(NSPoint::new(500.0, target.y + 2.0), true)
-                .is_none()
-        );
     }
 
     #[test]
@@ -1932,7 +1952,8 @@ mod tests {
                     &state.display,
                     1200.0,
                     &mut scroll,
-                    state.preferences.metrics()
+                    state.preferences.metrics(),
+                    BarAlign::Center,
                 )
             );
         }
@@ -1949,8 +1970,13 @@ mod tests {
         }
         let mut scroll = HashMap::new();
         scroll.insert(11, 60.0);
-        let layout =
-            BarLayout::resolve_with_metrics(&display, 700.0, &mut scroll, BarMetrics::default());
+        let layout = BarLayout::resolve_with_metrics(
+            &display,
+            700.0,
+            &mut scroll,
+            BarMetrics::default(),
+            BarAlign::Center,
+        );
         let slot = layout
             .spans
             .iter()

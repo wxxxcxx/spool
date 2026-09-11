@@ -57,6 +57,8 @@ pub struct Presentation {
     pub width: f64,
     pub height: f64,
     pub content_left: f64,
+    /// Where the fixed toolbar buttons sit in the presented frame.
+    pub toolbar_origin: f64,
     pub split: Option<NotchSplit>,
     pub items: Vec<VisualItem>,
 }
@@ -67,6 +69,7 @@ impl Presentation {
             width: layout.width,
             height: layout.height,
             content_left: layout.content_left,
+            toolbar_origin: layout.toolbar_origin,
             split: layout.split.clone(),
             items: layout
                 .items
@@ -139,6 +142,7 @@ impl Presentation {
         layout.width = self.width;
         layout.height = self.height;
         layout.content_left = self.content_left;
+        layout.toolbar_origin = self.toolbar_origin;
         layout.split.clone_from(&self.split);
         for item in &mut layout.items {
             if let ItemKind::ColumnDrop {
@@ -221,7 +225,13 @@ impl BarMotion {
         // Native toolbar controls and the menu-bar height update immediately.
         // Their clip region must not lag behind a configuration/display change.
         // A rebalanced Space relocates immediately instead of crossing the camera.
-        if (self.target.content_left - target.content_left).abs() > f64::EPSILON
+        //
+        // The toolbar lane's *width* is what must not lag, not the strip's
+        // absolute position: the toolbar leads a centred group, so that
+        // position also moves when the group merely re-centres, and that has to
+        // animate rather than jump.
+        let lane = |frame: &Presentation| frame.content_left - frame.toolbar_origin;
+        if (lane(&self.target) - lane(&target)).abs() > f64::EPSILON
             || (self.target.height - target.height).abs() > f64::EPSILON
             || self.target.split != target.split
         {
@@ -278,6 +288,7 @@ impl BarMotion {
             width: lerp(self.from.width, self.target.width, t),
             height: lerp(self.from.height, self.target.height, t),
             content_left: lerp(self.from.content_left, self.target.content_left, t),
+            toolbar_origin: lerp(self.from.toolbar_origin, self.target.toolbar_origin, t),
             split: self.target.split.clone(),
             items,
         };
@@ -324,6 +335,7 @@ fn interpolate(from: &VisualItem, to: &VisualItem, t: f64) -> VisualItem {
 
 #[cfg(test)]
 mod tests {
+    use super::super::layout::BarAlign;
     use super::*;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -334,6 +346,7 @@ mod tests {
             height: 34.0,
             content_width: 200.0 + x,
             content_left: 0.0,
+            toolbar_origin: 0.0,
             split: None,
             spans: Vec::new(),
             items: vec![
@@ -388,12 +401,18 @@ mod tests {
                 800.0,
                 &mut HashMap::new(),
                 preferences.metrics(),
+                BarAlign::Center,
             );
             motion.retarget(&target, now);
             assert!(!motion.is_active());
             assert!((motion.presented.height - height).abs() < f64::EPSILON);
+            // The toolbar leads the centred group, so the strip starts where
+            // that group's buttons end, not at the panel's left edge.
             assert!(
-                (motion.presented.content_left - preferences.toolbar_width()).abs() < f64::EPSILON
+                (motion.presented.content_left
+                    - (motion.presented.toolbar_origin + preferences.toolbar_width()))
+                .abs()
+                    < f64::EPSILON
             );
             let hits = motion.presented.interaction_layout(&target);
             for item in hits.items.iter().filter(|item| item.rect.width > 0.0) {
