@@ -1491,14 +1491,13 @@ pub(super) fn update_overlays(
 }
 
 pub(super) fn animate_decoration_overlay(
-    time: Res<Time>,
     config: Res<Config>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
 ) {
     let Some(mut overlay_mgr) = overlay_mgr else {
         return;
     };
-    overlay_mgr.animate_decorations(time.delta_secs_f64(), config.animation_speed());
+    overlay_mgr.animate_decorations(config.animation_speed());
 }
 
 #[derive(SystemParam)]
@@ -1548,8 +1547,22 @@ fn suspend_failed_frame_commit(
     entity: Entity,
     window: &mut Window,
     desired: IRect,
+    error: &crate::errors::Error,
     commands: &mut Commands,
 ) {
+    if matches!(
+        error.macos_code(),
+        Some(accessibility_sys::kAXErrorCannotComplete | accessibility_sys::kAXErrorAPIDisabled)
+    ) {
+        // The write may have partially succeeded. Retrying an unresponsive AX
+        // endpoint here can spend another timeout; bounded reconciliation owns
+        // recovery, and no stale physical geometry may be published meanwhile.
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<(WindowFrameMotion, ObservedWindowFrame)>();
+            entity_commands.try_insert(WindowFrameCommitSuspended::new(desired));
+        }
+        return;
+    }
     // AX can partially mutate a frame before returning an error. Publish only
     // readback and leave retries to the bounded correction policy.
     let readback = window.update_frame();
@@ -1828,10 +1841,82 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                 }
             }
             Err(error) => {
+                if let Some(started) = diagnostic_started {
+                    debug!(target: "spool::focus_diagnostics", window_id = window.id(),
+                        write_us = started.elapsed().as_micros(), %error, "frame_commit_failed");
+                }
                 warn!(window_id = window.id(), %error, "unable to commit window frame");
-                suspend_failed_frame_commit(entity, &mut window, desired.0, &mut commands);
+                suspend_failed_frame_commit(entity, &mut window, desired.0, &error, &mut commands);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod failed_commit_latency_tests {
+    use super::*;
+    use crate::manager::MockWindowApi;
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::prelude::World;
+
+    #[test]
+    fn unresponsive_ax_commit_does_not_immediately_probe_again() {
+        for code in [-25204, -25211] {
+            let mut world = World::new();
+            let frame = IRect::new(0, 0, 800, 600);
+            let entity = world
+                .spawn((ObservedWindowFrame(frame), WindowFrameMotion))
+                .id();
+            world
+                .run_system_once(move |mut commands: Commands| {
+                    let mut mock = MockWindowApi::new();
+                    mock.expect_update_frame().times(0);
+                    let mut window = Window::new(Box::new(mock));
+                    suspend_failed_frame_commit(
+                        entity,
+                        &mut window,
+                        frame,
+                        &crate::errors::Error::macos("frame commit", code),
+                        &mut commands,
+                    );
+                })
+                .unwrap();
+            assert!(world.get::<WindowFrameMotion>(entity).is_none());
+            assert!(world.get::<WindowFrameCommitSuspended>(entity).is_some());
+            assert!(world.get::<ObservedWindowFrame>(entity).is_none());
+        }
+    }
+
+    #[test]
+    fn unresponsive_ax_commit_recovers_through_reconciliation() {
+        let mut harness = crate::tests::TestHarness::new().with_windows(1);
+        harness.pump_frames(15);
+        let entity = crate::tests::find_window_entity(0, harness.world());
+        let desired = harness.world().get::<DesiredWindowFrame>(entity).unwrap().0;
+        harness
+            .world()
+            .run_system_once(
+                move |mut windows: Query<&mut Window>, mut commands: Commands| {
+                    let mut window = windows.get_mut(entity).unwrap();
+                    suspend_failed_frame_commit(
+                        entity,
+                        &mut window,
+                        desired,
+                        &crate::errors::Error::macos("frame commit", -25204),
+                        &mut commands,
+                    );
+                },
+            )
+            .unwrap();
+        assert!(harness.world().get::<ObservedWindowFrame>(entity).is_none());
+        harness.pump_frames(30);
+        assert!(harness.world().get::<ObservedWindowFrame>(entity).is_some());
+        assert!(
+            harness
+                .world()
+                .get::<WindowFrameCommitSuspended>(entity)
+                .is_none()
+        );
     }
 }
 

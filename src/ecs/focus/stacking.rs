@@ -101,8 +101,15 @@ impl TiledStacking<'_, '_> {
             .collect::<Vec<_>>();
         debug!(target: "spool::focus_diagnostics", space_id = self.active.active_strip().id(),
             ?ids, "tiled_stacking_requested_bottom_to_top");
+        let started = tracing::enabled!(target: "spool::focus_diagnostics", tracing::Level::DEBUG)
+            .then(std::time::Instant::now);
         for entity in &plan.bottom_to_top {
             self.raise_one(*entity);
+        }
+        if let Some(started) = started {
+            debug!(target: "spool::focus_diagnostics", space_id = self.active.active_strip().id(),
+                count = plan.bottom_to_top.len(), raise_us = started.elapsed().as_micros(),
+                "tiled_stacking_completed");
         }
         state.last_requested = Some(plan);
     }

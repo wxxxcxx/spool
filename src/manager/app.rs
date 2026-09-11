@@ -273,7 +273,14 @@ impl ApplicationApi for ApplicationOS {
     ///
     /// `Ok(WinID)` with the focused window ID if successful, otherwise `Err(Error)`.
     fn focused_window_id(&self) -> Result<WinID> {
-        self.element.focused_window_id()
+        let started = tracing::enabled!(target: "spool::focus_diagnostics", tracing::Level::DEBUG)
+            .then(std::time::Instant::now);
+        let result = self.element.focused_window_id();
+        if let Some(started) = started {
+            debug!(target: "spool::focus_diagnostics", pid = self.pid,
+                query_us = started.elapsed().as_micros(), ?result, "focused_window_query");
+        }
+        result
     }
 
     fn window_inventory(&self, config: &Config) -> Result<ApplicationWindowInventory> {

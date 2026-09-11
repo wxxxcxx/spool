@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -475,6 +476,7 @@ struct DecorationPresentation {
     target: NSRect,
     target_id: WinID,
     animating: bool,
+    last_advanced_at: Instant,
 }
 
 fn retarget_decoration(
@@ -483,12 +485,23 @@ fn retarget_decoration(
     target_id: WinID,
     allow_animation: bool,
 ) -> DecorationPresentation {
+    retarget_decoration_at(current, target, target_id, allow_animation, Instant::now())
+}
+
+fn retarget_decoration_at(
+    current: Option<DecorationPresentation>,
+    target: NSRect,
+    target_id: WinID,
+    allow_animation: bool,
+    now: Instant,
+) -> DecorationPresentation {
     let Some(current) = current else {
         return DecorationPresentation {
             presented: target,
             target,
             target_id,
             animating: false,
+            last_advanced_at: now,
         };
     };
 
@@ -504,6 +517,13 @@ fn retarget_decoration(
         target,
         target_id,
         animating: animate,
+        // A new transition must not consume time before its target existed.
+        // Repeated geometry projections preserve the running clock.
+        last_advanced_at: if focus_changed || !current.animating {
+            now
+        } else {
+            current.last_advanced_at
+        },
     }
 }
 
@@ -554,12 +574,14 @@ fn advance_decoration(presentation: &mut DecorationPresentation, rate: f64, delt
 fn advance_decorations<'a>(
     presentations: impl Iterator<Item = &'a mut DecorationPresentation>,
     rate: f64,
-    delta: f64,
+    now: Instant,
 ) -> bool {
     let mut advanced = false;
     for presentation in presentations {
+        let delta = now.saturating_duration_since(presentation.last_advanced_at);
+        presentation.last_advanced_at = now.max(presentation.last_advanced_at);
         // Do not short-circuit: every Space receives the same time step.
-        advanced |= advance_decoration(presentation, rate, delta);
+        advanced |= advance_decoration(presentation, rate, delta.as_secs_f64());
     }
     advanced
 }
@@ -753,6 +775,48 @@ mod tests {
     }
 
     #[test]
+    fn new_focus_does_not_consume_time_before_retarget() {
+        let previous_tick = Instant::now();
+        let now = previous_tick + std::time::Duration::from_millis(120);
+        let original = rect(8.0, 10.0, 856.0, 1032.0);
+        let target = rect(872.0, 10.0, 856.0, 1032.0);
+        let settled = retarget_decoration_at(None, original, 1, true, previous_tick);
+        let mut moving = retarget_decoration_at(Some(settled), target, 2, true, now);
+
+        // The focus target was created at the end of a 120ms ECS frame.
+        advance_decorations(std::iter::once(&mut moving), 32.0, now);
+        assert_eq!(moving.presented, original);
+
+        advance_decorations(
+            std::iter::once(&mut moving),
+            32.0,
+            now + std::time::Duration::from_millis(16),
+        );
+        let expected = 8.0 + 864.0 * (1.0 - (-32.0_f64 * 0.016).exp());
+        assert!((moving.presented.origin.x - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn repeated_focus_projection_does_not_reset_animation_clock() {
+        let start = Instant::now();
+        let original = rect(0.0, 0.0, 400.0, 600.0);
+        let target = rect(800.0, 0.0, 400.0, 600.0);
+        let settled = retarget_decoration_at(None, original, 1, true, start);
+        let moving = retarget_decoration_at(Some(settled), target, 2, true, start);
+        let now = start + std::time::Duration::from_millis(16);
+        let mut repeated = retarget_decoration_at(Some(moving), target, 2, true, now);
+        advance_decorations(std::iter::once(&mut repeated), 32.0, now);
+        assert!(repeated.presented.origin.x > 0.0);
+
+        // A reversal starts at the last rendered rectangle, with a fresh clock.
+        let before = repeated.presented;
+        let now = now + std::time::Duration::from_millis(100);
+        let mut reversed = retarget_decoration_at(Some(repeated), original, 1, true, now);
+        advance_decorations(std::iter::once(&mut reversed), 32.0, now);
+        assert_eq!(reversed.presented, before);
+    }
+
+    #[test]
     fn focus_change_animates_from_the_current_presented_border() {
         let original = rect(20.0, 20.0, 300.0, 500.0);
         let next = rect(340.0, 20.0, 300.0, 500.0);
@@ -849,15 +913,22 @@ mod tests {
         let next = rect(100.0, 40.0, 500.0, 300.0);
         let current = retarget_decoration(None, original, 1, true);
         let moving = retarget_decoration(Some(current), next, 2, true);
+        let now =
+            moving.last_advanced_at + std::time::Duration::from_secs_f64(std::f64::consts::LN_2);
         let mut presentations = [moving.clone(), moving];
 
-        assert!(advance_decorations(
-            presentations.iter_mut(),
-            1.0,
-            std::f64::consts::LN_2,
-        ));
+        assert!(advance_decorations(presentations.iter_mut(), 1.0, now));
         for presentation in presentations {
-            assert_eq!(presentation.presented, rect(50.0, 30.0, 400.0, 400.0));
+            let presented = presentation.presented;
+            // Instant has nanosecond precision, so ln(2) is rounded slightly.
+            for (actual, expected) in [
+                (presented.origin.x, 50.0),
+                (presented.origin.y, 30.0),
+                (presented.size.width, 400.0),
+                (presented.size.height, 400.0),
+            ] {
+                assert!((actual - expected).abs() < 1e-6);
+            }
         }
     }
 }
@@ -1101,7 +1172,7 @@ impl OverlayManager {
         }
     }
 
-    pub fn animate_decorations(&mut self, delta: f64, rate: f64) {
+    pub fn animate_decorations(&mut self, rate: f64) {
         if self.hidden {
             return;
         }
@@ -1110,7 +1181,7 @@ impl OverlayManager {
                 .values_mut()
                 .filter_map(|overlay| overlay.presentation.as_mut()),
             rate,
-            delta,
+            Instant::now(),
         );
         if advanced || self.needs_render {
             self.render_decorations();

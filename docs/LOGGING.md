@@ -56,6 +56,15 @@ window/entity IDs, changed frame readbacks, overlay targets and rendered
 presentations. It does not include window titles or document contents.
 Per-frame records can be verbose; enable this category only during diagnosis.
 
+For focus-animation stalls, compare consecutive `overlay_draw` timestamps while
+`animating: true`, not idle redraw intervals. `focused_window_query` reports
+`query_us`; `tiled_stacking_completed` reports the entire raise batch's `raise_us`.
+Both `frame_commit` and `frame_commit_failed` report `write_us`, so a failed AX
+request is not omitted from timing analysis. These stages do not cover all main
+thread work or WindowServer composition, and verbose terminal output may affect
+timing. Decorations use a per-transition monotonic clock, independent of the ECS
+frame delta; a newly selected target does not inherit time before its creation.
+
 ```sh
 spool log --tail 2000 | rg 'spool::focus_diagnostics'
 ```
