@@ -74,6 +74,9 @@ struct ViewState {
     /// Runtime-only collapse state: every Bar starts expanded and nothing
     /// persists this.
     collapsed: bool,
+    /// Whether the pointer is anywhere on the Bar. Both handles appear
+    /// together once it is, which is how they are discovered.
+    hovered: bool,
     /// Which end of the Bar chrome the pointer is over, if any.
     hover: Option<BarEdge>,
     /// Set when the panel's own rect must be recomputed: collapse and hover
@@ -129,12 +132,12 @@ impl ViewState {
     fn press_at(&mut self, point: NSPoint, size: (f64, f64)) -> Option<Action> {
         self.pressed = None;
         self.release_observed_at = None;
-        if let Some(edge) = self.edge_at((point.x, point.y), size) {
+        if self.edge_at((point.x, point.y), size).is_some() {
             // The handle toggles either way, but while expanded it only reacts
             // once it has been revealed: the hidden strip sits where the menu
             // bar's own controls used to be, and clicking an invisible button
             // must not collapse the Bar by accident.
-            if self.collapsed || self.hover == Some(edge) {
+            if self.collapsed || self.hovered {
                 self.set_collapsed(!self.collapsed);
             }
             return None;
@@ -465,6 +468,7 @@ impl BarView {
                 icons: HashMap::new(),
                 preferences,
                 collapsed: false,
+                hovered: false,
                 hover: None,
                 chrome_dirty: false,
             }),
@@ -521,10 +525,11 @@ impl BarView {
 
     fn draw_bar(&self) {
         let bounds = self.bounds();
-        let (collapsed, hover, notched, preferences) = {
+        let (collapsed, hovered, hover, notched, preferences) = {
             let state = self.ivars().state.borrow();
             (
                 state.collapsed,
+                state.hovered,
                 state.hover,
                 state.surface.notch.is_some(),
                 state.preferences.clone(),
@@ -532,7 +537,9 @@ impl BarView {
         };
         if collapsed {
             clear(bounds);
-            Self::draw_collapsed(bounds, hover, notched);
+            // A collapsed capsule keeps its handles on screen; they only
+            // brighten under the pointer.
+            Self::draw_collapsed(bounds, hovered, hover, notched);
             return;
         }
         let background =
@@ -650,28 +657,12 @@ impl BarView {
         NSGraphicsContext::restoreGraphicsState_class();
     }
 
-    /// The collapsed Bar draws no content at all: a black capsule merged with
-    /// the camera cutout, or a small tab on a plain display.
+    /// The collapse/expand handles at both ends of the Bar's chrome.
     ///
-    /// Rounding only the bottom corners uses the panel's own edge as the clip:
-    /// the shape starts one radius above the view, so its top corners are
-    /// never drawn.
-    fn draw_collapsed(bounds: NSRect, hover: Option<BarEdge>, notched: bool) {
-        let radius = if notched { CAPSULE_RADIUS } else { TAB_RADIUS };
-        let shape = NSRect::new(
-            NSPoint::new(bounds.origin.x, bounds.origin.y - radius),
-            NSSize::new(bounds.size.width, bounds.size.height + radius),
-        );
-        let fill = if notched || hover.is_some() {
-            // Opaque over the menu bar, and solid black once the tab is live.
-            NSColor::blackColor()
-        } else {
-            rgba([0.0, 0.0, 0.0, 0.92])
-        };
-        rounded_fill(shape, radius, fill);
-        if !notched {
-            return;
-        }
+    /// `always` keeps them drawn without a pointer, which a collapsed capsule
+    /// needs because it has no other affordance; the expanded Bar draws them
+    /// only while it is hovered.
+    fn draw_handles(bounds: NSRect, hover: Option<BarEdge>, always: bool) {
         for edge in [BarEdge::Left, BarEdge::Right] {
             let rect = NSRect::new(
                 NSPoint::new(
@@ -684,13 +675,45 @@ impl BarView {
                 ),
                 NSSize::new(END_ZONE, bounds.size.height),
             );
-            let opacity = if hover == Some(edge) { 1.0 } else { 0.55 };
+            let opacity = if hover == Some(edge) {
+                1.0
+            } else if always {
+                0.55
+            } else {
+                0.45
+            };
             draw_text(
                 edge.symbol(),
                 rect,
                 13.0,
                 NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, opacity),
             );
+        }
+    }
+
+    /// The collapsed Bar draws no content at all: a black capsule merged with
+    /// the camera cutout, or a small tab on a plain display.
+    ///
+    /// Rounding only the bottom corners uses the panel's own edge as the clip:
+    /// the shape starts one radius above the view, so its top corners are
+    /// never drawn.
+    fn draw_collapsed(bounds: NSRect, hovered: bool, hover: Option<BarEdge>, notched: bool) {
+        let radius = if notched { CAPSULE_RADIUS } else { TAB_RADIUS };
+        let shape = NSRect::new(
+            NSPoint::new(bounds.origin.x, bounds.origin.y - radius),
+            NSSize::new(bounds.size.width, bounds.size.height + radius),
+        );
+        let fill = if notched || hovered {
+            // Opaque over the menu bar, and solid black once the tab is live.
+            NSColor::blackColor()
+        } else {
+            rgba([0.0, 0.0, 0.0, 0.92])
+        };
+        rounded_fill(shape, radius, fill);
+        if notched {
+            // The capsule is the only thing left on screen, so its handles are
+            // always drawn; the pointer only brightens one of them.
+            Self::draw_handles(bounds, hover, true);
         }
     }
 
@@ -902,7 +925,6 @@ struct BarCapabilities {
 struct PanelRecord {
     window: Retained<NSPanel>,
     view: Retained<BarView>,
-    backdrop: Retained<NSVisualEffectView>,
     /// The expanded panel: exactly the menu-bar band.
     expanded: Rect,
     /// The owning display, for centring a collapsed panel on it.
@@ -930,8 +952,9 @@ impl PanelRecord {
         } else {
             self.expanded
         };
+        // The backdrop must stay visible even when collapsed: the content view
+        // is its subview, so hiding it would hide the capsule or tab with it.
         let rect = ns_rect(frame);
-        self.backdrop.setHidden(collapsed);
         self.view.setFrameSize(rect.size);
         self.view.layout_toolbar();
         if self.window.frame() != rect {
@@ -989,13 +1012,12 @@ impl BarManager {
                     capabilities,
                     preferences.clone(),
                 );
-                let (window, backdrop) = make_bar_panel(self.mtm, &view);
+                let window = make_bar_panel(self.mtm, &view);
                 self.panels.insert(
                     display.id,
                     PanelRecord {
                         window: window.clone(),
                         view: view.clone(),
-                        backdrop,
                         expanded,
                         screen: view_rect(screen.frame()),
                         gap,
@@ -1065,8 +1087,14 @@ impl BarManager {
         );
         let size = (frame.size.width, frame.size.height);
         let mut state = record.view.ivars().state.borrow_mut();
+        let hovered = local.0 >= 0.0
+            && local.1 >= 0.0
+            && local.0 <= size.0
+            && local.1 <= size.1
+            && size.0 > 0.0;
         let hover = state.edge_at(local, size);
-        if hover != state.hover {
+        if hovered != state.hovered || hover != state.hover {
+            state.hovered = hovered;
             state.hover = hover;
             state.chrome_dirty = true;
         }
@@ -1212,16 +1240,13 @@ fn make_bar_window(mtm: MainThreadMarker, view: &NSView) -> Retained<NSPanel> {
 
 /// The Bar's own panel: a Bar window whose content view is a menu-material
 /// backdrop, with the content riding on top of it and following on resize.
-fn make_bar_panel(
-    mtm: MainThreadMarker,
-    view: &NSView,
-) -> (Retained<NSPanel>, Retained<NSVisualEffectView>) {
+fn make_bar_panel(mtm: MainThreadMarker, view: &NSView) -> Retained<NSPanel> {
     let backdrop = make_backdrop(mtm, view.frame().size);
     view.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     backdrop.addSubview(view);
-    (make_bar_window(mtm, &backdrop), backdrop)
+    make_bar_window(mtm, &backdrop)
 }
 
 fn screens_by_id(mtm: MainThreadMarker) -> HashMap<u32, Retained<NSScreen>> {
@@ -1651,6 +1676,7 @@ mod tests {
                 icons: HashMap::new(),
                 preferences,
                 collapsed: false,
+                hovered: false,
                 hover: None,
                 chrome_dirty: false,
             },
@@ -2033,7 +2059,9 @@ mod tests {
         // own controls were, so an accidental click must not collapse the Bar.
         assert!(state.press_at(NSPoint::new(2.0, 18.0), size).is_none());
         assert!(!state.collapsed, "an unrevealed handle is inert");
-        state.hover = Some(BarEdge::Left);
+        // Hovering anywhere on the Bar reveals both handles, so no edge hunting
+        // is needed to reach them.
+        state.hovered = true;
         assert!(state.press_at(NSPoint::new(2.0, 18.0), size).is_none());
         assert!(
             state.collapsed,
