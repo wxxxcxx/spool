@@ -1948,7 +1948,10 @@ mod lua_setup_tests {
         assert_eq!(preferences.foreground_color, "#112233FF");
         assert_eq!(preferences.inactive_workspace_color, "#00000010");
         assert!((preferences.height - 40.0).abs() < f64::EPSILON);
-        assert!((preferences.toolbar_width() - 38.0).abs() < f64::EPSILON);
+        // One 28pt button lane plus its padding, plus the move handle.
+        assert!(
+            (preferences.toolbar_width() - (crate::bar::GRIP_WIDTH + 38.0)).abs() < f64::EPSILON
+        );
     }
 
     #[test]

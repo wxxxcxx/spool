@@ -4,6 +4,9 @@ use spool_shared_types::state::SpaceKind;
 use super::model::{BarColumn, BarDisplay, BarSpace, BarWindow};
 use super::toolbar::TOOLBAR_WIDTH;
 
+/// Leading lane of one Bar reserved for its move handle.
+pub const GRIP_WIDTH: f64 = 14.0;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f64,
@@ -270,6 +273,8 @@ impl PlacedItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ItemKind {
+    /// The Bar's own move handle, in the fixed leading lane.
+    Grip,
     Label {
         space_id: u64,
         ordinal: u32,
@@ -390,6 +395,8 @@ impl BarLayout {
         let mut x = metrics.toolbar_width + metrics.horizontal_padding - scroll_x;
         let mut items = Vec::new();
 
+        items.extend(grip_item(&metrics, height));
+
         for (space, space_width) in display.spaces.iter().zip(widths) {
             let space_rect = Rect {
                 x,
@@ -471,6 +478,19 @@ impl BarLayout {
             items,
         }
     }
+}
+
+/// The Bar's move handle, in the leading lane of the fixed toolbar area.
+fn grip_item(metrics: &BarMetrics, height: f64) -> Option<PlacedItem> {
+    (metrics.toolbar_width > 0.0).then(|| PlacedItem {
+        rect: Rect {
+            x: 0.0,
+            y: 0.0,
+            width: GRIP_WIDTH.min(metrics.toolbar_width),
+            height,
+        },
+        kind: ItemKind::Grip,
+    })
 }
 
 fn space_width(space: &BarSpace, metrics: &BarMetrics) -> f64 {

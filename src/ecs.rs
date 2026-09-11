@@ -243,6 +243,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
             state::cleanup_on_exit,
             script_state::periodic_script_state_save.run_if(on_timer(Duration::from_mins(5))),
             script_state::script_state_cleanup_on_exit,
+            crate::bar::periodic_bar_geometry_save.run_if(on_timer(Duration::from_mins(5))),
+            crate::bar::bar_geometry_cleanup_on_exit,
         ),
     );
     app.add_systems(
@@ -276,6 +278,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .chain(),
             (
                 crate::bar::update_bar.run_if(bar_dirty.or_eager(on_timer(Duration::from_secs(1)))),
+                crate::bar::capture_bar_edits,
                 crate::bar::animate_bar,
             )
                 .chain(),
@@ -827,6 +830,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     // Overwrites the empty store `register_commands` put there, which is what
     // the mock harness keeps: only the real app reads the user's file.
     app.insert_resource(script_state::ScriptStateStore::load());
+    app.insert_resource(crate::bar::BarGeometryStore::load());
 
     // Do not insert this in mocks.
     app.insert_resource(LowPowerMode(false));

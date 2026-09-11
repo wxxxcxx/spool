@@ -24,6 +24,8 @@ use tracing::warn;
 use crate::events::EventSender;
 
 use super::drag::{BarDrag, DropTarget};
+use super::geometry::PanelOverride;
+use super::gesture::{self, PanelGestureState};
 use super::layout::{BarLayout, BarMetrics, BarSurface, ItemKind, PlacedItem, Rect};
 use super::model::{BarDisplay, BarSnapshot};
 use super::motion::{BarMotion, VisualItem};
@@ -46,6 +48,16 @@ struct ViewState {
     floating_order: HashMap<u64, Vec<i32>>,
     icons: HashMap<String, Retained<NSImage>>,
     preferences: BarPreferences,
+    /// Hand-set panel geometry for this display; `None` axes stay automatic.
+    panel: PanelOverride,
+    /// The owning display in screen coordinates, for clamping gestures.
+    display_frame: Rect,
+    /// Last presented panel rect in screen coordinates.
+    panel_rect: Rect,
+    /// The gesture in flight on the Bar's own chrome, if any.
+    gesture: Option<PanelGestureState>,
+    /// Set when a gesture finished, so the store can persist the result.
+    panel_edited: bool,
 }
 
 impl ViewState {
@@ -60,9 +72,61 @@ impl ViewState {
         now.saturating_duration_since(*released) >= DRAG_RELEASE_GRACE
     }
 
+    /// The Bar's move handle, in view-local points, when the Bar has one.
+    fn grip_rect(&self) -> Option<Rect> {
+        (self.preferences.toolbar_width() > 0.0)
+            .then(|| toolbar::grip(self.panel_rect.height.max(1.0)))
+    }
+
+    /// Starts moving or resizing the panel itself when the press lands on the
+    /// Bar's chrome. Returns whether the press was consumed.
+    fn begin_panel_gesture(&mut self, point: (f64, f64)) -> bool {
+        let size = (self.panel_rect.width, self.panel_rect.height);
+        let Some(kind) = gesture::hit(size, self.grip_rect(), point, gesture::EDGE_GRAB) else {
+            return false;
+        };
+        self.gesture = Some(PanelGestureState {
+            kind,
+            origin: point,
+            start: self.panel_rect,
+        });
+        true
+    }
+
+    /// Moves or resizes the panel for the in-flight gesture.
+    fn drag_panel(&mut self, point: (f64, f64)) -> bool {
+        let Some(gesture) = self.gesture else {
+            return false;
+        };
+        self.panel = gesture::apply(gesture, point, self.display_frame);
+        true
+    }
+
+    /// Ends an in-flight panel gesture and reports whether one was running.
+    fn end_panel_gesture(&mut self) -> bool {
+        if self.gesture.take().is_none() {
+            return false;
+        }
+        self.panel_edited = true;
+        true
+    }
+
+    /// Double-clicking the handle returns this display to automatic placement.
+    fn reset_panel(&mut self) {
+        self.gesture = None;
+        if self.panel.is_empty() {
+            return;
+        }
+        self.panel = PanelOverride::default();
+        self.panel_edited = true;
+    }
+
     fn press_at(&mut self, point: NSPoint) -> Option<Action> {
         self.pressed = None;
         self.release_observed_at = None;
+        if self.begin_panel_gesture((point.x, point.y)) {
+            return None;
+        }
         let hit_layout = self.motion.presented.interaction_layout(&self.layout);
         if let Some(item) = window_at(&hit_layout, point)
             && let ItemKind::Window { space_id, .. } = item.kind
@@ -214,7 +278,29 @@ define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
-            let action = self.ivars().state.borrow_mut().press_at(point);
+            let mut state = self.ivars().state.borrow_mut();
+            // A double-click on the chrome resets the display to automatic
+            // placement, which is the only way back without editing the file.
+            let on_chrome = gesture::hit(
+                (state.panel_rect.width, state.panel_rect.height),
+                state.grip_rect(),
+                (point.x, point.y),
+                gesture::EDGE_GRAB,
+            )
+            .is_some();
+            if on_chrome && event.clickCount() >= 2 {
+                state.reset_panel();
+                drop(state);
+                self.setNeedsDisplay(true);
+                return;
+            }
+            let action = state.press_at(point);
+            let resizing = state.gesture.is_some();
+            drop(state);
+            if resizing {
+                self.setNeedsDisplay(true);
+                return;
+            }
             if let Some(action) = action {
                 self.dispatch(action);
             }
@@ -224,6 +310,11 @@ define_class!(
         fn mouse_dragged(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             let mut state = self.ivars().state.borrow_mut();
+            if state.drag_panel((point.x, point.y)) {
+                drop(state);
+                self.setNeedsDisplay(true);
+                return;
+            }
             state.drag_to(point, contains(view_rect(self.bounds()), point));
             drop(state);
             self.sync_drag_preview();
@@ -234,6 +325,11 @@ define_class!(
         fn mouse_up(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             let mut state = self.ivars().state.borrow_mut();
+            if state.end_panel_gesture() {
+                drop(state);
+                self.setNeedsDisplay(true);
+                return;
+            }
             let action = state.release_drag(point, contains(view_rect(self.bounds()), point));
             drop(state);
             self.sync_drag_preview();
@@ -339,10 +435,12 @@ impl BarView {
         events: EventSender,
         display: BarDisplay,
         surface: BarSurface,
-        can_focus_spaces: bool,
-        can_move_windows: bool,
+        capabilities: BarCapabilities,
         preferences: BarPreferences,
+        site: PanelSite,
     ) -> Retained<Self> {
+        let (surface, preferences) =
+            apply_panel_size(surface, preferences, site.panel, site.display);
         let metrics = display_metrics(&display, &preferences);
         let layout = BarLayout::resolve_surface(&display, surface, &mut [0.0; 2], metrics);
         let frame = ns_rect(Rect {
@@ -360,13 +458,22 @@ impl BarView {
                 layout,
                 surface,
                 scroll: [0.0; 2],
-                can_focus_spaces,
-                can_move_windows,
+                can_focus_spaces: capabilities.focus_spaces,
+                can_move_windows: capabilities.move_windows,
                 pressed: None,
                 release_observed_at: None,
                 floating_order: HashMap::new(),
                 icons: HashMap::new(),
                 preferences,
+                panel: site.panel,
+                display_frame: site.display,
+                panel_rect: Rect {
+                    width: frame.size.width,
+                    height: frame.size.height,
+                    ..Rect::default()
+                },
+                gesture: None,
+                panel_edited: false,
             }),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -378,15 +485,19 @@ impl BarView {
         &self,
         display: BarDisplay,
         surface: BarSurface,
-        can_focus_spaces: bool,
-        can_move_windows: bool,
+        capabilities: BarCapabilities,
         preferences: BarPreferences,
+        site: PanelSite,
     ) {
         let mut state = self.ivars().state.borrow_mut();
         state.display = display;
+        state.can_focus_spaces = capabilities.focus_spaces;
+        state.can_move_windows = capabilities.move_windows;
+        state.panel = site.panel;
+        state.display_frame = site.display;
+        let (surface, preferences) =
+            apply_panel_size(surface, preferences, site.panel, site.display);
         state.surface = surface;
-        state.can_focus_spaces = can_focus_spaces;
-        state.can_move_windows = can_move_windows;
         state.preferences = preferences;
         if state
             .pressed
@@ -395,7 +506,9 @@ impl BarView {
         {
             state.pressed = None;
         }
-        if !can_move_windows && let Some(drag) = &mut state.pressed {
+        if !capabilities.move_windows
+            && let Some(drag) = &mut state.pressed
+        {
             drag.target = None;
         }
         let target_missing = state
@@ -516,6 +629,7 @@ impl BarView {
         }
         NSGraphicsContext::restoreGraphicsState_class();
         if preferences.toolbar_width() > 0.0 {
+            draw_grip(bounds.size.height, &preferences);
             let mut separator = toolbar::separator(bounds.size.height);
             separator.x = preferences.toolbar_width() - 3.0;
             rounded_fill(ns_rect(separator), 0.5, color(1.0, 1.0, 1.0, 0.16));
@@ -721,25 +835,53 @@ impl Drop for DragGhost {
     }
 }
 
+/// Which interactions this Bar's capabilities allow.
+#[derive(Clone, Copy, Debug)]
+struct BarCapabilities {
+    focus_spaces: bool,
+    move_windows: bool,
+}
+
+/// Where one display's panel sits, and how the user sized it.
+#[derive(Clone, Copy, Debug, Default)]
+struct PanelSite {
+    /// Hand-set geometry; `None` axes stay automatic.
+    panel: PanelOverride,
+    /// The owning display in screen coordinates, for clamping.
+    display: Rect,
+}
+
 struct PanelRecord {
     window: Retained<NSPanel>,
     view: Retained<BarView>,
     available_frame: Rect,
+    /// The owning display, for clamping a hand-set panel rect.
+    display_frame: Rect,
 }
 
 impl PanelRecord {
     fn present(&self) {
-        let state = self.view.ivars().state.borrow();
-        let frame = &state.motion.presented;
-        let dragging = state.pressed.as_ref().is_some_and(|drag| drag.active);
-        // Compact previews preserve their origin; split panels stay notch-anchored.
-        let rect = ns_rect(super::placement::panel_frame(
-            self.available_frame,
-            frame.width,
-            frame.height,
-            (dragging && state.surface.notch.is_none()).then(|| self.window.frame().origin.x),
+        let (frame_width, frame_height, drag_x, panel, display_frame) = {
+            let state = self.view.ivars().state.borrow();
+            let frame = &state.motion.presented;
+            let dragging = state.pressed.as_ref().is_some_and(|drag| drag.active);
+            (
+                frame.width,
+                frame.height,
+                // Compact previews preserve their origin; split panels stay notch-anchored.
+                (dragging && state.surface.notch.is_none()).then(|| self.window.frame().origin.x),
+                state.panel,
+                state.display_frame,
+            )
+        };
+        let base =
+            super::placement::panel_frame(self.available_frame, frame_width, frame_height, drag_x);
+        let rect = ns_rect(super::placement::apply_override(
+            base,
+            display_frame,
+            Some(panel),
         ));
-        drop(state);
+        self.view.ivars().state.borrow_mut().panel_rect = view_rect(rect);
         self.view.setFrameSize(rect.size);
         self.view.layout_toolbar();
         if self.window.frame() != rect {
@@ -766,7 +908,12 @@ impl BarManager {
         }
     }
 
-    pub fn update(&mut self, snapshot: BarSnapshot, preferences: BarPreferences) {
+    pub fn update(
+        &mut self,
+        snapshot: BarSnapshot,
+        preferences: BarPreferences,
+        geometry: &super::geometry::BarGeometryStore,
+    ) {
         self.preferences = preferences;
         let screens = screens_by_id(self.mtm);
         let mut retained = HashSet::new();
@@ -776,6 +923,14 @@ impl BarManager {
                 continue;
             };
             retained.insert(display.id);
+            let site = PanelSite {
+                panel: geometry.panel(display.id).unwrap_or_default(),
+                display: view_rect(screen.frame()),
+            };
+            let capabilities = BarCapabilities {
+                focus_spaces: snapshot.can_focus_spaces,
+                move_windows: snapshot.can_move_windows,
+            };
             let (available_frame, surface, preferences) =
                 screen_placement(screen, &self.preferences);
             let (window, view) = if let Some(record) = self.panels.get(&display.id) {
@@ -786,9 +941,9 @@ impl BarManager {
                     self.events.clone(),
                     display.clone(),
                     surface,
-                    snapshot.can_focus_spaces,
-                    snapshot.can_move_windows,
+                    capabilities,
                     preferences.clone(),
+                    site,
                 );
                 let window = make_bar_window(self.mtm, &view);
                 self.panels.insert(
@@ -797,20 +952,16 @@ impl BarManager {
                         window: window.clone(),
                         view: view.clone(),
                         available_frame,
+                        display_frame: site.display,
                     },
                 );
                 (window, view)
             };
-            view.update(
-                display,
-                surface,
-                snapshot.can_focus_spaces,
-                snapshot.can_move_windows,
-                preferences.clone(),
-            );
+            view.update(display, surface, capabilities, preferences.clone(), site);
             window.setHasShadow(preferences.show_shadow);
             if let Some(record) = self.panels.get_mut(&display_id) {
                 record.available_frame = available_frame;
+                record.display_frame = site.display;
                 record.present();
             }
             window.orderFrontRegardless();
@@ -826,24 +977,40 @@ impl BarManager {
         });
     }
 
+    /// Geometry the user just set by hand, keyed by display. Draining clears
+    /// the flag so a gesture is written once.
+    pub fn take_panel_edits(&mut self) -> Vec<(u32, PanelOverride)> {
+        self.panels
+            .iter()
+            .filter_map(|(display_id, record)| {
+                let mut state = record.view.ivars().state.borrow_mut();
+                state.panel_edited.then(|| {
+                    state.panel_edited = false;
+                    (*display_id, state.panel)
+                })
+            })
+            .collect()
+    }
+
     pub fn is_animating(&self) -> bool {
         self.panels.values().any(|record| {
             let state = record.view.ivars().state.borrow();
-            state.motion.is_active() || state.pressed.as_ref().is_some_and(|drag| drag.active)
+            state.motion.is_active()
+                || state.pressed.as_ref().is_some_and(|drag| drag.active)
+                || state.gesture.is_some()
         })
     }
 
     pub fn animate(&mut self) {
         let now = Instant::now();
         for record in self.panels.values() {
-            let dragging = record
-                .view
-                .ivars()
-                .state
-                .borrow()
-                .pressed
-                .as_ref()
-                .is_some_and(|drag| drag.active);
+            let (dragging, gesturing) = {
+                let state = record.view.ivars().state.borrow();
+                (
+                    state.pressed.as_ref().is_some_and(|drag| drag.active),
+                    state.gesture.is_some(),
+                )
+            };
             if dragging {
                 let release_expired = record
                     .view
@@ -858,7 +1025,9 @@ impl BarManager {
                 }
             }
             let changed = record.view.ivars().state.borrow_mut().motion.advance(now);
-            if changed {
+            // The panel follows the pointer directly while it is being moved or
+            // resized, so it re-presents even when the content is static.
+            if changed || gesturing {
                 record.present();
             }
         }
@@ -926,6 +1095,23 @@ fn screen_placement(
         notch: None,
     };
     (region, surface, preferences)
+}
+
+/// Feeds a hand-set panel size into the layout inputs, so the strip inside the
+/// panel follows the panel the user sized rather than the automatic width.
+fn apply_panel_size(
+    mut surface: BarSurface,
+    mut preferences: BarPreferences,
+    panel: PanelOverride,
+    display_frame: Rect,
+) -> (BarSurface, BarPreferences) {
+    if let Some(width) = panel.width {
+        surface.width = width.clamp(1.0, display_frame.width.max(1.0));
+    }
+    if let Some(height) = panel.height {
+        preferences.height = height;
+    }
+    (surface, preferences)
 }
 
 fn make_bar_window(mtm: MainThreadMarker, view: &NSView) -> Retained<NSPanel> {
@@ -1090,6 +1276,27 @@ fn rounded_stroke(rect: NSRect, radius: f64, width: f64, color: Retained<NSColor
     let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius);
     path.setLineWidth(width);
     path.stroke();
+}
+
+/// The move handle: three stacked dots in the Bar's leading lane.
+fn draw_grip(height: f64, preferences: &BarPreferences) {
+    let grip = toolbar::grip(height);
+    let dot = 1.4;
+    let center_x = grip.x + grip.width / 2.0;
+    let center_y = grip.y + grip.height / 2.0;
+    let color = foreground_color(preferences, 0.32);
+    for offset in [-4.0, 0.0, 4.0] {
+        rounded_fill(
+            ns_rect(Rect {
+                x: center_x - dot,
+                y: center_y + offset - dot,
+                width: dot * 2.0,
+                height: dot * 2.0,
+            }),
+            dot,
+            color.clone(),
+        );
+    }
 }
 
 fn attributed_text(
@@ -1349,6 +1556,20 @@ mod tests {
                 floating_order: HashMap::new(),
                 icons: HashMap::new(),
                 preferences,
+                panel: PanelOverride::default(),
+                display_frame: Rect {
+                    width: 1200.0,
+                    height: 800.0,
+                    ..Rect::default()
+                },
+                panel_rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1200.0,
+                    height: 37.0,
+                },
+                gesture: None,
+                panel_edited: false,
             },
             point,
         )

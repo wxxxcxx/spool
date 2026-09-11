@@ -88,6 +88,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // Empty store so the mock harness and saveless runs still have one to
     // answer from; the real app overwrites it from disk.
     app.init_resource::<crate::ecs::script_state::ScriptStateStore>();
+    app.init_resource::<crate::bar::BarGeometryStore>();
     app.add_systems(PreUpdate, crate::ecs::script_state::script_state_handler);
     app.add_systems(
         PreUpdate,

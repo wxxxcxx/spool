@@ -36,6 +36,8 @@ impl VisualItem {
             | ItemKind::Placeholder { space_id }
             | ItemKind::Focus { space_id }
             | ItemKind::ColumnDrop { space_id, .. } => space_id,
+            // The move handle belongs to no Space; it never moves or fades.
+            ItemKind::Grip => u64::MAX,
         }
     }
 
@@ -46,6 +48,7 @@ impl VisualItem {
             ItemKind::Label { .. } => (2, 0),
             ItemKind::Placeholder { .. } => (3, 0),
             ItemKind::Focus { .. } => (4, 0),
+            ItemKind::Grip => (5, 0),
             ItemKind::ColumnDrop { .. } => unreachable!("drop targets are not painted"),
         };
         (self.space_id(), kind, id)
