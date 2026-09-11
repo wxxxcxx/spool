@@ -124,6 +124,7 @@ spool-shared-types = { workspace = true }
 spool-lua = { workspace = true, optional = true }
 objc2-quartz-core = { version = "0.3", features = [
   "CALayer",
+  "CAShapeLayer",
   "CAAnimation",
   "CAMediaTimingFunction",
   "CATransaction",

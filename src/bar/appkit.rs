@@ -20,7 +20,7 @@ use objc2_foundation::{
     ns_string,
 };
 use objc2_quartz_core::{
-    CABasicAnimation, CALayer, CAMediaTiming, CAMediaTimingFunction,
+    CABasicAnimation, CALayer, CAMediaTiming, CAMediaTimingFunction, CAShapeLayer,
     kCAMediaTimingFunctionEaseInEaseOut,
 };
 use spool_shared_types::commands::Action;
@@ -392,7 +392,7 @@ struct BarViewIvars {
     /// A soft halo around the collapsed Bar. Core Animation owns its pulse: the
     /// render server animates it without waking the frame loop, which matters
     /// because running the whole ECS continuously costs ~45% of a core.
-    glow: RefCell<Option<Retained<CALayer>>>,
+    glow: RefCell<Option<Retained<CAShapeLayer>>>,
     /// One hover highlight per toolbar button, sitting under the button's own
     /// view so the symbol draws on top of it.
     highlights: RefCell<Vec<Retained<CALayer>>>,
@@ -551,10 +551,9 @@ impl BarView {
 
     /// The collapsed Bar's hover halo.
     ///
-    /// A shadow-only layer whose path is the collapsed shape, so the bloom hugs
-    /// the capsule or the tab rather than a bounding box. It breathes only
-    /// while the pointer is on the collapsed Bar, and it is anchored at the top
-    /// so a pulse grows downwards off the screen edge.
+    /// A shape layer carrying the collapsed outline twice over: a hairline
+    /// rim, and the bloom its shadow casts from the same path. Both pulse
+    /// together while the pointer is on the collapsed Bar.
     fn sync_glow(&self) {
         let (collapsed, hovered, rect, radius, notched) = {
             let state = self.ivars().state.borrow();
@@ -579,25 +578,9 @@ impl BarView {
         };
         let view_height = self.bounds().size.height;
         let parent = self.layer();
-        let mut glow = self.ivars().glow.borrow_mut();
-        let layer = glow.get_or_insert_with(|| {
-            let layer = CALayer::new();
-            layer.setShadowColor(Some(&NSColor::whiteColor().CGColor()));
-            layer.setShadowOffset(NSSize::new(0.0, 0.0));
-            layer.setShadowRadius(if notched { 9.0 } else { 6.0 });
-            // The anchor is the band's top edge, which is also the shape's, so
-            // a pulse grows downwards and never lifts the shape off the screen.
-            layer.setAnchorPoint(NSPoint::new(0.5, 0.0));
-            layer.setOpacity(0.0);
-            if let Some(parent) = &parent {
-                parent.addSublayer(&layer);
-            }
-            layer
-        });
-        // The halo layer spans the whole view so the shape's path — which is in
-        // viewport coordinates, like everything else the Bar draws — lands where
-        // it is drawn. A shadow path is in the layer's own space, so a layer the
-        // size of the shape would double the offset.
+        // The layer spans the whole view so the shape's path — which is in
+        // viewport coordinates, like everything else the Bar draws — lands
+        // where it is drawn rather than an origin away from it.
         let Some(parent) = parent else {
             return;
         };
@@ -609,10 +592,11 @@ impl BarView {
             WARNED.call_once(|| {
                 warn!("Bar view layer is not geometry flipped; collapsed halo disabled");
             });
-            settle(layer);
+            if let Some(layer) = self.ivars().glow.borrow().as_ref() {
+                settle(layer);
+            }
             return;
         }
-        layer.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), self.bounds().size));
         let path = chrome_path(
             rect,
             radius,
@@ -622,9 +606,30 @@ impl BarView {
                 0.0
             },
         );
-        layer.setShadowPath(Some(&path.CGPath()));
+        let mut glow = self.ivars().glow.borrow_mut();
+        let layer = glow.get_or_insert_with(|| {
+            let layer = CAShapeLayer::new();
+            // Half-opaque white, so the pulse reads on a black shape without
+            // ever looking like a second, brighter Bar.
+            layer.setStrokeColor(Some(&color(1.0, 1.0, 1.0, 0.55).CGColor()));
+            layer.setFillColor(Some(&NSColor::clearColor().CGColor()));
+            layer.setLineWidth(1.2);
+            layer.setShadowColor(Some(&NSColor::whiteColor().CGColor()));
+            layer.setShadowOffset(NSSize::new(0.0, 0.0));
+            layer.setShadowRadius(if notched { 9.0 } else { 6.0 });
+            // The anchor is the band's top edge, which is also the shape's, so
+            // a pulse grows downwards and never lifts the shape off the screen.
+            layer.setAnchorPoint(NSPoint::new(0.5, 0.0));
+            layer.setOpacity(0.0);
+            parent.addSublayer(&layer);
+            layer
+        });
+        layer.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), self.bounds().size));
+        let cg_path = path.CGPath();
+        layer.setPath(Some(&cg_path));
+        layer.setShadowPath(Some(&cg_path));
         if collapsed && hovered {
-            breathe(layer, PULSE_SHADOW, 0.06, 0.4, BREATH_PERIOD);
+            breathe(layer, PULSE_OPACITY, 0.35, 1.0, BREATH_PERIOD);
             let reach = breath_reach(rect.height, view_height);
             if BREATH == Breath::Pulse && reach > 1.0 {
                 breathe(layer, PULSE_SCALE_Y, 1.0, reach, BREATH_PERIOD);

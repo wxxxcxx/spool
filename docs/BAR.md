@@ -69,17 +69,19 @@ menus and status items, which is why the Bar takes that space instead.
   Bar collapses.
 - Hover breathes. The toolbar button under the pointer and the collapsed Bar
   get a repeating 1.8s ease-in-out pulse — a translucent highlight under the
-  button's symbol, a soft halo around the collapsed shape. Both are Core
-  Animation layers rather than per-frame drawing: pulsing them from the frame
-  loop would mean running the whole ECS at refresh rate, which costs about 45%
-  of a core to animate a highlight.
+  button's symbol, and a halo around the collapsed shape made of a hairline rim
+  plus the bloom its shadow casts from the same path. Both are Core Animation
+  layers rather than per-frame drawing: pulsing them from the frame loop would
+  mean running the whole ECS at refresh rate, which costs about 45% of a core
+  to animate a highlight. The halo carries a rim as well as a shadow so the
+  pulse is never at the mercy of a shadow alone painting nothing.
 - The pulse's mechanism is one constant, `BREATH`: `Pulse` lifts the halo
   vertically as well as brightening it, `Bloom` only brightens it. How far a
   halo may stretch comes from the room the shape has left inside the band, so a
   six-point tab breathes and a capsule that already fills the menu bar only
-  brightens. The halo layer spans the whole panel because a shadow path lives in
-  its own layer's coordinates: a layer the size of the shape would double the
-  offset and paint the halo off-screen.
+  brightens. The halo layer spans the whole panel and draws the shape's own
+  path, because a path lives in its layer's coordinates: a layer the size of the
+  shape would land the halo an origin away from the shape it belongs to.
 
 ### Tuning the feel
 
