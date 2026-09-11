@@ -1,4 +1,3 @@
-use super::geometry::PanelOverride;
 use super::layout::{BarSurface, Rect};
 use super::preferences::BarPreferences;
 
@@ -48,40 +47,6 @@ pub fn panel_frame(screen: Rect, width: f64, height: f64, drag_x: Option<f64>) -
     Rect {
         x,
         y: screen.y + screen.height - height,
-        width,
-        height,
-    }
-}
-
-/// Applies a hand-set override on top of the automatic frame.
-///
-/// The result is clamped to the owning display, so geometry saved against a
-/// larger or differently arranged display can never strand the panel
-/// off-screen after a resolution or arrangement change.
-#[must_use]
-pub fn apply_override(base: Rect, display: Rect, panel: Option<PanelOverride>) -> Rect {
-    let Some(panel) = panel else {
-        return base;
-    };
-    let width = panel
-        .width
-        .unwrap_or(base.width)
-        .clamp(1.0, display.width.max(1.0));
-    let height = panel
-        .height
-        .unwrap_or(base.height)
-        .clamp(1.0, display.height.max(1.0));
-    let x = panel.x.unwrap_or(base.x).clamp(
-        display.x,
-        (display.x + display.width - width).max(display.x),
-    );
-    let y = panel.y.unwrap_or(base.y).clamp(
-        display.y,
-        (display.y + display.height - height).max(display.y),
-    );
-    Rect {
-        x,
-        y,
         width,
         height,
     }

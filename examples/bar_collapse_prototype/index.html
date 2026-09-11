@@ -1,0 +1,425 @@
+<!doctype html>
+<!--
+  PROTOTYPE — throwaway. Not production code, no tests, no persistence.
+
+  Question: what should Spool's bar look like when it takes over the whole
+  menu bar, and what should its collapsed form be on a notched vs a plain
+  screen? Variant A (the pick) plus B/C kept for comparison, switchable with
+  ?variant=, each shown in both states on both screen types.
+
+  Run: ./run.sh   (or: open index.html)
+  Keys: ←/→ variant · space collapse/expand · n notched/plain
+
+  Locked decisions (all variants honour these):
+    - expanded = the menu-bar rect (full width, menu-bar height, blurred) and
+      it COVERS the system menu bar
+    - collapse affordances sit at the far left and far right, revealed on hover
+    - collapsed on a notched screen = a black region wider than the notch that
+      merges with it, with a small expand button inside on each side
+    - collapsed on a plain screen = 120x6pt, radius 3, flush to the screen top,
+      centred, hover feedback, click restores
+    - state is not persisted; startup is always expanded
+  VERDICT (settled): variant A, with these rules confirmed by the user:
+    - toolbar and Spaces form one group that gathers toward the middle; the
+      group splits around the notch and each side HUGS the notch, so the
+      leftover whitespace falls at the outer ends;
+    - outer whitespace is NOT required to be equal on the two sides: equal
+      outer margins and "both sides hug the notch" cannot both hold unless the
+      two sides happen to be the same width. This was chosen deliberately.
+    - the split is by COUNT, not by width: items = [toolbar, Space1..SpaceN],
+      left = ceil((N+1)/2), right = the rest. The toolbar counts as one item.
+      The cut therefore only moves when the Space count changes.
+    - collapsed: notched = black capsule (notch + 24pt a side, bottom-rounded,
+      two expand chevrons inside); plain = 120x6pt r3 flush to the screen top,
+      centred, hover feedback, click restores.
+    - not persisted; a runtime action + Lua toggle is provided instead.
+  Two changes after the pick:
+    1. the toolbar buttons and the Spaces form ONE group that gathers toward the
+       middle, leaving the whitespace at the outer ends (the toolbar is no longer
+       pinned to the far left);
+    2. on a notched screen the group is split around the cutout by WIDTH, not by
+       count: both sides hug the notch and the split point is the one that keeps
+       the two sides as even as possible, with the Spaces staying in native
+       order (a contiguous prefix left, the rest right).
+-->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>PROTOTYPE · bar collapse</title>
+<style>
+  :root {
+    --screen-w: 1470px;
+    --screen-h: 956px;
+    --menu-h: 34px;
+    --notch-w: 179px;
+    --notch-h: 32px;
+    /* Room kept clear at both bar ends for the collapse buttons and the fixed
+       toolbar, so the centred Space group never slides under them. */
+    --end-inset: 30px;
+    --ink: #f2f2f7;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0c10; color: var(--ink);
+    font: 13px/1.45 -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; padding: 16px 0 92px; }
+
+  h1 { font-size: 13px; font-weight: 600; letter-spacing: .04em; opacity: .7;
+       margin: 0 0 10px; text-transform: uppercase; }
+
+  .stage { width: 100%; display: flex; justify-content: center; }
+  .fit { transform-origin: top center; }
+  .screen {
+    position: relative; width: var(--screen-w); height: var(--screen-h);
+    border-radius: 18px; overflow: hidden; background: #10131a;
+    box-shadow: 0 30px 80px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.08);
+  }
+  .wallpaper {
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(120% 90% at 18% 8%, #6d5bd0 0%, transparent 55%),
+      radial-gradient(120% 90% at 88% 12%, #2f8fd8 0%, transparent 50%),
+      radial-gradient(90% 80% at 70% 100%, #1f6f63 0%, transparent 60%),
+      linear-gradient(160deg, #1a1d2b, #0d1016 60%);
+  }
+  .fake { position: absolute; border-radius: 12px; background: rgba(255,255,255,.10);
+    border: 1px solid rgba(255,255,255,.16) }
+  .fake i { display: block; height: 8px; border-radius: 4px; margin: 10px 12px;
+    background: rgba(255,255,255,.22) }
+  .fake i:nth-child(2) { width: 60%; }
+  .fake i:nth-child(3) { width: 78%; }
+  #w1 { left: 90px;  top: 180px; width: 520px; height: 330px; }
+  #w2 { left: 700px; top: 120px; width: 420px; height: 260px; }
+  #w3 { left: 380px; top: 560px; width: 700px; height: 300px; }
+
+  /* the system menu bar underneath — what the prototype bar covers */
+  .sysbar {
+    position: absolute; left: 0; top: 0; width: 100%; height: var(--menu-h);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 14px; font-size: 13px; color: #fff; z-index: 1;
+    background: rgba(28,30,38,.55); backdrop-filter: blur(24px) saturate(180%);
+  }
+  .sysbar .l, .sysbar .r { display: flex; gap: 16px; align-items: center; white-space: nowrap; }
+  .sysbar .r span { opacity: .92 }
+  .notch {
+    position: absolute; left: calc((var(--screen-w) - var(--notch-w)) / 2); top: 0;
+    width: var(--notch-w); height: var(--notch-h); background: #000;
+    border-bottom-left-radius: 10px; border-bottom-right-radius: 10px; z-index: 4;
+  }
+  body.host-plain .notch { display: none; }
+
+  /* ── the prototype bar ───────────────────────────────────────────── */
+  .bar {
+    position: absolute; left: 0; top: 0; width: 100%; height: var(--menu-h);
+    z-index: 3; overflow: hidden; display: flex; align-items: center;
+    background: rgba(30,32,40,.72); backdrop-filter: blur(28px) saturate(180%);
+    transition: width .24s cubic-bezier(.22,.61,.36,1), height .24s cubic-bezier(.22,.61,.36,1),
+                left .24s cubic-bezier(.22,.61,.36,1), border-radius .24s, background .24s;
+  }
+  /* Two lanes split by the notch. Both hug the cutout, so the toolbar and the
+     Spaces gather around the middle together and the leftover whitespace falls
+     at the outer ends. On a plain screen one lane centres the same group. */
+  .lane { flex: 1 1 0; min-width: 0; height: 100%; overflow: hidden;
+    display: flex; align-items: center; gap: 5px;
+    padding: 0 var(--end-inset); opacity: 1; transition: opacity .16s }
+  .lane.left { justify-content: flex-end }
+  .lane.right { justify-content: flex-start }
+  body.host-plain .lane.left { justify-content: center }
+  .notchgap { flex: 0 0 var(--notch-w) }
+  /* Without a cutout the right lane would still claim half the bar and drag the
+     centred group into the left quarter, so it is dropped entirely. */
+  body.host-plain .notchgap, body.host-plain .lane.right { display: none }
+
+  /* the fixed buttons lead the same group; they are not pinned chrome */
+  .tools { display: flex; align-items: center; gap: 5px; flex: 0 0 auto }
+  .tool { width: 26px; height: 24px; border-radius: 6px; display: grid; place-items: center;
+    background: rgba(255,255,255,.10); font-size: 13px; opacity: .9 }
+
+  .sp { display: flex; align-items: center; gap: 3px; height: 24px; border-radius: 5px;
+    padding: 0 4px; background: rgba(255,255,255,.07); flex: 0 0 auto }
+  .sp.on { background: rgba(10,132,255,.30); box-shadow: inset 0 0 0 1px rgba(120,190,255,.5) }
+  .sp b { font-size: 10px; font-weight: 600; opacity: .8; width: 12px; text-align: center }
+  .ico { width: 18px; height: 18px; border-radius: 5px; background: linear-gradient(150deg,#fff,#c9d3e6);
+         box-shadow: 0 1px 2px rgba(0,0,0,.4) }
+  .ico.blue { background: linear-gradient(150deg,#7cc4ff,#2f6fd0) }
+  .ico.warm { background: linear-gradient(150deg,#ffd48a,#e0762c) }
+  .ico.green{ background: linear-gradient(150deg,#9be8a8,#2f9b52) }
+  .stack { position: relative; width: 22px; height: 18px }
+  .stack .ico { position: absolute; top: 0; left: 0 }
+  .stack .ico:nth-child(2) { left: 4px; top: 2px }
+  .deck { display: flex; position: relative; width: 40px; height: 18px }
+  .deck .ico { position: absolute; top: 0 }
+  .deck .ico:nth-child(1){left:0} .deck .ico:nth-child(2){left:6px}
+  .deck .ico:nth-child(3){left:12px} .deck .ico:nth-child(4){left:18px}
+
+  /* collapse affordances */
+  .fold { position: absolute; top: 0; height: var(--menu-h); width: 24px; z-index: 3;
+    display: grid; place-items: center; font-size: 14px; color: #fff; cursor: pointer;
+    background: none; border: 0; opacity: 0; transition: opacity .18s, transform .18s }
+  .fold.l { left: 0 } .fold.r { right: 0 }
+  .zone { position: absolute; top: 0; height: 100%; width: 26px; z-index: 2 }
+  .zone.l { left: 0 } .zone.r { right: 0 }
+  .zone.l:hover ~ .fold.l, .zone.r:hover ~ .fold.r, .fold:hover { opacity: 1 }
+
+  /* collapsed shapes */
+  .collapsed .lane, .collapsed .tools { opacity: 0; pointer-events: none }
+  .collapsed.host-notched .bar { left: calc((var(--screen-w) - var(--cap-w)) / 2);
+    width: var(--cap-w); border-radius: 0 0 var(--cap-r) var(--cap-r);
+    background: #000; backdrop-filter: none }
+  .collapsed.host-notched .fold { opacity: .55 }
+  .collapsed.host-notched .fold:hover { opacity: 1 }
+  .collapsed.host-plain .bar { left: calc((var(--screen-w) - var(--tab-w)) / 2);
+    top: 0; width: var(--tab-w); height: var(--tab-h);
+    border-radius: 0 0 var(--tab-r) var(--tab-r); background: rgba(0,0,0,.92);
+    backdrop-filter: none }
+  .collapsed.host-plain .bar:hover { height: var(--tab-h-hover); background: #000 }
+  .collapsed.host-plain .fold { display: none }
+
+  /* ── variant A (picked): capsule, notch + 24pt a side ────────────── */
+  body.vA { --cap-w: calc(var(--notch-w) + 48px); --cap-r: 12px;
+            --tab-w: 120px; --tab-h: 6px; --tab-r: 3px; --tab-h-hover: 9px }
+  /* ── variant B: stepped tray, notch width + bottom wings ─────────── */
+  body.vB { --cap-w: calc(var(--notch-w) + 12px); --cap-r: 16px;
+            --tab-w: 96px; --tab-h: 8px; --tab-r: 4px; --tab-h-hover: 8px }
+  body.vB.collapsed .bar { height: 44px !important }
+  body.vB .fold.l::after, body.vB .fold.r::after { content: ""; position: absolute;
+    top: 26px; width: 40px; height: 18px; background: #000;
+    border-bottom-left-radius: 9px; border-bottom-right-radius: 9px }
+  body.vB .fold.l::after { left: -34px } body.vB .fold.r::after { right: -34px }
+  body.vB .fold { opacity: .5 }
+  body.vB .fold:hover { opacity: 1 }
+  body.vB .fold.l, body.vB .fold.r { height: 44px; align-items: end; padding-bottom: 2px }
+  body.vB.collapsed.host-notched .bar { overflow: visible }
+  /* ── variant C: no black mass, floating buttons beside the notch ─── */
+  body.vC { --cap-w: 0px; --tab-w: 140px; --tab-h: 5px; --tab-r: 3px; --tab-h-hover: 24px }
+  body.vC.collapsed.host-notched .bar { display: none }
+  body.vC.collapsed.host-notched .notch {
+    border-bottom-left-radius: 0; border-bottom-right-radius: 0 }
+  .sidebtns { position: absolute; top: 7px; z-index: 5; display: none }
+  body.vC.collapsed.host-notched .sidebtns { display: block }
+  .sidebtn { position: absolute; top: 0; width: 20px; height: 20px; border-radius: 6px;
+    background: rgba(20,22,28,.92); border: 1px solid rgba(255,255,255,.18); color: #fff;
+    display: grid; place-items: center; font-size: 12px; cursor: pointer; opacity: .55;
+    transition: opacity .18s }
+  .sidebtn:hover { opacity: 1 }
+  .sidebtn.l { left: calc((var(--screen-w) - var(--notch-w)) / 2 - 26px) }
+  .sidebtn.r { left: calc((var(--screen-w) + var(--notch-w)) / 2 + 6px) }
+  body.vC .fold { transform: translateX(-24px) }
+  body.vC .fold.r { transform: translateX(24px) }
+  body.vC .zone.l:hover ~ .fold.l, body.vC .zone.r:hover ~ .fold.r, body.vC .fold:hover {
+    opacity: 1; transform: none }
+  .tabhint { display: none }
+  body.vC.collapsed.host-plain .bar:hover .tabhint {
+    display: block; width: 100%; text-align: center; color: #fff; font-size: 10px;
+    line-height: 22px; letter-spacing: .08em }
+
+  /* ── readout + switcher ─────────────────────────────────────────── */
+  .readout { margin-top: 12px; font-size: 12px; opacity: .72; text-align: center;
+    font-variant-numeric: tabular-nums; max-width: 1240px }
+  .switcher { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 999px;
+    background: rgba(20,22,28,.92); border: 1px solid rgba(255,255,255,.16);
+    box-shadow: 0 12px 30px rgba(0,0,0,.5); font-size: 13px; z-index: 50 }
+  .switcher button { all: unset; cursor: pointer; padding: 4px 9px; border-radius: 8px;
+    background: rgba(255,255,255,.08) }
+  .switcher button:hover { background: rgba(255,255,255,.16) }
+  .switcher .label { min-width: 190px; text-align: center; font-weight: 600 }
+  .switcher .hint { opacity: .55; font-size: 11px }
+</style>
+</head>
+<body class="vA host-notched">
+  <h1>prototype · bar takes over the menu bar · pick: A</h1>
+
+  <div class="stage">
+    <div class="fit" id="fit">
+      <div class="screen" id="screen">
+        <div class="wallpaper"></div>
+        <div class="fake" id="w1"><i></i><i></i><i></i></div>
+        <div class="fake" id="w2"><i></i><i></i><i></i></div>
+        <div class="fake" id="w3"><i></i><i></i><i></i></div>
+
+        <!-- the system menu bar: visible only where the prototype bar lets it be -->
+        <div class="sysbar">
+          <div class="l"><span>&#63743;</span><span>访达</span><span>文件</span><span>编辑</span><span>显示</span><span>窗口</span><span>帮助</span></div>
+          <div class="r"><span>◍</span><span>􀙇</span><span>􀙈</span><span>􀫥 20</span><span>􀍟</span><span>􀊫</span><span>􀊨</span><span>􀛨 88%</span><span>周六 9月12日 01:15</span></div>
+        </div>
+        <div class="notch"></div>
+
+        <!-- the prototype bar -->
+        <div class="bar" id="bar">
+          <div class="lane left" id="laneLeft">
+            <div class="tools"><div class="tool">▦</div><div class="tool">▭</div></div>
+          </div>
+          <div class="notchgap"></div>
+          <div class="lane right" id="laneRight"></div>
+          <div class="zone l"></div><div class="zone r"></div>
+          <button class="fold l" data-act="toggle">‹</button>
+          <button class="fold r" data-act="toggle">›</button>
+          <div class="tabhint">⌄ 展开</div>
+        </div>
+
+        <div class="sidebtns">
+          <button class="sidebtn l" data-act="toggle">‹</button>
+          <button class="sidebtn r" data-act="toggle">›</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="readout" id="readout"></div>
+
+  <div class="switcher">
+    <button id="prev">←</button>
+    <span class="label" id="label"></span>
+    <button id="next">→</button>
+    <button id="state">折叠</button>
+    <button id="scr">刘海屏</button>
+    <span class="hint">←/→ 变体 · space 折叠 · n 屏幕 · +/- Space 数</span>
+  </div>
+
+<script>
+const VARIANTS = [
+  { key: 'A', name: 'A — 直译胶囊（已选）' },
+  { key: 'B', name: 'B — 阶梯托盘' },
+  { key: 'C', name: 'C — 双钮分离' },
+];
+const params = new URLSearchParams(location.search);
+let variant = (params.get('variant') || 'A').toUpperCase();
+let collapsed = params.get('state') === 'collapsed';
+let plain = params.get('screen') === 'plain';
+if (!VARIANTS.some(v => v.key === variant)) variant = 'A';
+
+const body = document.body;
+const readout = document.getElementById('readout');
+const label = document.getElementById('label');
+const stateBtn = document.getElementById('state');
+const scrBtn = document.getElementById('scr');
+
+// The Space count is a prototype parameter (?n=, default 3) so the split rule
+// can be judged for more than one layout. Space 1 is the focused one, so it is
+// the wide one; the rest are collapsed decks of varying size.
+const DECKS = [0, 1, 4, 2, 3, 1, 4, 2];
+const spaceCount = Math.min(7, Math.max(1, Number(params.get('n') || 3) || 3));
+const SPACES = Array.from({ length: spaceCount }, (_, index) => {
+  const id = index + 1;
+  if (index === 0) {
+    return { id, on: true, body: `<div class="stack"><div class="ico blue"></div><div class="ico"></div></div>
+      <div class="ico warm"></div><div class="ico green"></div><div class="ico"></div>` };
+  }
+  const cards = DECKS[id % DECKS.length] || 1;
+  const tints = ['', 'blue', '', 'warm', 'green'];
+  return { id, on: false, body: `<div class="deck">${Array.from({ length: cards },
+    (_, card) => `<div class="ico ${tints[card % tints.length]}"></div>`).join('')}</div>` };
+});
+
+function spaceNode(space) {
+  const el = document.createElement('div');
+  el.className = 'sp' + (space.on ? ' on' : '');
+  el.innerHTML = `<b>${space.id}</b>${space.body}`;
+  return el;
+}
+
+let splitInfo = '';
+
+function layoutSpaces() {
+  const left = document.getElementById('laneLeft');
+  const right = document.getElementById('laneRight');
+  const tools = left.querySelector('.tools');
+  for (const node of left.querySelectorAll('.sp')) node.remove();
+  for (const node of right.querySelectorAll('.sp')) node.remove();
+
+  // Measure every Space in the left lane first, then hand the tail to the right.
+  const nodes = SPACES.map(spaceNode);
+  for (const node of nodes) left.append(node);
+
+  if (plain) {
+    // No cutout: the toolbar and every Space are one strip, centred.
+    splitInfo = `工具栏 + ${nodes.length} 个 Space 作为整体居中`;
+    return;
+  }
+
+  // Split by COUNT, with the fixed toolbar counting as one item. Native Space
+  // order is preserved, and the cut only moves when the Space count changes.
+  const items = nodes.length + 1;
+  const leftItems = Math.ceil(items / 2);
+  const split = Math.max(0, Math.min(nodes.length, leftItems - 1));
+  for (const node of nodes.slice(split)) right.append(node);
+  const names = list => list.length ? `Space ${list.map(s => s.id).join('、')}` : '（无）';
+  const widthOf = list => list.reduce((sum, node) => sum + node.offsetWidth + 5, 0) - 5;
+  splitInfo = `${items} 个 item（工具栏 + ${nodes.length} 个 Space）对半 → `
+    + `左 ${leftItems - 1 <= 0 ? '仅工具栏' : `工具栏 + ${names(SPACES.slice(0, split))}`}（${Math.round(tools.offsetWidth + 5 + widthOf(nodes.slice(0, split)))}pt）`
+    + ` / 右 ${names(SPACES.slice(split))}（${Math.round(widthOf(nodes.slice(split)))}pt）`;
+}
+
+function geometry() {
+  const g = { menuH: 34, notchW: 179, notchH: 32, endInset: 30 };
+  g.cap = variant === 'A' ? g.notchW + 48 : variant === 'B' ? g.notchW + 12 : 0;
+  g.tab = variant === 'A' ? '120 × 6 · r3' : variant === 'B' ? '96 × 8 · r4' : '140 × 5 · r3';
+  return g;
+}
+
+function render() {
+  body.className = `v${variant} host-${plain ? 'plain' : 'notched'}${collapsed ? ' collapsed' : ''}`;
+  const g = geometry();
+  layoutSpaces();
+  label.textContent = VARIANTS.find(v => v.key === variant).name;
+  stateBtn.textContent = collapsed ? '展开' : '折叠';
+  scrBtn.textContent = plain ? '普通屏' : '刘海屏';
+  const centring = splitInfo;
+  const capText = variant === 'C'
+    ? `折叠：刘海保持 ${g.notchW}pt，两个 20×20 按钮贴在刘海左右`
+    : `折叠：黑色区宽 ${g.cap}pt（刘海 ${g.notchW} + 两侧各 ${(g.cap - g.notchW) / 2}pt），高 ${variant === 'B' ? 44 : g.menuH}pt`;
+  readout.innerHTML =
+    `变体 ${variant} · ${plain ? '普通屏' : '刘海屏'} · ${collapsed ? '折叠' : '展开'} ` +
+    `&nbsp;|&nbsp; 屏 1470×956pt · 菜单栏高 ${g.menuH}pt · 刘海 ${g.notchW}×${g.notchH}pt ` +
+    `&nbsp;|&nbsp; <b>${centring}</b>` +
+    `&nbsp;|&nbsp; 两端各留 30pt 给折叠按钮` +
+    `&nbsp;|&nbsp; ${capText}`;
+    const q = new URLSearchParams({ variant, state: collapsed ? 'collapsed' : 'expanded',
+    screen: plain ? 'plain' : 'notched', n: String(spaceCount) });
+  history.replaceState(null, '', `?${q}`);
+}
+
+function bumpSpaces(step) {
+  const next = Math.min(7, Math.max(1, spaceCount + step));
+  if (next === spaceCount) return;
+  const q = new URLSearchParams(location.search);
+  q.set('n', next);
+  location.search = q;   // prototype: a reload is fine, nothing to preserve
+}
+
+function cycle(step) {
+  const i = VARIANTS.findIndex(v => v.key === variant);
+  variant = VARIANTS[(i + step + VARIANTS.length) % VARIANTS.length].key;
+  render();
+}
+
+document.getElementById('prev').onclick = () => cycle(-1);
+document.getElementById('next').onclick = () => cycle(1);
+stateBtn.onclick = () => { collapsed = !collapsed; render(); };
+scrBtn.onclick = () => { plain = !plain; render(); };
+document.getElementById('bar').addEventListener('click', () => {
+  if (collapsed) { collapsed = false; render(); }
+});
+for (const el of document.querySelectorAll('[data-act="toggle"]')) {
+  el.onclick = (e) => { e.stopPropagation(); collapsed = !collapsed; render(); };
+}
+document.addEventListener('keydown', (e) => {
+  if (e.target.matches('input, textarea, [contenteditable]')) return;
+  if (e.key === 'ArrowLeft') cycle(-1);
+  else if (e.key === 'ArrowRight') cycle(1);
+  else if (e.key === ' ') { e.preventDefault(); collapsed = !collapsed; render(); }
+  else if (e.key === 'n' || e.key === 'N') { plain = !plain; render(); }
+  else if (e.key === '+' || e.key === '=') { bumpSpaces(1); }
+  else if (e.key === '-' || e.key === '_') { bumpSpaces(-1); }
+});
+function fit() {
+  const scale = Math.min(1, (window.innerWidth - 32) / 1470);
+  document.getElementById('fit').style.transform = `scale(${scale})`;
+  document.querySelector('.stage').style.height = `${956 * scale}px`;
+}
+window.addEventListener('resize', fit);
+fit();
+render();
+</script>
+</body>
+</html>

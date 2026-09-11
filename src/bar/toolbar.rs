@@ -1,33 +1,15 @@
 use spool_shared_types::commands::Action;
 
-use super::layout::{GRIP_WIDTH, Rect};
+use super::layout::Rect;
 
-/// The fixed leading lane: the move handle plus the two button lanes.
-pub const TOOLBAR_WIDTH: f64 = GRIP_WIDTH + 66.0;
+pub const TOOLBAR_WIDTH: f64 = 66.0;
 
 pub fn width(mission_control: bool, show_desktop: bool) -> f64 {
-    GRIP_WIDTH + buttons_width(mission_control, show_desktop)
-}
-
-fn buttons_width(mission_control: bool, show_desktop: bool) -> f64 {
     let count = u8::from(mission_control) + u8::from(show_desktop);
     if count == 0 {
         0.0
     } else {
         10.0 + f64::from(count) * 28.0
-    }
-}
-
-/// The move handle of one Bar, in view-local points.
-///
-/// Its whole height is grabbable; the drawn glyph stays smaller than the lane.
-#[must_use]
-pub fn grip(height: f64) -> Rect {
-    Rect {
-        x: 0.0,
-        y: 0.0,
-        width: GRIP_WIDTH,
-        height,
     }
 }
 
@@ -45,8 +27,7 @@ pub fn configured_buttons(
         })
         .collect::<Vec<_>>();
     for (index, button) in buttons.iter_mut().enumerate() {
-        button.rect.x = GRIP_WIDTH
-            + 5.0
+        button.rect.x = 5.0
             + (24.0 - button.rect.width) / 2.0
             + f64::from(u32::try_from(index).unwrap_or(0)) * 28.0;
     }
@@ -110,20 +91,14 @@ mod tests {
                     let expected = usize::from(mission_control) + usize::from(show_desktop);
                     assert_eq!(buttons.len(), expected);
                     let width = width(mission_control, show_desktop);
-                    // The move handle keeps its lane even with no buttons left.
-                    assert!(width >= GRIP_WIDTH, "the grip lane is always reserved");
+                    assert_eq!(width > 0.0, expected > 0);
                     for button in &buttons {
-                        assert!(
-                            button.rect.x >= GRIP_WIDTH,
-                            "buttons stay right of the grip"
-                        );
                         assert!(button.rect.y >= 0.0);
                         assert!(button.rect.y + button.rect.height <= height);
                         assert!(button.rect.x + button.rect.width < width - 3.0);
                     }
                     if expected == 1 {
-                        // The remaining button takes the first lane after the grip.
-                        assert!(buttons[0].rect.x < GRIP_WIDTH + 12.0);
+                        assert!(buttons[0].rect.x < 12.0);
                     }
                 }
             }

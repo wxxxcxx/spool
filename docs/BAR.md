@@ -71,13 +71,6 @@ menus and status items. Use the width limit and notch side to avoid crowded area
 
 ## Interaction
 
-- Every Bar has a move handle: three dots in the leading lane, before the two
-  fixed buttons. Drag it to move the Bar anywhere on its display. Drag the left,
-  right, or bottom outer edge to resize it: width starts at 120pt, height is
-  bounded to 18-64pt. The opposite edge stays still while resizing, including
-  when a limit stops the drag. Double-click the handle to clear that display's
-  hand-set geometry and return to the automatic placement above.
-- Hand-set geometry is saved per display in `bar-state.json`, in the same XDG
   state directory as `state.json`, keyed by `CGDirectDisplayID`, and applied on
   the next run. Only the axes a gesture touched are stored, so resizing the width
   leaves the automatic position alone. A saved rect is clamped to its display, so

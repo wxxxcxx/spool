@@ -6,9 +6,6 @@ use spool_shared_types::state::SpaceKind;
 use super::model::{BarColumn, BarDisplay, BarSpace, BarWindow};
 use super::toolbar::TOOLBAR_WIDTH;
 
-/// Leading lane of one Bar reserved for its move handle.
-pub const GRIP_WIDTH: f64 = 14.0;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f64,
@@ -241,7 +238,7 @@ mod notch_tests {
         );
         assert_eq!(initial.split, scrolled.split);
         for (a, b) in initial.items.iter().zip(&scrolled.items) {
-            let same_space = space_of(&a.kind) == Some(left.space_id);
+            let same_space = a.kind.space_id() == left.space_id;
             let fixed = matches!(
                 a.kind,
                 ItemKind::Space { .. } | ItemKind::Label { .. } | ItemKind::Placeholder { .. }
@@ -255,7 +252,7 @@ mod notch_tests {
                 .items
                 .iter()
                 .zip(&scrolled.items)
-                .any(|(a, b)| space_of(&a.kind) == Some(left.space_id) && a.rect != b.rect),
+                .any(|(a, b)| a.kind.space_id() == left.space_id && a.rect != b.rect),
             "the scrolled Space's icons actually moved"
         );
 
@@ -272,18 +269,6 @@ mod notch_tests {
         );
         assert_eq!(initial.split, changed.split);
     }
-
-    fn space_of(kind: &ItemKind) -> Option<u64> {
-        match kind {
-            ItemKind::Space { space_id, .. }
-            | ItemKind::Window { space_id, .. }
-            | ItemKind::Label { space_id, .. }
-            | ItemKind::Placeholder { space_id }
-            | ItemKind::Focus { space_id }
-            | ItemKind::ColumnDrop { space_id, .. } => Some(*space_id),
-            ItemKind::Grip => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -293,17 +278,16 @@ pub struct PlacedItem {
 }
 
 impl ItemKind {
-    /// The Space this item belongs to, if any. The move handle has none.
+    /// The Space this item belongs to.
     #[must_use]
-    pub fn space_id(&self) -> Option<u64> {
+    pub fn space_id(&self) -> u64 {
         match self {
             Self::Space { space_id, .. }
             | Self::Window { space_id, .. }
             | Self::Label { space_id, .. }
             | Self::Placeholder { space_id }
             | Self::Focus { space_id }
-            | Self::ColumnDrop { space_id, .. } => Some(*space_id),
-            Self::Grip => None,
+            | Self::ColumnDrop { space_id, .. } => *space_id,
         }
     }
 }
@@ -340,8 +324,6 @@ impl PlacedItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ItemKind {
-    /// The Bar's own move handle, in the fixed leading lane.
-    Grip,
     Label {
         space_id: u64,
         ordinal: u32,
@@ -482,8 +464,6 @@ impl BarLayout {
         let mut x = metrics.toolbar_width + metrics.horizontal_padding;
         let mut items = Vec::new();
         let mut spans = Vec::new();
-
-        items.extend(grip_item(&metrics, height));
 
         for (space, (content_width, allocated)) in
             display.spaces.iter().zip(widths.iter().zip(&allocated))
@@ -651,19 +631,6 @@ fn place_space_content(
     } else {
         place_collapsed(space, scrolled, metrics, items);
     }
-}
-
-/// The Bar's move handle, in the leading lane of the fixed toolbar area.
-fn grip_item(metrics: &BarMetrics, height: f64) -> Option<PlacedItem> {
-    (metrics.toolbar_width > 0.0).then(|| PlacedItem {
-        rect: Rect {
-            x: 0.0,
-            y: 0.0,
-            width: GRIP_WIDTH.min(metrics.toolbar_width),
-            height,
-        },
-        kind: ItemKind::Grip,
-    })
 }
 
 fn space_width(space: &BarSpace, metrics: &BarMetrics) -> f64 {
@@ -1236,7 +1203,7 @@ pub(super) mod tests {
             layout
                 .items
                 .iter()
-                .filter(|item| item.kind.space_id() == Some(space_id))
+                .filter(|item| item.kind.space_id() == space_id)
                 .map(|item| item.rect.x)
                 .fold(f64::INFINITY, f64::min)
         };
@@ -1259,7 +1226,7 @@ pub(super) mod tests {
         }
         let layout = BarLayout::resolve_with_metrics(
             &display,
-            260.0,
+            200.0,
             &mut HashMap::new(),
             BarMetrics::default(),
         );
