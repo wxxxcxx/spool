@@ -119,6 +119,43 @@ fn retained_native_owner_follows_selection_without_a_creation_event() {
 }
 
 #[test]
+fn native_selection_does_not_raise_other_independent_windows() {
+    let mut harness = TestHarness::new().with_windows(2).with_focused_window(0);
+    harness.pump_frames(30);
+    let original = find_window_entity(0, harness.world());
+    let frame = harness.mock_state.actual_window_frame(0).unwrap();
+    harness.mock_state.take_raise_requests();
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, frame);
+    let mut previous = 0;
+    for next in [2, 0, 2, 0] {
+        published(&harness, previous, false);
+        published(&harness, next, true);
+        harness
+            .mock_state
+            .update_window(previous, |window| window.represented_window_id = Some(next));
+        harness
+            .mock_state
+            .update_window(next, |window| window.represented_window_id = None);
+        harness.mock_state.focus_window(next);
+        harness
+            .world()
+            .write_message(crate::events::Event::FocusRevalidationRequested {
+                pid: TEST_PROCESS_ID,
+                source: crate::events::FocusSource::AccessibilityUiElement,
+            });
+        harness.pump_frames(80);
+        assert_eq!(find_window_entity(next, harness.world()), original);
+        assert!(
+            harness.mock_state.take_raise_requests().is_empty(),
+            "changing a native control target must not raise the independent sibling window"
+        );
+        previous = next;
+    }
+}
+
+#[test]
 fn detaching_the_selected_root_preserves_the_remaining_window_slot() {
     let mut harness = TestHarness::new().with_windows(1).with_focused_window(0);
     harness.pump_frames(30);

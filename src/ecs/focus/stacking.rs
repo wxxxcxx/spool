@@ -6,12 +6,20 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use tracing::debug;
 
-use super::FocusCoordinator;
+use super::{FocusCoordinator, ObservedFocus};
 use crate::ecs::exit_restore::ExitInProgress;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::topology::NativeTopology;
 use crate::ecs::{Initializing, MissionControlActive, NativeFullscreenMarker, Scrolling};
+
+type PendingGeometry = Or<(
+    With<crate::ecs::WindowFrameMotion>,
+    With<crate::ecs::RepositionMarker>,
+    With<crate::ecs::ResizeMarker>,
+    With<crate::ecs::ReshuffleAroundMarker>,
+    With<crate::ecs::EnsureVisibleMarker>,
+)>;
 
 #[derive(Debug, PartialEq, Eq)]
 struct StackingPlan {
@@ -36,6 +44,7 @@ pub(super) struct TiledStacking<'w, 's> {
     exiting: Option<Res<'w, ExitInProgress>>,
     fullscreen: Query<'w, 's, (), With<NativeFullscreenMarker>>,
     scrolling: Query<'w, 's, &'static Scrolling>,
+    pending_geometry: Query<'w, 's, (), PendingGeometry>,
 }
 
 impl TiledStacking<'_, '_> {
@@ -87,11 +96,31 @@ impl TiledStacking<'_, '_> {
     }
 
     pub(super) fn raise_strip(&self, focus: Entity, state: &mut TiledStackingState, force: bool) {
-        let Some(plan) = self.plan(focus) else {
+        let Some(mut plan) = self.plan(focus) else {
             state.last_requested = None;
             return;
         };
+        if !force {
+            if self.pending_geometry.contains(plan.strip)
+                || plan
+                    .bottom_to_top
+                    .iter()
+                    .any(|&entity| self.pending_geometry.contains(entity))
+            {
+                return;
+            }
+            let viewport = self.active.display().bounds();
+            plan.bottom_to_top = overlapping_raise_order(&plan.bottom_to_top, focus, |entity| {
+                self.windows
+                    .observed_frame(entity)
+                    .map(|frame| frame.intersect(viewport))
+            });
+        }
         if !force && state.last_requested.as_ref() == Some(&plan) {
+            return;
+        }
+        if plan.bottom_to_top.is_empty() {
+            state.last_requested = Some(plan);
             return;
         }
         let ids = plan
@@ -115,6 +144,35 @@ impl TiledStacking<'_, '_> {
     }
 }
 
+/// `AXRaise` is an application action, not a passive `WindowServer` reorder.
+/// Only overlapping surfaces need automatic repair; preserve the native focus
+/// by raising its window last when background surfaces did need repair.
+fn overlapping_raise_order(
+    order: &[Entity],
+    focus: Entity,
+    mut frame: impl FnMut(Entity) -> Option<IRect>,
+) -> Vec<Entity> {
+    let frames: Vec<_> = order.iter().map(|&entity| frame(entity)).collect();
+    let mut result = Vec::new();
+    for (index, &entity) in order.iter().enumerate() {
+        if frames[index].is_some_and(|frame| {
+            frames.iter().enumerate().any(|(other, other_frame)| {
+                other != index
+                    && other_frame.is_some_and(|other_frame| {
+                        let overlap = frame.intersect(other_frame);
+                        overlap.width() > 0 && overlap.height() > 0
+                    })
+            })
+        }) {
+            result.push(entity);
+        }
+    }
+    if !result.is_empty() && !result.contains(&focus) {
+        result.push(focus);
+    }
+    result
+}
+
 pub(super) fn reconcile_tiled_stacking(
     stacking: TiledStacking,
     focus: Res<FocusCoordinator>,
@@ -127,7 +185,23 @@ pub(super) fn reconcile_tiled_stacking(
     }
     if let Some(entity) = snapshot.confirmed_entity() {
         stacking.raise_strip(entity, &mut state, false);
-    } else {
+    } else if !state.last_requested.as_ref().is_some_and(|plan| {
+        let ObservedFocus::Untracked {
+            pid: Some(pid),
+            window_id: Some(id),
+        } = snapshot.observed
+        else {
+            return false;
+        };
+        // A native tab can publish its new root before identity reconciliation.
+        // This is not a change of independently focused window or z-order.
+        stacking.windows.get(plan.focus).is_some_and(|window| {
+            window.pid().is_ok_and(|owner| owner == pid)
+                && window
+                    .represented_window_id()
+                    .is_ok_and(|target| target == id)
+        })
+    }) {
         state.last_requested = None;
     }
 }
@@ -181,6 +255,30 @@ fn bottom_to_top(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_order_excludes_isolated_and_unknown_surfaces() {
+        let mut world = World::new();
+        let e = (0..5).map(|_| world.spawn_empty().id()).collect::<Vec<_>>();
+        let frames = [
+            Some(IRect::new(0, 0, 10, 100)),
+            Some(IRect::new(0, 0, 10, 100)),
+            Some(IRect::new(10, 0, 110, 100)),
+            None,
+            Some(IRect::new(200, 0, 300, 100)),
+        ];
+        assert_eq!(
+            overlapping_raise_order(&e, e[4], |entity| frames
+                [e.iter().position(|&e| e == entity).unwrap()]),
+            vec![e[0], e[1], e[4]],
+            "touching edges do not need repair; focus remains last"
+        );
+        assert!(
+            overlapping_raise_order(&e[2..], e[4], |entity| frames
+                [e.iter().position(|&e| e == entity).unwrap()])
+            .is_empty()
+        );
+    }
 
     #[test]
     fn stacks_count_as_one_column_and_only_selected_tabs_are_raised() {

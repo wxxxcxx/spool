@@ -65,6 +65,10 @@ A read-only projection of a Space's retained layout containing available, visibl
 
 **Tiled Stacking Order**:
 A derived bottom-to-top request order for the currently visible active Space.
+Automatic repair only raises windows with overlapping observed rectangles on
+that display, with the confirmed focus last when repair is needed. Disjoint
+windows require no automatic AXRaise sweep; explicit layer raises still include
+the whole eligible strip. Known pending geometry defers automatic repair.
 Eligible columns farther from confirmed tiled focus are raised first; ties use
 layout order, and the focused window is raised last. Edge slivers participate.
 Each native tab group contributes only its selected tab. Hidden, minimized,

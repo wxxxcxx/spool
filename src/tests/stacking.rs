@@ -4,6 +4,21 @@ use crate::ecs::{Floating, MissionControlActive, RaiseWindow};
 use crate::events::Event;
 
 #[test]
+fn switching_nonoverlapping_windows_does_not_raise_the_previous_window() {
+    let mut harness = TestHarness::new().with_windows(2).with_focused_window(0);
+    harness.pump_frames(30);
+    harness.mock_state.take_raise_requests();
+    for id in [1, 0, 1, 0] {
+        harness.mock_state.focus_window(id);
+        harness.pump_frames(20);
+        assert!(
+            harness.mock_state.take_raise_requests().is_empty(),
+            "native focus already selected the window; no occlusion requires an AXRaise sweep"
+        );
+    }
+}
+
+#[test]
 fn background_ax_focus_events_do_not_restart_tiled_stacking() {
     let mut harness = TestHarness::new().with_windows(3).with_focused_window(2);
     harness.pump_frames(30);
@@ -42,16 +57,13 @@ fn background_ax_focus_events_do_not_restart_tiled_stacking() {
 }
 
 #[test]
-fn confirmed_tiled_focus_raises_columns_from_far_to_near() {
+fn confirmed_tiled_focus_repairs_overlapping_columns_from_far_to_near() {
     let mut harness = TestHarness::new().with_windows(5).with_focused_window(0);
     harness.pump_frames(20);
     harness.mock_state.take_raise_requests();
     harness.mock_state.focus_window(2);
     harness.pump_frames(20);
-    assert_eq!(
-        harness.mock_state.take_raise_requests(),
-        vec![0, 4, 1, 3, 2]
-    );
+    assert_eq!(harness.mock_state.take_raise_requests(), vec![4, 3, 2]);
     harness.pump_frames(20);
     assert!(harness.mock_state.take_raise_requests().is_empty());
 }
@@ -126,10 +138,7 @@ fn layout_reordering_updates_stacking_without_a_focus_change() {
     let mut strips = harness.world().query::<&mut LayoutStrip>();
     strips.single_mut(harness.world()).unwrap().swap(0, 4);
     harness.pump_frames(20);
-    assert_eq!(
-        harness.mock_state.take_raise_requests(),
-        vec![4, 0, 1, 3, 2]
-    );
+    assert_eq!(harness.mock_state.take_raise_requests(), vec![0, 3, 2]);
 }
 
 #[test]
@@ -208,10 +217,7 @@ fn mission_control_defers_stacking_until_it_closes() {
     assert!(harness.mock_state.take_raise_requests().is_empty());
     harness.world().resource_mut::<MissionControlActive>().0 = false;
     harness.pump_frames(20);
-    assert_eq!(
-        harness.mock_state.take_raise_requests(),
-        vec![4, 0, 1, 3, 2]
-    );
+    assert_eq!(harness.mock_state.take_raise_requests(), vec![0, 3, 2]);
 }
 
 #[test]
@@ -244,12 +250,16 @@ fn stacking_never_raises_another_spaces_windows() {
 fn changing_focus_updates_both_edge_priorities_without_focus_requests() {
     let mut harness = TestHarness::new().with_windows(5).with_focused_window(2);
     harness.pump_frames(20);
-    for (target, expected) in [(1, vec![4, 3, 0, 2, 1]), (3, vec![0, 1, 2, 4, 3])] {
+    // Focusing 3 first exposes the old right-edge overlap, then scrolling
+    // exposes the new left-edge overlap. Neither pass raises isolated panes.
+    for (target, expected) in [(1, vec![4, 3, 2, 1]), (3, vec![2, 4, 3, 0, 1, 4, 3])] {
         harness.mock_state.take_raise_requests();
         harness.mock_state.take_focus_requests();
         harness.mock_state.focus_window(target);
         harness.pump_frames(20);
         assert_eq!(harness.mock_state.take_raise_requests(), expected);
         assert!(harness.mock_state.take_focus_requests().is_empty());
+        harness.pump_frames(20);
+        assert!(harness.mock_state.take_raise_requests().is_empty());
     }
 }
