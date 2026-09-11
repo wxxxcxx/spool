@@ -174,6 +174,24 @@ objects stay on their owning threads.
 | `src/reader.rs` | The daemon adapter: turns authenticated local IPC requests into events. |
 | `crates/local_ipc` | The deep IPC module: singleton lock, Unix socket lifecycle, peer authentication, bounded framing, deadlines, replies, and subscriptions. |
 | `src/overlay.rs` | Logic for drawing active window borders and inactive window dimming. |
+| `src/bar/` | The native AppKit Bar: one panel per display occupying that display's menu-bar band, drawn on a menu-material blur backdrop. `layout.rs` owns the Space strip and its per-Space slots, `placement.rs` the menu-bar rect and the camera cutout, `appkit.rs` the panel, gestures and drawing. |
+| `src/bar/preferences.rs` | Bar preferences parsed from `spool.setup{ bar = … }`; the band's height is resolved from the observed menu bar, never from configuration. |
+
+### Bar presentation
+
+The Bar is not an `NSStatusItem`: macOS reserves no horizontal space for it, so
+it takes the menu bar's own rect instead — full display width, the menu bar's
+height, flush with the screen top, with no inset — and deliberately covers the
+system menu bar while expanded. Its content is drawn on an
+`NSVisualEffectView` using the menu material, so a `behindWindow` blur sits
+behind the Spaces and icons exactly as it does behind the menu bar itself.
+
+Collapse is runtime-only presentation state. `Action::ToggleBarCollapse` raises
+a one-shot `BarRequests` flag that the Bar's own schedule consumes on the next
+frame; the panel then shrinks to a capsule merged with the camera cutout, or to
+a small top-centred tab on a display without one. Nothing about it is persisted
+and every Bar starts expanded, so the collapsed state can never be restored
+into a session that did not ask for it.
 
 ## 4. Key Data Entities
 
