@@ -41,6 +41,42 @@ const DRAG_RELEASE_GRACE: Duration = Duration::from_millis(250);
 /// blink, which is what makes a hovered control feel alive.
 const BREATH_PERIOD: f64 = 1.8;
 
+/// The shape of the Bar's own collapse.
+///
+/// The content keeps `BarMotion`'s shared 240ms ease-out; this only shapes the
+/// chrome, which is the transition the eye reads as the Bar folding away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Every shape is kept: the prototype picks between them.
+enum Morph {
+    /// 240ms ease-out, the policy the rest of the Bar already follows.
+    Ease,
+    /// 320ms with a slight overshoot, the way an `AppKit` panel settles.
+    Spring,
+    /// 420ms smoothstep: no overshoot, a softer start and stop.
+    Smooth,
+}
+
+/// The morph the prototype settled on.
+const MORPH: Morph = Morph::Spring;
+
+impl Morph {
+    fn duration(self) -> f64 {
+        match self {
+            Self::Ease => motion::DURATION,
+            Self::Spring => 0.32,
+            Self::Smooth => 0.42,
+        }
+    }
+
+    fn ease(self, t: f64) -> f64 {
+        match self {
+            Self::Ease => motion::ease_out(t),
+            Self::Spring => motion::spring(t),
+            Self::Smooth => motion::smooth(t),
+        }
+    }
+}
+
 /// Which part of the pulse is animated. The animation's key is its key path, so
 /// adding and removing a pulse can never disagree about what to look for.
 const PULSE_SHADOW: &str = "shadowOpacity";
@@ -846,7 +882,7 @@ impl BarView {
             if let Some(split) = &split {
                 clip_notch(bounds, split.gap);
             }
-            set_alpha(progress);
+            set_alpha(progress.clamp(0.0, 1.0));
             self.draw_strip(&frame, drag.as_ref(), &preferences, bounds, radius);
             NSGraphicsContext::restoreGraphicsState_class();
         }
@@ -1234,13 +1270,13 @@ impl ChromeMotion {
         if !self.active {
             return false;
         }
-        let elapsed = now.saturating_duration_since(self.started).as_secs_f64() / motion::DURATION;
+        let elapsed = now.saturating_duration_since(self.started).as_secs_f64() / MORPH.duration();
         if elapsed >= 1.0 {
             self.progress = self.to;
             self.active = false;
             return true;
         }
-        self.progress = motion::lerp(self.from, self.to, motion::ease_out(elapsed));
+        self.progress = motion::lerp(self.from, self.to, MORPH.ease(elapsed));
         true
     }
 }
@@ -2537,14 +2573,18 @@ mod tests {
         assert!(chrome.advance(now), "the first frame still needs drawing");
         chrome.advance(now + Duration::from_millis(120));
         let half = chrome.progress();
-        assert!(half > 0.0 && half < 1.0, "mid-flight: {half}");
         assert!(
-            chrome.advance(now + Duration::from_millis(240)),
+            half < 1.0 && half > -0.05,
+            "mid-flight, allowing the spring's small overshoot: {half}"
+        );
+        let settled = Duration::from_secs_f64(MORPH.duration() + 0.01);
+        assert!(
+            chrome.advance(now + settled),
             "the settling frame is drawn too"
         );
         assert!((chrome.progress() - 0.0).abs() < f64::EPSILON);
         assert!(!chrome.is_active());
-        assert!(!chrome.advance(now + Duration::from_millis(260)));
+        assert!(!chrome.advance(now + settled + Duration::from_millis(20)));
 
         // Reversing mid-flight carries on from the frame on screen.
         chrome.set_target(true, now + Duration::from_millis(300));
@@ -2556,7 +2596,7 @@ mod tests {
             (chrome.progress() - flying).abs() < f64::EPSILON,
             "an interrupted morph does not jump"
         );
-        assert!(chrome.advance(now + Duration::from_millis(700)));
+        assert!(chrome.advance(now + Duration::from_secs(2)));
         assert!((chrome.progress() - 0.0).abs() < f64::EPSILON);
     }
 
@@ -2653,6 +2693,34 @@ mod tests {
                 .is_none()
         );
         assert!(!state.collapsed, "the left handle expands");
+    }
+
+    #[test]
+    fn every_morph_curve_starts_and_ends_where_it_should() {
+        for morph in [Morph::Ease, Morph::Spring, Morph::Smooth] {
+            assert!(morph.duration() > 0.0);
+            for t in [0.0, 0.5, 1.0] {
+                let value = morph.ease(t);
+                assert!(value.is_finite(), "{morph:?} at {t} is {value}");
+            }
+            assert!(
+                (morph.ease(1.0) - 1.0).abs() < f64::EPSILON,
+                "{morph:?} ends"
+            );
+            assert!(morph.ease(0.0).abs() < 1e-9, "{morph:?} starts at zero");
+            // Nothing may undershoot far enough to invert the collapsed shape.
+            let lowest = (0..=100)
+                .map(|i| morph.ease(f64::from(i) / 100.0))
+                .fold(f64::INFINITY, f64::min);
+            assert!(lowest > -0.1, "{morph:?} dips to {lowest}");
+        }
+        // Only the spring passes the target, and only slightly.
+        let peak = (0..=100)
+            .map(|i| motion::spring(f64::from(i) / 100.0))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(peak > 1.0 && peak < 1.1, "spring peaks at {peak}");
+        // Smoothstep starts slower than the ease-out it is an alternative to.
+        assert!(motion::smooth(0.25) < motion::ease_out(0.25));
     }
 
     #[test]

@@ -190,7 +190,7 @@ Collapse is runtime-only presentation state. `Action::ToggleBarCollapse` raises
 a one-shot `BarRequests` flag that the Bar's own schedule consumes on the next
 frame; the chrome then morphs to a capsule merged with the camera cutout, or to
 a small top-centred tab on a display without one. `ChromeMotion` eases that
-morph over `BarMotion`'s 240ms, but it moves no window: the panel is the
+morph over its own `MORPH` curve, but it moves no window: the panel is the
 menu-bar band for its whole life and only what is drawn inside it changes, so
 the window server never re-blurs a moving window. While collapsed the panel
 ignores mouse events except over the tab, which hands the rest of the menu bar

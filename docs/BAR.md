@@ -59,11 +59,14 @@ menus and status items, which is why the Bar takes that space instead.
   one-based numeric Space ordinal. The old `[workspace_labels]` name mapping
   is no longer supported; existing entries are ignored rather than producing
   a mixture of letters and numbers.
-- Expansion, collapse, icon movement and focus transitions share a 240ms
-  ease-out policy in `src/bar/motion.rs`. Interrupted transitions begin at the
-  last presented frame, and repeated snapshots do not restart motion. Content
-  is clipped to its Space and to the Bar's own chrome, so it wipes away with
-  the shape as the Bar collapses.
+- Expansion, icon movement and focus transitions share a 240ms ease-out policy
+  in `src/bar/motion.rs`. The collapse morph has its own `MORPH` curve — a
+  320ms spring with a four-percent overshoot by default, which is the small
+  settle an `AppKit` panel has — because it is the transition the eye reads as
+  the Bar folding away. Interrupted transitions begin at the last presented
+  frame, and repeated snapshots do not restart motion. Content is clipped to
+  its Space and to the Bar's own chrome, so it wipes away with the shape as the
+  Bar collapses.
 - Hover breathes. The toolbar button under the pointer and the collapsed Bar
   get a repeating 1.8s ease-in-out pulse — a translucent highlight under the
   button's symbol, a soft halo around the collapsed shape. Both are Core
@@ -94,7 +97,7 @@ the URL. Its vocabulary maps onto the code like this:
 | `br=bloom` / `pulse` | `BREATH` |
 | `br=heartbeat` | the pulse's two halves given different curves |
 | `period`, `amp` | `BREATH_PERIOD`, and the range passed to `breathe` |
-| `cv=ease` / `spring` / `smooth` | `motion::DURATION` and `motion::ease_out` |
+| `cv=ease` / `spring` / `smooth` | `MORPH`, with the curve in `motion::ease_out` / `spring` / `smooth` |
 - Every Space keeps a slot: the strip never scrolls, and no Space is dropped to
   make room. The focused Space takes whatever the others leave, up to its own
   content width; the rest keep the narrowest slot that still reads as that Space
