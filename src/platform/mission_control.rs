@@ -5,6 +5,7 @@ use accessibility_sys::{
 use core::ptr::NonNull;
 use objc2_app_kit::NSRunningApplication;
 use objc2_core_foundation::{CFRetained, CFString, kCFRunLoopDefaultMode};
+use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation};
 use objc2_foundation::ns_string;
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -24,55 +25,117 @@ pub(crate) enum SystemOverview {
     ShowDesktop,
 }
 
+/// `F11`, the system's default Show Desktop shortcut. The system listens for it
+/// with the secondary-fn flag, which is what an Apple keyboard sends when the
+/// function keys are not configured as standard function keys.
+const SHOW_DESKTOP_KEYCODE: u16 = 0x67;
+const SHOW_DESKTOP_FLAGS: CGEventFlags = CGEventFlags::MaskSecondaryFn;
+
+/// How one system overview is requested from macOS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverviewRequest {
+    /// Launch the Mission Control docklet with this mode argument.
+    Docklet(&'static str),
+    /// Post this key event at the HID tap.
+    Shortcut(u16, CGEventFlags),
+}
+
 impl SystemOverview {
-    fn command(self) -> std::process::Command {
-        // Direct execution of the Docklet violates macOS AMFI launch constraints.
-        // Launch Services must start the bundle; -n delivers arguments on every click.
-        let mut command = std::process::Command::new("/usr/bin/open");
-        command.args(["-n", "/System/Applications/Mission Control.app", "--args"]);
-        command.arg(match self {
-            Self::MissionControl => "0",
-            Self::ShowDesktop => "1",
-        });
-        command
+    /// The request that reaches this overview.
+    ///
+    /// The docklet reads its mode from `atoi(argv[1])` and falls back to
+    /// `com.apple.expose.awake` — Mission Control — when it has no argument.
+    /// Launch Services does not deliver `--args` to it on current macOS, so the
+    /// docklet can only ever reach Mission Control, and Show Desktop has to be
+    /// requested through the system shortcut instead. Posting an argumentless
+    /// launch for Show Desktop is what made both Bar buttons open Mission
+    /// Control.
+    fn request(self) -> OverviewRequest {
+        match self {
+            Self::MissionControl => OverviewRequest::Docklet("0"),
+            Self::ShowDesktop => {
+                OverviewRequest::Shortcut(SHOW_DESKTOP_KEYCODE, SHOW_DESKTOP_FLAGS)
+            }
+        }
     }
 
-    pub(crate) fn launch(self) -> std::io::Result<()> {
-        // Reap the helper off the UI thread; neither launching nor waiting may
-        // stall the main-thread AppKit event pump.
-        std::thread::Builder::new()
-            .name("spool-system-overview".to_owned())
-            .spawn(move || match self.command().status() {
-                Ok(status) if status.success() => {}
-                Ok(status) => warn!(overview = ?self, %status, "system overview launch request failed"),
-                Err(error) => warn!(overview = ?self, %error, "unable to submit system overview launch request"),
-            })
-            .map(|_| ())
+    /// Requests the overview.
+    ///
+    /// The docklet launch is reaped on a helper thread: neither launching nor
+    /// waiting may stall the main-thread `AppKit` event pump. Posting the shortcut
+    /// returns immediately.
+    pub(crate) fn launch(self) -> Result<()> {
+        match self.request() {
+            OverviewRequest::Docklet(argument) => std::thread::Builder::new()
+                .name("spool-system-overview".to_owned())
+                .spawn(move || match docklet_command(argument).status() {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => {
+                        warn!(overview = ?self, %status, "system overview launch request failed");
+                    }
+                    Err(error) => {
+                        warn!(overview = ?self, %error, "unable to submit system overview launch request");
+                    }
+                })
+                .map(|_| ())
+                .map_err(Error::from),
+            OverviewRequest::Shortcut(keycode, flags) => post_shortcut(keycode, flags),
+        }
     }
+}
+
+fn docklet_command(argument: &str) -> std::process::Command {
+    // Direct execution of the Docklet violates macOS AMFI launch constraints.
+    // Launch Services must start the bundle. The mode argument is sent for
+    // completeness only: the docklet's argumentless default is already Mission
+    // Control, which is the one mode it can reach.
+    let mut command = std::process::Command::new("/usr/bin/open");
+    command.args(["-n", "/System/Applications/Mission Control.app", "--args"]);
+    command.arg(argument);
+    command
+}
+
+fn post_shortcut(keycode: u16, flags: CGEventFlags) -> Result<()> {
+    for key_down in [true, false] {
+        let event = CGEvent::new_keyboard_event(None, keycode, key_down).ok_or_else(|| {
+            Error::Generic("unable to create the Show Desktop shortcut".to_string())
+        })?;
+        CGEvent::set_flags(Some(&event), flags);
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod command_tests {
-    use super::SystemOverview;
+    use super::{OverviewRequest, SystemOverview, docklet_command};
 
     #[test]
-    fn overview_actions_launch_the_app_bundle_through_launch_services() {
-        for (action, argument) in [
-            (SystemOverview::MissionControl, "0"),
-            (SystemOverview::ShowDesktop, "1"),
-        ] {
-            let command = action.command();
-            assert_eq!(command.get_program(), "/usr/bin/open");
-            assert_eq!(
-                command.get_args().collect::<Vec<_>>(),
-                vec![
-                    "-n",
-                    "/System/Applications/Mission Control.app",
-                    "--args",
-                    argument,
-                ]
-            );
-        }
+    fn mission_control_uses_the_docklet_and_show_desktop_uses_the_shortcut() {
+        assert_eq!(
+            SystemOverview::MissionControl.request(),
+            OverviewRequest::Docklet("0")
+        );
+        assert_eq!(
+            SystemOverview::ShowDesktop.request(),
+            OverviewRequest::Shortcut(0x67, objc2_core_graphics::CGEventFlags::MaskSecondaryFn),
+            "the docklet cannot be told to show the desktop, so F11 is the only request that reaches it"
+        );
+    }
+
+    #[test]
+    fn the_docklet_launch_goes_through_launch_services() {
+        let command = docklet_command("0");
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                "-n",
+                "/System/Applications/Mission Control.app",
+                "--args",
+                "0",
+            ]
+        );
     }
 }
 

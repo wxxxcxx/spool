@@ -158,13 +158,16 @@ and a notched display derives its collar from the Notch instead.
   group they lead. They also work in observe-only Space mode.
 - Both buttons dispatch the shared `Action::MissionControl` / `Action::ShowDesktop`
   through the same command handler and WindowManager API as CLI and keybindings.
-  The platform submits the system app bundle to Launch Services with `/usr/bin/open -n`
-  and the corresponding mode; it never directly executes the AMFI-restricted
-  bundle binary. No shell or synthesized keyboard shortcuts are used. The launch
-  request is reaped off the UI thread and failures are logged. Request acceptance
-  does not establish completion: Dock notifications remain authoritative for
-  overview entry/exit. Mode arguments are macOS implementation details, not a
-  public API contract.
+  Mission Control submits the system app bundle to Launch Services with
+  `/usr/bin/open -n`. That docklet reads its mode from `atoi(argv[1])` and falls
+  back to Mission Control when it has no argument, and Launch Services does not
+  deliver `--args` to it, so Show Desktop is requested by posting the system's
+  Show Desktop shortcut (`F11` with the secondary-fn flag) at the HID event tap:
+  the bundle cannot be asked for that mode. The launch request is reaped off the
+  UI thread and failures are logged. Request acceptance does not establish
+  completion: Dock notifications remain authoritative for overview entry/exit.
+  The docklet's mode argument and the shortcut binding are macOS implementation
+  details, not a public API contract.
 - Click a window icon to focus that exact window.
 - Click a collapsed Space to focus it when native Space control is available.
 - Drag any tiled icon to move its complete column. Dropping between columns
