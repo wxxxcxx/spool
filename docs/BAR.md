@@ -92,8 +92,8 @@ the URL. Its vocabulary maps onto the code like this:
 
 | Prototype | Code |
 | --- | --- |
-| `sn=sfillet` | `placement::CAPSULE_TOP_RADIUS` > 0, i.e. the top corners round inwards |
-| `sn=bottom` / `sn=shoulder` | `CAPSULE_TOP_RADIUS` = 0, with `CAPSULE_RADIUS` raised |
+| `sn=sfillet` | `placement::CAPSULE_TOP_RADIUS` > 0, i.e. concave shoulders |
+| `sn=bottom` / `sn=shoulder` | `CAPSULE_TOP_RADIUS` = 0, with `CAPSULE_BOTTOM_RADIUS` raised |
 | `sn=capsule` | a gap under the shape, i.e. `collapsed_rect` returning a `y > 0` |
 | `sp=r3` / `r5` / `capsule` | the plain tab's radii in `chrome_path`; `capsule` rounds both ends |
 | `br=bloom` / `pulse` | `BREATH` |
@@ -186,12 +186,14 @@ never written to disk and every Bar starts expanded.
 
 - Collapse a notched display and the Bar's chrome becomes a black capsule
   merged with the notch: the notch's own width plus 24pt on each side,
-  menu-bar height, opaque. Both ends of it round *inwards*, the top through
-  `CAPSULE_TOP_RADIUS` and the bottom through `CAPSULE_RADIUS`, so the capsule
-  reads as a rounded rectangle hanging from the screen edge. An earlier
-  revision flared the top corners outwards instead; that direction was wrong —
-  the corners recede, they do not spread. A small expand handle sits inside
-  each end.
+  menu-bar height, opaque. Its top corners are concave (`CAPSULE_TOP_RADIUS`,
+  12pt): the black spreads along the screen edge and narrows into the body, so
+  the wall blends into the top edge rather than meeting it at a corner. Its
+  bottom corners are convex and deliberately tighter (`CAPSULE_BOTTOM_RADIUS`,
+  8pt), which is what makes the capsule read as hanging from the edge rather
+  than as a pill lying against it. Both curves are tangent to what they meet,
+  so there is no flat run and no kink. A small expand handle sits inside each
+  end.
 - Collapse a display without a notch and it becomes a 120x6pt tab flush with
   the screen top, horizontally centred, a pill: both ends round, so it reads as
   the same rounded shape the capsule is, minus the notch. Hovering grows it to
