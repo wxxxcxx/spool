@@ -112,6 +112,21 @@ A live, accessible tracked window confirmed windowed at graceful exit. An eligib
 The graceful-exit restoration of eligible launch geometry, constrained to a currently available display. Windows without a launch snapshot also have their current geometry constrained. Oversized windows are resized to fit when the application permits; refused writes are logged and retried at most once to correct the origin. It does not alter Native Space membership, window visibility, focus, or z-order.
 _Avoid_: Exit centering
 
+**Notch**:
+The camera housing that interrupts the top edge of a built-in display. Spool
+never draws on it: it is a hole in the display, and the Bar works around it. The
+measured value is the gap between the display's two auxiliary top areas, which
+is what `notch_gap` returns and what `BarSurface::notch` carries; a display
+without one reports no gap at all.
+_Avoid_: Camera cutout, notched display (the display has a notch; the notch is
+not the display)
+
+**Notch Lane**:
+One of the two runs of Spaces either side of the Notch on a notched display.
+Both lanes hug the Notch, so the leftover space falls at the display's outer
+ends, and nothing is ever split across it.
+_Avoid_: Notch spacer, cutout lane
+
 **Native Space**:
 A macOS-managed desktop or fullscreen Space. macOS owns its lifecycle, order, visibility, and window membership.
 _Avoid_: Workspace, virtual workspace

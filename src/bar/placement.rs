@@ -2,7 +2,7 @@
 //!
 //! The Bar used to be a free-floating panel whose width and inset came from
 //! configuration. It now takes over the menu bar exactly, so placement is one
-//! rect plus the camera cutout the content has to work around.
+//! rect plus the notch the content has to work around.
 
 use super::layout::{BarSurface, Rect};
 use super::preferences::NotchSide;
@@ -34,10 +34,10 @@ pub fn panel_rect(screen: Rect, menu_height: f64) -> Rect {
     }
 }
 
-/// The drawing surface for a panel, with the camera cutout marked in
+/// The drawing surface for a panel, with the notch marked in
 /// panel-local coordinates.
 ///
-/// A display without a cutout gets a single run of Spaces; one with a cutout
+/// A display without a notch gets a single run of Spaces; one with a notch
 /// gets two lanes, one on each side of `gap`.
 #[must_use]
 pub fn surface(panel: Rect, gap: Option<Rect>, bias: NotchSide) -> BarSurface {
@@ -53,9 +53,9 @@ pub fn surface(panel: Rect, gap: Option<Rect>, bias: NotchSide) -> BarSurface {
     }
 }
 
-/// How much black capsule sits either side of the cutout when collapsed.
+/// How much black capsule sits either side of the notch when collapsed.
 pub const CAPSULE_SIDE: f64 = 24.0;
-/// The collapsed tab on a display without a cutout.
+/// The collapsed tab on a display without a notch.
 pub const PLAIN_TAB_WIDTH: f64 = 120.0;
 pub const PLAIN_TAB_HEIGHT: f64 = 6.0;
 /// Hovering the tab grows it, which is the only affordance it has.
@@ -72,7 +72,7 @@ pub const CAPSULE_TOP_RADIUS: f64 = 12.0;
 /// [`BarSurface::notch`], with the origin at the panel's top-left corner and
 /// `y` growing downwards, because a `BarView` is flipped.
 ///
-/// A display with a cutout gets a black capsule merged with it; one without
+/// A display with a notch gets a black capsule merged with it; one without
 /// gets a small top-centred tab. Either way the shape hangs from the top edge,
 /// so hovering only ever grows it downwards and never moves it.
 ///
@@ -116,7 +116,7 @@ pub fn collapsed_hover_rect(panel: (f64, f64), notch: Option<Rect>) -> Rect {
     collapsed_rect(panel, notch, true)
 }
 
-/// The physical camera cutout between the two auxiliary top areas, if the
+/// The physical notch between the two auxiliary top areas, if the
 /// display has one.
 #[must_use]
 pub fn notch_gap(left: Rect, right: Rect, menu_height: f64) -> Option<Rect> {
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cutout_is_reported_in_panel_local_coordinates() {
+    fn the_notch_is_reported_in_panel_local_coordinates() {
         let screen = screen();
         let panel = panel_rect(screen, 34.0);
         let left = Rect {
@@ -189,23 +189,23 @@ mod tests {
 
         let layout_surface = surface(panel, Some(gap), NotchSide::Balanced);
         assert!((layout_surface.width - 1470.0).abs() < f64::EPSILON);
-        let cutout = layout_surface.notch.expect("the cutout survives");
-        assert!((cutout.x - 646.0).abs() < f64::EPSILON, "panel x is 0 here");
-        assert!((cutout.height - 34.0).abs() < f64::EPSILON);
+        let notch = layout_surface.notch.expect("the notch survives");
+        assert!((notch.x - 646.0).abs() < f64::EPSILON, "panel x is 0 here");
+        assert!((notch.height - 34.0).abs() < f64::EPSILON);
 
-        // An offset panel shifts the cutout with it.
+        // An offset panel shifts the notch with it.
         let offset_panel = Rect { x: 100.0, ..panel };
-        let offset_cutout = surface(offset_panel, Some(gap), NotchSide::Balanced)
+        let offset_notch = surface(offset_panel, Some(gap), NotchSide::Balanced)
             .notch
             .unwrap();
-        assert!((offset_cutout.x - 546.0).abs() < f64::EPSILON);
+        assert!((offset_notch.x - 546.0).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn a_display_without_auxiliary_areas_has_no_cutout() {
+    fn a_display_without_auxiliary_areas_has_no_notch() {
         let menu_height = 24.0;
         assert!(notch_gap(Rect::default(), Rect::default(), menu_height).is_none());
-        // Overlapping auxiliary areas are not a cutout either.
+        // Overlapping auxiliary areas are not a notch either.
         let left = Rect {
             x: 0.0,
             y: 0.0,
@@ -219,11 +219,11 @@ mod tests {
             Some(Rect::default()),
             NotchSide::Balanced,
         );
-        assert!(zero.notch.is_none(), "a zero-width gap is not a cutout");
+        assert!(zero.notch.is_none(), "a zero-width gap is not a notch");
     }
 
     #[test]
-    fn a_collapsed_notched_bar_is_a_capsule_around_the_cutout() {
+    fn a_collapsed_notched_bar_is_a_capsule_around_the_notch() {
         let panel = (1470.0, 34.0);
         let gap = Rect {
             x: 646.0,
@@ -237,14 +237,14 @@ mod tests {
             assert!((rect.height - 34.0).abs() < f64::EPSILON);
             assert!(
                 (rect.x + rect.width / 2.0 - (gap.x + gap.width / 2.0)).abs() < f64::EPSILON,
-                "centred on the cutout"
+                "centred on the notch"
             );
             assert!(
                 (rect.y - 0.0).abs() < f64::EPSILON,
                 "flush with the panel's top edge"
             );
         }
-        // A cutout near the edge still keeps the capsule on its display.
+        // A notch near the edge still keeps the capsule on its display.
         let edge_gap = Rect {
             x: 1430.0,
             width: 40.0,
@@ -262,7 +262,7 @@ mod tests {
         assert!((hover.height - PLAIN_TAB_HOVER_HEIGHT).abs() < f64::EPSILON);
         assert!((hover.width - PLAIN_TAB_WIDTH).abs() < f64::EPSILON);
         assert_eq!(hover, collapsed_rect((1920.0, 24.0), None, true));
-        // A cutout keeps its capsule size whether or not it is hovered, so
+        // A notch keeps its capsule size whether or not it is hovered, so
         // there is nothing to grow into.
         let gap = Rect {
             x: 646.0,

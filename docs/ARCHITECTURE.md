@@ -174,7 +174,7 @@ objects stay on their owning threads.
 | `src/reader.rs` | The daemon adapter: turns authenticated local IPC requests into events. |
 | `crates/local_ipc` | The deep IPC module: singleton lock, Unix socket lifecycle, peer authentication, bounded framing, deadlines, replies, and subscriptions. |
 | `src/overlay.rs` | Logic for drawing active window borders and inactive window dimming. |
-| `src/bar/` | The native AppKit Bar: one panel per display occupying that display's menu-bar band, drawn on a menu-material blur backdrop. `layout.rs` owns the Space strip and its per-Space slots, `placement.rs` the menu-bar rect and the camera cutout, `appkit.rs` the panel, gestures and drawing. |
+| `src/bar/` | The native AppKit Bar: one panel per display occupying that display's menu-bar band, drawn on a menu-material blur backdrop. `layout.rs` owns the Space strip and its per-Space slots, `placement.rs` the menu-bar rect and the notch, `appkit.rs` the panel, gestures and drawing. |
 | `src/bar/preferences.rs` | Bar preferences parsed from `spool.setup{ bar = … }`; the band's height is resolved from the observed menu bar, never from configuration. |
 
 ### Bar presentation
@@ -188,7 +188,7 @@ behind the Spaces and icons exactly as it does behind the menu bar itself.
 
 Collapse is runtime-only presentation state. `Action::ToggleBarCollapse` raises
 a one-shot `BarRequests` flag that the Bar's own schedule consumes on the next
-frame; the chrome then morphs to a capsule merged with the camera cutout, or to
+frame; the chrome then morphs to a capsule merged with the notch, or to
 a small top-centred tab on a display without one. `ChromeMotion` eases that
 morph over its own `MORPH` curve, but it moves no window: the panel is the
 menu-bar band for its whole life and only what is drawn inside it changes, so

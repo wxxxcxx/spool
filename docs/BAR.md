@@ -11,14 +11,14 @@ the menu bar, flush with the screen top, with no inset and no rounding. It draws
 its content on a menu-material blur backdrop, so it looks like the menu bar it
 covers, and it deliberately covers the system menu bar while expanded.
 The fixed Mission Control / Show Desktop buttons and the Spaces are one group,
-and the group gathers toward the middle: a display without a camera cutout
-centres it, and a notched display puts it either side of the cutout with both
+and the group gathers toward the middle: a display without a notch
+centres it, and a notched display puts it either side of the notch with both
 halves hugging it, so the leftover whitespace falls at the outer ends and need
 not be equal. On a notched display the group is split by count, with the fixed
-buttons counting as one item, so the cutout takes the first `ceil((n + 1) / 2)`
+buttons counting as one item, so the notch takes the first `ceil((n + 1) / 2)`
 items on its left and the rest on its right; `notch_side = "left"` or
 `"right"` keeps every Space on one side instead. Spaces remain in native order
-and none is ever split across the cutout. Creation, deletion or native
+and none is ever split across the notch. Creation, deletion or native
 reordering recomputes the split; window counts and focus never do. Clipped
 content has no hit or drop targets.
 This is still a nonactivating panel, not an
@@ -30,7 +30,7 @@ menus and status items, which is why the Bar takes that space instead.
   above and below icons. Its background leaves 3pt gaps at the top and bottom,
   exposing the menu bar through the default transparent panel. Active Spaces use
   a subtle blue tint; others use neutral gray. Window icons retain their focus/drag behavior. The toolbar, inter-Space
-  gaps, and notch spacer are not Space-switch targets.
+  gaps, and the notch lanes are not Space-switch targets.
 - The visible Space is expanded. Tiled windows are grouped by layout column;
   columns run left to right. Multi-window columns use vertically overlapping
   icons inside a single fixed-height lane, so stacks never increase Bar height.
@@ -185,16 +185,16 @@ handle ignores clicks. Collapsing is runtime-only presentation state: it is
 never written to disk and every Bar starts expanded.
 
 - Collapse a notched display and the Bar's chrome becomes a black capsule
-  merged with the camera cutout: the cutout's own width plus 24pt on each side,
+  merged with the notch: the notch's own width plus 24pt on each side,
   menu-bar height, opaque. Both ends of it round *inwards*, the top through
   `CAPSULE_TOP_RADIUS` and the bottom through `CAPSULE_RADIUS`, so the capsule
   reads as a rounded rectangle hanging from the screen edge. An earlier
   revision flared the top corners outwards instead; that direction was wrong —
   the corners recede, they do not spread. A small expand handle sits inside
   each end.
-- Collapse a display without a cutout and it becomes a 120x6pt tab flush with
+- Collapse a display without a notch and it becomes a 120x6pt tab flush with
   the screen top, horizontally centred, a pill: both ends round, so it reads as
-  the same rounded shape the capsule is, minus the cutout. Hovering grows it to
+  the same rounded shape the capsule is, minus the notch. Hovering grows it to
   9pt as the click affordance, and a click anywhere on it expands the Bar
   again.
 - The **window never moves**. The panel is the menu-bar band for its whole
@@ -287,7 +287,7 @@ separate Bar config file or file polling in the renderer.
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `notch_side` | `"balanced"` | How the Space group is placed around the camera cutout. `"balanced"` splits it by count, `"left"` / `"right"` keep it on that side. |
+| `notch_side` | `"balanced"` | How the Space group is placed around the notch. `"balanced"` splits it by count, `"left"` / `"right"` keep it on that side. |
 | `icon_size` | `0` | Auto fit up to 20pt, or an explicit point size. Smaller icons stay vertically centered without reducing Bar height. |
 | `label_font_size` | `11` | Numeric label size (8-20pt); text is also bounded by its actual icon lane. |
 | `foreground_color` | `"auto"` | System appearance's label color, or an RGB/RGBA hex color for labels and toolbar symbols. |

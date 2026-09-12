@@ -849,7 +849,7 @@ impl BarView {
         );
         // The top corners round inwards once the Bar leaves the screen edge, so
         // both displays hang the same kind of rounded shape from it: a capsule
-        // with a cutout, a pill without one.
+        // with a notch, a pill without one.
         let collapsed_top = if notched {
             super::placement::CAPSULE_TOP_RADIUS
         } else {
@@ -898,7 +898,7 @@ impl BarView {
 
         if progress < 1.0 {
             // The collapsed capsule keeps an expand handle at each end; the
-            // pointer only brightens one of them. Without a cutout the tab has
+            // pointer only brightens one of them. Without a notch the tab has
             // no room for them and the whole tab is the target.
             if notched {
                 Self::draw_handles(ns_rect(chrome_rect), hover, true, 1.0 - progress);
@@ -1399,7 +1399,7 @@ fn sublayer_rect(parent: &CALayer, height: f64, rect: Rect) -> NSRect {
 /// How far a halo of this height can stretch before it leaves the band.
 ///
 /// A six-point tab has most of the menu bar to grow into; a capsule merged with
-/// the cutout fills the band already and can only brighten, not grow. A few
+/// the notch fills the band already and can only brighten, not grow. A few
 /// points is plenty either way: this is a breath, not a bounce.
 fn breath_reach(height: f64, band: f64) -> f64 {
     let room = (band - height).clamp(0.0, 3.0);

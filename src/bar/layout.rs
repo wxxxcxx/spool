@@ -9,8 +9,8 @@ use super::toolbar::TOOLBAR_WIDTH;
 
 /// Where a group of Bar items sits inside the width it was given.
 ///
-/// The two notch lanes use `End` and `Start` so both hug the camera cutout; a
-/// display without a cutout centres its single group.
+/// The two notch lanes use `End` and `Start` so both hug the notch; a
+/// display without a notch centres its single group.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BarAlign {
     Start,
@@ -126,7 +126,7 @@ impl SpaceSpan {
 pub struct BarSurface {
     pub width: f64,
     pub notch: Option<Rect>,
-    /// How the Space group is distributed around the cutout.
+    /// How the Space group is distributed around the notch.
     pub bias: NotchSide,
 }
 
@@ -189,7 +189,7 @@ mod notch_tests {
     }
 
     #[test]
-    fn a_display_without_a_cutout_centres_the_whole_group() {
+    fn a_display_without_a_notch_centres_the_whole_group() {
         let display = tests::display();
         for width in [400.0, 900.0, 1470.0] {
             let layout = BarLayout::resolve(&display, width);
@@ -214,7 +214,7 @@ mod notch_tests {
     }
 
     #[test]
-    fn notch_lanes_hug_the_cutout_and_split_by_count() {
+    fn notch_lanes_hug_the_notch_and_split_by_count() {
         let display = tests::display();
         let metrics = BarMetrics::default();
         let layout = BarLayout::resolve_surface(&display, surface(), &mut HashMap::new(), metrics);
@@ -248,12 +248,12 @@ mod notch_tests {
         assert!(
             split.gap.x - left_group >= 0.0
                 && split.gap.x - left_group <= metrics.horizontal_padding + 0.001,
-            "the left group ends against the cutout"
+            "the left group ends against the notch"
         );
         let right_group = left_edge(&right_ids, false);
         assert!(
             right_group - (split.gap.x + split.gap.width) >= -0.001,
-            "the right group starts against the cutout"
+            "the right group starts against the notch"
         );
     }
 
@@ -517,7 +517,7 @@ impl BarLayout {
             spaces: right_spaces,
             ..display.clone()
         };
-        // Both lanes hug the camera cutout: the left group is right-aligned
+        // Both lanes hug the notch: the left group is right-aligned
         // inside its lane, the right group left-aligned in its own.
         let mut a = Self::resolve_with_metrics(&left, gap.x, space_scroll, metrics, BarAlign::End);
         let right_x = gap.x + gap.width;
