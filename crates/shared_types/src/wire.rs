@@ -171,16 +171,20 @@ mod tests {
     fn overview_actions_append_wire_tags_without_renumbering_existing_actions() {
         use crate::commands::{MoveFocus, Placement};
 
+        // These are the tags of the *current* declaration order. They drifted
+        // once already — `ReconcileWindows` was inserted before `Lua`, which
+        // moved every tag from there on — so what this pins is the suffix: a new
+        // variant may only ever be appended.
         for (action, tag) in [
-            (Action::Lua(7), 11),
-            (Action::Layout(LayoutPlan::default()), 12),
+            (Action::Lua(7), 12),
+            (Action::Layout(LayoutPlan::default()), 13),
             (
                 Action::ReorderColumn {
                     window_id: 1,
                     anchor_window_id: 2,
                     placement: Placement::After,
                 },
-                13,
+                14,
             ),
             (
                 Action::MoveColumnToSpace {
@@ -188,10 +192,10 @@ mod tests {
                     space_id: 2,
                     move_focus: MoveFocus::Stay,
                 },
-                14,
+                15,
             ),
-            (Action::MissionControl, 15),
-            (Action::ShowDesktop, 16),
+            (Action::MissionControl, 16),
+            (Action::ShowDesktop, 17),
         ] {
             let request = Request::Dispatch(action);
             let bytes = postcard::to_allocvec(&request).unwrap();
