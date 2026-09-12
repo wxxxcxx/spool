@@ -105,11 +105,17 @@ impl BarDrag {
         )
     }
 
+    /// Whether the gesture still describes a window that is where it was.
+    ///
+    /// The Space a drag starts in does not have to be the one macOS is showing:
+    /// with `bar.collapse_inactive_spaces` off every Space draws its windows, so
+    /// a drag can start in any of them. Whether a Space's icons are live is
+    /// decided where the gesture begins (`BarView::press_at`), not here.
     pub fn is_valid(&self, display: &BarDisplay) -> bool {
         let Some(space) = display
             .spaces
             .iter()
-            .find(|space| space.id == self.space_id && space.visible)
+            .find(|space| space.id == self.space_id)
         else {
             return false;
         };
@@ -296,10 +302,22 @@ impl BarDrag {
         }
     }
 
-    pub fn action(&self) -> Option<Action> {
+    /// The action a release means: a click focuses, a drag moves.
+    ///
+    /// `source_visible` says whether the Space the drag started in is the one
+    /// macOS is showing. Focusing a window anywhere else means going to it
+    /// first, which cannot be expressed by [`Action::FocusWindow`] alone.
+    pub fn action(&self, source_visible: bool) -> Option<Action> {
         if !self.active {
-            return Some(Action::FocusWindow {
-                window_id: self.window_id,
+            return Some(if source_visible {
+                Action::FocusWindow {
+                    window_id: self.window_id,
+                }
+            } else {
+                Action::FocusWindowInSpace {
+                    window_id: self.window_id,
+                    space_id: self.space_id,
+                }
             });
         }
         match self.target? {
@@ -477,7 +495,7 @@ mod tests {
                 drag.target.is_none(),
                 "pointer at {x} must not keep a target"
             );
-            assert!(drag.action().is_none());
+            assert!(drag.action(true).is_none());
         }
     }
 
@@ -516,7 +534,7 @@ mod tests {
             assert_eq!(drag.target, expected);
         }
         assert!(matches!(
-            drag.action(),
+            drag.action(true),
             Some(Action::ReorderColumn {
                 window_id: 1,
                 anchor_window_id: 3,
@@ -552,7 +570,7 @@ mod tests {
         assert!(!display.spaces[0].visible);
         assert!(display.spaces[0].columns.is_empty());
         assert!(matches!(
-            drag.action(),
+            drag.action(true),
             Some(Action::MoveColumnToSpace {
                 window_id: 1,
                 space_id: 10,
@@ -571,14 +589,35 @@ mod tests {
             drag.update_target(&display, &layout, &frame, allowed);
             assert_eq!(drag.target, None);
             assert_eq!(drag.preview_display(&display), display);
-            assert!(drag.action().is_none());
+            assert!(drag.action(true).is_none());
         }
         drag.target = Some(DropTarget::Space(10));
         drag.move_pointer((50.0, 200.0));
         drag.update_target(&display, &layout, &frame, true);
         assert_eq!(drag.target, None);
         assert_eq!(drag.preview_display(&display), display);
-        assert!(drag.action().is_none());
+        assert!(drag.action(true).is_none());
+    }
+
+    #[test]
+    fn a_click_asks_to_go_to_the_window_when_its_space_is_not_up() {
+        let (_, _, mut drag) = setup();
+        drag.active = false;
+        assert_eq!(
+            drag.action(true),
+            Some(Action::FocusWindow {
+                window_id: drag.window_id
+            }),
+            "on the visible Space a click is just a focus"
+        );
+        assert_eq!(
+            drag.action(false),
+            Some(Action::FocusWindowInSpace {
+                window_id: drag.window_id,
+                space_id: drag.space_id,
+            }),
+            "anywhere else it has to say which Space to go to"
+        );
     }
 
     #[test]
@@ -590,9 +629,11 @@ mod tests {
         closed.spaces[1].columns[0].windows.pop();
         assert!(!drag.is_valid(&closed));
         assert_eq!(drag.preview_display(&closed), closed);
+        // The Space the gesture started in stops being the visible one: that is
+        // no longer fatal — only the window leaving the Space is.
         let mut switched = display.clone();
         switched.spaces[1].visible = false;
-        assert!(!drag.is_valid(&switched));
+        assert!(drag.is_valid(&switched));
         let mut removed_target = display.clone();
         removed_target.spaces.remove(0);
         assert!(!drag.target_valid(&removed_target));
@@ -644,7 +685,7 @@ mod tests {
         assert_eq!(preview.spaces[0].floating[0].id, 4);
         assert!(preview.spaces[0].columns.is_empty());
         assert!(matches!(
-            drag.action(),
+            drag.action(true),
             Some(Action::MoveWindowToSpace {
                 window_id: 4,
                 space_id: 10,
@@ -689,13 +730,13 @@ mod tests {
         assert!(!drag.active);
         assert_eq!(drag.preview_display(&display), display);
         assert!(matches!(
-            drag.action(),
+            drag.action(true),
             Some(Action::FocusWindow { window_id: 1 })
         ));
         display.spaces[1].kind = SpaceKind::Fullscreen;
         assert!(drag.is_valid(&display));
         assert!(matches!(
-            drag.action(),
+            drag.action(true),
             Some(Action::FocusWindow { window_id: 1 })
         ));
     }

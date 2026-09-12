@@ -935,6 +935,125 @@ fn native_move_ax_timeout_retains_hidden_reassignment_until_membership_audit() {
 }
 
 #[test]
+fn focusing_a_window_in_another_space_goes_there_first() {
+    let (mut harness, _, _) = column_harness();
+    // Park the column in the other Space without following it there, so the
+    // only thing that can focus window 0 is the request under test.
+    submit(&mut harness, MoveFocus::Stay);
+    reconcile(&mut harness);
+    harness.mock_state.take_focus_requests();
+    let intents = harness.mock_state.native_space_intents().len();
+
+    dispatch_action(
+        &mut harness,
+        Action::FocusWindowInSpace {
+            window_id: 0,
+            space_id: TARGET,
+        },
+    );
+    assert_eq!(
+        harness.mock_state.native_space_intents().len(),
+        intents + 1,
+        "the Space switch is submitted straight away"
+    );
+    assert!(
+        harness.mock_state.take_focus_requests().is_empty(),
+        "the window is not focused before its Space is up"
+    );
+
+    mark_target_visible(&mut harness);
+    refresh_native_observation(&mut harness);
+    reconcile(&mut harness);
+    assert_eq!(
+        harness.mock_state.take_focus_requests(),
+        vec![0],
+        "and then it is focused"
+    );
+}
+
+#[test]
+fn focusing_a_withdrawn_window_in_another_space_still_goes_there() {
+    let (mut harness, _, _) = column_harness();
+    // Park the column in the other Space without following it there, so the
+    // only thing that can switch is the request under test.
+    submit(&mut harness, MoveFocus::Stay);
+    reconcile(&mut harness);
+    harness.mock_state.take_focus_requests();
+    let intents = harness.mock_state.native_space_intents().len();
+
+    // macOS withdraws the AX surface of every window in a Space it is not
+    // showing. That is the normal state of the windows a Bar icon for another
+    // Space points at, so the request must not depend on seeing the window: the
+    // Space switch is all the user asked for, and the focus can wait for it.
+    harness.mock_state.os_withdraw_window(0);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(2);
+    let withdrawn = find_window_entity(0, harness.world());
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::reconcile::WindowUnavailable>(withdrawn)
+            .is_some(),
+        "the fixture must model the withdrawn window a hidden Space holds"
+    );
+
+    dispatch_action(
+        &mut harness,
+        Action::FocusWindowInSpace {
+            window_id: 0,
+            space_id: TARGET,
+        },
+    );
+    assert_eq!(
+        harness.mock_state.native_space_intents().len(),
+        intents + 1,
+        "the Space switch is submitted for a window whose surface is withdrawn"
+    );
+    assert!(
+        harness.mock_state.take_focus_requests().is_empty(),
+        "the window is not focused before its Space is up"
+    );
+
+    // Its Space comes up and macOS exposes the window again.
+    harness.mock_state.os_restore_withdrawn_window(0);
+    mark_target_visible(&mut harness);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(5);
+    refresh_native_observation(&mut harness);
+    reconcile(&mut harness);
+    assert_eq!(
+        harness.mock_state.take_focus_requests(),
+        vec![0],
+        "and then the window it was aimed at is focused"
+    );
+}
+
+#[test]
+fn focusing_a_window_that_is_no_longer_in_that_space_is_refused() {
+    let (mut harness, _, _) = column_harness();
+    let intents = harness.mock_state.native_space_intents().len();
+    // Window 0 is in the Space macOS is showing, not in TARGET: the request is
+    // stale, and switching the user to an empty Space on the strength of it
+    // would be worse than doing nothing.
+    dispatch_action(
+        &mut harness,
+        Action::FocusWindowInSpace {
+            window_id: 0,
+            space_id: TARGET,
+        },
+    );
+    assert_eq!(
+        harness.mock_state.native_space_intents().len(),
+        intents,
+        "no switch for a window that is not there"
+    );
+    mark_target_visible(&mut harness);
+    refresh_native_observation(&mut harness);
+    reconcile(&mut harness);
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
 fn native_move_follow_requires_observed_visibility_not_a_retained_marker() {
     for visibility in [Err(()), Ok(TEST_WORKSPACE_ID)] {
         let (mut harness, _, _) = column_harness();

@@ -250,6 +250,20 @@ fn space_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     };
     space.set("focus", focus)?;
 
+    let focus_window = {
+        let dispatch = Rc::clone(dispatch);
+        lua.create_function(move |lua, opts: Table| {
+            dispatch(
+                lua,
+                Action::FocusWindowInSpace {
+                    window_id: opts.get("window_id")?,
+                    space_id: opts.get("space_id")?,
+                },
+            )
+        })?
+    };
+    space.set("focus_window", focus_window)?;
+
     let move_window = {
         let dispatch = Rc::clone(dispatch);
         lua.create_function(move |lua, opts: Table| {

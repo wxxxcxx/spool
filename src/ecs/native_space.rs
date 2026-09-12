@@ -448,6 +448,52 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
         commands.run_system_cached_with(focus_window_command, (*window_id, policy));
         return;
     }
+    if let Action::FocusWindowInSpace {
+        window_id,
+        space_id,
+    } = action
+    {
+        // A window in a Space macOS is not showing has its AX surface withdrawn,
+        // so it is suspended rather than gone: `find` only answers for live
+        // surfaces, and refusing here would refuse exactly the case this action
+        // exists for. The identity lookup still knows it, which is all the Space
+        // switch needs; the follow waits for the surface to come back.
+        let Some((window, entity)) = windows.find_any(*window_id) else {
+            warn!(window_id, "window is not tracked");
+            return;
+        };
+        // The Bar drew this icon from a snapshot, so the window may have moved
+        // since. Refuse rather than switch to a Space the window is no longer
+        // in: an unasked-for Space switch is worse than nothing happening.
+        if let Ok(memberships) = topology.observe_memberships(&window_manager)
+            && let Some(observed) = memberships.unique_space(*window_id)
+            && observed != *space_id
+        {
+            warn!(
+                window_id,
+                space_id, observed, "window is no longer in the Space it was drawn in"
+            );
+            return;
+        }
+        let member = MoveWindowIdentity {
+            window_id: *window_id,
+            entity,
+            incarnation: window.incarnation(),
+        };
+        // Repeat clicks replace the pending focus instead of stacking follows.
+        transactions.cancel_follows_for(&[*window_id]);
+        if let Some(pending) =
+            PendingFollow::submit(member, *space_id, &window_manager, &config, time.elapsed())
+        {
+            transactions.follows.push(pending);
+        } else {
+            warn!(
+                window_id,
+                space_id, "unable to switch to that Space to focus the window"
+            );
+        }
+        return;
+    }
     let move_request = match action {
         Action::MoveWindowToSpace {
             window_id,

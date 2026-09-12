@@ -260,6 +260,7 @@ integrations should use `action`.
 | `window move-to-space <window-id> <space-id> stay` | Experimentally move a window to a user Space |
 | `window move-to-space <window-id> <space-id> follow` | Move a window, switch to its Space, and focus it after reconciliation |
 | `space focus <space-id>` | Focus a Space when the runtime reports support |
+| `window focus-in-space <window-id> <space-id>` | Focus a window, switching to its Space first when that is not the one on screen |
 | `space create <display-id>` / `space delete <space-id>` | Space lifecycle actions when supported |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
@@ -310,6 +311,9 @@ $ spool action window move-to-space 321 42 stay
 
 # Move that window, switch to its Space, and focus it.
 $ spool action window move-to-space 321 42 follow
+
+# Focus a window that lives on another Space: switch there, then focus it.
+$ spool action window focus-in-space 321 42
 
 # Focus a stable Space ID on the active display.
 $ spool action space focus 42

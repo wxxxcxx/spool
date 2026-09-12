@@ -249,7 +249,7 @@ mod tests {
             space.windows().map(|window| window.id).collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
-        let layout = BarLayout::resolve(&state.displays[0], 1200.0);
+        let layout = crate::bar::layout::tests::collapsed_layout(&state.displays[0], 1200.0);
         assert_eq!(
             layout
                 .items
@@ -707,7 +707,7 @@ mod tests {
         assert_eq!(space.kind, spool_shared_types::state::SpaceKind::Fullscreen);
         assert_eq!(space.visible, visible);
         assert_eq!(space.windows().map(|w| w.id).collect::<Vec<_>>(), vec![10]);
-        let layout = BarLayout::resolve(&state.displays[0], 1200.0);
+        let layout = crate::bar::layout::tests::collapsed_layout(&state.displays[0], 1200.0);
         assert_eq!(
             layout
                 .items

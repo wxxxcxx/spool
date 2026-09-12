@@ -196,6 +196,13 @@ mod tests {
             ),
             (Action::MissionControl, 16),
             (Action::ShowDesktop, 17),
+            (
+                Action::FocusWindowInSpace {
+                    window_id: 1,
+                    space_id: 2,
+                },
+                18,
+            ),
         ] {
             let request = Request::Dispatch(action);
             let bytes = postcard::to_allocvec(&request).unwrap();

@@ -48,6 +48,9 @@ pub struct BarPreferences {
     pub handle_height: f64,
     /// The Bar Handle's bottom corners. Its top edge never rounds.
     pub handle_radius: f64,
+    /// Collapse the Spaces macOS is not showing into a compact deck. Off by
+    /// default: every Space shows what it holds.
+    pub collapse_inactive_spaces: bool,
 }
 
 impl Default for BarPreferences {
@@ -78,6 +81,7 @@ impl Default for BarPreferences {
             show_desktop: true,
             handle_height: super::placement::HandleMetrics::DEFAULT.height,
             handle_radius: super::placement::HandleMetrics::DEFAULT.radius,
+            collapse_inactive_spaces: false,
         }
     }
 }
@@ -156,6 +160,7 @@ impl BarPreferences {
             },
             collapsed_width: 38.0,
             toolbar_width: self.toolbar_width(),
+            collapse_inactive_spaces: self.collapse_inactive_spaces,
         }
     }
 
@@ -263,6 +268,20 @@ mod tests {
         assert_eq!(BarPreferences::workspace_label(0), "1");
         assert_eq!(BarPreferences::workspace_label(9), "10");
         assert_eq!(BarPreferences::workspace_label(u32::MAX), "4294967296");
+    }
+
+    #[test]
+    fn inactive_spaces_show_their_windows_unless_collapsing_is_asked_for() {
+        let default = BarPreferences::default();
+        assert!(
+            !default.collapse_inactive_spaces,
+            "the compact deck is opt-in"
+        );
+        assert!(!default.metrics().collapse_inactive_spaces);
+        let collapsed: BarPreferences =
+            serde_json::from_str(r#"{"collapse_inactive_spaces": true}"#).unwrap();
+        assert!(collapsed.collapse_inactive_spaces);
+        assert!(collapsed.metrics().collapse_inactive_spaces);
     }
 
     #[test]

@@ -569,11 +569,12 @@ mod tests {
     fn stack_collapse_and_interrupted_expansion_converge_to_target_geometry() {
         let now = Instant::now();
         let mut display = crate::bar::layout::tests::display();
-        let expanded = BarLayout::resolve(&display, 1200.0);
+        // This test is about the deck: collapsing inactive Spaces is opt-in.
+        let expanded = crate::bar::layout::tests::collapsed_layout(&display, 1200.0);
         let mut motion = BarMotion::new(&expanded, now);
         let original = motion.presented.clone();
         display.spaces[1].visible = false;
-        let collapsed = BarLayout::resolve(&display, 1200.0);
+        let collapsed = crate::bar::layout::tests::collapsed_layout(&display, 1200.0);
         let target = Presentation::from_layout(&collapsed);
         motion.retarget(&collapsed, now);
         for millis in [0, 30, 70, 120, 240] {

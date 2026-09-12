@@ -68,7 +68,14 @@ grew. Its frame never moves.
   paints last, above its siblings, without changing layout/window order.
 - Floating windows appear after the tiled columns with an overlapping-window
   symbol badge.
-- Other Spaces show up to four application icons as a compact deck, with at
+- By default every Space shows its columns at the width those columns need,
+  whether or not macOS is showing it: the Space you are on is where focus and the
+  newest layout live, but the others stay just as readable — none of their icons
+  are traded away for a narrower slot — and a window in one can be clicked or
+  dragged like any other (see Interaction). Set
+  `bar.collapse_inactive_spaces = true` to shrink the Spaces you are not on into
+  a compact deck instead.
+- A collapsed Space shows up to four application icons as a compact deck, with at
   least 5px exposed edges, without added backing plates or icon outlines. The first
   window in layout order is the front card; rendering proceeds back to front.
   All collapsed icons use the normal icon size and share one horizontal lane,
@@ -133,9 +140,12 @@ height). The width is not configurable: 64pt is the width the prototype picked,
 and a notched display derives its collar from the Notch instead.
 - Every Space keeps a slot: the strip never scrolls, and no Space is dropped to
   make room. The focused Space takes whatever the others leave, up to its own
-  content width; the rest keep the narrowest slot that still reads as that Space
-  (a collapsed Space keeps its whole deck, an expanded one its label and one
-  icon). When even those minimums do not fit, every Space takes an equal share.
+  content width; the rest keep the width what they show needs — a collapsed Space
+  its whole deck, a Space drawing its columns every column's width — so not
+  collapsing a Space never costs it an icon. The Space macOS is showing is the one
+  with a floor of a label and one icon, because it is the one that can scroll
+  without hiding something the user asked to see. When even those widths do not
+  fit, every Space takes an equal share.
 - A Space whose icons do not fit its slot scrolls inside the slot: the icons
   slide under the label, the label and the slot stay where they are, and
   scrolling one Space never moves another. Scrolling is bound to the Space under
@@ -167,14 +177,29 @@ and a notched display derives its collar from the Notch instead.
   UI thread and failures are logged. Request acceptance does not establish
   completion: Dock notifications remain authoritative for overview entry/exit.
   The docklet's mode argument and the shortcut binding are macOS implementation
-  details, not a public API contract.
-- Click a window icon to focus that exact window.
-- Click a collapsed Space to focus it when native Space control is available.
-- Drag any tiled icon to move its complete column. Dropping between columns
-  reorders the column; dropping on another user Space moves the whole column
-  while preserving stack/tab structure and member order.
-- Drag a floating icon within the current Space to reorder the floating icon
-  lane. Drop it on another user Space to move that window alone.
+  The platform submits the system app bundle to Launch Services with `/usr/bin/open -n`
+  and the corresponding mode; it never directly executes the AMFI-restricted
+  bundle binary. No shell or synthesized keyboard shortcuts are used. The launch
+  request is reaped off the UI thread and failures are logged. Request acceptance
+  does not establish completion: Dock notifications remain authoritative for
+  overview entry/exit. Mode arguments are macOS implementation details, not a
+  public API contract.
+- Click a window icon to focus that exact window. A window in a Space macOS is
+  not showing is focused by going to it: the Space switch is submitted first and
+  the window is focused once its Space is up, because focusing a window whose
+  Space is not on screen does not stick. Both halves are one command,
+  `window focus-in-space <window-id> <space-id>`, so a keybinding or script can
+  ask for the same thing.
+- A request for a window that has since moved to another Space is refused rather
+  than obeyed: an unasked-for Space switch is worse than nothing happening.
+- Click a collapsed Space to focus it when native Space control is available: a
+  deck shows what is in a Space, it is not a set of separate targets.
+- Drag any tiled icon to move its complete column, from any Space that draws its
+  windows. Dropping between columns reorders the column; dropping on another user
+  Space moves the whole column while preserving stack/tab structure and member
+  order.
+- Drag a floating icon within its Space to reorder the floating icon lane. Drop
+  it on another user Space to move that window alone.
 - After a 4px drag threshold, a translucent application-icon preview follows
   the pointer with its original grab offset. Tiled columns keep every member's
   overlapping geometry and paint order; floating windows preview individually.
@@ -322,6 +347,10 @@ spool.setup {
     handle_height = 5, -- pt the handle hangs below the Bar (4-24); also the
                        -- collapsed collar's reach past a notch.
     handle_radius = 2.5, -- handle's bottom corners (0 to handle_height).
+    collapse_inactive_spaces = false, -- false keeps Spaces you are not on at the
+                                      -- width their columns need (one icon per
+                                      -- window); true shrinks them into a compact
+                                      -- deck of up to four icons instead.
   },
 }
 ```
@@ -344,6 +373,7 @@ separate Bar config file or file polling in the renderer.
 | `show_desktop` | `true` | Show the Show Desktop button. Hidden buttons release their width. |
 | `handle_height` | `5` | Point size the Bar Handle hangs below the Bar (4-24pt). On a notched display it is also how far the collapsed collar reaches past the Notch, and it always sets how much taller than the band the panel window is. |
 | `handle_radius` | `2.5` | The handle's bottom corners, 0 to `handle_height`. Above half the height the sides vanish and the bottom reads as a pill. Its top edge never rounds. |
+| `collapse_inactive_spaces` | `false` | `true` shrinks the Spaces macOS is not showing into a compact deck of up to four icons each. `false` draws every Space's columns, each at the width it needs, so no icon of an inactive Space is traded away for a narrower slot and a window in any of them can be clicked or dragged. |
 
 The Bar is the menu bar band: it is exactly as wide and as tall as the menu bar
 on each display, so the band's own geometry is not configurable. The handle is

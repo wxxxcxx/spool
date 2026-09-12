@@ -73,6 +73,11 @@ pub struct BarMetrics {
     pub horizontal_padding: f64,
     pub label_width: f64,
     pub collapsed_width: f64,
+    /// Whether Spaces macOS is not showing are drawn as a compact deck instead
+    /// of showing their columns. See [`BarPreferences::collapse_inactive_spaces`].
+    ///
+    /// [`BarPreferences::collapse_inactive_spaces`]: super::preferences::BarPreferences::collapse_inactive_spaces
+    pub collapse_inactive_spaces: bool,
 }
 
 impl Default for BarMetrics {
@@ -86,6 +91,7 @@ impl Default for BarMetrics {
             horizontal_padding: 6.0,
             label_width: 24.0,
             collapsed_width: 38.0,
+            collapse_inactive_spaces: false,
         }
     }
 }
@@ -717,13 +723,30 @@ fn allocate_space_widths(
     vec![share; spaces.len()]
 }
 
-/// The narrowest a Space may be while still showing what it is: a collapsed
-/// Space keeps its whole deck, an expanded one keeps its label and one icon.
+/// Whether a Space is drawn showing its columns.
+///
+/// The Space macOS is showing always is. The rest are, unless the user asked for
+/// the compact deck — which is the one switch that decides it, so the width
+/// minimums, the placements and the hit targets can never disagree about which
+/// Spaces are open.
+fn shows_columns(space: &BarSpace, metrics: &BarMetrics) -> bool {
+    space.visible || !metrics.collapse_inactive_spaces
+}
+
+/// The narrowest a Space may be while still showing what it is.
+///
+/// A Space drawn as a deck keeps that whole deck, and a Space drawn as columns
+/// keeps the width every one of those columns needs. Showing an inactive Space's
+/// columns is only worth anything if all of them are readable: a lane narrower
+/// than they need shows one icon and hides the rest behind a scroll, which is a
+/// worse collapse than the deck it replaced. Only the Space macOS is showing
+/// keeps the tighter floor of a label and one icon, because it is the one that
+/// can be scrolled without hiding anything the user asked to see.
 fn space_min_width(space: &BarSpace, metrics: &BarMetrics) -> f64 {
-    if !space.visible {
-        return space_width(space, metrics);
+    if space.visible && shows_columns(space, metrics) {
+        return label_extent(metrics) + 6.0 + metrics.icon_size;
     }
-    label_extent(metrics) + 6.0 + metrics.icon_size
+    space_width(space, metrics)
 }
 
 /// One Space's fixed parts and its scrolling icons.
@@ -763,7 +786,7 @@ fn place_space_content(
             kind: ItemKind::Placeholder { space_id: space.id },
         });
     }
-    if space.visible {
+    if shows_columns(space, metrics) {
         place_expanded(space, scrolled, metrics, items);
     } else {
         place_collapsed(space, scrolled, metrics, items);
@@ -771,7 +794,7 @@ fn place_space_content(
 }
 
 fn space_width(space: &BarSpace, metrics: &BarMetrics) -> f64 {
-    if !space.visible {
+    if !shows_columns(space, metrics) {
         let deck = collapsed_deck(space);
         let deck = deck
             .last()
@@ -1084,9 +1107,160 @@ pub(super) mod tests {
         assert!(windows[&4].x > windows[&3].x);
     }
 
+    /// The metrics a deck test needs: collapsing the Spaces macOS is not showing
+    /// is `bar.collapse_inactive_spaces`, and off by default.
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "test geometry, rounded to a tenth so equal rows compare equal"
+    )]
+    fn inactive_spaces_show_their_columns_unless_told_otherwise() {
+        let display = {
+            let mut display = display();
+            display.spaces[1].visible = false;
+            display
+        };
+        let expanded = BarLayout::resolve(&display, 1200.0);
+        let collapsed = collapsed_layout(&display, 1200.0);
+
+        // The fullscreen Space is inactive and holds a stack of three. Expanded
+        // it stacks them vertically in one column; collapsed it lays the same
+        // members out in a single lane with a bit of each exposed.
+        let inactive = display.spaces[2].id;
+        let rows = |layout: &BarLayout| {
+            let mut ys = layout
+                .items
+                .iter()
+                .filter_map(|item| match item.kind {
+                    ItemKind::Window { space_id, .. } if space_id == inactive => {
+                        Some((item.rect.y * 10.0).round() as i64)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            ys.sort_unstable();
+            ys.dedup();
+            ys.len()
+        };
+        assert!(rows(&expanded) > rows(&collapsed), "stacked vs one lane");
+        assert!(expanded.items.iter().any(|item| matches!(
+            item.kind,
+            ItemKind::Window {
+                space_id,
+                collapsed: false,
+                ..
+            } if space_id == inactive
+        )));
+        assert!(collapsed.items.iter().any(|item| matches!(
+            item.kind,
+            ItemKind::Window {
+                space_id,
+                collapsed: true,
+                ..
+            } if space_id == inactive
+        )));
+
+        // Not collapsing a Space is about its width: an inactive Space that draws
+        // its columns keeps every column's width, so all of them stay readable.
+        // Only the Space macOS is showing keeps the tighter floor of a label and
+        // one icon, because it is the one that can scroll without hiding
+        // something the user asked to see; a deck is one narrow lane instead.
+        let metrics = BarMetrics::default();
+        let mut on_now = display.spaces[2].clone();
+        on_now.visible = true;
+        assert!(
+            (space_min_width(&on_now, &metrics)
+                - (label_extent(&metrics) + 6.0 + metrics.icon_size))
+                .abs()
+                < f64::EPSILON,
+            "the Space you are on may shrink to a label and one icon"
+        );
+        for inactive in [&display.spaces[1], &display.spaces[2]] {
+            assert!(
+                space_min_width(inactive, &metrics) >= space_width(inactive, &metrics) - 0.001,
+                "an inactive Space that draws its columns keeps the width they need"
+            );
+        }
+        assert!(
+            (space_min_width(&display.spaces[2], &collapsed_metrics())
+                - space_width(&display.spaces[2], &collapsed_metrics()))
+            .abs()
+                < f64::EPSILON,
+            "a deck is one narrow lane carrying the whole deck"
+        );
+    }
+
+    #[test]
+    fn an_inactive_space_keeps_the_whole_width_its_columns_need() {
+        // Space 10 is the one macOS is showing; 11 and 12 are not. Both of them
+        // draw their columns, so both must be laid out at the width those
+        // columns need — not squeezed to a single icon.
+        let mut display = display();
+        display.spaces[0].visible = true;
+        display.spaces[0].focused = true;
+        display.spaces[1].visible = false;
+        display.spaces[1].focused = false;
+        let layout = BarLayout::resolve_with_metrics(
+            &display,
+            1920.0,
+            &mut HashMap::new(),
+            BarMetrics::default(),
+            BarAlign::Center,
+        );
+        let span = layout
+            .spans
+            .iter()
+            .find(|span| span.space_id == 11)
+            .expect("every Space keeps a slot");
+        assert!(
+            span.rect.width >= span.content_width - 0.001,
+            "an inactive Space keeps its expanded width: lane {:.1}, content {:.1}",
+            span.rect.width,
+            span.content_width
+        );
+        assert!(
+            layout.max_space_scroll(11).abs() < f64::EPSILON,
+            "nothing of an inactive Space may be hidden behind a scroll"
+        );
+        // Its two columns (a stack of two and a single) and its floating window
+        // are all inside the lane, so all of them are readable and clickable.
+        let drawn = layout
+            .items
+            .iter()
+            .filter(|item| matches!(item.kind, ItemKind::Window { space_id: 11, .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(drawn.len(), 4, "every window of the Space is drawn");
+        for item in drawn {
+            assert!(
+                item.rect.x >= span.rect.x - 0.001
+                    && item.rect.x + item.rect.width <= span.rect.x + span.rect.width + 0.001,
+                "icon {:?} sits inside its Space's lane {:?}",
+                item.rect,
+                span.rect
+            );
+        }
+    }
+
+    pub(crate) fn collapsed_metrics() -> BarMetrics {
+        BarMetrics {
+            collapse_inactive_spaces: true,
+            ..BarMetrics::default()
+        }
+    }
+
+    pub(crate) fn collapsed_layout(display: &BarDisplay, width: f64) -> BarLayout {
+        BarLayout::resolve_with_metrics(
+            display,
+            width,
+            &mut HashMap::new(),
+            collapsed_metrics(),
+            BarAlign::Center,
+        )
+    }
+
     #[test]
     fn collapsed_space_keeps_a_bounded_ordered_icon_deck() {
-        let layout = BarLayout::resolve(&display(), 1200.0);
+        let layout = collapsed_layout(&display(), 1200.0);
         let deck = layout
             .items
             .iter()
@@ -1128,7 +1302,7 @@ pub(super) mod tests {
         for icon_size in [12.0, 20.0, 32.0] {
             let metrics = BarMetrics {
                 icon_size,
-                ..BarMetrics::default()
+                ..collapsed_metrics()
             };
             let mut display = display();
             display.spaces[1].visible = false;
@@ -1435,7 +1609,7 @@ pub(super) mod tests {
 
     #[test]
     fn collapsed_deck_exposes_at_least_five_pixels_per_layer_in_paint_order() {
-        let layout = BarLayout::resolve(&display(), 1200.0);
+        let layout = collapsed_layout(&display(), 1200.0);
         let deck = layout
             .items
             .iter()
@@ -1477,7 +1651,7 @@ pub(super) mod tests {
 
     #[test]
     fn every_deck_layer_has_visible_pixels_after_later_cards_are_painted() {
-        let layout = BarLayout::resolve(&display(), 1200.0);
+        let layout = collapsed_layout(&display(), 1200.0);
         let deck = layout
             .items
             .iter()

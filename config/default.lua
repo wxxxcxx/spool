@@ -37,6 +37,10 @@ spool.setup {
     handle_height = 5, -- pt the handle hangs below the Bar (4-24); also the
                        -- collapsed collar's reach past a notch.
     handle_radius = 2.5, -- handle's bottom corners (0 to handle_height).
+    collapse_inactive_spaces = false, -- false keeps Spaces you are not on at the
+                                      -- width their columns need (one icon per
+                                      -- window); true shrinks them into a compact
+                                      -- deck of up to four icons instead.
   },
 }
 

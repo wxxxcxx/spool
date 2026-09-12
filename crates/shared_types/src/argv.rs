@@ -78,6 +78,10 @@ fn parse_window_action(argv: &[&str]) -> Result<Action> {
         "focusid" if argv.len() == 2 => Ok(Action::FocusWindow {
             window_id: parse_i32(argv[1], "window id")?,
         }),
+        "focus-in-space" if argv.len() == 3 => Ok(Action::FocusWindowInSpace {
+            window_id: parse_i32(argv[1], "window id")?,
+            space_id: parse_u64(argv[2], "space id")?,
+        }),
         "move-to-space" if argv.len() == 4 => {
             let move_focus = match argv[3] {
                 "follow" => MoveFocus::Follow,
@@ -199,6 +203,15 @@ impl Action {
             Action::FocusSpace { space_id } => vec![
                 "space".to_string(),
                 "focus".to_string(),
+                space_id.to_string(),
+            ],
+            Action::FocusWindowInSpace {
+                window_id,
+                space_id,
+            } => vec![
+                "window".to_string(),
+                "focus-in-space".to_string(),
+                window_id.to_string(),
                 space_id.to_string(),
             ],
             Action::MoveWindowToSpace {
@@ -333,6 +346,10 @@ mod tests {
             Action::ShowDesktop,
             Action::Mouse(MouseMove::ToNextDisplay),
             Action::FocusWindow { window_id: 42 },
+            Action::FocusWindowInSpace {
+                window_id: 42,
+                space_id: 99,
+            },
             Action::FocusSpace { space_id: 99 },
             Action::MoveWindowToSpace {
                 window_id: 42,

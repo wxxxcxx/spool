@@ -196,8 +196,11 @@ impl ViewState {
         let hit_layout = self.motion.presented.interaction_layout(&self.layout);
         if let Some(item) = window_at(&hit_layout, point)
             && let ItemKind::Window { space_id, .. } = item.kind
-            && self.space_is_visible(space_id)
+            && self.space_shows_windows(space_id)
         {
+            // A drag can start in any Space that draws its windows; what a
+            // release means is settled in `release_drag`, once it is known
+            // whether the pointer moved.
             self.pressed = BarDrag::begin(&item, &self.motion.presented, (point.x, point.y));
             return None;
         }
@@ -247,7 +250,7 @@ impl ViewState {
             {
                 self.reorder_floating(pressed.space_id, pressed.window_id, anchor, before);
             }
-            pressed.action()
+            pressed.action(self.space_is_visible(pressed.space_id))
         } else {
             None
         };
@@ -299,6 +302,13 @@ impl ViewState {
             .spaces
             .iter()
             .any(|space| space.id == space_id && space.visible)
+    }
+
+    /// Whether a Space draws its windows, and so whether they are worth aiming
+    /// at. A collapsed Space draws a deck instead: clicking it means "take me
+    /// there", not "this icon".
+    fn space_shows_windows(&self, space_id: u64) -> bool {
+        !self.preferences.collapse_inactive_spaces || self.space_is_visible(space_id)
     }
 }
 
@@ -2578,6 +2588,68 @@ mod tests {
                 .is_none()
         );
         assert!(!state.collapsed, "the handle expands the Bar again");
+    }
+
+    #[test]
+    fn a_window_in_another_space_is_clicked_and_dragged_like_one_here() {
+        // Space 12 is not the one macOS is showing, and with
+        // `bar.collapse_inactive_spaces` off its windows are drawn, so they are
+        // aimed at rather than treated as one "take me there" target.
+        let (mut state, _) = drag_state();
+        let point_of = |state: &ViewState, window_id: i32| {
+            let visual = state
+                .motion
+                .presented
+                .items
+                .iter()
+                .find(|visual| {
+                    matches!(
+                        visual.item.kind,
+                        ItemKind::Window {
+                            window_id: id,
+                            space_id: 12,
+                            ..
+                        } if id == window_id
+                    )
+                })
+                .expect("a window drawn in the inactive Space");
+            NSPoint::new(
+                visual.item.rect.x + visual.item.rect.width / 2.0,
+                visual.item.rect.y + visual.item.rect.height / 2.0,
+            )
+        };
+        let point = point_of(&state, 7);
+
+        // Pressing starts a drag, so the release decides what it meant. Which
+        // member of a stacked column is on top is the layout's business: take
+        // the one the press actually grabbed.
+        assert!(state.press_at(point).is_none());
+        let pressed = state
+            .pressed
+            .clone()
+            .expect("a drag can start in any Space that draws its windows");
+        assert_eq!(pressed.space_id, 12);
+        let window_id = pressed.window_id;
+        assert_eq!(
+            state.release_drag(point, true),
+            Some(Action::FocusWindowInSpace {
+                window_id,
+                space_id: 12,
+            }),
+            "a click there has to say which Space to go to"
+        );
+
+        // With inactive Spaces collapsed the same card is the Space: a deck
+        // shows what is in a Space, it is not a set of separate targets.
+        state.preferences.collapse_inactive_spaces = true;
+        state.relayout();
+        let point = point_of(&state, window_id);
+        assert_eq!(
+            state.press_at(point),
+            Some(Action::FocusSpace { space_id: 12 }),
+            "the press switches Spaces"
+        );
+        assert!(state.pressed.is_none(), "a deck card is not a drag handle");
     }
 
     #[test]

@@ -144,6 +144,7 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
                 commands.run_system_cached_with(focus_other_display, (None, DisplayTarget::Next));
             }
             Action::FocusWindow { .. }
+            | Action::FocusWindowInSpace { .. }
             | Action::FocusSpace { .. }
             | Action::MoveWindowToSpace { .. }
             | Action::MoveColumnToSpace { .. }

@@ -379,4 +379,15 @@ pub enum Action {
     MissionControl,
     /// Requests the system Show Desktop overview.
     ShowDesktop,
+    /// Focuses the exact window, switching to `space_id` first when that is not
+    /// the Space macOS is showing, and focusing it once it has arrived.
+    ///
+    /// The two halves cannot be split across a plain `FocusWindow` and a
+    /// `FocusSpace`: `FocusWindow` refuses a window it cannot confirm on the
+    /// visible Space, because focusing a window in a Space that is not up yet is
+    /// unreliable, and a switch alone loses which window was meant.
+    FocusWindowInSpace {
+        window_id: i32,
+        space_id: u64,
+    },
 }
