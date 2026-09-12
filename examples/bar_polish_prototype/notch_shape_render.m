@@ -70,8 +70,26 @@ static NSBezierPath *chromePath(NSRect rect, CGFloat bottom, CGFloat top, BOOL c
     return path;
 }
 
+// The hover halo: a shape layer whose path is the collapsed outline, stroked
+// white, with the bloom cast from the same path. `phase` picks the two ends of
+// the breath (GLOW_PULSE / GLOW_SWELL in appkit.rs).
+static void halo(NSBezierPath *path, CGFloat radius, CGFloat lineWidth, CGFloat layerOpacity, CGFloat phase) {
+    // sync_glow: rim = white 0.55 * layer opacity, bloom = white * layer opacity.
+    NSShadow *shadow = [[NSShadow alloc] init];
+    shadow.shadowColor = [[NSColor whiteColor] colorWithAlphaComponent:layerOpacity];
+    shadow.shadowBlurRadius = radius;
+    shadow.shadowOffset = NSMakeSize(0, 0);
+    [NSGraphicsContext saveGraphicsState];
+    [shadow set];
+    [[[NSColor whiteColor] colorWithAlphaComponent:0.55 * layerOpacity] setStroke];
+    path.lineWidth = lineWidth;
+    [path stroke];
+    [NSGraphicsContext restoreGraphicsState];
+    (void)phase;
+}
+
 // One panel: a wallpaper-ish background with the shape hanging from the top edge.
-static void panel(NSRect frame, NSRect shape, CGFloat bottom, CGFloat top, BOOL concave, CGFloat scale, NSString *label, NSDictionary *attrs, CGFloat height) {
+static void panel(NSRect frame, NSRect shape, CGFloat bottom, CGFloat top, BOOL concave, CGFloat scale, NSString *label, NSDictionary *attrs, CGFloat height, CGFloat haloAlpha, CGFloat haloRadius) {
     [[NSColor colorWithCalibratedRed:0.72 green:0.45 blue:0.72 alpha:1.0] setFill];
     NSRectFill(frame);
     // the screen's top edge
@@ -80,6 +98,7 @@ static void panel(NSRect frame, NSRect shape, CGFloat bottom, CGFloat top, BOOL 
     NSBezierPath *path = chromePath(shape, bottom * scale, top * scale, concave);
     [[NSColor blackColor] setFill];
     [path fill];
+    if (haloAlpha > 0) halo(path, haloRadius * scale, 1.2 * scale, haloAlpha, 0);
     // Undo the flip for the text so the captions read the right way up.
     [NSGraphicsContext saveGraphicsState];
     NSAffineTransform *unflip = [NSAffineTransform transform];
@@ -95,9 +114,9 @@ int main(void) {
         CGFloat scale = 4;
         CGFloat pad = 20;
         CGFloat panelW = 300 * scale, panelH = 60 * scale;
-        NSArray *labels = @[@"A  concave scoop (what ships): black carved out of the corner",
-                            @"B  overhang + convex fillet (rejected): black rounded over the corner",
-                            @"C  inset top + convex fillet (the plain tab's pill shape)"];
+        NSArray *labels = @[@"collapsed capsule, no hover",
+                            @"hover halo, quiet end (layer 0.30, bloom 0.60x = 5.4pt)",
+                            @"hover halo, peak (layer 0.75, bloom 1.35x = 12pt)  <- softened after this render"];
         CGFloat width = panelW + pad * 2;
         CGFloat height = (panelH + 40) * 3 + pad;
 
@@ -124,14 +143,14 @@ int main(void) {
         CGFloat x0 = pad + (panelW - bodyW) / 2;
         NSRect frame1 = NSMakeRect(pad, 26, panelW, panelH);
         NSRect shape1 = NSMakeRect(x0, NSMinY(frame1), bodyW, bodyH);
-        panel(frame1, shape1, 8, 12, YES, scale, labels[0], attrs, height);
+        panel(frame1, shape1, 8, 12, YES, scale, labels[0], attrs, height, 0, 0);
 
         NSRect frame2 = NSMakeRect(pad, NSMaxY(frame1) + 34, panelW, panelH);
         NSRect shape2 = NSMakeRect(x0, NSMinY(frame2), bodyW, bodyH);
-        panel(frame2, shape2, 8, -12, 0, scale, labels[1], attrs, height);   // overhang, convex
+        panel(frame2, shape2, 9 * 0.60, 12, YES, scale, labels[1], attrs, height, 0.30, 9 * 0.60);   // breath, low
         NSRect frame3 = NSMakeRect(pad, NSMaxY(frame2) + 34, panelW, panelH);
         NSRect shape3 = NSMakeRect(x0, NSMinY(frame3), bodyW, bodyH);
-        panel(frame3, shape3, 8, 12, NO, scale, labels[2], attrs, height);   // inset, convex
+        panel(frame3, shape3, 9 * 1.35, 12, YES, scale, labels[2], attrs, height, 0.75, 9 * 1.35);   // breath, peak
 
         [NSGraphicsContext restoreGraphicsState];
         NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];

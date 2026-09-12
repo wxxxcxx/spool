@@ -227,7 +227,8 @@ impl ViewState {
             ChromeShape {
                 bottom: motion::lerp(super::placement::CAPSULE_BOTTOM_RADIUS, corner, progress),
                 top: motion::lerp(super::placement::CAPSULE_TOP_RADIUS, 0.0, progress),
-                concave_top: true,
+                overhang: true,
+                shoulder: SHOULDER,
             }
         } else {
             // A plain display's tab is a pill: a narrow top edge too, but with
@@ -236,7 +237,8 @@ impl ViewState {
             ChromeShape {
                 bottom: motion::lerp(tab, corner, progress),
                 top: motion::lerp(tab, 0.0, progress),
-                concave_top: false,
+                overhang: false,
+                shoulder: Shoulder::Fillet,
             }
         }
     }
@@ -1338,36 +1340,51 @@ impl ChromeMotion {
     }
 }
 
-/// The Bar's own outline: how far its corners round, and which way the top
-/// ones go.
+/// How the top edge's overhang rounds into the walls below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Both are kept: this choice has flipped once already.
+enum Shoulder {
+    /// The ordinary convex fillet: the black rounds over the corner, so the
+    /// overhang reads as a brim flowing into the body.
+    Fillet,
+    /// Scooped: the black is carved out of the corner instead, which leaves a
+    /// small notch where the scoop meets the screen edge.
+    Scoop,
+}
+
+/// The shoulder the prototype picked, rendered beside its alternative against a
+/// photograph of the hardware.
+const SHOULDER: Shoulder = Shoulder::Fillet;
+
+/// The Bar's own outline: how far its corners round, and how the top ones meet
+/// the screen edge.
 ///
-/// Collapsed on a notched display the top edge is *narrower* than the body and
-/// its corners are scooped, so the black draws in where it meets the screen
-/// edge; the bottom corners round outwards. Expanded, and on a plain display
-/// where the tab is a pill, the top corners are ordinary rounded ones.
+/// Collapsed on a notched display the top edge *overhangs* the body — the black
+/// is widest along the screen edge — and rounds back down into vertical walls;
+/// the bottom corners round outwards too. Expanded, and on a plain display where
+/// the tab is a pill, the top edge is inset instead.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ChromeShape {
     bottom: f64,
     top: f64,
-    /// Scoop the top corners: the boundary leaves the top edge at a right angle
-    /// and curves out to the body's wall, which is concave. Otherwise they are
-    /// the ordinary convex fillet.
-    concave_top: bool,
+    /// Overhang the top edge past the body rather than insetting it.
+    overhang: bool,
+    shoulder: Shoulder,
 }
 
 /// The Bar's own outline, in viewport coordinates.
 ///
-/// This is the MacBook notch's silhouette: the black is *wider* along the screen
-/// edge than the body below it, the shoulder between the two is **concave** (the
-/// black is scooped away at the corner, so the boundary curves in as it
-/// descends), the sides are vertical, and the bottom corners are the ordinary
-/// **convex** fillet.
+/// The Bar's own outline, in viewport coordinates.
 ///
-/// The two top corners are either scooped like that, or rounded the ordinary
-/// convex way; the scooped pair is the notched capsule, the rounded pair the
-/// plain tab. `bottom` rounds the bottom corners outwards either way. Expanded,
-/// `top` reaches zero and the outline is the menu-bar band itself, with square
-/// top corners.
+/// Collapsed on a notched display this is the notch's silhouette: the black is
+/// widest along the screen edge, a convex fillet carries each end of that
+/// overhang back down to a vertical wall, and the bottom corners round outwards
+/// too. The `MacBook`'s own hardware is the reference — the prototype renders
+/// this beside a photograph of it.
+///
+/// A plain display's tab insets its top edge instead and rounds the same way,
+/// so it is a pill; expanded, `top` reaches zero and the outline is the menu-bar
+/// band itself, with square top corners.
 fn chrome_path(rect: Rect, shape: ChromeShape) -> Retained<NSBezierPath> {
     // Circular-arc approximation for a cubic Bezier quadrant.
     const KAPPA: f64 = 0.552_284_749_8;
@@ -1379,30 +1396,37 @@ fn chrome_path(rect: Rect, shape: ChromeShape) -> Retained<NSBezierPath> {
     let b = shape.bottom.clamp(0.0, limit);
     let t = shape.top.clamp(0.0, limit);
     let path = NSBezierPath::bezierPath();
-    if shape.concave_top && t > 0.0 {
-        // The top edge overhangs the body by `t` on each side, and the scoop
-        // below it is centred on the corner the two would have met at: every
-        // point of the curve is `t` away from that corner, so the black is
-        // carved out of it rather than rounded over it.
+    if t <= 0.0 {
+        // Expanded: the Bar is the band, so its top corners are the screen's.
+        path.moveToPoint(NSPoint::new(left, top));
+        path.lineToPoint(NSPoint::new(right, top));
+    } else if shape.overhang {
+        // Collapsed: the top edge is the widest part and the shoulders carry it
+        // back down to the walls. A fillet leaves the edge tangentially and
+        // arrives at the wall tangentially, so there is no notch and no kink.
         path.moveToPoint(NSPoint::new(left - t, top));
         path.lineToPoint(NSPoint::new(right + t, top));
-        path.curveToPoint_controlPoint1_controlPoint2(
-            NSPoint::new(right, top + t),
-            NSPoint::new(right + t, top + t * KAPPA),
-            NSPoint::new(right - t * KAPPA, top + t),
-        );
+        let (c1, c2) = match shape.shoulder {
+            Shoulder::Fillet => (
+                NSPoint::new(right + t - t * KAPPA, top),
+                NSPoint::new(right, top + t - t * KAPPA),
+            ),
+            Shoulder::Scoop => (
+                NSPoint::new(right + t, top + t * KAPPA),
+                NSPoint::new(right - t * KAPPA, top + t),
+            ),
+        };
+        path.curveToPoint_controlPoint1_controlPoint2(NSPoint::new(right, top + t), c1, c2);
     } else {
+        // A plain display's tab is a pill: an inset top edge, rounded the
+        // ordinary way.
         path.moveToPoint(NSPoint::new(left + t, top));
         path.lineToPoint(NSPoint::new(right - t, top));
-        if t > 0.0 {
-            path.curveToPoint_controlPoint1_controlPoint2(
-                NSPoint::new(right, top + t),
-                NSPoint::new(right - t + t * KAPPA, top),
-                NSPoint::new(right, top + t - t * KAPPA),
-            );
-        } else {
-            path.lineToPoint(NSPoint::new(right, top));
-        }
+        path.curveToPoint_controlPoint1_controlPoint2(
+            NSPoint::new(right, top + t),
+            NSPoint::new(right - t + t * KAPPA, top),
+            NSPoint::new(right, top + t - t * KAPPA),
+        );
     }
     if b > 0.0 {
         path.lineToPoint(NSPoint::new(right, bottom - b));
@@ -1421,25 +1445,27 @@ fn chrome_path(rect: Rect, shape: ChromeShape) -> Retained<NSBezierPath> {
         path.lineToPoint(NSPoint::new(right, bottom));
         path.lineToPoint(NSPoint::new(left, bottom));
     }
-    if shape.concave_top && t > 0.0 {
-        // Back up the wall and scoop out to the overhanging top edge.
-        path.lineToPoint(NSPoint::new(left, top + t));
-        path.curveToPoint_controlPoint1_controlPoint2(
-            NSPoint::new(left - t, top),
-            NSPoint::new(left + t * KAPPA, top + t),
-            NSPoint::new(left - t, top + t * KAPPA),
-        );
-    } else {
-        path.lineToPoint(NSPoint::new(left, top + t));
-        if t > 0.0 {
-            path.curveToPoint_controlPoint1_controlPoint2(
-                NSPoint::new(left + t, top),
+    path.lineToPoint(NSPoint::new(left, top + t));
+    if t <= 0.0 {
+        path.lineToPoint(NSPoint::new(left, top));
+    } else if shape.overhang {
+        let (c1, c2) = match shape.shoulder {
+            Shoulder::Fillet => (
                 NSPoint::new(left, top + t - t * KAPPA),
-                NSPoint::new(left + t - t * KAPPA, top),
-            );
-        } else {
-            path.lineToPoint(NSPoint::new(left, top));
-        }
+                NSPoint::new(left - t + t * KAPPA, top),
+            ),
+            Shoulder::Scoop => (
+                NSPoint::new(left + t * KAPPA, top + t),
+                NSPoint::new(left - t, top + t * KAPPA),
+            ),
+        };
+        path.curveToPoint_controlPoint1_controlPoint2(NSPoint::new(left - t, top), c1, c2);
+    } else {
+        path.curveToPoint_controlPoint1_controlPoint2(
+            NSPoint::new(left + t, top),
+            NSPoint::new(left, top + t - t * KAPPA),
+            NSPoint::new(left + t - t * KAPPA, top),
+        );
     }
     path.closePath();
     path
@@ -2857,11 +2883,12 @@ mod tests {
 
     #[test]
     fn the_collapsed_capsule_overhangs_the_body_and_rounds_at_the_bottom() {
-        // The notch's silhouette: black along the screen edge, a vertical wall
-        // below a shoulder that draws in, and an ordinary convex bottom corner.
-        // Whether that shoulder is concave or convex is a visual property — it
-        // is settled in the prototype against the hardware — so what is pinned
-        // here is the structure, not the curvature.
+        // The notch's silhouette: the black is widest along the screen edge, a
+        // fillet carries each end back to a vertical wall, and the bottom
+        // corners round outwards. Which shoulder shape that fillet is — B in the
+        // prototype's render, a convex fillet — is a visual property settled
+        // against a photograph of the hardware, so what is pinned here is the
+        // structure and the direction.
         let capsule = Rect {
             x: 100.0,
             y: 0.0,
@@ -2871,7 +2898,8 @@ mod tests {
         let shape = ChromeShape {
             bottom: super::super::placement::CAPSULE_BOTTOM_RADIUS,
             top: super::super::placement::CAPSULE_TOP_RADIUS,
-            concave_top: true,
+            overhang: true,
+            shoulder: SHOULDER,
         };
         let path = chrome_path(capsule, shape);
         let t = shape.top;
@@ -2881,8 +2909,12 @@ mod tests {
             view_rect(path.bounds())
         );
         assert!(
-            path.containsPoint(NSPoint::new(capsule.x - t + 1.0, 0.5)),
+            path.containsPoint(NSPoint::new(capsule.x - 4.0, 0.5)),
             "the overhang is black at the screen edge"
+        );
+        assert!(
+            !path.containsPoint(NSPoint::new(capsule.x - t, t)),
+            "and the shoulder has rounded it away by the time it reaches the wall"
         );
         assert!(
             path.containsPoint(NSPoint::new(capsule.x + 0.5, t + 1.0)),
@@ -2914,7 +2946,8 @@ mod tests {
             ChromeShape {
                 bottom: 10.0,
                 top: 0.0,
-                concave_top: false,
+                overhang: false,
+                shoulder: Shoulder::Fillet,
             },
         );
         assert!(expanded.containsPoint(NSPoint::new(0.5, 0.5)));
@@ -2933,7 +2966,8 @@ mod tests {
             ChromeShape {
                 bottom: super::super::placement::PLAIN_TAB_HEIGHT / 2.0,
                 top: super::super::placement::PLAIN_TAB_HEIGHT / 2.0,
-                concave_top: false,
+                overhang: false,
+                shoulder: Shoulder::Fillet,
             },
         );
         assert!(pill.containsPoint(NSPoint::new(960.0, 3.0)));

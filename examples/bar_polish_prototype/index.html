@@ -119,6 +119,10 @@
   调好后把 URL 发回来。按键：<code>←/→</code> 预设 · <code>空格</code> 折叠/展开 · <code>h</code> 强制 hover。
 </p>
 
+<h2>0 · 硬件参照（你拍的刘海）</h2>
+<img src="notch_photo.jpg" alt="MacBook notch" style="width:520px;border-radius:8px;border:1px solid var(--line)">
+<p class="lede" style="margin-top:8px">下面是按这张照片定的形状候选：<b>A 是定稿</b>（顶边外扩 + 凸圆角）。</p>
+
 <h2>1 · 形状候选 — 刘海屏（整体 / 左端 5×）</h2>
 <div class="scale" id="scaleN"></div>
 <h2>1b · 形状候选 — 普通屏（整体 / 左端 5×）</h2>
@@ -182,12 +186,10 @@
 <script>
 // ── settings ────────────────────────────────────────────────────────────────
 const SHAPES = {
-  bottom:  'A · 平头，仅下部圆角',
-  sfillet: 'B · 刘海形：顶边外扩 + 凹肩 + 底部外圆（现状）',
-  shoulder:'D · 四角大圆角，贴顶边',
-  sfillet12:'B2 · S 形：内凹与外圆同半径 12（更平缓）',
-  sfilletIn:'B3 · 反向：上角外圆 10 + 下角外圆 12（上边显窄）',
-  smelt:   'B4 · 反向内凹：上边平，下边向外扩散',
+  fillet:  'A · 顶边外扩 + 凸圆角（定稿：现在代码里的）',
+  scoop:   'B · 顶边外扩 + 凹肩（备选，肩上有小缺口）',
+  shoulder:'C · 内收顶边 + 大圆角（药丸）',
+  bottom:  'D · 平头，仅下缘圆角',
 };
 const PLAIN_SHAPES = {
   square: 'A · 直角',
@@ -207,9 +209,9 @@ const CURVES = {
   smooth: '420ms Apple smooth（无过冲）',
 };
 const PRESETS = {
-  A: { name:'Notch extension',   sn:'sfillet',  sp:'capsule', br:'pulse',     cv:'spring', period:1800, amp:1.6 },
-  B: { name:'Floating capsule',  sn:'capsule',  sp:'capsule', br:'bloom',     cv:'smooth', period:2200, amp:2.2 },
-  C: { name:'Heartbeat tab',     sn:'shoulder', sp:'r3',      br:'heartbeat', cv:'ease',   period:1500, amp:1.2 },
+  A: { name:'Notch (overhang + fillet)', sn:'fillet', sp:'capsule', br:'pulse', cv:'spring', period:1800, amp:1.6 },
+  B: { name:'Notch (scooped shoulder)', sn:'scoop', sp:'capsule', br:'bloom', cv:'smooth', period:2200, amp:2.2 },
+  C: { name:'Pill', sn:'shoulder', sp:'capsule', br:'heartbeat', cv:'ease', period:1500, amp:1.2 },
 };
 const DURATION = { ease:240, spring:320, smooth:420 };
 
@@ -247,12 +249,20 @@ const RADIUS = 8;                // bottom fillet
 function shape(which, { x, w, h }) {
   const r = RADIUS, f = FLARE;
   switch (which) {
-    case 'bottom':
-      return `M${x},0 H${x+w} V${h-r} A${r},${r} 0 0 1 ${x+w-r},${h} H${x+r} A${r},${r} 0 0 1 ${x},${h-r} Z`;
-    case 'sfillet': {
-      // MacBook notch: the top edge overhangs the body and the shoulder is
-      // scooped (concave) down to the vertical wall; the bottom corners are the
-      // ordinary convex fillet, tighter than the scoop.
+    case 'fillet': {
+      // Overhanging top edge, convex fillet down to the wall (the pick).
+      const t = 12, K = 0.5523;
+      return `M${x-t},0 L${x+w+t},0 `
+        + `C${x+w+t-t*K},0 ${x+w},${t-t*K} ${x+w},${t} `
+        + `L${x+w},${h-r} `
+        + `C${x+w},${h-r+r*K} ${x+w-r+r*K},${h} ${x+w-r},${h} `
+        + `L${x+r},${h} `
+        + `C${x+r-r*K},${h} ${x},${h-r+r*K} ${x},${h-r} `
+        + `L${x},${t} `
+        + `C${x},${t-t*K} ${x-t+t*K},0 ${x-t},0 Z`;
+    }
+    case 'scoop': {
+      // Same overhang, but the shoulder is carved out (concave).
       const t = 12, K = 0.5523;
       return `M${x-t},0 L${x+w+t},0 `
         + `C${x+w+t},${t*K} ${x+w-t*K},${t} ${x+w},${t} `
@@ -265,20 +275,10 @@ function shape(which, { x, w, h }) {
     }
     case 'shoulder': {
       const R = Math.min(12, w / 2);
-      return `M${x},0 V${h-R} A${R},${R} 0 0 0 ${x+R},${h} H${x+w-R} A${R},${R} 0 0 0 ${x+w},${h-R} V0 Z`;
+      return `M${x+R},0 H${x+w-R} A${R},${R} 0 0 1 ${x+w-R},${h} H${x+R} A${R},${R} 0 0 1 ${x+R},0 Z`;
     }
-    case 'sfillet12': {
-      const f = 12, r = 12;
-      return `M${x-f},0 A${f},${f} 0 0 0 ${x},${f} V${h-r} A${r},${r} 0 0 1 ${x+r},${h} H${x+w-r} A${r},${r} 0 0 1 ${x+w},${h-r} V${f} A${f},${f} 0 0 0 ${x+w+f},0 Z`;
-    }
-    case 'sfilletIn': {
-      const rt = 10, r = 12;
-      return `M${x+rt},0 A${rt},${rt} 0 0 0 ${x},${rt} V${h-r} A${r},${r} 0 0 1 ${x+r},${h} H${x+w-r} A${r},${r} 0 0 1 ${x+w},${h-r} V${rt} A${rt},${rt} 0 0 0 ${x+w-rt},0 Z`;
-    }
-    case 'smelt': {
-      const f = 10;
-      return `M${x},0 V${h-f} A${f},${f} 0 0 0 ${x-f},${h} H${x+w+f} A${f},${f} 0 0 0 ${x+w},${h-f} V0 Z`;
-    }
+    case 'bottom':
+      return `M${x},0 H${x+w} V${h-r} A${r},${r} 0 0 1 ${x+w-r},${h} H${x+r} A${r},${r} 0 0 1 ${x},${h-r} Z`;
     default: return '';
   }
 }
