@@ -1561,7 +1561,10 @@ impl PanelRecord {
         if self.window.frame() != rect {
             self.window.setFrame_display(rect, false);
         }
+        // The blur fades out with the collapse; the content does not, or the
+        // capsule would fade out with it.
         self.backdrop.setAlphaValue(progress);
+        self.backdrop.setHidden(progress <= 0.01);
         self.view.layout_toolbar();
         self.view.setNeedsDisplay(true);
     }
@@ -1889,17 +1892,32 @@ fn make_bar_window(mtm: MainThreadMarker, view: &NSView) -> Retained<NSPanel> {
 
 /// The Bar's own panel: a Bar window whose content view is a menu-material
 /// backdrop, with the content riding on top of it and following on resize.
+/// The Bar's own panel: a transparent container holding the blur and the
+/// content as *siblings*, blur first.
+///
+/// They cannot be nested, even though nesting is the obvious way to put content
+/// on blur: the blur is faded out as the Bar collapses, and AppKit propagates a
+/// view's alpha to its subviews, so a nested content view faded to nothing along
+/// with it and the collapsed Bar became invisible.
 fn make_bar_panel(
     mtm: MainThreadMarker,
     view: &NSView,
 ) -> (Retained<NSPanel>, Retained<NSVisualEffectView>) {
-    let backdrop = make_backdrop(mtm, view.frame().size);
+    let size = view.frame().size;
+    let container: Retained<NSView> = unsafe {
+        msg_send![
+            NSView::alloc(mtm),
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), size)
+        ]
+    };
+    let backdrop = make_backdrop(mtm, size);
     view.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     view.setClipsToBounds(true);
-    backdrop.addSubview(view);
-    (make_bar_window(mtm, &backdrop), backdrop)
+    container.addSubview(&backdrop);
+    container.addSubview(view);
+    (make_bar_window(mtm, &container), backdrop)
 }
 
 fn screens_by_id(mtm: MainThreadMarker) -> HashMap<u32, Retained<NSScreen>> {
