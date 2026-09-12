@@ -56,6 +56,17 @@ fn enable_space_control(harness: &mut TestHarness) {
     harness.mock_state.enable_native_space_control();
 }
 
+/// A native read that keeps failing, in both answers a focus command may ask
+/// for.
+///
+/// A Space the retained layout places the window in is read once to confirm
+/// that claim, and once more by the full observation the command falls back to
+/// when the claim is not confirmed. A read that must refuse therefore has to
+/// answer the same way both times.
+fn always_unavailable<T>() -> [std::result::Result<T, ()>; 2] {
+    [Err(()), Err(())]
+}
+
 fn multi_display_harness() -> TestHarness {
     let mut harness = focus_harness()
         .with_display(
@@ -98,7 +109,7 @@ fn native_focus_refreshes_visibility_instead_of_trusting_a_retained_marker() {
         if read_fails {
             harness
                 .mock_state
-                .script_active_space_queries(TEST_DISPLAY_ID, [Err(())]);
+                .script_active_space_queries(TEST_DISPLAY_ID, always_unavailable());
         } else {
             harness
                 .mock_state
@@ -180,33 +191,69 @@ fn native_focus_cannot_bypass_space_visibility_when_a_window_is_outside_layout()
 }
 
 #[test]
-fn native_focus_rejects_missing_ambiguous_or_failed_membership() {
-    for (source, target) in [
-        (Err(()), Ok(vec![1])),
-        (Ok(vec![]), Ok(vec![1])),
-        (Ok(vec![0]), Ok(vec![0, 1])),
-    ] {
-        let mut harness = focus_harness();
-        harness
-            .mock_state
-            .script_workspace_membership_queries(TEST_WORKSPACE_ID, [source]);
-        harness
-            .mock_state
-            .script_workspace_membership_queries(TARGET, [target]);
-        focus(&mut harness, 0);
-        assert!(
-            harness.mock_state.take_focus_requests().is_empty(),
-            "layout placement is not proof of current native membership"
-        );
-        harness
-            .mock_state
-            .script_workspace_membership_queries(TEST_WORKSPACE_ID, []);
-        harness
-            .mock_state
-            .script_workspace_membership_queries(TARGET, []);
-        focus(&mut harness, 0);
-        assert_eq!(harness.mock_state.take_focus_requests(), vec![0]);
-    }
+fn native_focus_rejects_missing_or_failed_membership() {
+    // A membership read that keeps failing.
+    let mut harness = focus_harness();
+    harness
+        .mock_state
+        .script_workspace_membership_queries(TEST_WORKSPACE_ID, always_unavailable());
+    focus(&mut harness, 0);
+    assert!(
+        harness.mock_state.take_focus_requests().is_empty(),
+        "layout placement is not proof of current native membership"
+    );
+
+    // The window is not in the Space that placement claims, and no other Space
+    // holds it either.
+    let mut harness = focus_harness();
+    harness
+        .mock_state
+        .script_workspace_membership_queries(TEST_WORKSPACE_ID, [Ok(vec![]), Ok(vec![])]);
+    harness
+        .mock_state
+        .script_workspace_membership_queries(TARGET, [Ok(vec![1]), Ok(vec![1])]);
+    focus(&mut harness, 0);
+    assert!(
+        harness.mock_state.take_focus_requests().is_empty(),
+        "layout placement is not proof of current native membership"
+    );
+
+    // Recovery: with the reads answering again, the same command focuses.
+    harness
+        .world()
+        .run_system_once(crate::ecs::topology::gather_initial_topology)
+        .unwrap();
+    focus(&mut harness, 0);
+    assert_eq!(harness.mock_state.take_focus_requests(), vec![0]);
+}
+
+/// A caller that names the Space it drew the window in resolves the one
+/// ambiguity the unclaimed path refuses: a window macOS lists in two Spaces is
+/// focusable when the named Space is confirmed to be visible and to hold it.
+#[test]
+fn native_focus_accepts_a_named_space_for_a_multiply_listed_window() {
+    let mut harness = focus_harness();
+    harness
+        .mock_state
+        .script_workspace_membership_queries(TEST_WORKSPACE_ID, [Ok(vec![0])]);
+    harness
+        .mock_state
+        .script_workspace_membership_queries(TARGET, [Ok(vec![0, 1])]);
+    focus(&mut harness, 0);
+    assert_eq!(harness.mock_state.take_focus_requests(), vec![0]);
+}
+
+/// Confirming the caller's Space must not read the other Spaces: that scan is
+/// what this path exists to skip, so a Space that cannot be read cannot refuse
+/// a focus whose own Space is confirmed.
+#[test]
+fn native_focus_confirmed_claim_does_not_scan_other_spaces() {
+    let mut harness = focus_harness();
+    harness
+        .mock_state
+        .script_workspace_membership_queries(TARGET, always_unavailable());
+    focus(&mut harness, 0);
+    assert_eq!(harness.mock_state.take_focus_requests(), vec![0]);
 }
 
 #[test]
@@ -300,7 +347,7 @@ fn native_focus_distinguishes_unrelated_visibility_failure_from_incomplete_topol
     );
     harness
         .mock_state
-        .script_active_space_queries(EXT_DISPLAY_ID, [Err(())]);
+        .script_active_space_queries(EXT_DISPLAY_ID, always_unavailable());
     focus(&mut harness, 2);
     assert!(harness.mock_state.take_focus_requests().is_empty());
     harness
@@ -386,7 +433,7 @@ fn native_focus_rejection_waits_for_observation_recovery_without_canceling_follo
     harness.mock_state.take_focus_requests();
     harness
         .mock_state
-        .script_active_space_queries(TEST_DISPLAY_ID, [Err(())]);
+        .script_active_space_queries(TEST_DISPLAY_ID, always_unavailable());
     focus(&mut harness, 1);
     harness
         .world()

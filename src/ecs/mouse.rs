@@ -3,7 +3,7 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Query, Res, ResMut, SystemParam};
+use bevy::ecs::system::{Commands, Local, NonSend, Query, Res, ResMut, SystemParam};
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::collections::HashMap;
@@ -221,6 +221,9 @@ struct MouseDownCtx<'w, 's> {
     config: Res<'w, Config>,
     mouse_held: Query<'w, 's, Entity, With<MouseHeldMarker>>,
     focus: ResMut<'w, FocusCoordinator>,
+    /// The Bar's own panels, when a Bar is running. Its clicks are the Bar's,
+    /// not a window's: the tap sees them either way.
+    bar: Option<NonSend<'w, crate::bar::BarManager>>,
     commands: Commands<'w, 's>,
 }
 
@@ -230,6 +233,19 @@ fn mouse_down_trigger(mut messages: MessageReader<InputEvent>, mut ctx: MouseDow
             continue;
         };
         trace!("{point:?}");
+
+        // The global tap sees clicks on the Bar too. A panel only takes mouse
+        // events while the pointer is on the Bar's own chrome, so this is the
+        // same test AppKit uses to decide who receives the click: anything
+        // else here would record the Bar's own surface as a window focus and
+        // clear the focus the click is about to request.
+        if ctx
+            .bar
+            .as_ref()
+            .is_some_and(|bar| bar.pointer_is_on_chrome())
+        {
+            continue;
+        }
 
         let Ok(window_id) = ctx.window_manager.find_window_at_point(point) else {
             continue;

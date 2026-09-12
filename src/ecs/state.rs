@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
 use crate::ecs::params::Windows;
+use crate::ecs::topology::WindowMemberships;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker};
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
@@ -679,10 +680,18 @@ impl QueryStateParams<'_, '_> {
             })
     }
 
-    /// Both public read models use one complete membership scan per extraction.
-    fn floating_by_space(&self) -> HashMap<WorkspaceId, Vec<Entity>> {
-        let floating = self
-            .windows
+    /// One membership scan, shared by every read model built from this world.
+    ///
+    /// A caller that needs more than one model — the Bar builds both — takes
+    /// this once and hands it down; `None` means the scan failed, and a failed
+    /// scan publishes no destination at all rather than a partial map.
+    pub(crate) fn memberships(&self) -> Option<WindowMemberships> {
+        self.topology.observe_memberships(&self.window_manager).ok()
+    }
+
+    /// Tracked floating windows by native window id.
+    pub(crate) fn floating_windows(&self) -> HashMap<WinID, Entity> {
+        self.windows
             .iter()
             .filter_map(|(window, entity)| {
                 self.windows
@@ -690,11 +699,37 @@ impl QueryStateParams<'_, '_> {
                     .is_some_and(|(_, _, state)| state.is_floating())
                     .then_some((window.id(), entity))
             })
-            .collect::<HashMap<_, _>>();
+            .collect()
+    }
+
+    /// The membership scan a read model needs, taken only when a float exists
+    /// to place: nothing else in either model depends on Space membership.
+    ///
+    /// A caller that builds more than one model — the Bar builds both — takes
+    /// [`Self::memberships`] once instead and hands the same scan to each.
+    pub(crate) fn floating_memberships(
+        &self,
+        floating: &HashMap<WinID, Entity>,
+    ) -> Option<WindowMemberships> {
+        if floating.is_empty() {
+            return None;
+        }
+        self.memberships()
+    }
+
+    /// Both public read models use one complete membership scan per extraction.
+    ///
+    /// `memberships` is that scan; `None` means no scan was needed or it
+    /// failed, and either way no float gets a destination from it.
+    fn floating_by_space(
+        &self,
+        floating: &HashMap<WinID, Entity>,
+        memberships: Option<&WindowMemberships>,
+    ) -> HashMap<WorkspaceId, Vec<Entity>> {
         if floating.is_empty() {
             return HashMap::new();
         }
-        let Ok(memberships) = self.topology.observe_memberships(&self.window_manager) else {
+        let Some(memberships) = memberships else {
             return HashMap::new();
         };
         self.workspaces
@@ -718,11 +753,23 @@ impl QueryStateParams<'_, '_> {
 /// `ws:east`, `ws:stack` and friends to know what is beside what.
 impl QueryStateParams<'_, '_> {
     pub fn extract_window_set(&self) -> WindowSet {
+        let floating = self.floating_windows();
+        let memberships = self.floating_memberships(&floating);
+        self.window_set(&floating, memberships.as_ref())
+    }
+
+    /// The same read model from a float set and membership scan the caller
+    /// already took.
+    pub(crate) fn window_set(
+        &self,
+        floating: &HashMap<WinID, Entity>,
+        memberships: Option<&WindowMemberships>,
+    ) -> WindowSet {
         use spool_shared_types::windowset::{DisplaySet, WorkspaceSet};
 
         let focused_entity = self.windows.focused().map(|(_, entity)| entity);
         let sliver_width = self.config.sliver_width();
-        let floating = self.floating_by_space();
+        let floating_by_space = self.floating_by_space(floating, memberships);
 
         // Group the workspace strips by the display entity that owns them, so
         // each display can be built with its own workspaces in one pass.
@@ -736,7 +783,7 @@ impl QueryStateParams<'_, '_> {
                 })
                 .collect();
             // Native membership, not visibility or a remembered strip, owns a float's Space.
-            let floating = floating
+            let floating = floating_by_space
                 .get(&strip.id())
                 .into_iter()
                 .flatten()
@@ -904,6 +951,23 @@ impl QueryStateParams<'_, '_> {
         reason = "preserve the query adapter Result contract; unknown observations are represented in the payload"
     )]
     pub fn extract(&self) -> crate::errors::Result<SpoolQueryState> {
+        let floating = self.floating_windows();
+        let memberships = self.floating_memberships(&floating);
+        self.query_state(&floating, memberships.as_ref())
+    }
+
+    /// The same read model from a float set and membership scan the caller
+    /// already took.
+    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "preserve the query adapter Result contract; unknown observations are represented in the payload"
+    )]
+    pub(crate) fn query_state(
+        &self,
+        floating_by_window: &HashMap<WinID, Entity>,
+        memberships: Option<&WindowMemberships>,
+    ) -> crate::errors::Result<SpoolQueryState> {
         let Self {
             workspaces,
             displays,
@@ -914,7 +978,7 @@ impl QueryStateParams<'_, '_> {
         } = self;
         let focused_entity = windows.focused().map(|(_, entity)| entity);
         let sliver_width = config.sliver_width();
-        let floating = self.floating_by_space();
+        let floating = self.floating_by_space(floating_by_window, memberships);
 
         let active_display = displays
             .iter()

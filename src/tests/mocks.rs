@@ -107,6 +107,7 @@ struct MockStateInner {
     cached_frames: HashMap<WinID, IRect>,
     displays: HashMap<u32, MockDisplayData>,
     display_observation_count: usize,
+    workspace_membership_query_count: usize,
     display_inventory_available: bool,
     fullscreen_spaces: HashSet<WorkspaceId>,
     active_display_id: u32,
@@ -186,6 +187,7 @@ impl MockState {
                 cached_frames: HashMap::new(),
                 displays: HashMap::new(),
                 display_observation_count: 0,
+                workspace_membership_query_count: 0,
                 display_inventory_available: true,
                 fullscreen_spaces: HashSet::new(),
                 active_display_id: 0,
@@ -509,11 +511,18 @@ impl MockState {
         self.inner.force_read().display_observation_count
     }
 
+    /// Native per-Space membership reads, which one membership scan costs one
+    /// of per Space.
+    pub(crate) fn workspace_membership_query_count(&self) -> usize {
+        self.inner.force_read().workspace_membership_query_count
+    }
+
     fn query_workspace_windows(
         &self,
         workspace_id: WorkspaceId,
     ) -> crate::errors::Result<Vec<WinID>> {
         let mut inner = self.inner.force_write();
+        inner.workspace_membership_query_count += 1;
         if let Some(response) = inner
             .workspace_membership_scripts
             .get_mut(&workspace_id)

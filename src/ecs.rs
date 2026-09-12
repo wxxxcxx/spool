@@ -122,6 +122,67 @@ fn overlay_dirty(
         || window_removed.read().next().is_some()
 }
 
+/// Whether anything the Bar draws has changed since this last ran.
+///
+/// Deliberately not `Changed<Window>`: systems that tick a window's cached
+/// frame or a lifecycle timer re-mark that component without changing anything
+/// the Bar renders, and that alone made the Bar re-extract the whole native
+/// Space projection at the frame rate.
+///
+/// The terms are the Bar's own projection: its strips and Spaces, the focused,
+/// floating, hidden and unavailable states of the windows it lists, the app
+/// identity behind an icon, the display frames it is placed in, and the config
+/// it is drawn from. A window's cached frame and title are carried in the
+/// snapshot but never drawn, so they deliberately do not appear.
+pub(crate) fn bar_projection_dirty(
+    layout_changed: Query<(), Changed<LayoutStrip>>,
+    native_space_changed: ChangedNativeSpaces,
+    gained: Query<
+        (),
+        Or<(
+            Added<native_space::VisibleNativeSpaceMarker>,
+            Added<FocusedMarker>,
+            Added<Floating>,
+        )>,
+    >,
+    hidden_or_unavailable: Query<
+        (),
+        Or<(
+            Changed<WindowVisibility>,
+            Added<reconcile::WindowUnavailable>,
+        )>,
+    >,
+    app_changed: Query<(), Changed<Application>>,
+    display_changed: Query<(), Changed<Display>>,
+    focus: Option<Res<focus::FocusCoordinator>>,
+    config: Option<Res<Config>>,
+    mut visible_space_lost: RemovedComponents<native_space::VisibleNativeSpaceMarker>,
+    mut focus_lost: RemovedComponents<FocusedMarker>,
+    mut floating_lost: RemovedComponents<Floating>,
+    mut unavailable_lost: RemovedComponents<reconcile::WindowUnavailable>,
+    mut visibility_lost: RemovedComponents<WindowVisibility>,
+    mut native_space_removed: RemovedComponents<native_space::NativeSpace>,
+    mut window_removed: RemovedComponents<Window>,
+) -> bool {
+    !layout_changed.is_empty()
+        || !native_space_changed.is_empty()
+        || !gained.is_empty()
+        || !hidden_or_unavailable.is_empty()
+        || !app_changed.is_empty()
+        || !display_changed.is_empty()
+        // A request the Bar draws before confirmation moves the indicator; it
+        // is not a component change, so it has to be watched explicitly.
+        || focus.is_some_and(|focus| focus.is_changed())
+        || config.is_some_and(|config| config.is_changed())
+        || visible_space_lost.read().next().is_some()
+        || focus_lost.read().next().is_some()
+        || floating_lost.read().next().is_some()
+        || unavailable_lost.read().next().is_some()
+        || visibility_lost.read().next().is_some()
+        || native_space_removed.read().next().is_some()
+        || window_removed.read().next().is_some()
+}
+
 /// Registers the Bevy systems for the `WindowManager`.
 /// This function adds various systems to the `Update` schedule, including event dispatchers,
 /// process/application/window lifecycle management, animation, and periodic watchers.
@@ -145,34 +206,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             .next()
             .is_none_or(|marker| !marker.is_user_swiping)
     };
-    let bar_dirty =
-        |layout_changed: Query<(), Changed<LayoutStrip>>,
-         native_space_changed: ChangedNativeSpaces,
-         visible_space_gained: Query<(), Added<native_space::VisibleNativeSpaceMarker>>,
-         focus_gained: Query<(), Added<FocusedMarker>>,
-         floating_gained: Query<(), Added<Floating>>,
-         window_gained: Query<(), Changed<Window>>,
-         display_changed: Query<(), Changed<Display>>,
-         config: Option<Res<Config>>,
-         mut visible_space_lost: RemovedComponents<native_space::VisibleNativeSpaceMarker>,
-         mut focus_lost: RemovedComponents<FocusedMarker>,
-         mut floating_lost: RemovedComponents<Floating>,
-         mut native_space_removed: RemovedComponents<native_space::NativeSpace>,
-         mut window_removed: RemovedComponents<Window>| {
-            !layout_changed.is_empty()
-                || !native_space_changed.is_empty()
-                || !visible_space_gained.is_empty()
-                || !focus_gained.is_empty()
-                || !floating_gained.is_empty()
-                || !window_gained.is_empty()
-                || !display_changed.is_empty()
-                || config.is_some_and(|config| config.is_changed())
-                || visible_space_lost.read().next().is_some()
-                || focus_lost.read().next().is_some()
-                || floating_lost.read().next().is_some()
-                || native_space_removed.read().next().is_some()
-                || window_removed.read().next().is_some()
-        };
+    let bar_dirty = bar_projection_dirty.or_eager(on_timer(Duration::from_secs(1)));
 
     app.add_systems(
         Startup,

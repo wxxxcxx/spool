@@ -9,6 +9,7 @@ use tracing::warn;
 
 use super::BarSnapshot;
 use super::model::{BarColumn, BarSpace, BarWindow};
+use crate::ecs::focus::FocusCoordinator;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::reconcile::WindowUnavailable;
 use crate::ecs::state::QueryStateParams;
@@ -38,12 +39,31 @@ pub(crate) struct BarStateParams<'w, 's> {
     windows: BarWindows<'w, 's>,
     apps: Query<'w, 's, (Entity, &'static Application)>,
     window_manager: Res<'w, WindowManager>,
+    /// A focus request the command path has already made, if any.
+    ///
+    /// The Bar draws this request instead of waiting for accessibility to
+    /// confirm it, so the indicator moves on the click rather than a frame and
+    /// an AX round trip later. Confirmed focus remains authoritative for
+    /// everything that acts on a window; this is presentation only.
+    requested_focus: Option<Res<'w, FocusCoordinator>>,
 }
 
 impl BarStateParams<'_, '_> {
     pub fn extract(&self) -> crate::errors::Result<BarSnapshot> {
-        let mut snapshot =
-            BarSnapshot::from_state(&self.state.extract()?, &self.state.extract_window_set());
+        // One native membership scan serves the state document, the window set
+        // and the Bar's own per-Space membership. A scan that fails publishes
+        // nothing, so each Space falls back to being read on its own rather
+        // than the whole Bar degrading to the retained layout.
+        let memberships = self.state.memberships();
+        let floating_by_window = self.state.floating_windows();
+        let mut snapshot = BarSnapshot::from_state(
+            &self
+                .state
+                .query_state(&floating_by_window, memberships.as_ref())?,
+            &self
+                .state
+                .window_set(&floating_by_window, memberships.as_ref()),
+        );
         let strips = self
             .strips
             .iter()
@@ -56,17 +76,25 @@ impl BarStateParams<'_, '_> {
             .collect::<Vec<_>>();
         for display in &mut snapshot.displays {
             for space in &mut display.spaces {
-                let membership = self
-                    .window_manager
-                    .windows_in_workspace(space.id)
-                    .map(|ids| ids.into_iter().collect::<HashSet<_>>())
-                    .inspect_err(|error| {
-                        // SkyLight reports an empty Space as NotFound.
-                        if !matches!(error, crate::errors::Error::NotFound(_)) {
-                            warn!(space_id = space.id, %error, "unable to observe Bar membership");
-                        }
-                    })
-                    .ok();
+                let membership = memberships.as_ref().map_or_else(
+                    || {
+                        self.window_manager
+                            .windows_in_workspace(space.id)
+                            .map(|ids| ids.into_iter().collect::<HashSet<_>>())
+                            .inspect_err(|error| {
+                                // SkyLight reports an empty Space as NotFound.
+                                if !matches!(error, crate::errors::Error::NotFound(_)) {
+                                    warn!(
+                                        space_id = space.id,
+                                        %error,
+                                        "unable to observe Bar membership"
+                                    );
+                                }
+                            })
+                            .ok()
+                    },
+                    |memberships| Some(memberships.listed_in(space.id).collect()),
+                );
                 if let Some(strip) = strips.get(&space.id) {
                     self.project_windows(space, strip, &floating, membership.as_ref());
                 }
@@ -86,6 +114,23 @@ impl BarStateParams<'_, '_> {
             .windows()
             .map(|window| (window.id, window.clone()))
             .collect::<HashMap<_, _>>();
+        // Whether this Space is where the Bar draws a window, by the same rule
+        // the floating lane has always used.
+        let in_space = |entity: Entity, window_id: i32| {
+            membership.map_or_else(
+                || strip.contains(entity) || known.contains_key(&window_id),
+                |ids| ids.contains(&window_id),
+            )
+        };
+        // A pending request is what the user just clicked, so it is drawn as
+        // the focused member now rather than a frame and an accessibility round
+        // trip later. Scoped to the Space that holds it: another display's Bar
+        // keeps drawing the confirmed focus.
+        let requested = self.requested_focus_entity().filter(|entity| {
+            self.windows
+                .get(*entity)
+                .is_ok_and(|(window, ..)| strip.contains(*entity) || in_space(*entity, window.id()))
+        });
         space.columns = strip
             .columns()
             .filter_map(|column| {
@@ -96,7 +141,9 @@ impl BarStateParams<'_, '_> {
                             .get(*entity)
                             .is_ok_and(|(_, _, _, floating, _, _, _)| !floating)
                     })
-                    .filter_map(|entity| self.window_record(entity, space.visible, &known))
+                    .filter_map(|entity| {
+                        self.window_record(entity, space.visible, &known, requested)
+                    })
                     .collect::<Vec<_>>();
                 if windows.is_empty() {
                     return None;
@@ -131,15 +178,23 @@ impl BarStateParams<'_, '_> {
             .iter()
             .copied()
             .filter(|entity| {
-                self.windows.get(*entity).is_ok_and(|(window, ..)| {
-                    membership.map_or_else(
-                        || strip.contains(*entity) || known.contains_key(&window.id()),
-                        |ids| ids.contains(&window.id()),
-                    )
-                })
+                self.windows
+                    .get(*entity)
+                    .is_ok_and(|(window, ..)| in_space(*entity, window.id()))
             })
-            .filter_map(|entity| self.window_record(entity, space.visible, &known))
+            .filter_map(|entity| self.window_record(entity, space.visible, &known, requested))
             .collect();
+    }
+
+    /// The window a focus request has already named, if any.
+    ///
+    /// A request is dropped as soon as any focus observation is accepted, so
+    /// what is drawn from it and what accessibility confirms agree within a
+    /// frame or two of each other.
+    fn requested_focus_entity(&self) -> Option<Entity> {
+        self.requested_focus
+            .as_ref()
+            .and_then(|focus| focus.snapshot().requested_entity())
     }
 
     fn window_record(
@@ -147,8 +202,10 @@ impl BarStateParams<'_, '_> {
         entity: Entity,
         space_visible: bool,
         known: &HashMap<i32, BarWindow>,
+        requested: Option<Entity>,
     ) -> Option<BarWindow> {
-        let (window, _, parent, _, focused, unavailable, hidden) = self.windows.get(entity).ok()?;
+        let (window, _, parent, _, confirmed, unavailable, hidden) =
+            self.windows.get(entity).ok()?;
         if unavailable.is_some()
             && self
                 .windows
@@ -164,6 +221,13 @@ impl BarStateParams<'_, '_> {
         if !hidden && unavailable.is_some_and(WindowUnavailable::excludes_from_layout_projection) {
             return None;
         }
+        // A pending request outranks the confirmed focus for drawing, but never
+        // the gates below: it cannot make an unavailable or hidden window (or
+        // one outside the visible Space) draw as focused.
+        let focused = match requested {
+            Some(requested) => requested == entity,
+            None => confirmed,
+        };
         let (_, app) = self.apps.get(parent.parent()).ok()?;
         Some(BarWindow {
             id: window.id(),
@@ -203,6 +267,84 @@ mod tests {
             .iter()
             .find(|space| space.id == TEST_WORKSPACE_ID)
             .unwrap()
+    }
+
+    fn draws_focused(state: &BarSnapshot, id: i32) -> bool {
+        state
+            .displays
+            .iter()
+            .flat_map(|display| display.spaces.iter())
+            .flat_map(BarSpace::windows)
+            .any(|window| window.id == id && window.focused)
+    }
+
+    /// The whole point of drawing a request: the window the user clicked is the
+    /// one the indicator moves to, without waiting for the accessibility
+    /// observation that confirms it (measured at 13–72 ms, and then a frame or
+    /// two of projection behind it).
+    #[test]
+    fn a_requested_focus_moves_the_indicator_before_accessibility_confirms() {
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.pump_frames(15);
+        let before = harness.world().run_system_once(snapshot).unwrap();
+        let target = [0, 1]
+            .into_iter()
+            .find(|id| !draws_focused(&before, *id))
+            .expect("one of the two windows is not drawn as focused");
+
+        harness.world().write_message(Event::action_requested(
+            crate::commands::Action::FocusWindow { window_id: target },
+        ));
+        harness
+            .world()
+            .run_system_once(crate::commands::dispatch_actions)
+            .unwrap();
+        harness
+            .world()
+            .resource_mut::<bevy::ecs::message::Messages<Event>>()
+            .clear();
+
+        // No observation has been delivered: only the request exists.
+        let after = harness.world().run_system_once(snapshot).unwrap();
+        assert!(
+            draws_focused(&after, target),
+            "the Bar must draw the requested window as focused"
+        );
+        assert_eq!(
+            after
+                .displays
+                .iter()
+                .flat_map(|display| display.spaces.iter())
+                .flat_map(BarSpace::windows)
+                .filter(|window| window.focused)
+                .count(),
+            1,
+            "exactly one window draws as focused"
+        );
+    }
+
+    /// One extraction builds three read models — the state document, the
+    /// window set and the Bar's own per-Space membership — and they must share
+    /// one native membership scan: per-Space reads dominate the Bar's frame.
+    #[test]
+    fn one_bar_extraction_reads_native_membership_once_per_space() {
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.pump_frames(15);
+        let spaces = harness
+            .world()
+            .resource::<crate::ecs::topology::NativeTopology>()
+            .known_displays()
+            .flat_map(|(_, spaces)| spaces.iter().copied())
+            .collect::<HashSet<_>>()
+            .len();
+        assert!(spaces > 0, "the harness must have native Spaces to scan");
+        let before = harness.mock_state.workspace_membership_query_count();
+        harness.world().run_system_once(snapshot).unwrap();
+        assert_eq!(
+            harness.mock_state.workspace_membership_query_count() - before,
+            spaces,
+            "one scan reads each Space once; the three read models share it"
+        );
     }
 
     fn hide_space(harness: &mut TestHarness) {

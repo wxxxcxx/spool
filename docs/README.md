@@ -23,6 +23,7 @@
 
 - [Window exclusion policy: DockDoor and AltTab](research/window-exclusion-policy.md)
 - [Window tiling policy: yabai, AeroSpace and Rift](research/window-tiling-policy.md)
+- [Bar click to window switch latency](research/bar-click-focus-latency-2026-09-12.md)
 - [Native tabs as one layout window](research/native-tab-platform-observation-2026-09-11.md)
 - [macOS window capability matrix](research/macos-window-capability-matrix.md)
 - [Private `SLSOrderWindow`: signature, permission and local measurements](research/sls-order-window-research.md)

@@ -424,6 +424,51 @@ fn window_set_without_floats_does_not_scan_native_memberships() {
     );
 }
 
+/// Systems that tick a window's cached frame or a lifecycle timer re-mark the
+/// `Window` component without changing anything the Bar draws. The Bar's
+/// projection must not follow that: re-drawing it costs a native membership
+/// scan, so an incidental touch would put that scan back on the frame rate.
+#[test]
+fn incidental_window_mutation_does_not_dirty_the_bar_projection() {
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(15);
+    let dirty = harness
+        .world()
+        .register_system(crate::ecs::bar_projection_dirty);
+    // A system's first run sees everything that already existed as new.
+    harness.world().run_system(dirty).unwrap();
+    assert!(
+        !harness.world().run_system(dirty).unwrap(),
+        "an idle world is not a dirty Bar"
+    );
+
+    harness
+        .world()
+        .run_system_once(
+            |mut windows: bevy::prelude::Query<&mut crate::manager::Window>| {
+                for mut window in &mut windows {
+                    // Any `Mut<Window>` deref re-marks the component.
+                    let _ = &mut *window;
+                }
+            },
+        )
+        .unwrap();
+    assert!(
+        !harness.world().run_system(dirty).unwrap(),
+        "touching a Window component is not a Bar change"
+    );
+
+    let entity = crate::tests::find_window_entity(0, harness.world());
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(crate::ecs::WindowVisibility::Hidden);
+    assert!(
+        harness.world().run_system(dirty).unwrap(),
+        "hiding a window the Bar lists is a Bar change"
+    );
+}
+
 fn test_dir(name: &str) -> std::path::PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

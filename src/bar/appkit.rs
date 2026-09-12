@@ -1419,6 +1419,19 @@ impl BarManager {
         })
     }
 
+    /// Whether the pointer is on some Bar panel's own chrome.
+    ///
+    /// [`PanelRecord::set_interactive`] gives a panel mouse events exactly
+    /// while the pointer is on the Bar's band or handle — the same test
+    /// `AppKit` applies before it hands the click to the Bar rather than to the
+    /// window underneath. The global event tap sees the click either way, so
+    /// this is how the focus path tells a Bar click from a desktop click.
+    pub fn pointer_is_on_chrome(&self) -> bool {
+        self.panels
+            .values()
+            .any(|record| !record.window.ignoresMouseEvents())
+    }
+
     pub fn animate(&mut self) {
         let now = Instant::now();
         for record in self.panels.values() {

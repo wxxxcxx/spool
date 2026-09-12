@@ -18,7 +18,7 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::layout_snapshot::{LayoutSession, matches_window};
 use crate::ecs::params::Windows;
-use crate::ecs::topology::NativeTopology;
+use crate::ecs::topology::{NativeTopology, SpaceClaim};
 use crate::ecs::window_frame::{DisplayTransferFrame, DisplayTransferReadback};
 use crate::ecs::workspace::{
     PendingSpaceDestruction, WindowSpaceReassignmentPending, freeze_window_for_space_reassignment,
@@ -353,7 +353,7 @@ enum FocusSpacePolicy {
 }
 
 fn focus_window_command(
-    In((window_id, policy)): In<(WinID, FocusSpacePolicy)>,
+    In((window_id, policy, known_space)): In<(WinID, FocusSpacePolicy, Option<WorkspaceId>)>,
     windows: Windows,
     window_manager: Res<WindowManager>,
     mut topology: ResMut<NativeTopology>,
@@ -363,16 +363,27 @@ fn focus_window_command(
         warn!(window_id, "window is not tracked");
         return;
     };
-    if matches!(policy, FocusSpacePolicy::VisibleOnly)
-        && topology
-            .observe_visible_window_space(&window_manager, window_id)
-            .is_none()
-    {
-        warn!(
-            window_id,
-            "cannot confirm a unique visible Space for window focus"
-        );
-        return;
+    if matches!(policy, FocusSpacePolicy::VisibleOnly) {
+        // A caller that drew this window in a Space it can name hands that
+        // Space over here, so confirming visibility can skip the scan of every
+        // other Space. Only a confirmation takes that shortcut; a refusal asks
+        // the question the strict path always asked, and an unreadable Space
+        // refuses on evidence that path would refuse on.
+        let claim = known_space.map(|space_id| {
+            topology.confirm_visible_window_space(&window_manager, window_id, space_id)
+        });
+        let confirmed = match claim {
+            Some(SpaceClaim::Confirmed) => true,
+            // An unreadable Space is not evidence that it is visible.
+            Some(SpaceClaim::Unavailable) => false,
+            Some(SpaceClaim::Refused) | None => topology
+                .observe_visible_window_space(&window_manager, window_id)
+                .is_some(),
+        };
+        if !confirmed {
+            warn!(window_id, "cannot confirm a visible Space for window focus");
+            return;
+        }
     }
     commands.focus_entity(entity, true);
 }
@@ -445,7 +456,18 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
         } else {
             FocusSpacePolicy::VisibleOnly
         };
-        commands.run_system_cached_with(focus_window_command, (*window_id, policy));
+        // The retained layout already places this window in a Space, and that
+        // placement is what a Bar icon was drawn from or what the caller meant
+        // by an id. Handing it over lets the command confirm visibility from
+        // one Space's membership instead of a full topology sample; a claim
+        // the native reads contradict is still refused there.
+        let known_space = windows.find(*window_id).and_then(|(_, entity)| {
+            spaces
+                .iter()
+                .find(|strip| strip.contains(entity))
+                .map(LayoutStrip::id)
+        });
+        commands.run_system_cached_with(focus_window_command, (*window_id, policy, known_space));
         return;
     }
     if let Action::FocusWindowInSpace {

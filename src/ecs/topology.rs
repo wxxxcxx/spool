@@ -27,6 +27,16 @@ impl WindowMemberships {
         self.by_window.get(&window_id).copied().flatten()
     }
 
+    /// Every window macOS lists in this Space, including ones another Space
+    /// also lists.
+    ///
+    /// [`Self::windows_in_space`] answers a different question: it removes
+    /// overlapping memberships, which is what a destination needs but not what
+    /// a projection of the Space's own contents needs.
+    pub(crate) fn listed_in(&self, space: WorkspaceId) -> impl Iterator<Item = WinID> + '_ {
+        self.by_space.get(&space).into_iter().flatten().copied()
+    }
+
     /// Unique members in the native list's order, with duplicate entries removed.
     pub(crate) fn windows_in_space(&self, space: WorkspaceId) -> impl Iterator<Item = WinID> + '_ {
         self.by_space
@@ -36,6 +46,23 @@ impl WindowMemberships {
             .copied()
             .filter(move |&window| self.unique_space(window) == Some(space))
     }
+}
+
+/// The answer to a caller's claim that a window sits in a Space that is
+/// currently on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpaceClaim {
+    /// The Space is the one its display is showing, and the window is in it.
+    Confirmed,
+    /// Current native evidence did not bear the claim out: the Space is not
+    /// the visible one, its display ownership is ambiguous, or the window is
+    /// not in it. A retained layout may simply be behind the window's real
+    /// Space, so this is not yet a refusal.
+    Refused,
+    /// An inventory or membership read the answer depends on failed. The full
+    /// observation refuses on the same evidence, so there is nothing to fall
+    /// back to.
+    Unavailable,
 }
 
 #[derive(Default, Resource)]
@@ -94,8 +121,12 @@ impl NativeTopology {
         let mut by_space = HashMap::<WorkspaceId, Vec<WinID>>::new();
         for space in spaces {
             for window_id in manager.windows_in_workspace(space)? {
-                if !by_window.contains_key(&window_id) {
-                    by_space.entry(space).or_default().push(window_id);
+                // The per-Space list keeps every Space that lists the window,
+                // so a projection can ask what this Space holds; readers that
+                // need an unambiguous destination filter it themselves.
+                let members = by_space.entry(space).or_default();
+                if !members.contains(&window_id) {
+                    members.push(window_id);
                 }
                 by_window
                     .entry(window_id)
@@ -127,6 +158,32 @@ impl NativeTopology {
         let (display, _) = owners.next()?;
         (owners.next().is_none() && self.visible_space(display.id()) == Some(space_id))
             .then_some(display.id())
+    }
+
+    /// Confirms a caller's claim that `window_id` sits in `space_id` and that
+    /// macOS is showing that Space.
+    ///
+    /// The first two steps are the full observation's own: a current display
+    /// inventory and the Space's unique visible display. The last step reads
+    /// that one Space's membership instead of every Space's, which is what a
+    /// Bar click can afford to pay.
+    pub(crate) fn confirm_visible_window_space(
+        &mut self,
+        manager: &WindowManager,
+        window_id: WinID,
+        space_id: WorkspaceId,
+    ) -> SpaceClaim {
+        if !self.refresh_for_command(manager) {
+            return SpaceClaim::Unavailable;
+        }
+        if self.visible_display_for_space(space_id).is_none() {
+            return SpaceClaim::Refused;
+        }
+        match manager.windows_in_workspace(space_id) {
+            Ok(ids) if ids.contains(&window_id) => SpaceClaim::Confirmed,
+            Ok(_) => SpaceClaim::Refused,
+            Err(_) => SpaceClaim::Unavailable,
+        }
     }
 
     /// A preceding command may already have changed native visibility in this batch.
