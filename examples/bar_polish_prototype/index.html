@@ -25,6 +25,19 @@
   The URL always carries the current settings; send it back and its numbers are
   what gets folded into src/bar/appkit.rs.
 
+  VERDICT SO FAR — the shape question is settled:
+    - notched collapsed shape: concave shoulders (12pt) that spread the black
+      along the screen edge and narrow it into the body, plus convex bottom
+      corners that are deliberately tighter (8pt). Specified directly by the
+      user as a path; the only departure is that the flat run before each
+      shoulder is zero, because a flat segment past the arc's start has no black
+      under it and draws as a hairline spike. See s_corner_spec.png.
+    - plain collapsed shape: a pill (both ends round). Implemented for
+      consistency with the capsule; not separately confirmed.
+  STILL OPEN: whether the shoulder keeps that zero flat run, the breathing
+  mechanism (pulse / bloom / heartbeat), its period and amplitude, and which
+  morph curve the collapse uses (spring 320ms is what ships).
+
   ALREADY IN THE CODE (shipped in 0d11101, so it is the baseline to compare
   against rather than a question):
     - the panel never moves: the chrome morphs inside a still menu-bar band, so
@@ -167,7 +180,7 @@
 // ── settings ────────────────────────────────────────────────────────────────
 const SHAPES = {
   bottom:  'A · 平头，仅下部圆角',
-  sfillet: 'B · 四角都向内圆（现状：上 12 + 下 12）',
+  sfillet: 'B · 刘海形：顶边外扩 + 凹肩 + 底部外圆（现状）',
   shoulder:'D · 四角大圆角，贴顶边',
   sfillet12:'B2 · S 形：内凹与外圆同半径 12（更平缓）',
   sfilletIn:'B3 · 反向：上角外圆 10 + 下角外圆 12（上边显窄）',
@@ -233,12 +246,19 @@ function shape(which, { x, w, h }) {
   switch (which) {
     case 'bottom':
       return `M${x},0 H${x+w} V${h-r} A${r},${r} 0 0 1 ${x+w-r},${h} H${x+r} A${r},${r} 0 0 1 ${x},${h-r} Z`;
-    case 'sfillet':
-      // concave shoulders (r12) blend into the screen edge, convex bottom (r8)
-      return `M${x-12},0 A12,12 0 0 0 ${x},12 V${h-r} A${r},${r} 0 0 1 ${x+r},${h} H${x+w-r} A${r},${r} 0 0 1 ${x+w},${h-r} V12 A12,12 0 0 0 ${x+w+12},0 Z`;
-    case 'capsule': {
-      const g = 3, rr = h / 2, y = g;
-      return `M${x+rr},${y} H${x+w-rr} A${rr},${rr} 0 0 1 ${x+w-rr},${y+h} H${x+rr} A${rr},${rr} 0 0 1 ${x+rr},${y} Z`;
+    case 'sfillet': {
+      // MacBook notch: the top edge overhangs the body and the shoulder is
+      // scooped (concave) down to the vertical wall; the bottom corners are the
+      // ordinary convex fillet, tighter than the scoop.
+      const t = 12, K = 0.5523;
+      return `M${x-t},0 L${x+w+t},0 `
+        + `C${x+w+t},${t*K} ${x+w-t*K},${t} ${x+w},${t} `
+        + `L${x+w},${h-r} `
+        + `C${x+w},${h-r+r*K} ${x+w-r+r*K},${h} ${x+w-r},${h} `
+        + `L${x+r},${h} `
+        + `C${x+r-r*K},${h} ${x},${h-r+r*K} ${x},${h-r} `
+        + `L${x},${t} `
+        + `C${x+t*K},${t} ${x-t},${t*K} ${x-t},0 Z`;
     }
     case 'shoulder': {
       const R = Math.min(12, w / 2);

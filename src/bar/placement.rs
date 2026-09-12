@@ -61,18 +61,15 @@ pub const PLAIN_TAB_HEIGHT: f64 = 6.0;
 /// Hovering the tab grows it, which is the only affordance it has.
 pub const PLAIN_TAB_HOVER_HEIGHT: f64 = 9.0;
 
-/// The collapsed capsule's top corners: concave, radius 12.
+/// How far the collapsed capsule's top edge overhangs its body on each side,
+/// and how deep the scoop below it goes.
 ///
-/// The black spreads along the screen edge and narrows into the body, so the
-/// notch's side wall transitions smoothly into the top edge instead of meeting
-/// it at a corner.
+/// The black is widest along the screen edge and its side walls stand in by this
+/// much, joined by a **concave** shoulder: the corner is carved out rather than
+/// rounded over. A convex fillet here is a different shape — it is what the Bar
+/// had before, and it reads as a rounded rectangle rather than as a notch, which
+/// is why the prototype renders it against a photograph of the hardware.
 pub const CAPSULE_TOP_RADIUS: f64 = 12.0;
-/// How much flat top edge runs before each concave shoulder begins.
-///
-/// Zero, because the shoulder has to meet the top edge tangentially: any flat
-/// run past the arc's start is a segment with no black under it, which draws as
-/// a hairline spike rather than as part of the shape.
-pub const CAPSULE_TOP_FLAT: f64 = 0.0;
 /// The collapsed capsule's bottom corners: convex, radius 8 — deliberately
 /// smaller than the top shoulder, so the shape reads as hanging from the edge
 /// rather than as a pill lying against it.
