@@ -112,6 +112,26 @@ A live, accessible tracked window confirmed windowed at graceful exit. An eligib
 The graceful-exit restoration of eligible launch geometry, constrained to a currently available display. Windows without a launch snapshot also have their current geometry constrained. Oversized windows are resized to fit when the application permits; refused writes are logged and retried at most once to correct the origin. It does not alter Native Space membership, window visibility, focus, or z-order.
 _Avoid_: Exit centering
 
+**Bar**:
+Spool's own replacement for a display's menu bar: the panel that occupies that
+display's menu-bar band and presents its Spaces, their windows, and the fixed
+overview controls. It covers the system menu bar while expanded, so collapsing
+it is how the menu bar is handed back.
+_Avoid_: Status bar, toolbar, taskbar
+
+**Bar Handle**:
+The small tab at the centre of a display's Bar that collapses and expands it in
+one click, and the only part of the Bar still on screen once the Bar has
+collapsed. It is always visible, hanging below the Bar while expanded and
+resting at the screen's top edge once the Bar has gone.
+_Avoid_: Handbar, grabber, chevron, pull tab
+
+**Notch Collar**:
+The Bar Handle's form on a display with a Notch: a frame clearing the Notch on
+every side the display actually shows, so a collapsed Bar reads as a slightly
+larger Notch rather than as a tab hidden behind the camera housing.
+_Avoid_: Notch capsule, notch spacer
+
 **Notch**:
 The camera housing that interrupts the top edge of a built-in display. Spool
 never draws on it: it is a hole in the display, and the Bar works around it. The

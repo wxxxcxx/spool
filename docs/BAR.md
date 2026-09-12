@@ -25,6 +25,26 @@ This is still a nonactivating panel, not an
 `NSStatusItem`: macOS does not reserve horizontal space for it among application
 menus and status items, which is why the Bar takes that space instead.
 
+One **Bar Handle** sits at the display's centre, and it is the Bar's only control
+of its own: a small tab whose square top edge is glued to the Bar's bottom edge,
+so while expanded it hangs 10pt below the band, over the desktop below. It is
+64pt wide and 10pt tall with 5pt bottom corners on a display without a notch; on
+a notched display it is the Notch's width plus 10pt a side, and 10pt below it,
+because the middle of the band there is the camera housing and a tab centred
+inside it would be drawn on pixels that do not exist. It is filled like the Bar
+itself — menu-material glass plus `background_color`, with `border_color` and
+`border_width` around it — and as the Bar leaves, black ramps in on the same
+formula the Bar's own shape uses, so the resting handle is opaque black and the
+Notch's ears merge with the Notch. Hovering grows it by a few points and never
+changes its colour (see below).
+
+The panel window is therefore the menu-bar band **plus** that handle's overhang:
+10pt for the handle at rest and 3pt more for the room it grows into when hovered,
+so 13pt taller than the menu bar on every display, even while expanded. That
+headroom is not optional — the view clips its own drawing, so a window sized to
+the resting handle alone would slice the rounded bottom off the moment the handle
+grew. Its frame never moves.
+
 - Every native Space on the display is listed in its current macOS order.
 - Each Space is clickable over its full height, including the blank padding
   above and below icons. Its background leaves 3pt gaps at the top and bottom,
@@ -59,50 +79,45 @@ menus and status items, which is why the Bar takes that space instead.
   one-based numeric Space ordinal. The old `[workspace_labels]` name mapping
   is no longer supported; existing entries are ignored rather than producing
   a mixture of letters and numbers.
-- Expansion, icon movement and focus transitions share a 240ms ease-out policy
-  in `src/bar/motion.rs`. The collapse morph has its own `MORPH` curve — a
-  320ms spring with a four-percent overshoot by default, which is the small
-  settle an `AppKit` panel has — because it is the transition the eye reads as
-  the Bar folding away. Interrupted transitions begin at the last presented
-  frame, and repeated snapshots do not restart motion. Content is clipped to
-  its Space and to the Bar's own chrome, so it wipes away with the shape as the
-  Bar collapses.
-- Hover breathes. The toolbar button under the pointer and the collapsed Bar
-  get a repeating 1.8s ease-in-out pulse — a translucent highlight under the
-  button's symbol (0.07..0.17), and a halo around the collapsed shape made of a
-  hairline rim plus the bloom its shadow casts from the same path, breathing
-  between 0.30 and 0.75 layer opacity while the bloom's radius moves between
-  0.60 and 1.35 times its resting 6pt (plain) or 9pt (notched). Both are Core Animation
-  layers rather than per-frame drawing: pulsing them from the frame loop would
-  mean running the whole ECS at refresh rate, which costs about 45% of a core
-  to animate a highlight. The halo carries a rim as well as a shadow so the
-  pulse is never at the mercy of a shadow alone painting nothing.
-- The pulse's mechanism is one constant, `BREATH`: `Pulse` lifts the halo
-  vertically as well as brightening it, `Bloom` only brightens it. How far a
-  halo may stretch comes from the room the shape has left inside the band, so a
-  six-point tab breathes and a capsule that already fills the menu bar only
-  brightens. The halo layer spans the whole panel and draws the shape's own
-  path, because a path lives in its layer's coordinates: a layer the size of the
-  shape would land the halo an origin away from the shape it belongs to.
+- Expansion, icon movement, the collapse, the handle's hover growth and focus
+  transitions all share one 240ms ease-out policy in `src/bar/motion.rs`
+  (`motion::DURATION` and `motion::ease_out`). Nothing in the Bar overshoots: the Bar leaves through the
+  screen's top edge, so a curve that passed its target would push the handle past
+  the edge it is coming to rest on. Interrupted transitions begin at the last
+  presented frame, and repeated snapshots do not restart motion. Content is
+  clipped to its Space and to the band it rides on, so it leaves with the Bar.
+- The Bar Handle answers the pointer by growing, never by changing colour: it
+  gains `HANDLE_HOVER_GROWTH` (8pt of width, 3pt of height) over the same 240ms
+  ease-out as every other transition, centred on itself and growing *away* from
+  the edge it is glued to — the Bar's bottom edge while expanded, the screen's
+  top edge once collapsed — so the join never opens and the handle never lifts
+  off the Bar. A notched display's collar grows the same way, which thickens its
+  ears and its chin. The grown rect contains the resting one, so a pointer that
+  is inside the small shape is still inside the large one: growing can never drop
+  the pointer out of hover and flip the handle back and forth every frame. It is
+  a frame-loop transition, not a repeating pulse, so it costs nothing once it has
+  settled.
+- The toolbar button under the pointer keeps the other hover language: a
+  repeating 1.8s ease-in-out wash of translucent white over the button's own
+  shape, between 0.07 and 0.17 layer opacity. It is a Core Animation layer rather
+  than per-frame drawing, because pulsing it from the frame loop would mean
+  running the whole ECS at refresh rate, which costs about 45% of a core to
+  animate a highlight.
 
 ### Tuning the feel
 
-`examples/bar_polish_prototype` (kept on the throwaway `prototype/bar-polish`
-branch, with a copy in the working tree) is the primary source for the shape
-and motion exploration; it renders every candidate and carries its settings in
-the URL. Its vocabulary maps onto the code like this:
+`examples/bar_handbar_prototype` (throwaway, with a copy in the working tree)
+carries the current shape and motion exploration: both display kinds, both
+states, a scrubber that freezes the slide at any progress, and the retired
+alternatives it was picked over. `examples/bar_polish_prototype` and
+`examples/bar_collapse_prototype` (kept on the throwaway `prototype/bar-polish`
+and `prototype/bar-collapse` branches) explored the capsule and tab shapes this
+design replaced; their settings no longer map onto any constant.
 
-| Prototype | Code |
-| --- | --- |
-| `sn=sfillet` | `placement::CAPSULE_TOP_RADIUS` > 0 with `ChromeShape::overhang`, i.e. an overhanging top edge |
-| `sn=scoop` | `SHOULDER = Shoulder::Scoop`, the concave alternative |
-| `sn=bottom` / `sn=shoulder` | `CAPSULE_TOP_RADIUS` = 0, with `CAPSULE_BOTTOM_RADIUS` raised |
-| `sn=capsule` | a gap under the shape, i.e. `collapsed_rect` returning a `y > 0` |
-| `sp=r3` / `r5` / `capsule` | the plain tab's radii in `chrome_path`; `capsule` rounds both ends |
-| `br=bloom` / `pulse` | `BREATH` |
-| `br=heartbeat` | the pulse's two halves given different curves |
-| `period`, `amp` | `BREATH_PERIOD`, and the range passed to `breathe` |
-| `cv=ease` / `spring` / `smooth` | `MORPH`, with the curve in `motion::ease_out` / `spring` / `smooth` |
+The numbers the prototype settled on live in `src/bar/placement.rs`:
+`HANDLE_WIDTH` (64pt), `HANDLE_HEIGHT` (10pt, which is also how far the collar
+reaches past the Notch and how much taller than the band the panel is), and
+`HANDLE_RADIUS` (5pt, the handle's bottom corners).
 - Every Space keeps a slot: the strip never scrolls, and no Space is dropped to
   make room. The focused Space takes whatever the others leave, up to its own
   content width; the rest keep the narrowest slot that still reads as that Space
@@ -180,47 +195,46 @@ from the keyboard.
 ## Collapse
 
 The Bar covers the system menu bar while expanded, so collapsing is how the
-menu bar is handed back. Two chevron handles sit in the 24pt zone at each end
-of the Bar — where the system menu bar's own edge items were — and appear as
-soon as the pointer is anywhere on the Bar, so collapsing is discoverable
-without hunting for an edge. The handle under the pointer brightens; a hidden
-handle ignores clicks. Collapsing is runtime-only presentation state: it is
-never written to disk and every Bar starts expanded.
+menu bar is handed back. The **Bar Handle** is the Bar's only collapse control,
+in both directions and in one click: it hangs below the band while expanded, so
+there is nothing to reveal first and no chevron to hunt for at the display's
+edges. Collapsing is runtime-only presentation state: it is never written to
+disk and every Bar starts expanded.
 
-- Collapse a notched display and the Bar's chrome becomes a black capsule
-  merged with the notch: the notch's own width plus 24pt on each side,
-  menu-bar height, opaque. It is shaped like the notch: its top edge
-  **overhangs** the body by `CAPSULE_TOP_RADIUS` (12pt) on each side, so the
-  black is widest along the screen edge, and a **convex fillet** of the same
-  radius carries each end back down to a vertical wall. The bottom corners are
-  the ordinary convex fillet too, deliberately tighter
-  (`CAPSULE_BOTTOM_RADIUS`, 8pt). The alternative — a *scooped*, concave
-  shoulder that carves the corner out — is kept behind `SHOULDER`, because this
-  choice flipped once: the scoop leaves a small notch where it meets the screen
-  edge, and the prototype's render beside a photograph of the hardware is what
-  settled it. A small expand handle sits inside each end.
-- The collapsed shapes paint their own black. The Bar's configured background
-  colour defaults to fully transparent, because expanded its look *is* the blur
-  behind it; the blur is faded out as the Bar collapses, so the chrome fills
-  opaque black in proportion to how much of the blur has gone and lays the
-  configured colour over that.
-- Collapse a display without a notch and it becomes a 120x6pt tab flush with
-  the screen top, horizontally centred, a pill: both ends round, so it reads as
-  the same rounded shape the capsule is, minus the notch. Hovering grows it to
-  9pt as the click affordance, and a click anywhere on it expands the Bar
-  again.
-- The **window never moves**. The panel is the menu-bar band for its whole
-  life, and only the chrome drawn inside it morphs — that is what keeps the
-  transition smooth, because moving and resizing a blurred window every frame
-  makes the window server re-blur it every frame. An interrupted morph restarts
-  from the frame on screen.
-- While collapsed the panel still covers the band, so it ignores mouse events
-  everywhere except the tab: the Apple menu, application menus and status items
-  underneath keep working, and only the few points the tab occupies are ours.
-- On a plain display the tab's hover is judged against the 9pt box it grows
-  into, never against its current height: otherwise a tab growing under the
-  pointer would drop the pointer out of hover and flip every frame. The shape
-  hangs from the top edge either way, so hover only ever grows it downwards.
+- Collapsing slides the whole Bar — band, content and glass — up out of the
+  screen through the display's top edge, over the shared 240ms ease-out. The
+  handle is what stays behind.
+- On a display **without a notch** the handle rides up with the band and comes
+  to rest flush with the screen's top edge: 64x10pt, square where it was glued
+  to the Bar, 5pt rounded at the bottom. It is 10pt below the menu bar before
+  the collapse and 0pt after, and it is the same size throughout — the shape
+  never grows on hover or at rest.
+- On a **notched** display the handle is a collar around the Notch — the Notch's
+  width plus 10pt a side, and 10pt below it — and it does not move at all. The
+  middle of the band there is the camera housing, so the pixels a centred tab
+  would occupy do not exist; the collar's two ears and its chin, outside the
+  housing, are what is left on screen, and the collapsed Bar reads as a slightly
+  larger Notch.
+- The handle's fill follows the Bar's: menu-material glass plus the configured
+  `background_color`, with the configured border around it. The Bar's own
+  configured background colour defaults to fully transparent, because expanded
+  its look *is* the blur behind it; as the Bar leaves, opaque black ramps in
+  where that blur has gone and the configured colour is laid over it, so the
+  resting handle is solid black — which is also what merges the Notch's ears
+  with the Notch.
+- The **window never moves**. The panel is the menu-bar band plus the handle's
+  window overhang (`placement::window_overhang`) for its whole life, and only what
+  is drawn inside it slides:
+  that is what keeps the transition smooth, because moving and resizing a
+  blurred window every frame makes the window server re-blur it every frame. The
+  blur is masked to the moving chrome rather than faded, so the glass leaves with
+  the Bar instead of lingering over the desktop below it. An interrupted slide
+  restarts from the frame on screen.
+- The panel is ours only where the pointer is on the Bar's own chrome — the band
+  while it is there, the handle either way — and ignores mouse events everywhere
+  else. So the Apple menu, application menus and status items under a collapsed
+  Bar keep working, and so does the 10pt strip beside the handle: pointing at it
+  hands the click to whatever is underneath before it can be swallowed.
 - Everything the Bar does not cover while collapsed is the normal macOS menu
   bar, so the Apple menu, application menus and status items work as usual.
 - `spool.action.bar.toggle_collapse` acts on the display that owns the active
@@ -309,9 +323,12 @@ separate Bar config file or file polling in the renderer.
 | `show_desktop` | `true` | Show the Show Desktop button. Hidden buttons release their width. |
 
 The Bar is the menu bar band: it is exactly as wide and as tall as the menu bar
-on each display, so its geometry is not configurable. `embed_in_menu_bar`,
-`height`, `top_offset`, `max_width` and `screen_padding` are therefore retired;
-an `init.lua` that still sets them keeps loading and the keys are ignored.
+on each display, and its handle is a fixed 64x10pt (5pt bottom corners, the
+Notch plus 10pt a side on a notched display), so its geometry is not
+configurable and there are no handle keys to set. `bar.corner_radius` still
+rounds the band's own bottom corners. `embed_in_menu_bar`, `height`,
+`top_offset`, `max_width` and `screen_padding` are retired; an `init.lua` that
+still sets them keeps loading and the keys are ignored.
 
 Existing spacing, background/border, shadow, selection color, focus ring and
 label-visibility settings remain available. All lengths use logical points, not

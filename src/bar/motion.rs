@@ -319,24 +319,6 @@ pub fn ease_out(t: f64) -> f64 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
-/// A lightly damped spring, for the Bar's own collapse.
-///
-/// It passes the target by about four percent and settles, which is the small
-/// overshoot `AppKit` panels have; `ease_out` never passes it at all. Matching
-/// the prototype's curve exactly matters: that is the feel that was picked.
-#[must_use]
-pub fn spring(t: f64) -> f64 {
-    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
-        * (t.clamp(0.0, 1.0) * std::f64::consts::PI * 1.35).cos()
-}
-
-/// Smoothstep: no overshoot, a slower start and stop than [`ease_out`].
-#[must_use]
-pub fn smooth(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
 pub(crate) fn lerp(from: f64, to: f64, t: f64) -> f64 {
     from + (to - from) * t
 }

@@ -174,7 +174,7 @@ objects stay on their owning threads.
 | `src/reader.rs` | The daemon adapter: turns authenticated local IPC requests into events. |
 | `crates/local_ipc` | The deep IPC module: singleton lock, Unix socket lifecycle, peer authentication, bounded framing, deadlines, replies, and subscriptions. |
 | `src/overlay.rs` | Logic for drawing active window borders and inactive window dimming. |
-| `src/bar/` | The native AppKit Bar: one panel per display occupying that display's menu-bar band, drawn on a menu-material blur backdrop. `layout.rs` owns the Space strip and its per-Space slots, `placement.rs` the menu-bar rect and the notch, `appkit.rs` the panel, gestures and drawing. |
+| `src/bar/` | The native AppKit Bar: one panel per display occupying that display's menu-bar band plus the handle's overhang, drawn on a menu-material blur backdrop. `layout.rs` owns the Space strip and its per-Space slots, `placement.rs` the menu-bar rect, the notch and the handle's geometry, `appkit.rs` the panel, gestures and drawing. |
 | `src/bar/preferences.rs` | Bar preferences parsed from `spool.setup{ bar = … }`; the band's height is resolved from the observed menu bar, never from configuration. |
 
 ### Bar presentation
@@ -184,21 +184,25 @@ it takes the menu bar's own rect instead — full display width, the menu bar's
 height, flush with the screen top, with no inset — and deliberately covers the
 system menu bar while expanded. Its content is drawn on an
 `NSVisualEffectView` using the menu material, so a `behindWindow` blur sits
-behind the Spaces and icons exactly as it does behind the menu bar itself.
+behind the Spaces and icons exactly as it does behind the menu bar itself. One
+small handle at the display's centre hangs below that band, so the panel window
+is taller than the menu bar on every display by `placement::window_overhang` —
+which is the handle at rest plus the room it grows into under the pointer.
 
-Collapse is runtime-only presentation state. `Action::ToggleBarCollapse` raises
-a one-shot `BarRequests` flag that the Bar's own schedule consumes on the next
-frame; the chrome then morphs to a capsule merged with the notch, or to
-a small top-centred tab on a display without one. `ChromeMotion` eases that
-morph over its own `MORPH` curve, but it moves no window: the panel is the
-menu-bar band for its whole life and only what is drawn inside it changes, so
-the window server never re-blurs a moving window. While collapsed the panel
-ignores mouse events except over the tab, which hands the rest of the menu bar
-back without a second window. Hover pulses are Core Animation layers, not frame
-loop work: a window manager that wakes its whole ECS at refresh rate to animate
-a highlight spends ~45% of a core doing it. Nothing about collapse is persisted
-and every Bar starts expanded, so the collapsed state can never be restored
-into a session that did not ask for it.
+Collapse is runtime-only presentation state. `Action::ToggleBarCollapse` raises a
+one-shot `BarRequests` flag that the Bar's own schedule consumes on the next
+frame; the whole Bar — band, content and its glass — then slides up out of the
+screen through the display's top edge over the content's shared 240ms ease-out,
+leaving the handle behind (`ChromeMotion`). It moves no window: the panel keeps
+its rect for its whole life, and the blur is masked to the moving chrome rather
+than faded. Because the panel is taller than the band, it is interactive only
+where the pointer is on the Bar's own chrome, which hands both the menu bar
+underneath and the strip beside the handle back to their owners without a second
+window. Hover pulses are Core Animation layers, not frame loop work: a window
+manager that wakes its whole ECS at refresh rate to animate a highlight spends
+~45% of a core doing it. Nothing about collapse is persisted and every Bar starts
+expanded, so the collapsed state can never be restored into a session that did
+not ask for it.
 
 ## 4. Key Data Entities
 

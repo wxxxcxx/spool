@@ -1,0 +1,564 @@
+<!doctype html>
+<!--
+  PROTOTYPE — throwaway. Not production code, no tests, no persistence.
+
+  Question (2026-09-12): the Bar keeps its full-width menu-bar band, but the
+  collapse affordance moves to ONE small handle at the display's centre — a
+  rounded tab whose top edge is glued to the Bar's bottom edge — and collapsing
+  SLIDES the whole Bar up out of the screen, leaving only that handle behind.
+  Does that read right, at these numbers?
+
+  Locked by the grilling (2026-09-12) — do not re-litigate here:
+    - the expanded Bar is unchanged: full width, menu-bar height, flush with
+      the screen top, covers the system menu bar, menu-material glass, content
+      and interactions exactly as today
+    - the two end chevrons are gone; this handle is the only toggle, and it
+      toggles in one click in both directions (no hover-reveal step)
+    - plain display: 64x10pt, bottom corners r5, top edge glued to the Bar's
+      bottom edge — so while expanded it hangs 10pt below the band over the
+      desktop, and on collapse it rides up with the Bar and rests flush with
+      the screen top. Same size in both states; hover does not grow it
+    - notched display: a collar hugging the Notch — 10pt more on each side and
+      10pt below it, top flush with the screen top, outer bottom corners r5.
+      It is PINNED, because the Notch is a hole in the hardware; the Bar slides
+      out from behind it. While expanded only the 10pt chin below the band shows
+    - material: the Bar's own fill (menu-material glass + background colour); as
+      the Bar leaves, black ramps in on the existing formula, so the resting
+      handle is opaque black and the Notch ears merge with the Notch
+    - hover: the existing rim + bloom breath on the handle's outline, in both
+      states, no size change
+    - motion: ONE 240ms ease-out for chrome and content together; the glass is
+      masked to the moving chrome shape and leaves with it, and the panel
+      window frame never moves
+  Open here (what this page is for):
+    - does the handle read as part of the Bar while expanded, and as "the last
+      bit of Bar left behind" once collapsed?
+    - is the black ramping over the whole shape during the slide muddy, or
+      should only the handle darken?              → 2 · 参数 · 黑度渐入
+    - does the plain handle's ride-to-top beat pinning it under the menu bar?
+                                                 → 2 · 参数 · 普通屏归位
+    - the numbers: width / height / corner radius / Notch margin sliders, and a
+      scrubber that freezes the slide at any progress
+    - what the collapsed handle looks like lying ON the revealed system menu
+      bar: the mock menubar is drawn behind the glass, so it is both what the
+      glass blurs and what the handle ends up sitting on
+  VERDICT (2026-09-12, accepted): the design stands as drawn here — plain
+  display 64x10pt r5 riding to the screen top, notched display a pinned collar
+  10pt past the Notch on each side and below, black ramping over the whole shape
+  as the Bar leaves, one 240ms ease-out, hover feedback with no size change.
+  Post-review change: the rim + bloom halo this page draws was replaced by a
+  rim-less translucent-white wash over the handle's own shape (0.07..0.17, same
+  1.8s period as the toolbar buttons). Hovering the handle showed a white frame
+  tracing its outline — including the top edge glued to the Bar — which broke the
+  handle's one-piece read; a wash keeps the breath without the seam. The review also caught a mock bug worth recording: the black ramp was
+  an SVG path inside the backdrop-filtered layer's stacking context, so Chrome
+  painted it *under* the glass and the collapsed collar looked like the Notch
+  alone. It is now its own clipped layer (`.black`), and the same shape in the
+  real Bar is an `NSBezierPath` fill drawn over the backdrop, so it cannot
+  regress there. Implementation: src/bar/placement.rs, src/bar/appkit.rs.
+
+  Run: ./run.sh [expanded|collapsed] [p=0.5] [only=plain|notched] [guides=1]
+  Keys: space 折叠/展开 · h 强制 hover · 1/2/3 定格展开/中途/收起 · p 继续播放
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>PROTOTYPE — Bar Handle</title>
+<style>
+  :root { --ink:#e8e8ea; --dim:#9a9aa2; --panel:#1b1b1f; --line:#33333a; --accent:#0a84ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 24px 80px; background:#101013; color:var(--ink);
+         font:13px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  h1 { font-size:15px; font-weight:600; margin:0 0 6px; }
+  h2 { font-size:12px; font-weight:600; margin:28px 0 10px; color:var(--dim);
+       text-transform:uppercase; letter-spacing:.08em; }
+  p.lede { margin:0 0 8px; color:var(--dim); max-width:92ch; }
+  code { font:11px/1.4 ui-monospace, "SF Mono", Menlo, monospace; color:#c8c8d0; }
+  b { font-weight:600; color:var(--ink); }
+
+  .grid { display:flex; flex-wrap:wrap; gap:20px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+          padding:14px; flex:1 1 520px; min-width:420px; }
+  .card h3 { margin:0 0 10px; font-size:12px; font-weight:600; color:var(--dim); }
+
+  /* ── the mock screen ───────────────────────────────────────────────────── */
+  .screen { position:relative; width:100%; height:150px; border-radius:10px; overflow:hidden;
+            background:linear-gradient(160deg,#2f4a75 0%,#1d2b45 45%,#121722 100%);
+            box-shadow:inset 0 0 0 1px #2a2a31; }
+  .screen[data-p] { width:300px; height:104px; }
+
+  .wall { position:absolute; inset:0; background:linear-gradient(160deg,#3a5a8c 0%,#22314e 50%,#121722 100%); }
+  /* a tiled window right below the band, so the expanded handle is judged over one */
+  .win { position:absolute; left:6%; right:6%; top:34px; bottom:8px; border-radius:8px;
+         background:#1a1d24; box-shadow:inset 0 0 0 1px #34343d; }
+  .win .tl { position:absolute; left:10px; top:7px; width:78px; height:6px; border-radius:3px;
+             background:rgba(255,255,255,.18); }
+  .win .tl::before { content:""; position:absolute; left:-1px; top:-3px; width:6px; height:6px; border-radius:50%;
+             background:#ff5f57; box-shadow:9px 0 0 #febc2e, 18px 0 0 #28c840; }
+
+  /* the system menu bar, revealed once the Bar slides away */
+  .sysbar { position:absolute; top:0; left:0; right:0; height:30px; z-index:2;
+            display:flex; align-items:center; justify-content:space-between;
+            padding:0 8px; color:rgba(255,255,255,.86); font-size:11px; font-weight:500;
+            background:rgba(20,22,28,.42); -webkit-backdrop-filter:blur(18px) saturate(1.4);
+            backdrop-filter:blur(18px) saturate(1.4); }
+  .sysbar .grp { display:flex; align-items:center; gap:12px; white-space:nowrap; }
+  .sysbar .apple { font-size:12px; }
+  .sysbar .dim { color:rgba(255,255,255,.55); }
+
+  /* the Bar's own material: one backdrop-filtered layer, masked to the chrome */
+  .black { position:absolute; inset:0; z-index:4; pointer-events:none; background:#000; }
+  .glass { position:absolute; inset:0; z-index:3; pointer-events:none;
+           background:rgba(8,8,10,.72);
+           -webkit-backdrop-filter:blur(18px) saturate(1.4);
+           backdrop-filter:blur(18px) saturate(1.4); }
+
+  /* the Bar's content: slides up with the chrome and is clipped by the screen top */
+  .content { position:absolute; top:0; left:0; right:0; height:30px; z-index:5;
+             display:flex; align-items:center; justify-content:center; gap:10px; pointer-events:none; }
+  .tb { display:grid; place-items:center; width:20px; height:20px; color:rgba(255,255,255,.9); }
+  .spills { display:flex; align-items:center; gap:5px; }
+  .spill { height:16px; border-radius:4px; background:rgba(255,255,255,.08); width:20px; }
+  .spill.on { width:32px; background:rgba(10,132,255,.28);
+              box-shadow:inset 0 0 0 1px rgba(10,132,255,.5); }
+
+  .overlay { position:absolute; inset:0; z-index:6; pointer-events:none;
+             width:100%; height:100%; }
+  .notch { position:absolute; top:0; left:50%; transform:translateX(-50%); width:190px; height:30px;
+           background:#000; border-radius:0 0 5px 5px; z-index:7; pointer-events:none; }
+  .hit { position:absolute; z-index:8; cursor:pointer; }
+  .screen[data-p] .hit { display:none; }
+  body.guides .notch { outline:1px solid #00ffff; outline-offset:-1px; }
+  body.guides .screen { box-shadow:inset 0 0 0 1px #ff00ff; }
+
+  .frames { display:flex; gap:14px; flex-wrap:wrap; }
+  .frame figcaption { margin-top:6px; font:11px/1.4 ui-monospace, Menlo, monospace; color:var(--dim); }
+  .scale figure { margin:0 0 14px; background:#141418; border:1px solid var(--line); border-radius:10px; padding:10px; }
+  .scale figure > figcaption { font-size:11px; color:var(--ink); margin-top:8px; }
+
+  .row { display:flex; align-items:center; gap:10px; margin:9px 0 0; flex-wrap:wrap; }
+  .row label { color:var(--dim); min-width: 88px; }
+  input[type=range] { width:150px; accent-color:var(--accent); }
+  select, button { background:#23232a; color:var(--ink); border:1px solid var(--line);
+                   border-radius:7px; padding:4px 8px; font:inherit; }
+  button:hover { background:#2c2c35; }
+  .readout { font:11px/1.6 ui-monospace, Menlo, monospace; color:#a9a9b4; }
+  #url { margin-top:10px; font:11px ui-monospace, Menlo, monospace; color:#7f7f8a; word-break:break-all; }
+  .kbd { font:11px ui-monospace, Menlo, monospace; color:#5b5b66; }
+</style>
+</head>
+<body>
+
+<h1>PROTOTYPE — Bar Handle（把手式折叠）</h1>
+<p class="lede">
+  点手把、或按 <code>空格</code>，折叠/展开。展开时手把挂在 bar 下缘、压在桌面上（唯一入口）；
+  折叠时整条 bar 连玻璃带内容一起上滑出屏幕 —— 普通屏的手把停在屏幕顶边，刘海屏的框钉在刘海上不动。
+  被让出来的系统菜单栏画在玻璃后面，用来判断黑手把够不够显眼、玻璃遮住了它多少。
+  下面的滑杆可以改尺寸、改渐黑方式、并把动画定格在任意进度。<b>URL 实时反映当前设置</b>，调好后把 URL 发回来。
+</p>
+
+<h2>1 · 模拟屏（点手把 / 空格）</h2>
+<div class="grid">
+  <div class="card" id="cardP">
+    <h3>普通屏 · 手把挂在 bar 下缘，收起后停在屏幕顶边</h3>
+    <div class="row" style="margin:0 0 10px">
+      <button data-toggle>折叠 / 展开</button>
+      <span class="readout" id="readP"></span>
+    </div>
+    <div class="screen" data-kind="plain" data-live="1" id="screenP"></div>
+  </div>
+  <div class="card" id="cardN">
+    <h3>刘海屏 · 手把是贴着刘海的一圈外框，钉住不动</h3>
+    <div class="row" style="margin:0 0 10px">
+      <button data-toggle>折叠 / 展开</button>
+      <span class="readout" id="readN"></span>
+    </div>
+    <div class="screen" data-kind="notched" data-live="1"></div>
+  </div>
+</div>
+
+<h2>2 · 定格三帧（展开 p=1 → 中途 p=0.5 → 收起 p=0）</h2>
+<div class="scale" id="frames"></div>
+
+<h2>3 · 参数</h2>
+<div class="card">
+  <div class="row">
+    <label>手把宽度</label><input type="range" id="rngW" min="40" max="120" step="1">
+    <span class="readout" id="outW"></span>
+    <label>手把高度</label><input type="range" id="rngH" min="6" max="20" step="1">
+    <span class="readout" id="outH"></span>
+  </div>
+  <div class="row">
+    <label>底角半径</label><input type="range" id="rngR" min="0" max="10" step="1">
+    <span class="readout" id="outR"></span>
+    <label>刘海外扩</label><input type="range" id="rngEar" min="4" max="20" step="1">
+    <span class="readout" id="outEar"></span>
+  </div>
+  <div class="row">
+    <label>黑度渐入</label>
+    <select id="selBlack">
+      <option value="all">整条 bar 一起变黑（沿用现有公式）</option>
+      <option value="handle">只有手把变黑（bar 保持玻璃直到离屏）</option>
+    </select>
+    <label>普通屏归位</label>
+    <select id="selRide">
+      <option value="ride">随 bar 上移，停在屏幕顶边（定稿）</option>
+      <option value="pinned">钉在菜单栏下方不动</option>
+    </select>
+  </div>
+  <div class="row">
+    <label>折叠曲线</label>
+    <select id="selCurve">
+      <option value="ease">240ms ease-out（定稿）</option>
+      <option value="spring">320ms spring（旧的，有轻微过冲）</option>
+      <option value="smooth">420ms smooth（无过冲）</option>
+    </select>
+    <label>呼吸周期</label><input type="range" id="rngPeriod" min="900" max="3000" step="50">
+    <span class="readout" id="outPeriod"></span>
+  </div>
+  <div class="row">
+    <label>定格进度</label><input type="range" id="rngP" min="0" max="100" step="1">
+    <span class="readout" id="outP"></span>
+    <button id="btnResume">继续播放</button>
+    <button id="btnReset">回到定稿参数</button>
+  </div>
+  <div id="url"></div>
+</div>
+
+<p class="lede" style="margin-top:14px">
+  按键：<code>空格</code> 折叠/展开 · <code>h</code> 强制 hover（看呼吸光晕） ·
+  <code>1</code>/<code>2</code>/<code>3</code> 定格 p=1/0.5/0 · <code>p</code> 继续播放
+</p>
+
+<script>
+// ── settings (URL is the source of truth for every number) ──────────────────
+const q = new URLSearchParams(location.search);
+const num = (key, fallback) => q.get(key) === null ? fallback : +q.get(key);
+const clamp = (v, a, b) => Math.min(Math.max(v, a), b);
+
+const S = {
+  collapsed: (q.get('state') || 'expanded') === 'collapsed',
+  freeze: q.get('p') === null ? null : clamp(+q.get('p'), 0, 1),
+  w: num('w', 64),
+  h: num('h', 10),
+  r: num('r', 5),
+  ear: num('ear', 10),
+  black: q.get('black') || 'all',
+  ride: (q.get('ride') || 'ride') !== 'pinned',
+  curve: q.get('cv') || 'ease',
+  period: num('period', 1800),
+  hover: q.get('hover') === '1',
+  guides: q.get('guides') === '1',
+};
+
+// ── curves (same shapes the real code has: one 240ms ease-out is the pick) ──
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+const smooth = t => t * t * (3 - 2 * t);
+const spring = t => 1 - Math.pow(1 - t, 3) * Math.cos(t * Math.PI * 1.35);
+const CURVE = { ease: easeOut, spring, smooth };
+const DURATION = { ease: 240, spring: 320, smooth: 420 };
+const CURVE_LABEL = { ease: '240ms ease-out', spring: '320ms spring', smooth: '420ms smooth' };
+const curveAt = (which, t) => CURVE[which](clamp(t, 0, 1));
+
+// ── geometry (mock px = pt, 1:1 with the real Bar) ──────────────────────────
+const BAND = 30;                        // menu-bar band height in the mock
+const NOTCH = { w: 190, h: 30 };        // a 1470pt screen's cutout, scaled to the mock
+
+const $ = id => document.getElementById(id);
+const R = (x, y, w, h) => `M${x},${y} H${x + w} V${y + h} H${x} Z`;
+
+/// Square top edge, rounded bottom corners: the handle's own outline.
+function tabPath({ x, y, w, h, r }) {
+  const k = clamp(r, 0, Math.min(w / 2, h));
+  if (k <= 0) return R(x, y, w, h);
+  return `M${x},${y} H${x + w} V${y + h - k} `
+    + `A${k},${k} 0 0 1 ${x + w - k},${y + h} H${x + k} `
+    + `A${k},${k} 0 0 1 ${x},${y + h - k} Z`;
+}
+
+/// The handle's rect at progress `p` (1 = expanded), in screen coordinates.
+///
+/// Plain: the assembly slides up by the band's height, so the handle ends flush
+/// with the screen top. Notched: the collar is pinned around the Notch.
+function handleRect(kind, width, p) {
+  const slide = (1 - p) * BAND;
+  if (kind === 'notched') {
+    const w = NOTCH.w + S.ear * 2;
+    const h = NOTCH.h + S.ear;
+    return { x: (width - w) / 2, y: 0, w, h, r: S.r, pinned: true };
+  }
+  return {
+    x: (width - S.w) / 2,
+    y: S.ride ? BAND - slide : BAND,
+    w: S.w,
+    h: S.h,
+    r: S.r,
+    pinned: !S.ride,
+  };
+}
+
+// ── the mock screens ────────────────────────────────────────────────────────
+const ICON_A = `<svg width="17" height="17" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+  stroke-width="1.15" stroke-linejoin="round"><rect x="1.3" y="2.3" width="5.9" height="4.5" rx="1.2"/>
+  <rect x="8.8" y="2.3" width="5.9" height="4.5" rx="1.2"/><rect x="1.3" y="9.2" width="5.9" height="4.5" rx="1.2"/>
+  <rect x="8.8" y="9.2" width="5.9" height="4.5" rx="1.2"/></svg>`;
+const ICON_B = `<svg width="17" height="17" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+  stroke-width="1.15" stroke-linejoin="round"><rect x="2" y="1.8" width="12" height="7" rx="1.4"/>
+  <path d="M2.6 11.4h10.8"/><path d="M2 14.2h12"/></svg>`;
+
+const contentHTML = () => `<span class="tb">${ICON_A}</span><span class="tb">${ICON_B}</span>`
+  + `<span class="spills"><span class="spill"></span><span class="spill on"></span>`
+  + `<span class="spill"></span><span class="spill"></span></span>`;
+
+const sysbarHTML = () => `
+  <span class="grp"><span class="apple">&#63743;</span><span>Finder</span><span>文件</span>
+    <span>编辑</span><span>显示</span><span>窗口</span><span>帮助</span></span>
+  <span class="grp"><span class="dim">&#8984;</span><span class="dim">&#8997;</span>
+    <span>&#128266;</span><span>&#128267;</span><span>14:32</span></span>`;
+
+const screens = [];
+let uid = 0;
+
+function buildScreen(scr) {
+  const kind = scr.dataset.kind;
+  scr.innerHTML = `
+    <div class="wall"></div>
+    <div class="win"><span class="tl"></span></div>
+    <div class="sysbar">${sysbarHTML()}</div>
+    <div class="glass"></div>
+    <div class="black"></div>
+    <div class="content">${contentHTML()}</div>
+    <svg class="overlay"></svg>
+    <div class="hit"></div>${kind === 'notched' ? '<div class="notch"></div>' : ''}`;
+  const record = {
+    el: scr,
+    kind,
+    id: `s${uid++}`,
+    glass: scr.querySelector('.glass'),
+    black: scr.querySelector('.black'),
+    content: scr.querySelector('.content'),
+    overlay: scr.querySelector('.overlay'),
+    hit: scr.querySelector('.hit'),
+    fixed: scr.dataset.p === undefined ? null : +scr.dataset.p,
+    live: scr.dataset.live === '1',
+    hovered: S.hover && scr.dataset.live === '1',
+  };
+  record.hit.addEventListener('mouseenter', () => { record.hovered = true; wake(); });
+  record.hit.addEventListener('mouseleave', () => { record.hovered = false; wake(); });
+  record.hit.addEventListener('click', event => { event.stopPropagation(); toggle(); });
+  scr.addEventListener('click', event => {
+    // Clicking the Bar itself is not a toggle in the real thing; the handle is.
+    if (event.target === record.hit) return;
+  });
+  screens.push(record);
+}
+
+function geometryFor(kind, width, p) {
+  const slide = (1 - p) * BAND;
+  return { slide, handle: handleRect(kind, width, p) };
+}
+
+function render(record, now, progress) {
+  const p = record.fixed === null ? progress : record.fixed;
+  const width = record.el.clientWidth;
+  const { slide, handle } = geometryFor(record.kind, width, p);
+  const chrome = R(0, -slide, width, BAND) + ' ' + tabPath(handle);
+  const ramp = S.black === 'all' ? chrome : tabPath(handle);
+  const bloom = record.hovered ? 0.30 + 0.45 * ((Math.sin((now / S.period) * Math.PI * 2) + 1) / 2) : 0;
+
+  record.glass.style.clipPath = `path("${chrome}")`;
+  record.black.style.clipPath = `path("${ramp}")`;
+  record.black.style.opacity = (1 - p).toFixed(3);
+  record.content.style.transform = `translateY(${(-slide).toFixed(2)}px)`;
+  record.overlay.innerHTML = `
+    <defs><filter id="bloom-${record.id}" x="-60%" y="-140%" width="220%" height="380%">
+      <feGaussianBlur stdDeviation="3.5"/></filter></defs>
+`
+    + (bloom > 0 ? `<path d="${tabPath(handle)}" fill="none" stroke="rgba(255,255,255,.55)"
+        stroke-width="1.2" opacity="${bloom.toFixed(3)}" filter="url(#bloom-${record.id})"/>` : '')
+    + (S.guides ? `<path d="${tabPath(handle)}" fill="none" stroke="#ff00ff" stroke-width="1"/>
+        <path d="${chrome}" fill="none" stroke="#00ffff" stroke-width="0.6"/>` : '');
+  record.hit.style.cssText = `left:${handle.x}px; top:${handle.y}px;`
+    + ` width:${handle.w}px; height:${handle.h}px;`;
+  return { p, slide, handle };
+}
+
+// ── animation ───────────────────────────────────────────────────────────────
+const view = {
+  progress: S.collapsed ? 0 : 1,
+  from: S.collapsed ? 0 : 1,
+  started: performance.now(),
+};
+
+function toggle() {
+  if (S.freeze !== null) setFreeze(null);
+  S.collapsed = !S.collapsed;
+  view.from = view.progress;
+  view.started = performance.now();
+  syncURL();
+  wake();
+}
+
+function setFreeze(value) {
+  S.freeze = value;
+  if (value !== null) view.progress = value;
+  else { view.from = view.progress; view.started = performance.now(); }
+  refreshControls();
+  syncURL();
+  wake();
+}
+
+function morph(now) {
+  if (S.freeze !== null) return;
+  const target = S.collapsed ? 0 : 1;
+  const k = clamp((now - view.started) / DURATION[S.curve], 0, 1);
+  view.progress = view.from + (target - view.from) * curveAt(S.curve, k);
+  if (k >= 1) view.from = view.progress;
+}
+
+/// The loop only runs while something is actually moving — a morph in flight or
+/// a handle breathing under the pointer. That keeps the page (and a headless
+/// screenshot) quiescent instead of pinning a core with a permanent rAF.
+let raf = null;
+function wake() {
+  if (raf === null) raf = requestAnimationFrame(frame);
+}
+
+function stillMoving() {
+  if (S.freeze !== null) return false;
+  const target = S.collapsed ? 0 : 1;
+  if (Math.abs(view.progress - target) > 1e-4) return true;
+  return screens.some(record => record.live && record.hovered);
+}
+
+function frame(now) {
+  raf = null;
+  morph(now);
+  const rows = screens.map(record => [record, render(record, now, view.progress)]);
+  for (const [record, { p, handle }] of rows) {
+    if (!record.live) continue;
+    const out = record.kind === 'plain'
+      ? `p=<b>${p.toFixed(2)}</b> · 手把 <b>${handle.w}×${handle.h}</b> r${S.r} · `
+        + `y=<b>${handle.y.toFixed(1)}</b>（展开时贴 band 下缘 ${BAND}，收起后 0）`
+      : `p=<b>${p.toFixed(2)}</b> · 外框 <b>${handle.w}×${handle.h}</b>（刘海 ${NOTCH.w}×${NOTCH.h} + ${S.ear}）· `
+        + `x=<b>${handle.x.toFixed(1)}</b> / 屏宽 <b>${record.el.clientWidth}</b> · `
+        + `固定 y=0，下巴 <b>${S.ear}</b>pt · 耳朵 <b>${S.ear}×${handle.h}</b>`;
+    $(record.kind === 'plain' ? 'readP' : 'readN').innerHTML = out;
+  }
+  $('url').textContent = location.href;
+  if (stillMoving()) wake();
+}
+
+// ── controls ────────────────────────────────────────────────────────────────
+function refreshControls() {
+  $('rngW').value = S.w;
+  $('rngH').value = S.h;
+  $('rngR').value = S.r;
+  $('rngEar').value = S.ear;
+  $('rngPeriod').value = S.period;
+  $('selBlack').value = S.black;
+  $('selRide').value = S.ride ? 'ride' : 'pinned';
+  $('selCurve').value = S.curve;
+  $('outW').textContent = `${S.w}pt`;
+  $('outH').textContent = `${S.h}pt`;
+  $('outR').textContent = `r${S.r}`;
+  $('outEar').textContent = `${S.ear}pt`;
+  $('outPeriod').textContent = `${S.period}ms`;
+  $('outP').textContent = S.freeze === null
+    ? `${CURVE_LABEL[S.curve]} · 播放中`
+    : `定格 p=${S.freeze.toFixed(2)}`;
+  $('rngP').value = Math.round(view.progress * 100);
+}
+
+function syncURL() {
+  const url = new URL(location.href);
+  url.searchParams.set('state', S.collapsed ? 'collapsed' : 'expanded');
+  if (S.freeze === null) url.searchParams.delete('p');
+  else url.searchParams.set('p', S.freeze.toFixed(2));
+  url.searchParams.set('w', S.w);
+  url.searchParams.set('h', S.h);
+  url.searchParams.set('r', S.r);
+  url.searchParams.set('ear', S.ear);
+  url.searchParams.set('black', S.black);
+  url.searchParams.set('ride', S.ride ? 'ride' : 'pinned');
+  url.searchParams.set('cv', S.curve);
+  url.searchParams.set('period', S.period);
+  history.replaceState(null, '', url);
+}
+
+const bindRange = (id, apply) => {
+  $(id).addEventListener('input', event => {
+    apply(+event.target.value);
+    refreshControls();
+    syncURL();
+    wake();
+  });
+};
+bindRange('rngW', value => { S.w = value; });
+bindRange('rngH', value => { S.h = value; });
+bindRange('rngR', value => { S.r = value; });
+bindRange('rngEar', value => { S.ear = value; });
+bindRange('rngPeriod', value => { S.period = value; });
+bindRange('rngP', value => setFreeze(value / 100));
+
+$('selBlack').addEventListener('change', event => { S.black = event.target.value; syncURL(); wake(); });
+$('selRide').addEventListener('change', event => { S.ride = event.target.value === 'ride'; syncURL(); wake(); });
+$('selCurve').addEventListener('change', event => {
+  S.curve = event.target.value;
+  view.from = view.progress;
+  view.started = performance.now();
+  refreshControls();
+  syncURL();
+  wake();
+});
+$('btnResume').addEventListener('click', () => { setFreeze(null); });
+$('btnReset').addEventListener('click', () => {
+  Object.assign(S, { w: 64, h: 10, r: 5, ear: 10, black: 'all', ride: true, curve: 'ease', period: 1800 });
+  setFreeze(null);
+});
+document.querySelectorAll('[data-toggle]').forEach(button => button.addEventListener('click', toggle));
+
+addEventListener('keydown', event => {
+  if (event.key === ' ') { event.preventDefault(); toggle(); }
+  else if (event.key === 'h') {
+    S.hover = !S.hover;
+    for (const record of screens) if (record.live) record.hovered = S.hover;
+    wake();
+  } else if (event.key === '1') setFreeze(1);
+  else if (event.key === '2') setFreeze(0.5);
+  else if (event.key === '3') setFreeze(0);
+  else if (event.key === 'p') setFreeze(null);
+});
+
+// ── boot ────────────────────────────────────────────────────────────────────
+$('frames').innerHTML = ['plain', 'notched'].map(kind => `
+  <figure>
+    <div class="frames">${[1, 0.5, 0].map(p => `
+      <div class="frame">
+        <div class="screen" data-kind="${kind}" data-p="${p}"></div>
+        <figcaption>p=${p.toFixed(1)}</figcaption>
+      </div>`).join('')}
+    </div>
+    <figcaption>${kind === 'plain'
+      ? '普通屏 · 手把随 bar 上移，停在屏幕顶边'
+      : '刘海屏 · 外框钉在刘海上；中途露出下巴与两侧耳朵'}</figcaption>
+  </figure>`).join('');
+
+document.querySelectorAll('.screen').forEach(buildScreen);
+if (S.freeze !== null) view.progress = S.freeze;
+// `?only=plain|notched` strips the page down to one screen, so it can be read
+// (or screenshotted) at full width without the other card in the way.
+if (S.guides) document.body.classList.add('guides');
+const only = q.get('only');
+if (only === 'plain' || only === 'notched') {
+  const keep = $(only === 'plain' ? 'cardP' : 'cardN');
+  document.querySelectorAll('.card').forEach(card => { if (card !== keep) card.style.display = 'none'; });
+  document.querySelectorAll('h1, p.lede, h2, .scale').forEach(el => { el.style.display = 'none'; });
+  keep.style.flex = '1 1 100%';
+  keep.style.minWidth = '0';
+}
+refreshControls();
+wake();
+</script>
+</body>
+</html>

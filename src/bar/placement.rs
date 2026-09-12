@@ -1,8 +1,10 @@
-//! Where the Bar lives: the menu-bar band, and nothing else.
+//! Where the Bar lives: the menu-bar band, and the handle that outlives it.
 //!
 //! The Bar used to be a free-floating panel whose width and inset came from
 //! configuration. It now takes over the menu bar exactly, so placement is one
-//! rect plus the notch the content has to work around.
+//! rect plus the notch the content has to work around. The panel window is that
+//! band plus the handle's overhang below it — the one part of the Bar that stays
+//! on screen once the band has slid away.
 
 use super::layout::{BarSurface, Rect};
 use super::preferences::NotchSide;
@@ -53,74 +55,120 @@ pub fn surface(panel: Rect, gap: Option<Rect>, bias: NotchSide) -> BarSurface {
     }
 }
 
-/// How much black capsule sits either side of the notch when collapsed.
-pub const CAPSULE_SIDE: f64 = 24.0;
-/// The collapsed tab on a display without a notch.
-pub const PLAIN_TAB_WIDTH: f64 = 120.0;
-pub const PLAIN_TAB_HEIGHT: f64 = 6.0;
-/// Hovering the tab grows it, which is the only affordance it has.
-pub const PLAIN_TAB_HOVER_HEIGHT: f64 = 9.0;
-
-/// How far the collapsed capsule's top edge overhangs its body on each side,
-/// and how deep the scoop below it goes.
+/// The Bar Handle: a small rounded tab at the display's centre. Its square top
+/// edge is glued to the Bar above it and its bottom corners round, so it reads
+/// as part of the Bar rather than as a separate control.
 ///
-/// The black is widest along the screen edge and its side walls stand in by this
-/// much, joined by a **concave** shoulder: the corner is carved out rather than
-/// rounded over. A convex fillet here is a different shape — it is what the Bar
-/// had before, and it reads as a rounded rectangle rather than as a notch, which
-/// is why the prototype renders it against a photograph of the hardware.
-pub const CAPSULE_TOP_RADIUS: f64 = 12.0;
-/// The collapsed capsule's bottom corners: convex, radius 8 — deliberately
-/// smaller than the top shoulder, so the shape reads as hanging from the edge
-/// rather than as a pill lying against it.
-pub const CAPSULE_BOTTOM_RADIUS: f64 = 8.0;
+/// This is its width on a display without a notch. A notched display gets a
+/// collar the width of the notch plus [`HANDLE_HEIGHT`] a side instead, because
+/// the middle of the menu-bar band there is the camera housing: a tab centred
+/// inside it would be drawn on pixels that do not exist.
+pub const HANDLE_WIDTH: f64 = 64.0;
+/// The handle's height, the distance it hangs below the band while expanded,
+/// and — on a notched display — how far the collar reaches past the notch on
+/// every side. It is also what the panel window hangs below the band by.
+pub const HANDLE_HEIGHT: f64 = 10.0;
+/// The handle's bottom corners. Its top edge never rounds.
+pub const HANDLE_RADIUS: f64 = 5.0;
+
+/// The menu-bar band at `progress` (1 = expanded), in panel-local coordinates.
+///
+/// Collapsing slides the band up out of the screen by its own height, so the
+/// bar leaves through the screen's top edge and its bottom edge — with the
+/// content riding on it — comes to rest there.
+#[must_use]
+pub fn band_rect(panel: (f64, f64), progress: f64) -> Rect {
+    let (width, height) = (panel.0.max(1.0), panel.1.max(1.0));
+    Rect {
+        x: 0.0,
+        y: -(1.0 - progress.clamp(0.0, 1.0)) * height,
+        width,
+        height,
+    }
+}
 
 /// The collapsed Bar, in panel-local coordinates: the same space as
 /// [`BarSurface::notch`], with the origin at the panel's top-left corner and
 /// `y` growing downwards, because a `BarView` is flipped.
 ///
-/// A display with a notch gets a black capsule merged with it; one without
-/// gets a small top-centred tab. Either way the shape hangs from the top edge,
-/// so hovering only ever grows it downwards and never moves it.
-///
-/// `hovered` only matters for the plain tab, where growing is the click
-/// affordance; the capsule keeps its size and brightens its handles instead.
+/// A display with a notch gets a collar hugging it — the notch plus
+/// [`HANDLE_HEIGHT`] on each side and below it — which does not move: the notch
+/// is a hole in the hardware, so the Bar has to stay around it while the band
+/// leaves through the screen's top edge. A display without one gets a small tab
+/// that rides up with the band and comes to rest flush with the screen top.
 #[must_use]
-pub fn collapsed_rect(panel: (f64, f64), notch: Option<Rect>, hovered: bool) -> Rect {
-    let (panel_width, panel_height) = (panel.0.max(1.0), panel.1.max(1.0));
-    let Some(notch) = notch else {
-        let width = PLAIN_TAB_WIDTH.min(panel_width);
-        let height = if hovered {
-            PLAIN_TAB_HOVER_HEIGHT
-        } else {
-            PLAIN_TAB_HEIGHT
-        };
-        return Rect {
-            x: (panel_width - width) / 2.0,
-            y: 0.0,
-            width,
-            height,
-        };
-    };
-    let width = (notch.width + CAPSULE_SIDE * 2.0).clamp(1.0, panel_width);
-    let centre = notch.x + notch.width / 2.0;
-    Rect {
-        x: (centre - width / 2.0).clamp(0.0, (panel_width - width).max(0.0)),
-        y: 0.0,
-        width,
-        height: panel_height,
+pub fn handle_rect(panel: (f64, f64), notch: Option<Rect>, progress: f64) -> Rect {
+    let (width, height) = (panel.0.max(1.0), panel.1.max(1.0));
+    match notch {
+        None => {
+            let tab = HANDLE_WIDTH.min(width);
+            Rect {
+                x: (width - tab) / 2.0,
+                // Expanded it hangs below the band; collapsed it has ridden up
+                // with the band, which moves it by the band's own height.
+                y: progress.clamp(0.0, 1.0) * height,
+                width: tab,
+                height: HANDLE_HEIGHT,
+            }
+        }
+        Some(notch) => {
+            let collar = (notch.width + HANDLE_HEIGHT * 2.0).clamp(1.0, width);
+            let centre = notch.x + notch.width / 2.0;
+            Rect {
+                x: (centre - collar / 2.0).clamp(0.0, (width - collar).max(0.0)),
+                y: 0.0,
+                width: collar,
+                height: height + HANDLE_HEIGHT,
+            }
+        }
     }
 }
 
-/// The rect the pointer must be inside for the collapsed Bar to count as
-/// hovered: the grown tab, not the resting one.
+/// How much more of the handle the pointer reveals: extra width and extra
+/// height, split evenly about its centre so it never shifts sideways.
 ///
-/// Hover is judged against this rather than against the panel as it currently
-/// is, so the tab growing under the pointer cannot drop the pointer out of
-/// hover and flip the Bar back and forth every frame.
+/// It grows *away* from the edge it is glued to — the Bar's bottom edge while
+/// expanded, the screen's top edge once collapsed — because that join has to
+/// stay exactly where it is for the handle to read as part of the Bar. On a
+/// notched display the same deltas thicken the collar's ears and its chin.
+pub const HANDLE_HOVER_GROWTH: (f64, f64) = (8.0, 3.0);
+
+/// The handle's grown rect: the same top edge, the same centre, and
+/// [`HANDLE_HOVER_GROWTH`] more of it.
 #[must_use]
-pub fn collapsed_hover_rect(panel: (f64, f64), notch: Option<Rect>) -> Rect {
-    collapsed_rect(panel, notch, true)
+pub fn grown_handle_rect(resting: Rect) -> Rect {
+    Rect {
+        x: resting.x - HANDLE_HOVER_GROWTH.0 / 2.0,
+        y: resting.y,
+        width: resting.width + HANDLE_HOVER_GROWTH.0,
+        height: resting.height + HANDLE_HOVER_GROWTH.1,
+    }
+}
+
+/// How far below the menu-bar band the panel window reaches: the handle at rest,
+/// plus the room it grows into under the pointer.
+///
+/// The headroom matters: a view clips its drawing, so a window that only just
+/// held the resting handle would slice the rounded bottom off the moment the
+/// handle grew, leaving it square-cornered.
+#[must_use]
+pub fn window_overhang() -> f64 {
+    HANDLE_HEIGHT + HANDLE_HOVER_GROWTH.1
+}
+
+/// The window the Bar is drawn in: the menu-bar band plus [`window_overhang`]
+/// below it.
+///
+/// The window frame never moves — only what is drawn inside it does — which is
+/// what keeps the blur behind the Bar from being recomputed every frame.
+#[must_use]
+pub fn window_rect(panel: Rect) -> Rect {
+    let overhang = window_overhang();
+    Rect {
+        y: panel.y - overhang,
+        height: panel.height + overhang,
+        ..panel
+    }
 }
 
 /// The physical notch between the two auxiliary top areas, if the
@@ -230,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_notched_bar_is_a_capsule_around_the_notch() {
+    fn a_collapsed_notched_bar_is_a_collar_around_the_notch() {
         let panel = (1470.0, 34.0);
         let gap = Rect {
             x: 646.0,
@@ -238,70 +286,174 @@ mod tests {
             width: 179.0,
             height: 34.0,
         };
-        for hovered in [false, true] {
-            let rect = collapsed_rect(panel, Some(gap), hovered);
-            assert!((rect.width - (179.0 + CAPSULE_SIDE * 2.0)).abs() < f64::EPSILON);
-            assert!((rect.height - 34.0).abs() < f64::EPSILON);
+        for progress in [0.0, 0.5, 1.0] {
+            let rect = handle_rect(panel, Some(gap), progress);
+            assert!((rect.width - (179.0 + HANDLE_HEIGHT * 2.0)).abs() < f64::EPSILON);
+            assert!(
+                (rect.height - (34.0 + HANDLE_HEIGHT)).abs() < f64::EPSILON,
+                "the collar reaches below the band, where the chin shows"
+            );
             assert!(
                 (rect.x + rect.width / 2.0 - (gap.x + gap.width / 2.0)).abs() < f64::EPSILON,
                 "centred on the notch"
             );
             assert!(
                 (rect.y - 0.0).abs() < f64::EPSILON,
-                "flush with the panel's top edge"
+                "pinned: the notch is a hole in the hardware"
             );
         }
-        // A notch near the edge still keeps the capsule on its display.
+        // A notch near the edge still keeps the collar on its display.
         let edge_gap = Rect {
             x: 1430.0,
             width: 40.0,
             ..gap
         };
-        let rect = collapsed_rect(panel, Some(edge_gap), false);
+        let rect = handle_rect(panel, Some(edge_gap), 0.0);
         assert!(rect.x >= 0.0 && rect.x + rect.width <= 1470.0);
     }
 
     #[test]
-    fn the_collapsed_hover_rect_is_the_grown_bar() {
-        // The plain tab is judged by the box it grows into, so a growing tab
-        // never drops the pointer out of hover.
-        let hover = collapsed_hover_rect((1920.0, 24.0), None);
-        assert!((hover.height - PLAIN_TAB_HOVER_HEIGHT).abs() < f64::EPSILON);
-        assert!((hover.width - PLAIN_TAB_WIDTH).abs() < f64::EPSILON);
-        assert_eq!(hover, collapsed_rect((1920.0, 24.0), None, true));
-        // A notch keeps its capsule size whether or not it is hovered, so
-        // there is nothing to grow into.
+    fn a_plain_handle_hangs_below_the_band_and_rides_up_to_the_screen_top() {
+        let panel = (1470.0, 24.0);
+        let expanded = handle_rect(panel, None, 1.0);
+        assert!((expanded.width - HANDLE_WIDTH).abs() < f64::EPSILON);
+        assert!((expanded.height - HANDLE_HEIGHT).abs() < f64::EPSILON);
+        assert!(
+            (expanded.x + expanded.width / 2.0 - 735.0).abs() < f64::EPSILON,
+            "centred on the display"
+        );
+        assert!(
+            (expanded.y - 24.0).abs() < f64::EPSILON,
+            "glued to the band's bottom edge"
+        );
+
+        let collapsed = handle_rect(panel, None, 0.0);
+        assert!(
+            (collapsed.y - 0.0).abs() < f64::EPSILON,
+            "flush with the top"
+        );
+        assert_eq!(
+            (collapsed.width, collapsed.height, collapsed.x),
+            (expanded.width, expanded.height, expanded.x),
+            "the handle keeps its size: only its progress changes"
+        );
+
+        // Halfway through the slide it is halfway up the band.
+        let mid = handle_rect(panel, None, 0.5);
+        assert!((mid.y - 12.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn the_band_leaves_through_the_top_edge() {
+        let panel = (1470.0, 24.0);
+        let expanded = band_rect(panel, 1.0);
+        assert!((expanded.y - 0.0).abs() < f64::EPSILON);
+        assert!((expanded.height - 24.0).abs() < f64::EPSILON);
+
+        let collapsed = band_rect(panel, 0.0);
+        assert!(
+            (collapsed.y + collapsed.height - 0.0).abs() < f64::EPSILON,
+            "fully collapsed, the band's bottom edge is the screen's top edge"
+        );
+    }
+
+    #[test]
+    fn the_window_is_the_band_plus_the_handles_overhang() {
+        let panel = panel_rect(screen(), 24.0);
+        let window = window_rect(panel);
+        assert!((window.x - panel.x).abs() < f64::EPSILON);
+        assert!((window.width - panel.width).abs() < f64::EPSILON);
+        assert!(
+            (window.y - (panel.y - window_overhang())).abs() < f64::EPSILON,
+            "it hangs below the band, so the handle has room outside it"
+        );
+        assert!((window.height - (panel.height + window_overhang())).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn the_window_has_room_for_the_handle_to_grow() {
+        // A view clips its own drawing, so the window must hold the handle at
+        // its grown size, not just its resting one: otherwise hovering slices
+        // the rounded bottom off and the handle goes square-cornered.
+        let panel = (1470.0, 24.0);
+        let overhang = window_overhang();
+        assert!(
+            overhang > HANDLE_HEIGHT,
+            "the window carries headroom for the hover growth"
+        );
+        // In panel-local coordinates the window ends where the band ends plus
+        // the overhang: the handle's `y` is measured from the band's top edge.
+        let window_bottom = panel.1 + overhang;
+        let grown = grown_handle_rect(handle_rect(panel, None, 1.0));
+        assert!(
+            grown.y + grown.height <= window_bottom + f64::EPSILON,
+            "the grown tab fits: {} > {window_bottom}",
+            grown.y + grown.height
+        );
+
         let gap = Rect {
             x: 646.0,
             y: 0.0,
             width: 179.0,
             height: 34.0,
         };
-        assert_eq!(
-            collapsed_hover_rect((1470.0, 34.0), Some(gap)),
-            collapsed_rect((1470.0, 34.0), Some(gap), false)
+        let collar_panel = (1470.0, 34.0);
+        let grown_collar = grown_handle_rect(handle_rect(collar_panel, Some(gap), 0.0));
+        assert!(
+            grown_collar.y + grown_collar.height <= collar_panel.1 + overhang + f64::EPSILON,
+            "the grown collar fits too"
         );
     }
 
     #[test]
-    fn a_collapsed_plain_bar_is_a_small_top_centred_tab() {
-        let panel = (1470.0, 24.0);
-        let resting = collapsed_rect(panel, None, false);
-        assert!((resting.width - PLAIN_TAB_WIDTH).abs() < f64::EPSILON);
-        assert!((resting.height - PLAIN_TAB_HEIGHT).abs() < f64::EPSILON);
-        assert!((resting.x + resting.width / 2.0 - 735.0).abs() < f64::EPSILON);
-        assert!((resting.y - 0.0).abs() < f64::EPSILON, "flush with the top");
+    fn a_hovered_handle_grows_away_from_the_edge_it_is_glued_to() {
+        let resting = handle_rect((1470.0, 24.0), None, 1.0);
+        let grown = grown_handle_rect(resting);
+        assert!(
+            (grown.y - resting.y).abs() < f64::EPSILON,
+            "the glued top edge does not move: no seam, and no lift off the Bar"
+        );
+        assert!(
+            (grown.x + grown.width / 2.0 - (resting.x + resting.width / 2.0)).abs() < f64::EPSILON,
+            "it grows about its own centre"
+        );
+        assert!((grown.width - resting.width - HANDLE_HOVER_GROWTH.0).abs() < f64::EPSILON);
+        assert!((grown.height - resting.height - HANDLE_HOVER_GROWTH.1).abs() < f64::EPSILON);
+        // Growing must not break the hit test: the resting shape is inside it.
+        assert!(grown.x <= resting.x);
+        assert!(grown.y + grown.height >= resting.y + resting.height);
 
-        let hovered = collapsed_rect(panel, None, true);
-        assert!(hovered.height > resting.height, "hover grows the tab");
-        assert!(
-            (hovered.width - resting.width).abs() < f64::EPSILON,
-            "width is fixed"
-        );
-        assert!(
-            (hovered.y - 0.0).abs() < f64::EPSILON,
-            "growth goes downwards, never off the top"
-        );
+        // The collar grows the same way, which thickens its ears and its chin.
+        let gap = Rect {
+            x: 646.0,
+            y: 0.0,
+            width: 179.0,
+            height: 34.0,
+        };
+        let collar = handle_rect((1470.0, 34.0), Some(gap), 0.0);
+        let grown_collar = grown_handle_rect(collar);
+        assert!((grown_collar.y - collar.y).abs() < f64::EPSILON);
+        assert!(grown_collar.x < collar.x);
+        assert!(grown_collar.x + grown_collar.width > collar.x + collar.width);
+        assert!(grown_collar.height > collar.height);
+    }
+
+    #[test]
+    fn the_handle_reaches_past_the_notch_on_every_visible_side() {
+        // The notch is a hole in the hardware, so the only black the eye can
+        // see around a collapsed notched Bar is the collar outside it. It has
+        // to clear the notch on the two sides and below, and it does so by the
+        // handle's own height.
+        let gap = Rect {
+            x: 646.0,
+            y: 0.0,
+            width: 179.0,
+            height: 34.0,
+        };
+        let collar = handle_rect((1470.0, 34.0), Some(gap), 0.0);
+        assert!(collar.x <= gap.x - HANDLE_HEIGHT + f64::EPSILON);
+        assert!(collar.x + collar.width >= gap.x + gap.width + HANDLE_HEIGHT - f64::EPSILON);
+        assert!(collar.y + collar.height >= gap.y + gap.height + HANDLE_HEIGHT - f64::EPSILON);
     }
 
     #[test]
