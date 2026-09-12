@@ -114,8 +114,6 @@ const BREATH: Breath = Breath::Pulse;
 
 /// Width of the collapse handle at either end of the Bar.
 const END_ZONE: f64 = 24.0;
-/// Bottom-corner radius of the collapsed capsule / tab.
-const CAPSULE_RADIUS: f64 = 12.0;
 
 /// One end of the Bar's own chrome. While expanded these are the collapse
 /// handles; while collapsed they are the expand handles.
@@ -204,6 +202,32 @@ impl ViewState {
             return panel;
         }
         super::placement::collapsed_hover_rect((panel.width, panel.height), self.surface.notch)
+    }
+
+    /// The outline the chrome is drawn with at `progress` (1 = expanded).
+    ///
+    /// One description feeds both the drawn shape and the halo, so they cannot
+    /// drift apart: collapsed on a notched display the top corners are concave
+    /// and the bottom ones convex, and both flatten out as the Bar expands.
+    fn chrome_shape(&self, progress: f64) -> ChromeShape {
+        let corner = self.preferences.corner_radius.clamp(0.0, 20.0);
+        if self.surface.notch.is_some() {
+            ChromeShape {
+                bottom: motion::lerp(super::placement::CAPSULE_BOTTOM_RADIUS, corner, progress),
+                top: motion::lerp(super::placement::CAPSULE_TOP_RADIUS, 0.0, progress),
+                flat: motion::lerp(super::placement::CAPSULE_TOP_FLAT, 0.0, progress),
+                concave_top: true,
+            }
+        } else {
+            // A plain display's tab is a pill: both ends round the same way.
+            let tab = super::placement::PLAIN_TAB_HEIGHT / 2.0;
+            ChromeShape {
+                bottom: motion::lerp(tab, corner, progress),
+                top: motion::lerp(tab, 0.0, progress),
+                flat: 0.0,
+                concave_top: false,
+            }
+        }
     }
 
     /// Where the Bar's own chrome is drawn, in viewport coordinates.
@@ -569,25 +593,21 @@ impl BarView {
     /// rim, and the bloom its shadow casts from the same path. Both pulse
     /// together while the pointer is on the collapsed Bar.
     fn sync_glow(&self) {
-        let (collapsed, hovered, rect, radius, notched) = {
+        let (collapsed, hovered, rect, shape, notched) = {
             let state = self.ivars().state.borrow();
             let panel = state.panel_rect();
-            let notched = state.surface.notch;
+            let notched = state.surface.notch.is_some();
             let rect = super::placement::collapsed_rect(
                 (panel.width, panel.height),
-                notched,
+                state.surface.notch,
                 state.hovered,
             );
             (
                 state.chrome.progress() < 0.01,
                 state.hovered,
                 rect,
-                if notched.is_some() {
-                    CAPSULE_RADIUS
-                } else {
-                    super::placement::PLAIN_TAB_HEIGHT / 2.0
-                },
-                notched.is_some(),
+                state.chrome_shape(0.0),
+                notched,
             )
         };
         let view_height = self.bounds().size.height;
@@ -611,15 +631,7 @@ impl BarView {
             }
             return;
         }
-        let path = chrome_path(
-            rect,
-            radius,
-            if notched {
-                super::placement::CAPSULE_TOP_RADIUS
-            } else {
-                super::placement::PLAIN_TAB_HEIGHT / 2.0
-            },
-        );
+        let path = chrome_path(rect, shape);
         let mut glow = self.ivars().glow.borrow_mut();
         let layer = glow.get_or_insert_with(|| {
             let layer = CAShapeLayer::new();
@@ -844,7 +856,7 @@ impl BarView {
 
     fn draw_bar(&self) {
         let bounds = self.bounds();
-        let (hovered, hover, preferences, chrome_rect, progress, notched, split, collapsed_radius) = {
+        let (hovered, hover, preferences, chrome_rect, progress, notched, split, shape) = {
             let state = self.ivars().state.borrow();
             (
                 state.hovered,
@@ -854,13 +866,7 @@ impl BarView {
                 state.chrome.progress(),
                 state.surface.notch.is_some(),
                 state.motion.presented.split.clone(),
-                if state.surface.notch.is_some() {
-                    CAPSULE_RADIUS
-                } else {
-                    // A plain-screen tab is a pill whatever height it has, so
-                    // its rounding is unmistakable at six points tall.
-                    super::placement::PLAIN_TAB_HEIGHT / 2.0
-                },
+                state.chrome_shape(state.chrome.progress()),
             )
         };
         clear(bounds);
@@ -868,21 +874,8 @@ impl BarView {
         // One shape morphs from the menu-bar band to the collapsed capsule or
         // tab. Nothing here moves the window, so the blur behind it is only
         // ever recomputed at the panel's fixed size.
-        let radius = motion::lerp(
-            collapsed_radius,
-            preferences.corner_radius.clamp(0.0, 20.0),
-            progress,
-        );
-        // The top corners round inwards once the Bar leaves the screen edge, so
-        // both displays hang the same kind of rounded shape from it: a capsule
-        // with a notch, a pill without one.
-        let collapsed_top = if notched {
-            super::placement::CAPSULE_TOP_RADIUS
-        } else {
-            super::placement::PLAIN_TAB_HEIGHT / 2.0
-        };
-        let top_radius = motion::lerp(collapsed_top, 0.0, progress);
-        let path = chrome_path(chrome_rect, radius, top_radius);
+        let radius = shape.bottom;
+        let path = chrome_path(chrome_rect, shape);
         let background = rgba(BarPreferences::rgba(
             &preferences.background_color,
             [0.08, 0.08, 0.09, 0.88],
@@ -1316,6 +1309,23 @@ impl ChromeMotion {
     }
 }
 
+/// The Bar's own outline: how far its corners round, and which way the top
+/// ones go.
+///
+/// Collapsed on a notched display the top corners are concave and the bottom
+/// ones convex, so the black spreads along the screen edge and narrows into the
+/// body. Expanded — and on a plain display, where the tab is a pill — the top
+/// corners are convex like the bottom ones.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ChromeShape {
+    bottom: f64,
+    top: f64,
+    /// Flat run of top edge before each concave shoulder. Ignored when the top
+    /// corners are convex.
+    flat: f64,
+    concave_top: bool,
+}
+
 /// The Bar's own outline, in viewport coordinates.
 ///
 /// `radius` rounds the bottom corners and `top_radius` the top ones. Expanded,
@@ -1323,7 +1333,7 @@ impl ChromeMotion {
 /// are the screen's own. Collapsed, both ends round the same way, which is what
 /// makes the capsule read as a rounded rectangle hanging from the screen edge
 /// instead of a shape that spreads outwards where it meets it.
-fn chrome_path(rect: Rect, radius: f64, top_radius: f64) -> Retained<NSBezierPath> {
+fn chrome_path(rect: Rect, shape: ChromeShape) -> Retained<NSBezierPath> {
     // Circular-arc approximation for a cubic Bezier quadrant.
     const KAPPA: f64 = 0.552_284_749_8;
     let left = rect.x;
@@ -1331,10 +1341,27 @@ fn chrome_path(rect: Rect, radius: f64, top_radius: f64) -> Retained<NSBezierPat
     let right = rect.x + rect.width;
     let bottom = rect.y + rect.height;
     let limit = (rect.width / 2.0).min(rect.height);
-    let r = radius.clamp(0.0, limit);
-    let t = top_radius.clamp(0.0, limit);
+    let r = shape.bottom.clamp(0.0, limit);
+    let t = shape.top.clamp(0.0, limit);
+    let flat = if shape.concave_top {
+        shape.flat.clamp(0.0, limit)
+    } else {
+        0.0
+    };
     let path = NSBezierPath::bezierPath();
-    if t > 0.0 {
+    if shape.concave_top && t > 0.0 {
+        // The top edge is the widest part: it runs `flat` further out on each
+        // side, then the shoulder curves back in to the body's wall. Both ends
+        // of the curve are tangent to what they meet, so there is no ledge and
+        // no kink.
+        path.moveToPoint(NSPoint::new(left - flat - t, top));
+        path.lineToPoint(NSPoint::new(left - t, top));
+        path.curveToPoint_controlPoint1_controlPoint2(
+            NSPoint::new(left, top + t),
+            NSPoint::new(left - t + t * KAPPA, top),
+            NSPoint::new(left, top + t - t * KAPPA),
+        );
+    } else if t > 0.0 {
         path.moveToPoint(NSPoint::new(left + t, top));
         path.curveToPoint_controlPoint1_controlPoint2(
             NSPoint::new(left, top + t),
@@ -1361,7 +1388,15 @@ fn chrome_path(rect: Rect, radius: f64, top_radius: f64) -> Retained<NSBezierPat
         path.lineToPoint(NSPoint::new(left, bottom));
         path.lineToPoint(NSPoint::new(right, bottom));
     }
-    if t > 0.0 {
+    if shape.concave_top && t > 0.0 {
+        path.lineToPoint(NSPoint::new(right, top + t));
+        path.curveToPoint_controlPoint1_controlPoint2(
+            NSPoint::new(right + t, top),
+            NSPoint::new(right, top + t - t * KAPPA),
+            NSPoint::new(right + t - t * KAPPA, top),
+        );
+        path.lineToPoint(NSPoint::new(right + flat + t, top));
+    } else if t > 0.0 {
         path.lineToPoint(NSPoint::new(right, top + t));
         path.curveToPoint_controlPoint1_controlPoint2(
             NSPoint::new(right - t, top),
@@ -2780,55 +2815,71 @@ mod tests {
     }
 
     #[test]
-    fn the_collapsed_capsule_rounds_both_ends_inwards() {
-        // Notched: the top corners round inwards exactly like the bottom ones,
-        // so the capsule is a rounded rectangle hanging from the screen edge
-        // rather than a shape that spreads outwards where it meets it.
+    fn the_collapsed_capsule_spreads_along_the_edge_and_rounds_at_the_bottom() {
+        // Notched: the top edge is the widest part and the shoulders are
+        // concave, so the black blends into the screen edge and narrows into
+        // the body; the bottom corners round outwards.
         let capsule = Rect {
             x: 100.0,
             y: 0.0,
             width: 227.0,
             height: 34.0,
         };
-        let path = chrome_path(
-            capsule,
-            CAPSULE_RADIUS,
-            super::super::placement::CAPSULE_TOP_RADIUS,
+        let shape = ChromeShape {
+            bottom: super::super::placement::CAPSULE_BOTTOM_RADIUS,
+            top: super::super::placement::CAPSULE_TOP_RADIUS,
+            flat: super::super::placement::CAPSULE_TOP_FLAT,
+            concave_top: true,
+        };
+        let path = chrome_path(capsule, shape);
+        assert!(
+            (shape.bottom - 8.0).abs() < f64::EPSILON,
+            "the bottom corner is deliberately tighter than the top shoulder"
+        );
+        let outset = shape.flat + shape.top;
+        assert!(
+            (view_rect(path.bounds()).width - (capsule.width + outset * 2.0)).abs() < f64::EPSILON,
+            "the top edge is the widest part: {:?}",
+            view_rect(path.bounds())
         );
         assert!(
-            (view_rect(path.bounds()).width - capsule.width).abs() < f64::EPSILON,
-            "nothing spreads past the body"
+            path.containsPoint(NSPoint::new(capsule.x - 5.0, 2.0)),
+            "the shoulder carries the black out past the body wall"
         );
         assert!(
-            !path.containsPoint(NSPoint::new(capsule.x + 0.5, 0.5)),
-            "the top-left corner is rounded away"
+            !path.containsPoint(NSPoint::new(capsule.x - 2.0, shape.top + 4.0)),
+            "the shoulder is concave: below it the black stops at the body"
         );
         assert!(
             path.containsPoint(NSPoint::new(capsule.x + 20.0, capsule.height / 2.0)),
             "the body is filled"
         );
         assert!(
-            !path.containsPoint(NSPoint::new(capsule.x + 0.5, capsule.height - 0.5)),
-            "the bottom-left corner is rounded too"
-        );
-        assert!(
-            !path.containsPoint(NSPoint::new(capsule.x + capsule.width - 0.5, 0.5)),
-            "and so is the top-right"
+            !path.containsPoint(NSPoint::new(capsule.x - 1.0, capsule.height - 1.0)),
+            "the bottom-left corner rounds outwards, so nothing sits outside it"
         );
 
-        // Expanded, the top corners are square: the Bar is the menu-bar band.
+        // Expanded, the outline is the band itself: square top corners, rounded
+        // bottom ones.
         let band = Rect {
             x: 0.0,
             y: 0.0,
             width: 1470.0,
             height: 34.0,
         };
-        let expanded = chrome_path(band, 10.0, 0.0);
+        let expanded = chrome_path(
+            band,
+            ChromeShape {
+                bottom: 10.0,
+                top: 0.0,
+                flat: 0.0,
+                concave_top: false,
+            },
+        );
         assert!(expanded.containsPoint(NSPoint::new(0.5, 0.5)));
         assert!(!expanded.containsPoint(NSPoint::new(0.5, band.height - 0.5)));
 
-        // A plain-screen tab is only six points tall, so its bottom edge is a
-        // semicircle and its top stays flush with the screen edge.
+        // A plain-screen tab is a pill: six points tall, both ends rounded.
         let tab = Rect {
             x: 900.0,
             y: 0.0,
@@ -2837,17 +2888,21 @@ mod tests {
         };
         let pill = chrome_path(
             tab,
-            super::super::placement::PLAIN_TAB_HEIGHT / 2.0,
-            super::super::placement::PLAIN_TAB_HEIGHT / 2.0,
+            ChromeShape {
+                bottom: super::super::placement::PLAIN_TAB_HEIGHT / 2.0,
+                top: super::super::placement::PLAIN_TAB_HEIGHT / 2.0,
+                flat: 0.0,
+                concave_top: false,
+            },
         );
         assert!(pill.containsPoint(NSPoint::new(960.0, 3.0)));
         assert!(
             !pill.containsPoint(NSPoint::new(tab.x + 0.4, 0.4)),
-            "the tab rounds its top corners too, like the capsule"
+            "the tab rounds its top corners too"
         );
         assert!(
             !pill.containsPoint(NSPoint::new(tab.x + 0.4, tab.height - 0.4)),
-            "and its bottom edge is a visible semicircle, not a square end"
+            "and its bottom edge is a semicircle, not a square end"
         );
     }
 

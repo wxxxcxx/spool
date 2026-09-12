@@ -61,12 +61,22 @@ pub const PLAIN_TAB_HEIGHT: f64 = 6.0;
 /// Hovering the tab grows it, which is the only affordance it has.
 pub const PLAIN_TAB_HOVER_HEIGHT: f64 = 9.0;
 
-/// The radius of the collapsed capsule's *top* corners.
+/// The collapsed capsule's top corners: concave, radius 12.
 ///
-/// They round inwards like the bottom ones, so the collapsed Bar reads as a
-/// rounded rectangle hanging from the screen edge rather than as a black region
-/// that spreads outwards where it meets it.
+/// The black spreads along the screen edge and narrows into the body, so the
+/// notch's side wall transitions smoothly into the top edge instead of meeting
+/// it at a corner.
 pub const CAPSULE_TOP_RADIUS: f64 = 12.0;
+/// How much flat top edge runs before each concave shoulder begins.
+///
+/// Zero, because the shoulder has to meet the top edge tangentially: any flat
+/// run past the arc's start is a segment with no black under it, which draws as
+/// a hairline spike rather than as part of the shape.
+pub const CAPSULE_TOP_FLAT: f64 = 0.0;
+/// The collapsed capsule's bottom corners: convex, radius 8 — deliberately
+/// smaller than the top shoulder, so the shape reads as hanging from the edge
+/// rather than as a pill lying against it.
+pub const CAPSULE_BOTTOM_RADIUS: f64 = 8.0;
 
 /// The collapsed Bar, in panel-local coordinates: the same space as
 /// [`BarSurface::notch`], with the origin at the panel's top-left corner and
