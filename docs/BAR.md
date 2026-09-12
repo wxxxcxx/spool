@@ -95,7 +95,7 @@ the URL. Its vocabulary maps onto the code like this:
 | `sn=sfillet` | `placement::CAPSULE_TOP_RADIUS` > 0, i.e. the top corners round inwards |
 | `sn=bottom` / `sn=shoulder` | `CAPSULE_TOP_RADIUS` = 0, with `CAPSULE_RADIUS` raised |
 | `sn=capsule` | a gap under the shape, i.e. `collapsed_rect` returning a `y > 0` |
-| `sp=r3` / `r5` / `capsule` | the plain tab's bottom radius in `chrome_path` |
+| `sp=r3` / `r5` / `capsule` | the plain tab's radii in `chrome_path`; `capsule` rounds both ends |
 | `br=bloom` / `pulse` | `BREATH` |
 | `br=heartbeat` | the pulse's two halves given different curves |
 | `period`, `amp` | `BREATH_PERIOD`, and the range passed to `breathe` |
@@ -193,9 +193,10 @@ never written to disk and every Bar starts expanded.
   the corners recede, they do not spread. A small expand handle sits inside
   each end.
 - Collapse a display without a cutout and it becomes a 120x6pt tab flush with
-  the screen top, horizontally centred, its bottom edge a visible semicircle.
-  Hovering grows it to 9pt as the click affordance, and a click anywhere on it
-  expands the Bar again.
+  the screen top, horizontally centred, a pill: both ends round, so it reads as
+  the same rounded shape the capsule is, minus the cutout. Hovering grows it to
+  9pt as the click affordance, and a click anywhere on it expands the Bar
+  again.
 - The **window never moves**. The panel is the menu-bar band for its whole
   life, and only the chrome drawn inside it morphs — that is what keeps the
   transition smooth, because moving and resizing a blurred window every frame

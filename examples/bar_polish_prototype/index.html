@@ -176,8 +176,8 @@ const SHAPES = {
 const PLAIN_SHAPES = {
   square: 'A · 直角',
   r3:     'B · 圆角 3pt',
-  r5:     'C · 圆角 5pt',
-  capsule:'D · 半高圆角（胶囊）',
+  r5:     'C · 圆角 5pt（只圆下缘）',
+  capsule:'D · 四角都圆（胶囊，现状）',
 };
 const BREATHS = {
   pulse:     'pulse — 形状自身轻微起伏',
@@ -191,7 +191,7 @@ const CURVES = {
   smooth: '420ms Apple smooth（无过冲）',
 };
 const PRESETS = {
-  A: { name:'Notch extension',   sn:'sfillet',  sp:'r5',      br:'pulse',     cv:'spring', period:1800, amp:1.6 },
+  A: { name:'Notch extension',   sn:'sfillet',  sp:'capsule', br:'pulse',     cv:'spring', period:1800, amp:1.6 },
   B: { name:'Floating capsule',  sn:'capsule',  sp:'capsule', br:'bloom',     cv:'smooth', period:2200, amp:2.2 },
   C: { name:'Heartbeat tab',     sn:'shoulder', sp:'r3',      br:'heartbeat', cv:'ease',   period:1500, amp:1.2 },
 };

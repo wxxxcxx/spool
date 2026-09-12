@@ -603,7 +603,7 @@ impl BarView {
             if notched {
                 super::placement::CAPSULE_TOP_RADIUS
             } else {
-                0.0
+                super::placement::PLAIN_TAB_HEIGHT / 2.0
             },
         );
         let mut glow = self.ivars().glow.borrow_mut();
@@ -847,12 +847,15 @@ impl BarView {
             preferences.corner_radius.clamp(0.0, 20.0),
             progress,
         );
-        // The top corners round inwards once the Bar leaves the screen edge.
-        let top_radius = if notched {
-            motion::lerp(super::placement::CAPSULE_TOP_RADIUS, 0.0, progress)
+        // The top corners round inwards once the Bar leaves the screen edge, so
+        // both displays hang the same kind of rounded shape from it: a capsule
+        // with a cutout, a pill without one.
+        let collapsed_top = if notched {
+            super::placement::CAPSULE_TOP_RADIUS
         } else {
-            0.0
+            super::placement::PLAIN_TAB_HEIGHT / 2.0
         };
+        let top_radius = motion::lerp(collapsed_top, 0.0, progress);
         let path = chrome_path(chrome_rect, radius, top_radius);
         let background = rgba(BarPreferences::rgba(
             &preferences.background_color,
@@ -2788,15 +2791,19 @@ mod tests {
             width: 120.0,
             height: super::super::placement::PLAIN_TAB_HEIGHT,
         };
-        let pill = chrome_path(tab, super::super::placement::PLAIN_TAB_HEIGHT / 2.0, 0.0);
+        let pill = chrome_path(
+            tab,
+            super::super::placement::PLAIN_TAB_HEIGHT / 2.0,
+            super::super::placement::PLAIN_TAB_HEIGHT / 2.0,
+        );
         assert!(pill.containsPoint(NSPoint::new(960.0, 3.0)));
         assert!(
-            pill.containsPoint(NSPoint::new(tab.x + 0.4, 0.4)),
-            "the tab hangs from the screen edge, so its top stays flush"
+            !pill.containsPoint(NSPoint::new(tab.x + 0.4, 0.4)),
+            "the tab rounds its top corners too, like the capsule"
         );
         assert!(
             !pill.containsPoint(NSPoint::new(tab.x + 0.4, tab.height - 0.4)),
-            "its bottom edge is a visible semicircle, not a square end"
+            "and its bottom edge is a visible semicircle, not a square end"
         );
     }
 
