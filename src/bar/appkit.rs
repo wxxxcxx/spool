@@ -1534,12 +1534,7 @@ fn make_bar_window(mtm: MainThreadMarker, view: &NSView) -> Retained<NSPanel> {
     window.setFloatingPanel(true);
     window.setBecomesKeyOnlyIfNeeded(true);
     window.setLevel(NSMainMenuWindowLevel + 1);
-    window.setCollectionBehavior(
-        NSWindowCollectionBehavior::CanJoinAllSpaces
-            | NSWindowCollectionBehavior::Transient
-            | NSWindowCollectionBehavior::FullScreenAuxiliary
-            | NSWindowCollectionBehavior::IgnoresCycle,
-    );
+    window.setCollectionBehavior(bar_collection_behavior());
     window.setContentView(Some(view));
     unsafe { window.setReleasedWhenClosed(true) };
     window
@@ -1604,6 +1599,26 @@ fn mask_chrome(backdrop: &NSVisualEffectView, size: NSSize) -> Retained<CAShapeL
         warn!("Bar backdrop is not layer backed; the blur will cover the handle's overhang");
     }
     mask
+}
+
+/// What the Bar's panel is to the window server.
+///
+/// `Stationary` is the one that matters: it means "unaffected by Exposé", and
+/// without it the window server scales the panel to a point the moment Mission
+/// Control or Show Desktop runs, so the Bar disappears for as long as the mode
+/// is up. It is measurably that — the panel's `WindowServer` bounds collapse to
+/// 1x1 — not the Bar hiding itself.
+///
+/// `Transient` is the alternative and is what the Bar used to set. Apple's
+/// guide is explicit that they are mutually exclusive: `Transient` "causes the
+/// window to float in Spaces and be hidden in Exposé", which is exactly the
+/// wrong half of it here. Dropping it costs nothing, because the Spaces half is
+/// already asked for by `CanJoinAllSpaces`.
+fn bar_collection_behavior() -> NSWindowCollectionBehavior {
+    NSWindowCollectionBehavior::CanJoinAllSpaces
+        | NSWindowCollectionBehavior::Stationary
+        | NSWindowCollectionBehavior::FullScreenAuxiliary
+        | NSWindowCollectionBehavior::IgnoresCycle
 }
 
 fn screens_by_id(mtm: MainThreadMarker) -> HashMap<u32, Retained<NSScreen>> {
@@ -2640,6 +2655,27 @@ mod tests {
         let rounded = chrome_path(band, handle, 10.0);
         assert!(!rounded.containsPoint(NSPoint::new(0.5, band.height - 0.5)));
         assert!(rounded.containsPoint(NSPoint::new(0.5, 0.5)));
+    }
+
+    #[test]
+    fn the_panel_is_stationary_so_expose_cannot_take_the_bar_away() {
+        let behavior = bar_collection_behavior();
+        assert!(
+            behavior.contains(NSWindowCollectionBehavior::Stationary),
+            "Mission Control and Show Desktop must not move or scale the Bar"
+        );
+        assert!(
+            !behavior.contains(NSWindowCollectionBehavior::Transient),
+            "Transient means hidden in Expose — the two are mutually exclusive"
+        );
+        assert!(
+            !behavior.contains(NSWindowCollectionBehavior::Managed),
+            "the Bar would then be a thumbnail in the Mission Control grid"
+        );
+        assert!(
+            behavior.contains(NSWindowCollectionBehavior::CanJoinAllSpaces),
+            "the Bar belongs to every Space, which Transient used to provide"
+        );
     }
 
     #[test]

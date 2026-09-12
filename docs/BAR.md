@@ -38,6 +38,14 @@ formula the Bar's own shape uses, so the resting handle is opaque black and the
 Notch's ears merge with the Notch. Hovering grows it by a few points and never
 changes its colour (see below).
 
+The panel is `Stationary` to the window server: Mission Control, Exposé and Show
+Desktop must not move or scale it. Without that flag the window server scales the
+panel to a point while either mode is up — measurably, the panel's WindowServer
+bounds collapse to 1x1 — and the Bar disappears until the mode ends. Apple's
+guide makes the choice exclusive: the `Transient` flag the Bar used to set means
+"float in Spaces and be hidden in Exposé", which is exactly the wrong half, and
+`CanJoinAllSpaces` already asks for the other half.
+
 The panel window is therefore the menu-bar band **plus** that handle's overhang:
 10pt for the handle at rest and 3pt more for the room it grows into when hovered,
 so 13pt taller than the menu bar on every display, even while expanded. That
