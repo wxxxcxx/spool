@@ -141,7 +141,8 @@ impl ViewState {
             self.chrome.progress(),
             handle,
         );
-        let grown = super::placement::grown_handle_rect(resting, handle);
+        let grown =
+            super::placement::grown_handle_rect(resting, handle, self.surface.notch.is_some());
         let growth = self.handle_grow.progress();
         Rect {
             x: motion::lerp(resting.x, grown.x, growth),
@@ -2650,6 +2651,42 @@ mod tests {
             "the press switches Spaces"
         );
         assert!(state.pressed.is_none(), "a deck card is not a drag handle");
+    }
+
+    #[test]
+    fn no_space_sits_under_the_notch_collar_even_when_it_grows() {
+        let (mut state, _) = drag_state();
+        let band = state.panel_rect();
+        state.surface.notch = Some(Rect {
+            x: 500.0,
+            y: 0.0,
+            width: 180.0,
+            height: band.height,
+        });
+        // Taller than the horizontal padding: a lane that only kept clear of the
+        // Notch itself would now show through the collar's ears.
+        state.preferences.handle_height = 12.0;
+        state.relayout();
+        assert!(!state.layout.spans.is_empty(), "there are Spaces to place");
+
+        for grown in [false, true] {
+            state.handle_grow = EasedProgress::new(grown, Instant::now());
+            let collar = state.handle_rect();
+            assert!(
+                collar.width >= 180.0 + state.preferences.handle_height * 2.0 - f64::EPSILON,
+                "the collar reaches past the notch: {collar:?}"
+            );
+            for span in &state.layout.spans {
+                let left_of_it = span.rect.x + span.rect.width <= collar.x + f64::EPSILON;
+                let right_of_it = span.rect.x >= collar.x + collar.width - f64::EPSILON;
+                assert!(
+                    left_of_it || right_of_it,
+                    "grown={grown}: Space {} ({:?}) sits under the collar {collar:?}",
+                    span.space_id,
+                    span.rect
+                );
+            }
+        }
     }
 
     #[test]

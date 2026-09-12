@@ -14,7 +14,10 @@ The fixed Mission Control / Show Desktop buttons and the Spaces are one group,
 and the group gathers toward the middle: a display without a notch
 centres it, and a notched display puts it either side of the notch with both
 halves hugging it, so the leftover whitespace falls at the outer ends and need
-not be equal. On a notched display the group is split by count, with the fixed
+not be equal. What they hug is the notch plus the handle's reach past it
+(`BarSurface::keep_out`): the collapsed Bar draws a collar there, so a lane that
+kept clear of the notch alone would put its label and icons under the collar and
+its clicks would go to the handle instead of the Space. On a notched display the group is split by count, with the fixed
 buttons counting as one item, so the notch takes the first `ceil((n + 1) / 2)`
 items on its left and the rest on its right; `notch_side = "left"` or
 `"right"` keeps every Space on one side instead. Spaces remain in native order
@@ -109,8 +112,10 @@ grew. Its frame never moves.
   240ms ease-out as every other transition, centred on itself and growing *away*
   from the edge it is glued to — the Bar's bottom edge while expanded, the
   screen's top edge once collapsed — so the join never opens and the handle never
-  lifts off the Bar. A notched display's collar grows the same way, which thickens
-  its ears and its chin. The grown rect contains the resting one, so a pointer that
+  lifts off the Bar. A notched display's collar takes the height's share only, on
+  each side: its width is mostly the Notch, so scaling that would slide its ears
+  over the neighbouring Spaces, while a thickness always stays inside the gap the
+  lanes keep clear. The grown rect contains the resting one, so a pointer that
   is inside the small shape is still inside the large one: growing can never drop
   the pointer out of hover and flip the handle back and forth every frame. It is
   a frame-loop transition, not a repeating pulse, so it costs nothing once it has

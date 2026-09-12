@@ -73,6 +73,9 @@ pub struct BarMetrics {
     pub horizontal_padding: f64,
     pub label_width: f64,
     pub collapsed_width: f64,
+    /// How far the Bar Handle reaches past the Notch on each side. The lanes
+    /// keep this clear, because that is where the collapsed collar is drawn.
+    pub handle_height: f64,
     /// Whether Spaces macOS is not showing are drawn as a compact deck instead
     /// of showing their columns. See [`BarPreferences::collapse_inactive_spaces`].
     ///
@@ -91,6 +94,7 @@ impl Default for BarMetrics {
             horizontal_padding: 6.0,
             label_width: 24.0,
             collapsed_width: 38.0,
+            handle_height: super::placement::HandleMetrics::DEFAULT.height,
             collapse_inactive_spaces: false,
         }
     }
@@ -195,6 +199,33 @@ mod notch_tests {
     }
 
     #[test]
+    fn the_keep_out_gap_is_the_notch_plus_the_handles_reach() {
+        let surface = surface();
+        let notch = surface.notch.expect("a notched surface");
+        let gap = surface
+            .keep_out(BarMetrics::default().handle_height)
+            .expect("a notched surface keeps a gap");
+        assert!((gap.x - (notch.x - 5.0)).abs() < f64::EPSILON);
+        assert!((gap.width - (notch.width + 10.0)).abs() < f64::EPSILON);
+        assert!((gap.height - notch.height).abs() < f64::EPSILON);
+        // A wider handle keeps more clear, and a notch against the edge cannot
+        // push the gap off the panel.
+        let wide = surface.keep_out(20.0).expect("a gap");
+        assert!((wide.x - (notch.x - 20.0)).abs() < f64::EPSILON);
+        let edge = BarSurface {
+            notch: Some(Rect {
+                x: 2.0,
+                width: 10.0,
+                height: 34.0,
+                ..Rect::default()
+            }),
+            ..surface
+        };
+        let clamped = edge.keep_out(20.0).expect("a gap");
+        assert!(clamped.x >= 0.0 && clamped.x + clamped.width <= edge.width);
+    }
+
+    #[test]
     fn a_display_without_a_notch_centres_the_whole_group() {
         let display = tests::display();
         for width in [400.0, 900.0, 1470.0] {
@@ -259,7 +290,26 @@ mod notch_tests {
         let right_group = left_edge(&right_ids, false);
         assert!(
             right_group - (split.gap.x + split.gap.width) >= -0.001,
-            "the right group starts against the notch"
+            "the right group starts against the gap"
+        );
+
+        // The gap is the Notch plus the handle's reach past it, so nothing sits
+        // under the collar the collapsed Bar draws there.
+        let notch = surface().notch.expect("a notched surface");
+        assert!(
+            (split.gap.x - (notch.x - metrics.handle_height)).abs() < f64::EPSILON
+                && (split.gap.x + split.gap.width
+                    - (notch.x + notch.width + metrics.handle_height))
+                    .abs()
+                    < f64::EPSILON
+        );
+        assert!(
+            notch.x - left_group >= metrics.handle_height - 0.001,
+            "the left lane keeps the collar's reach clear"
+        );
+        assert!(
+            right_group - (notch.x + notch.width) >= metrics.handle_height - 0.001,
+            "and so does the right lane"
         );
     }
 
@@ -496,7 +546,9 @@ impl BarLayout {
         space_scroll: &mut HashMap<u64, f64>,
         metrics: BarMetrics,
     ) -> Self {
-        let Some(gap) = surface.notch else {
+        // The lanes keep clear of the handle's collar, not just the notch: see
+        // `BarSurface::keep_out`.
+        let Some(gap) = surface.keep_out(metrics.handle_height) else {
             return Self::resolve_with_metrics(
                 display,
                 surface.width,
@@ -523,8 +575,8 @@ impl BarLayout {
             spaces: right_spaces,
             ..display.clone()
         };
-        // Both lanes hug the notch: the left group is right-aligned
-        // inside its lane, the right group left-aligned in its own.
+        // Both lanes hug the gap: the left group is right-aligned inside its
+        // lane, the right group left-aligned in its own.
         let mut a = Self::resolve_with_metrics(&left, gap.x, space_scroll, metrics, BarAlign::End);
         let right_x = gap.x + gap.width;
         let mut b = Self::resolve_with_metrics(

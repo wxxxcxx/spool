@@ -143,8 +143,9 @@ not the display)
 
 **Notch Lane**:
 One of the two runs of Spaces either side of the Notch on a notched display.
-Both lanes hug the Notch, so the leftover space falls at the display's outer
-ends, and nothing is ever split across it.
+Both lanes hug the Notch, keeping clear of the Bar Handle's collar, so the
+leftover space falls at the display's outer ends, and nothing is ever split
+across it.
 _Avoid_: Notch spacer, cutout lane
 
 **Native Space**:

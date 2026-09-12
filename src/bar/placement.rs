@@ -36,6 +36,29 @@ pub fn panel_rect(screen: Rect, menu_height: f64) -> Rect {
     }
 }
 
+impl BarSurface {
+    /// The gap the Bar's content must keep clear: the Notch, plus how far the
+    /// Bar Handle reaches past it on each side.
+    ///
+    /// The collapsed Bar is a collar around the Notch, and that collar is drawn
+    /// in the band — so a Space lane hugging the physical Notch would sit under
+    /// it, with its label and icons showing through the collar's ears and its
+    /// clicks going to the handle instead of the Space. The lanes hug this gap
+    /// instead, and the content is clipped to it.
+    #[must_use]
+    pub fn keep_out(&self, handle_height: f64) -> Option<Rect> {
+        let notch = self.notch?;
+        let margin = handle_height.clamp(0.0, self.width / 2.0);
+        let left = (notch.x - margin).max(0.0);
+        let right = (notch.x + notch.width + margin).min(self.width);
+        Some(Rect {
+            x: left,
+            width: (right - left).max(1.0),
+            ..notch
+        })
+    }
+}
+
 /// The drawing surface for a panel, with the notch marked in
 /// panel-local coordinates.
 ///
@@ -90,6 +113,11 @@ impl HandleMetrics {
     /// How much the handle grows under the pointer, as a fraction of its own
     /// size: an eighth wider, a third taller. Proportional, so a handle the user
     /// makes slimmer or taller keeps the feel the default was tuned for.
+    ///
+    /// The width half only applies to the plain tab, whose width *is* its own
+    /// size. A collar's width is mostly the Notch, so scaling it would slide the
+    /// ears sideways over the neighbouring Spaces; it thickens by the height's
+    /// share instead, which always fits inside the gap the lanes keep clear.
     pub const HOVER_GROWTH: (f64, f64) = (0.125, 0.30);
 
     /// Resolves a preference into geometry, clamping everything the renderer
@@ -177,13 +205,21 @@ pub fn handle_rect(
 /// The handle's grown rect: the same top edge, the same centre, and the growth
 /// [`HandleMetrics::hover_growth`] asks for.
 ///
+/// `notched` picks the collar's growth: it thickens by the height's share on
+/// each side rather than by a share of its own (mostly-Notch) width.
+///
 /// It grows *away* from the edge it is glued to — the Bar's bottom edge while
 /// expanded, the screen's top edge once collapsed — because that join has to
 /// stay exactly where it is for the handle to read as part of the Bar. On a
 /// notched display the same growth thickens the collar's ears and its chin.
 #[must_use]
-pub fn grown_handle_rect(resting: Rect, handle: HandleMetrics) -> Rect {
-    let (grow_width, grow_height) = handle.hover_growth();
+pub fn grown_handle_rect(resting: Rect, handle: HandleMetrics, notched: bool) -> Rect {
+    let (scaled_width, grow_height) = handle.hover_growth();
+    let grow_width = if notched {
+        grow_height * 2.0
+    } else {
+        scaled_width
+    };
     Rect {
         x: resting.x - grow_width / 2.0,
         y: resting.y,
@@ -440,7 +476,7 @@ mod tests {
         // In panel-local coordinates the window ends where the band ends plus
         // the overhang: the handle's `y` is measured from the band's top edge.
         let window_bottom = panel.1 + overhang;
-        let grown = grown_handle_rect(handle_rect(panel, None, 1.0, handle), handle);
+        let grown = grown_handle_rect(handle_rect(panel, None, 1.0, handle), handle, false);
         assert!(
             grown.y + grown.height <= window_bottom + f64::EPSILON,
             "the grown tab fits: {} > {window_bottom}",
@@ -448,8 +484,11 @@ mod tests {
         );
 
         let collar_panel = (1470.0, 34.0);
-        let grown_collar =
-            grown_handle_rect(handle_rect(collar_panel, Some(gap()), 0.0, handle), handle);
+        let grown_collar = grown_handle_rect(
+            handle_rect(collar_panel, Some(gap()), 0.0, handle),
+            handle,
+            true,
+        );
         assert!(
             grown_collar.y + grown_collar.height <= collar_panel.1 + overhang + f64::EPSILON,
             "the grown collar fits too"
@@ -460,7 +499,7 @@ mod tests {
     fn a_hovered_handle_grows_away_from_the_edge_it_is_glued_to() {
         let handle = HandleMetrics::DEFAULT;
         let resting = handle_rect((1470.0, 24.0), None, 1.0, handle);
-        let grown = grown_handle_rect(resting, handle);
+        let grown = grown_handle_rect(resting, handle, false);
         assert!(
             (grown.y - resting.y).abs() < f64::EPSILON,
             "the glued top edge does not move: no seam, and no lift off the Bar"
@@ -480,13 +519,23 @@ mod tests {
         assert!(grown.x <= resting.x);
         assert!(grown.y + grown.height >= resting.y + resting.height);
 
-        // The collar grows the same way, which thickens its ears and its chin.
+        // The collar thickens rather than scaling: its own width is mostly the
+        // Notch, so a share of it would slide the ears over the neighbouring
+        // Spaces. Growth per side is the height's share, which the gap the lanes
+        // keep clear (the handle's height) always contains.
         let collar = handle_rect((1470.0, 34.0), Some(gap()), 0.0, handle);
-        let grown_collar = grown_handle_rect(collar, handle);
+        let grown_collar = grown_handle_rect(collar, handle, true);
         assert!((grown_collar.y - collar.y).abs() < f64::EPSILON);
-        assert!(grown_collar.x < collar.x);
-        assert!(grown_collar.x + grown_collar.width > collar.x + collar.width);
-        assert!(grown_collar.height > collar.height);
+        assert!((collar.x - grown_collar.x - grow_height).abs() < f64::EPSILON);
+        assert!(
+            (grown_collar.x + grown_collar.width - (collar.x + collar.width) - grow_height).abs()
+                < f64::EPSILON
+        );
+        assert!((grown_collar.height - collar.height - grow_height).abs() < f64::EPSILON);
+        assert!(
+            grow_height < handle.height,
+            "the grown ears stay inside the gap the lanes keep clear"
+        );
     }
 
     #[test]

@@ -160,6 +160,7 @@ impl BarPreferences {
             },
             collapsed_width: 38.0,
             toolbar_width: self.toolbar_width(),
+            handle_height: self.handle_metrics().height,
             collapse_inactive_spaces: self.collapse_inactive_spaces,
         }
     }
