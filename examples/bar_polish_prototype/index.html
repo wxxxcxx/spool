@@ -25,31 +25,34 @@
   The URL always carries the current settings; send it back and its numbers are
   what gets folded into src/bar/appkit.rs.
 
-  VERDICT SO FAR — the shape question is settled:
-    - notched collapsed shape: concave shoulders (12pt) that spread the black
-      along the screen edge and narrow it into the body, plus convex bottom
-      corners that are deliberately tighter (8pt). Specified directly by the
-      user as a path; the only departure is that the flat run before each
-      shoulder is zero, because a flat segment past the arc's start has no black
-      under it and draws as a hairline spike. See s_corner_spec.png.
+  VERDICT SO FAR — the shape question is settled against a photograph of the
+  hardware (notch_photo.jpg, and notch_from_photo.png which renders four
+  candidate shoulders beside it):
+    - notched collapsed shape: the black is widest along the screen edge (it
+      overhangs the body by 12pt each side), the shoulder below that is concave
+      — carved out of the corner rather than rounded over it — the walls are
+      vertical, and only the bottom corners are the ordinary convex fillet, at
+      8pt. A convex shoulder is what the Bar had for several revisions; it reads
+      as a rounded rectangle with a brim, not as a notch. Rendering it convex is
+      the mistake this exploration exists to prevent.
     - plain collapsed shape: a pill (both ends round). Implemented for
       consistency with the capsule; not separately confirmed.
-  STILL OPEN: whether the shoulder keeps that zero flat run, the breathing
-  mechanism (pulse / bloom / heartbeat), its period and amplitude, and which
-  morph curve the collapse uses (spring 320ms is what ships).
+  STILL OPEN: whether the shoulder's outer end (where the scoop meets the
+  overhanging top edge) wants a small rounding rather than a point, the
+  breathing mechanism (pulse / bloom / heartbeat), its period and amplitude,
+  and which morph curve the collapse uses (spring 320ms is what ships).
 
-  ALREADY IN THE CODE (shipped in 0d11101, so it is the baseline to compare
-  against rather than a question):
+  ALREADY IN THE CODE (so this is the baseline to compare against, not a
+  question):
     - the panel never moves: the chrome morphs inside a still menu-bar band, so
-      the transition no longer stutters. The prototype's morph timing is the
-      real one (240ms ease-out, from the frame on screen).
+      the transition no longer stutters. The morph uses its own curve (Spring,
+      320ms) rather than the content's 240ms ease-out.
     - the shape hangs from the top edge, so hover only grows it downwards.
-    - notched collapsed shape: concave shoulders (flare 9pt) + bottom radius
-      12pt — that is candidate B below. Plain tab: 120x6, bottom radius h/2.
-    - hover breathes via Core Animation: 1.8s, halo shadow opacity 0.06..0.4
-      plus a 5% scale, and a 0.07..0.17 highlight under the pointer's button.
-  STILL OPEN (what this page is for): which shape, which breathing mechanism,
-  and the period/amplitude/curve numbers.
+    - notched collapsed shape: the scoop below (candidate B here); plain tab: a
+      120x6 pill, both ends rounded.
+    - hover breathes via Core Animation: a 1.8s pulse on the halo's opacity and
+      its bloom's radius, plus a quieter 0.07..0.17 highlight under the
+      pointer's button.
 -->
 <meta charset="utf-8">
 <title>PROTOTYPE — bar polish</title>

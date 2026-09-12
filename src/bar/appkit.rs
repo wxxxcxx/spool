@@ -85,6 +85,7 @@ impl Morph {
 /// Which part of the pulse is animated. The animation's key is its key path, so
 /// adding and removing a pulse can never disagree about what to look for.
 const PULSE_SHADOW: &str = "shadowOpacity";
+const PULSE_SHADOW_RADIUS: &str = "shadowRadius";
 const PULSE_OPACITY: &str = "opacity";
 const PULSE_SCALE: &str = "transform.scale";
 const PULSE_SCALE_Y: &str = "transform.scale.y";
@@ -92,7 +93,17 @@ const PULSE_SCALE_Y: &str = "transform.scale.y";
 /// How bright the collapsed Bar's halo pulses, low to high. The prototype's
 /// amplitude dial moves these; both stay below opaque so a hovered Bar never
 /// looks like a second, brighter Bar.
-const GLOW_PULSE: (f64, f64) = (0.35, 1.0);
+const GLOW_PULSE: (f64, f64) = (0.30, 0.75);
+/// How far the halo's bloom swells, as a multiple of its resting radius.
+///
+/// On a notched display the collapsed capsule fills the whole band and has no
+/// room to lift, so this *is* its breath; on a plain display it adds to the
+/// tab's lift. The range was cut back after rendering both ends of it — a
+/// full-opacity rim with a 15pt bloom reads as neon, which is the opposite of a
+/// restful hint.
+const GLOW_SWELL: (f64, f64) = (0.60, 1.35);
+/// The bloom's radius at rest, per display kind.
+const GLOW_RADIUS: (f64, f64) = (6.0, 9.0);
 /// The same for the highlight under the pointer's toolbar button. It stays
 /// quieter than the halo: a button is a control, the collapsed Bar is the only
 /// thing left on screen.
@@ -642,7 +653,11 @@ impl BarView {
             layer.setLineWidth(1.2);
             layer.setShadowColor(Some(&NSColor::whiteColor().CGColor()));
             layer.setShadowOffset(NSSize::new(0.0, 0.0));
-            layer.setShadowRadius(if notched { 9.0 } else { 6.0 });
+            layer.setShadowRadius(if notched {
+                GLOW_RADIUS.1
+            } else {
+                GLOW_RADIUS.0
+            });
             // The anchor is the band's top edge, which is also the shape's, so
             // a pulse grows downwards and never lifts the shape off the screen.
             layer.setAnchorPoint(NSPoint::new(0.5, 0.0));
@@ -660,6 +675,20 @@ impl BarView {
                 PULSE_OPACITY,
                 GLOW_PULSE.0,
                 GLOW_PULSE.1,
+                BREATH_PERIOD,
+            );
+            // The bloom swells at every breath, which is what the collapsed
+            // capsule on a notched display has instead of room to lift.
+            let resting = if notched {
+                GLOW_RADIUS.1
+            } else {
+                GLOW_RADIUS.0
+            };
+            breathe(
+                layer,
+                PULSE_SHADOW_RADIUS,
+                resting * GLOW_SWELL.0,
+                resting * GLOW_SWELL.1,
                 BREATH_PERIOD,
             );
             let reach = breath_reach(rect.height, view_height);
@@ -1442,7 +1471,13 @@ fn breathe(layer: &CALayer, key_path: &str, from: f64, to: f64, period: f64) {
 
 /// Stops every pulse on a layer and rests it.
 fn settle(layer: &CALayer) {
-    for key in [PULSE_SHADOW, PULSE_OPACITY, PULSE_SCALE, PULSE_SCALE_Y] {
+    for key in [
+        PULSE_SHADOW,
+        PULSE_SHADOW_RADIUS,
+        PULSE_OPACITY,
+        PULSE_SCALE,
+        PULSE_SCALE_Y,
+    ] {
         layer.removeAnimationForKey(&NSString::from_str(key));
     }
     layer.setOpacity(0.0);
@@ -2920,6 +2955,14 @@ mod tests {
         assert!(
             BUTTON_PULSE.1 < GLOW_PULSE.0,
             "a button highlight stays quieter than the halo it competes with"
+        );
+        assert!(
+            GLOW_SWELL.0 < 1.0 && GLOW_SWELL.1 > 1.0,
+            "the bloom both tightens and swells: {GLOW_SWELL:?}"
+        );
+        assert!(
+            GLOW_PULSE.1 < 1.0,
+            "a full-opacity rim reads as neon, not as a hint"
         );
     }
 

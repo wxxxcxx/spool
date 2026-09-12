@@ -69,8 +69,10 @@ menus and status items, which is why the Bar takes that space instead.
   Bar collapses.
 - Hover breathes. The toolbar button under the pointer and the collapsed Bar
   get a repeating 1.8s ease-in-out pulse — a translucent highlight under the
-  button's symbol, and a halo around the collapsed shape made of a hairline rim
-  plus the bloom its shadow casts from the same path. Both are Core Animation
+  button's symbol (0.07..0.17), and a halo around the collapsed shape made of a
+  hairline rim plus the bloom its shadow casts from the same path, breathing
+  between 0.30 and 0.75 layer opacity while the bloom's radius moves between
+  0.60 and 1.35 times its resting 6pt (plain) or 9pt (notched). Both are Core Animation
   layers rather than per-frame drawing: pulsing them from the frame loop would
   mean running the whole ECS at refresh rate, which costs about 45% of a core
   to animate a highlight. The halo carries a rim as well as a shadow so the
