@@ -236,6 +236,11 @@ retained identity still occupies a tile and icon.
 `WorkspaceSet.active` is per-display native visibility, not the global
 `ActiveWorkspaceMarker`. `DisplaySet.active` identifies the globally active
 display from the same topology epoch, not a retained `ActiveDisplayMarker`.
+The ECS `ActiveDisplayMarker` is reconciled from that epoch by
+`reconcile_native_spaces`: AppKit posts no notification when the menu bar
+display changes, and a marker pinned to the launch display withdraws the active
+Space from the display owning the key window and restores that Space's
+remembered focus.
 `WindowSet::current()` requires a unique active display and a unique
 visible Space there; retained strips do not substitute for missing observations.
 Focus/view/follow predictions update these two levels separately, preserve

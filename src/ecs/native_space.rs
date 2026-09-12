@@ -1112,8 +1112,31 @@ pub(crate) fn reconcile_native_spaces(ctx: NativeSpaceObservationCtx) {
         .map(|(display, spaces)| (display.id(), spaces))
         .collect::<HashMap<_, _>>();
 
-    for (display, display_entity, display_active) in &displays {
+    for (display, display_entity, marker_active) in &displays {
         let display_id = display.id();
+        // macOS moves the menu bar (the active display) to whichever display
+        // owns the key window, but `AppKit` posts no notification for that, so
+        // the marker has to follow our own observation. Deriving the active
+        // Space from a notification-only marker leaves it pinned to the display
+        // that was active at launch: the next sample would then withdraw the
+        // active Space from the display the user just clicked and re-focus the
+        // remembered window of the display they left.
+        let display_active = match observation.active_display() {
+            Some(active_display_id) => active_display_id == display_id,
+            // An unavailable read is not evidence that the display changed.
+            None => marker_active,
+        };
+        if display_active != marker_active
+            && let Ok(mut entity_commands) = commands.get_entity(display_entity)
+        {
+            if display_active {
+                debug!(display_id, "display became active");
+                entity_commands.try_insert(ActiveDisplayMarker);
+            } else {
+                debug!(display_id, "display is no longer active");
+                entity_commands.try_remove::<ActiveDisplayMarker>();
+            }
+        }
         let Some(visible_id) = observation.visible_space(display_id) else {
             error!(display_id, "unable to read visible Space");
             continue;

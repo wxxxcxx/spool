@@ -396,6 +396,13 @@ impl MockState {
         self.inner.force_read().active_display_id
     }
 
+    /// Moves the menu bar display the way macOS does after a click hands the
+    /// key window to another display. Deliberately does not queue an
+    /// `Event::DisplayChanged`: `AppKit` posts no active-display notification.
+    pub fn set_active_display(&self, id: u32) {
+        self.inner.force_write().active_display_id = id;
+    }
+
     pub(crate) fn activate_workspace(
         &self,
         display_id: u32,

@@ -1,4 +1,5 @@
 mod command_dispatch;
+mod cross_display_focus;
 mod display;
 mod display_commands;
 mod exit_restore;

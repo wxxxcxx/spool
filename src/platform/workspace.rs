@@ -48,16 +48,6 @@ define_class!(
     pub struct WorkspaceObserver;
 
     impl WorkspaceObserver {
-        /// Called when the active display changes.
-        ///
-        /// # Arguments
-        ///
-        /// * `_` - The notification object (unused).
-        #[unsafe(method(activeDisplayDidChange:))]
-        fn display_changed(&self, _: &NSNotification) {
-            _ = self.ivars().events.send(Event::DisplayChanged);
-        }
-
         /// Called when the active space changes.
         ///
         /// # Arguments
@@ -271,10 +261,6 @@ impl WorkspaceObserver {
     /// Starts observing workspace notifications by registering selectors with `NSWorkspace` and `NSDistributedNotificationCenter`.
     pub(super) fn start(&self) {
         let methods = [
-            (
-                sel!(activeDisplayDidChange:),
-                "NSWorkspaceActiveDisplayDidChangeNotification",
-            ),
             (
                 sel!(activeSpaceDidChange:),
                 "NSWorkspaceActiveSpaceDidChangeNotification",

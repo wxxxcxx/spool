@@ -75,6 +75,21 @@ The animated `presented` rectangle may lag intentionally; the target must not
 remain on an older readback. Include periods with no `FocusedMarker`: overlays
 can still use the requested or last navigation window while AX focus resolves.
 
+### Cross-display focus
+
+When focus returns to the display the user just left, run the daemon with
+`RUST_LOG=info,spool::focus_diagnostics=debug,spool::ecs::native_space=debug` and
+collect `spool subscribe --json --raw` alongside it; the `window_focused` and
+`space_changed` rows carry the window IDs that the log refers to by entity.
+
+A bounce reads as a confirmed `focus_observation` for the clicked window,
+followed by `focus_request` for an entity on the display the user left and
+`restoring the Space's previous focus`. `display became active display_id=…`
+records the active-Space projection that follows the change. No AppKit
+notification announces a menu bar display change, so that projection is driven
+by Spool's own reading of the active display; a marker that never moves leaves
+the projection pinned to one display.
+
 ### Capture steps
 
 For overlapping edge windows, the focus diagnostic category emits
