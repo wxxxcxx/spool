@@ -972,6 +972,56 @@ fn focusing_a_window_in_another_space_goes_there_first() {
 }
 
 #[test]
+fn a_space_window_click_supersedes_both_stages_of_an_older_follow() {
+    for focus_submitted in [false, true] {
+        let (mut harness, _, _) = column_harness();
+        add_source_windows(&mut harness, &[2]);
+        submit(&mut harness, MoveFocus::Follow);
+        if focus_submitted {
+            reconcile(&mut harness);
+        }
+        dispatch_action(
+            &mut harness,
+            Action::FocusWindowInSpace {
+                window_id: 2,
+                space_id: TEST_WORKSPACE_ID,
+            },
+        );
+        harness.mock_state.take_focus_requests();
+        refresh_native_observation(&mut harness);
+        reconcile(&mut harness);
+        assert_eq!(harness.mock_state.take_focus_requests(), vec![2]);
+        mark_target_visible(&mut harness);
+        refresh_native_observation(&mut harness);
+        reconcile(&mut harness);
+        assert!(
+            harness.mock_state.take_focus_requests().is_empty(),
+            "the older follow must not revive when its Space becomes visible"
+        );
+    }
+}
+
+#[test]
+fn a_failed_repeat_space_window_click_preserves_the_accepted_follow() {
+    let (mut harness, _, _) = column_harness();
+    submit(&mut harness, MoveFocus::Stay);
+    reconcile(&mut harness);
+    let action = Action::FocusWindowInSpace {
+        window_id: 0,
+        space_id: TARGET,
+    };
+    dispatch_action(&mut harness, action.clone());
+    harness.mock_state.disable_native_space_control();
+    dispatch_action(&mut harness, action);
+    harness.mock_state.enable_native_space_control();
+    harness.mock_state.take_focus_requests();
+    mark_target_visible(&mut harness);
+    refresh_native_observation(&mut harness);
+    reconcile(&mut harness);
+    assert_eq!(harness.mock_state.take_focus_requests(), vec![0]);
+}
+
+#[test]
 fn focusing_a_withdrawn_window_in_another_space_still_goes_there() {
     let (mut harness, _, _) = column_harness();
     // Park the column in the other Space without following it there, so the

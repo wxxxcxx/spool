@@ -374,7 +374,8 @@ pub enum Action {
         space_id: u64,
         move_focus: MoveFocus,
     },
-    // Append new variants: postcard uses declaration order for the IPC tags.
+    // IPC encodes actions and their nested operations by serde name.
+    // Renaming a variant or field changes that wire contract.
     /// Requests the system Mission Control overview.
     MissionControl,
     /// Requests the system Show Desktop overview.

@@ -172,3 +172,19 @@ INFO; reserve sampled detail for TRACE. Logging must not change retry budgets.
 Never log access tokens, complete IPC payloads, Lua source, window titles, or
 document URLs by default. DEBUG is not permission to expose credentials. Audit
 existing `%error` and `?event` sites before claiming the logs are share-safe.
+
+## Inactive-Space startup discovery
+
+For an application whose Bar icon is missing, the read-only native probe
+`examples/native_window_probe/main.m` compares its AX and WindowServer windows.
+If `AXWindows` is empty but focused/main still names a window, verify the daemon's
+publication collector directly without changing focus or restarting:
+
+```sh
+cargo run --example ax-window-inventory -- <pid> <expected-window-id>
+```
+
+This probe uses the production AX collector. It asserts that the expected
+identity is published; it does not prove that a running daemon has been upgraded
+or that the Bar has drawn the icon. Query the daemon after a separately authorized
+restart for that final check.

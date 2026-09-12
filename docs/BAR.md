@@ -301,6 +301,13 @@ This does not relax focus or movement availability checks. Confirmed window
 destruction removes the tracked identity and its icon; the Bar does not retain
 a separate last-known snapshot of closed windows.
 
+Application discovery merges `AXWindows`, `AXFocusedWindow` and `AXMainWindow`,
+deduplicating identical AX endpoints. Some apps publish an empty `AXWindows`
+list while their fullscreen Space is inactive but still publish its focused or
+main window. All three sources pass the same identity and admission checks;
+startup, lifecycle reconciliation and ownership checks use this same inventory.
+A failed `AXWindows` read remains unknown, not a complete empty inventory.
+
 Cold-start discovery can leave a native surface without a tracked AX identity
 after the bounded startup scan. Such surfaces remain discovery candidates, not
 Bar icons. Native membership, a known application bundle, and visible geometry

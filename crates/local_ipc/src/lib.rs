@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver as MessageReceiver, SyncSender, TrySendErro
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const PROTOCOL_VERSION: u16 = 4;
+const PROTOCOL_VERSION: u16 = 5;
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(2);
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(1);
@@ -1456,6 +1456,11 @@ mod tests {
     #[test]
     fn the_unbound_layout_operations_protocol_is_rejected_before_dispatch() {
         assert_protocol_version_rejected(3);
+    }
+
+    #[test]
+    fn the_numeric_action_protocol_is_rejected_before_dispatch() {
+        assert_protocol_version_rejected(4);
     }
 
     fn assert_protocol_version_rejected(version: u16) {

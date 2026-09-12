@@ -26,6 +26,26 @@ use crate::{
     platform::{OSStatus, WinID},
 };
 
+/// Collect the application's published window endpoints through one shared
+/// seam for startup, reconciliation and ownership checks.
+fn published_application_windows<T>(
+    listed: Result<Vec<T>>,
+    mut read_window: impl FnMut(&str) -> Result<T>,
+    same_window: impl Fn(&T, &T) -> bool,
+) -> Result<Vec<T>> {
+    // An unreadable AXWindows list is still an unknown inventory, even if a
+    // supplementary endpoint works. Do not turn it into proof of absence.
+    let mut windows = listed?;
+    for attribute in ["AXFocusedWindow", "AXMainWindow"] {
+        if let Ok(window) = read_window(attribute)
+            && !windows.iter().any(|listed| same_window(listed, &window))
+        {
+            windows.push(window);
+        }
+    }
+    Ok(windows)
+}
+
 /// Converts a floating-point pixel measurement into whole pixels.
 ///
 /// Rounds rather than truncates, since truncating biases every derived
@@ -206,7 +226,15 @@ pub trait AXUIAttributes {
     fn windows(&self) -> Result<Vec<CFRetained<AXUIWrapper>>> {
         let axname = CFString::from_static_str(kAXWindowsAttribute);
         let array = self.get_attribute::<CFArray<AXUIWrapper>>(&axname)?;
-        Ok(array.to_vec())
+        published_application_windows(
+            Ok(array.to_vec()),
+            |name| self.get_attribute::<AXUIWrapper>(&CFString::from_str(name)),
+            |left, right| {
+                let left: &CFType = left.as_ref();
+                let right: &CFType = right.as_ref();
+                left == right
+            },
+        )
     }
 
     fn get_attribute<T: Type>(&self, name: &CFRetained<CFString>) -> Result<CFRetained<T>>;
@@ -432,5 +460,52 @@ mod ax_ownership_tests {
         assert_eq!(CFGetRetainCount(Some(owned.as_ref())), before + 1);
         drop(borrowed);
         assert_eq!(CFGetRetainCount(Some(owned.as_ref())), before);
+    }
+}
+
+#[cfg(test)]
+mod published_window_tests {
+    use super::*;
+
+    #[test]
+    fn inactive_application_retains_its_focused_window_when_ax_windows_is_empty() {
+        let windows = published_application_windows(
+            Ok(Vec::new()),
+            |attribute| {
+                assert!(matches!(attribute, "AXFocusedWindow" | "AXMainWindow"));
+                Ok(3201)
+            },
+            |a, b| a == b,
+        )
+        .unwrap();
+        assert_eq!(windows, vec![3201]);
+    }
+
+    #[test]
+    fn partial_publications_merge_without_duplicating_listed_windows() {
+        let windows = published_application_windows(
+            Ok(vec![1]),
+            |attribute| Ok(if attribute == "AXFocusedWindow" { 1 } else { 2 }),
+            |a, b| a == b,
+        )
+        .unwrap();
+        assert_eq!(windows, vec![1, 2]);
+    }
+
+    #[test]
+    fn optional_publication_failures_preserve_the_list_but_not_a_failed_inventory() {
+        let windows = published_application_windows(
+            Ok(vec![1]),
+            |_| Err(Error::InvalidWindow),
+            |a, b| a == b,
+        )
+        .unwrap();
+        assert_eq!(windows, vec![1]);
+        let result = published_application_windows::<i32>(
+            Err(Error::InvalidWindow),
+            |_| panic!("failed inventory must stay unknown"),
+            |a, b| a == b,
+        );
+        assert!(result.is_err());
     }
 }

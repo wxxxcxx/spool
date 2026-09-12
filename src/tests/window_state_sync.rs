@@ -832,6 +832,32 @@ fn window_state_sync_silent_frame_drift_converges_cache_and_ecs() {
 }
 
 #[test]
+fn disabled_automatic_sweeps_still_recover_silent_frame_drift() {
+    let config: Config = (
+        MainOptions {
+            automatic_reconcile: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(1);
+    harness.pump_frames(15);
+    let entity = find_window_entity(0, harness.world());
+    harness.world().entity_mut(entity).insert(Floating);
+    harness.pump_frames(10);
+    let actual = IRect::from_corners(IVec2::new(77, 88), IVec2::new(577, 688));
+    harness.mock_state.os_set_window_frame_silently(0, actual);
+    assert_ne!(harness.mock_state.cached_window_frame(0), Some(actual));
+    harness.pump_frames(40);
+    assert_eq!(harness.mock_state.cached_window_frame(0), Some(actual));
+    assert_eq!(
+        harness.world().get::<Window>(entity).unwrap().frame(),
+        actual
+    );
+}
+
+#[test]
 fn floating_resize_notification_adopts_the_complete_observed_frame() {
     let mut harness = TestHarness::new().with_windows(1);
     harness.pump_frames(15);

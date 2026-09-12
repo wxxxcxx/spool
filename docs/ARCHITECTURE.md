@@ -292,8 +292,13 @@ The predicted tree does not make deferred operations synchronous. A Space move
 or view does not guarantee that later layout operations wait for native
 confirmation, and backend focus may reject a target on another display.
 
-The bound snapshot/plan representation uses local IPC protocol version 4.
-Versions 2 and 3 are rejected instead of interpreting incompatible postcard data.
+Local IPC uses protocol version 5. Dispatch actions carry their snake-case serde
+names and payloads as a JSON string inside the postcard envelope, including
+nested operations; enum declaration order no longer determines action meaning.
+Renaming an action or payload field remains a wire contract change. Other
+messages retain their postcard encoding. Versions 2–4 are rejected rather than
+interpreted as current requests; daemon and CLI/Lua clients must be upgraded
+together.
 This is independent of persisted layout-state and public query-document versions.
 
 ### Cross-Display Command Admission
@@ -429,19 +434,21 @@ barrier; native confirmation or the ordinary membership audit releases it.
 ### Named Window Focus
 
 Ordinary `Action::FocusWindow` requests do not implicitly select another native
-Space. Admission samples topology and visibility at the request, then requires
-a complete membership scan to identify one actual Space and one visible owning
-display. It never substitutes a retained `LayoutStrip`, `VisibleNativeSpaceMarker`,
-or active-display fallback for that evidence. Floating, hidden, minimized, and
-not-yet-placed tracked windows use the same ownership check. A visible fullscreen
-Space is eligible for focus even though it is not a valid native-move destination.
+Space. Admission samples current topology and visibility. If the retained layout
+names a Space, native membership in that visible Space confirms the claim with
+one read. A contradicted claim falls back to the complete unique-membership
+scan; an unreadable claim is refused. This shortcut deliberately accepts a
+window also listed in another Space (see the Bar latency research). Windows
+without a retained claim, including floating windows, use the complete scan.
+A visible fullscreen Space is eligible for focus even though it is not a valid
+native-move destination.
 
 The sampler runs inside the ordered command executor, so it can observe a Space
 selection issued earlier in the same batch before ECS markers catch up. It does
 not wait for an asynchronous native transition: unresolved visibility still
 rejects the request. A visible secondary display does not need to be the active
 display; an unrelated visibility failure is acceptable, but incomplete global
-Space topology cannot establish unique window membership.
+Space topology cannot establish a focus destination.
 
 `FocusSpacePolicy` keeps this distinct from bound script `focus`, which retains
 its existing permission to request native Space activation through window focus.

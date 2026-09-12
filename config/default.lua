@@ -1,11 +1,9 @@
 -- Spool configuration. Changes are hot-reloaded on save.
 spool.setup {
   options = {
-    -- Spool re-syncs tracked window state against macOS on its own: a
-    -- one-second heartbeat and a full sweep after every mouse-up. Both read
-    -- every tracked application's accessibility window list. Set false to
-    -- reconcile only what a notification names, and on request with
-    -- `spool action reconcile-windows`.
+    -- Full inventory sweeps on each heartbeat and mouse-up. Set false to
+    -- skip those sweeps; frame/focus heartbeats, structural changes (Space,
+    -- display, wake), scoped notifications and explicit reconcile still run.
     -- automatic_reconcile = true,
   },
   -- Editable preferences, not built-in window classification. Higher priority

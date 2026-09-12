@@ -34,7 +34,7 @@ pub enum Request {
     /// Dispatch an action — the same one a hotkey binds to. Fire-and-forget: the
     /// daemon applies it best-effort against the live world and a client that
     /// wants the result queries for it.
-    Dispatch(Action),
+    Dispatch(#[serde(with = "named_action")] Action),
     /// Read part of the state document.
     Query(StateQueryKind),
     /// Read the window set — the same layout tree a `spool.windows` handler is
@@ -58,6 +58,31 @@ pub enum Request {
 pub enum ScriptStateRequest {
     Get { key: String },
     Write(ScriptStateWrite),
+}
+
+/// Actions carry their serde names, including nested operations, rather than
+/// postcard declaration-order discriminants. Only this payload uses JSON; the
+/// enclosing request and replies remain postcard. Keep human-readable serde
+/// unchanged for tools that already inspect requests as JSON.
+mod named_action {
+    use super::Action;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(action: &Action, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            return action.serialize(serializer);
+        }
+        let text = serde_json::to_string(action).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&text)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Action, D::Error> {
+        if deserializer.is_human_readable() {
+            return Action::deserialize(deserializer);
+        }
+        let text = String::deserialize(deserializer)?;
+        serde_json::from_str(&text).map_err(serde::de::Error::custom)
+    }
 }
 
 /// What the daemon says back.
@@ -168,47 +193,30 @@ mod tests {
     }
 
     #[test]
-    fn overview_actions_append_wire_tags_without_renumbering_existing_actions() {
-        use crate::commands::{MoveFocus, Placement};
-
-        // These are the tags of the *current* declaration order. They drifted
-        // once already — `ReconcileWindows` was inserted before `Lua`, which
-        // moved every tag from there on — so what this pins is the suffix: a new
-        // variant may only ever be appended.
-        for (action, tag) in [
-            (Action::Lua(7), 12),
-            (Action::Layout(LayoutPlan::default()), 13),
-            (
-                Action::ReorderColumn {
-                    window_id: 1,
-                    anchor_window_id: 2,
-                    placement: Placement::After,
-                },
-                14,
-            ),
-            (
-                Action::MoveColumnToSpace {
-                    window_id: 1,
-                    space_id: 2,
-                    move_focus: MoveFocus::Stay,
-                },
-                15,
-            ),
-            (Action::MissionControl, 16),
-            (Action::ShowDesktop, 17),
+    fn actions_use_stable_names_instead_of_enum_positions() {
+        for (action, name) in [
+            (Action::Quit, "\"quit\""),
+            (Action::Restart, "\"restart\""),
+            (Action::ToggleBarCollapse, "\"toggle_bar_collapse\""),
             (
                 Action::FocusWindowInSpace {
-                    window_id: 1,
-                    space_id: 2,
+                    window_id: 7,
+                    space_id: 9,
                 },
-                18,
+                "{\"focus_window_in_space\":{\"window_id\":7,\"space_id\":9}}",
             ),
         ] {
+            // Independent fixture: Dispatch's envelope tag plus a string,
+            // with no Action serialization involved in constructing the bytes.
+            let fixture = postcard::to_allocvec(&(0u8, name)).unwrap();
             let request = Request::Dispatch(action);
-            let bytes = postcard::to_allocvec(&request).unwrap();
-            assert_eq!(&bytes[..2], &[0, tag]);
-            round_trip(&request);
+            assert_eq!(postcard::to_allocvec(&request).unwrap(), fixture);
+            assert_eq!(postcard::from_bytes::<Request>(&fixture).unwrap(), request);
         }
+        let unknown = postcard::to_allocvec(&(0u8, "\"future_action\"")).unwrap();
+        assert!(postcard::from_bytes::<Request>(&unknown).is_err());
+        // A v4 Restart must never become a v5 Quit (or any other action).
+        assert!(postcard::from_bytes::<Request>(&[0, 8]).is_err());
     }
 
     #[test]

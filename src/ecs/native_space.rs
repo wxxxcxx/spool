@@ -502,11 +502,12 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
             entity,
             incarnation: window.incarnation(),
         };
-        // Repeat clicks replace the pending focus instead of stacking follows.
-        transactions.cancel_follows_for(&[*window_id]);
         if let Some(pending) =
             PendingFollow::submit(member, *space_id, &window_manager, &config, time.elapsed())
         {
+            // Only an accepted selection supersedes every older focus intent,
+            // including follows still attached to unconfirmed moves.
+            transactions.cancel_pending_follows();
             transactions.follows.push(pending);
         } else {
             warn!(

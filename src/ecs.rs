@@ -132,6 +132,16 @@ fn overlay_dirty(
         || window_removed.read().next().is_some()
 }
 
+type BarGained = Or<(
+    Added<native_space::VisibleNativeSpaceMarker>,
+    Added<FocusedMarker>,
+    Added<Floating>,
+)>;
+type BarAvailabilityChanged = Or<(
+    Changed<WindowVisibility>,
+    Added<reconcile::WindowUnavailable>,
+)>;
+
 /// Whether anything the Bar draws has changed since this last ran.
 ///
 /// Deliberately not `Changed<Window>`: systems that tick a window's cached
@@ -144,24 +154,15 @@ fn overlay_dirty(
 /// identity behind an icon, the display frames it is placed in, and the config
 /// it is drawn from. A window's cached frame and title are carried in the
 /// snapshot but never drawn, so they deliberately do not appear.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Bevy injects independent change readers as system parameters"
+)]
 pub(crate) fn bar_projection_dirty(
     layout_changed: Query<(), Changed<LayoutStrip>>,
     native_space_changed: ChangedNativeSpaces,
-    gained: Query<
-        (),
-        Or<(
-            Added<native_space::VisibleNativeSpaceMarker>,
-            Added<FocusedMarker>,
-            Added<Floating>,
-        )>,
-    >,
-    hidden_or_unavailable: Query<
-        (),
-        Or<(
-            Changed<WindowVisibility>,
-            Added<reconcile::WindowUnavailable>,
-        )>,
-    >,
+    gained: Query<(), BarGained>,
+    hidden_or_unavailable: Query<(), BarAvailabilityChanged>,
     app_changed: Query<(), Changed<Application>>,
     display_changed: Query<(), Changed<Display>>,
     focus: Option<Res<focus::FocusCoordinator>>,
@@ -319,7 +320,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             )
                 .chain(),
             (
-                crate::bar::update_bar.run_if(bar_dirty.or_eager(on_timer(Duration::from_secs(1)))),
+                crate::bar::update_bar.run_if(bar_dirty),
                 crate::bar::apply_bar_requests,
                 crate::bar::animate_bar,
             )

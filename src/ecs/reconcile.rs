@@ -245,7 +245,8 @@ struct SyncRequest {
     /// The heartbeat, or an event that says something may have changed
     /// everywhere rather than which window did. This is the expensive one — it
     /// reads every tracked application's accessibility window list — so
-    /// `automatic_reconcile = false` drops it while leaving `all` alone.
+    /// `automatic_reconcile = false` drops heartbeat/mouse-up sweeps only;
+    /// structural events and explicit requests still sweep.
     sweep: bool,
     /// Read every live window's frame back and re-resolve focus. Cheap, and what
     /// the heartbeat is for: it catches drift whose notification never arrived.
@@ -304,17 +305,14 @@ impl SyncRequest {
                 Event::WindowDestroyed {
                     incarnation: None, ..
                 }
-                | Event::MouseUp { .. }
                 | Event::SpaceChanged
                 | Event::SpaceDestroyed { .. }
                 | Event::MissionControlExit
                 | Event::DisplayChanged
                 | Event::SystemWoke { .. } => request.sweep = true,
+                Event::MouseUp { .. } => request.sweep |= automatic,
                 _ => {}
             }
-        }
-        if !automatic {
-            request.sweep = false;
         }
         if request.sweeps() {
             request.frames = true;
@@ -1102,11 +1100,10 @@ pub(super) fn reconcile_windows(
     mut sync: ResMut<WindowStateSync>,
     mut commands: Commands,
 ) {
-    // `tick` always advances the retry clock; only its heartbeat answer is
-    // something this option may drop.
+    // The heartbeat always reads frames; collect gates only its full sweep.
     let heartbeat = sync.tick(time.delta());
     let automatic = config.automatic_reconcile();
-    let request = SyncRequest::collect(&mut messages, heartbeat && automatic, automatic);
+    let request = SyncRequest::collect(&mut messages, heartbeat, automatic);
     if request.is_empty() {
         return;
     }
@@ -1535,9 +1532,19 @@ mod tests {
         );
 
         // A click no longer sweeps.
-        assert!(on(&[mouse_up.clone()], false).sweeps());
-        assert!(!off(&[mouse_up.clone()], false).sweeps());
-        assert!(off(&[mouse_up.clone()], false).is_empty());
+        assert!(on(std::slice::from_ref(&mouse_up), false).sweeps());
+        assert!(!off(std::slice::from_ref(&mouse_up), false).sweeps());
+        assert!(off(std::slice::from_ref(&mouse_up), false).is_empty());
+
+        for event in [
+            Event::SpaceChanged,
+            Event::DisplayChanged,
+            Event::MissionControlExit,
+        ] {
+            let request = off(std::slice::from_ref(&event), false);
+            assert!(request.sweeps(), "structural events still audit membership");
+            assert!(request.frames);
+        }
 
         // A request by name is not automatic, and neither is the suspension
         // protocol's own confirmation of an absence it already suspects.

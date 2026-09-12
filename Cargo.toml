@@ -149,3 +149,7 @@ uuid = { version = "1.23", features = ["v4"] }
 ctrlc = { version = "3.5", features = ["termination"] }
 xdg = "3.0"
 mockall = "0.15"
+
+[[example]]
+name = "ax-window-inventory"
+path = "examples/native_window_probe/inventory.rs"
