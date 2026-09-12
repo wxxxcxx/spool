@@ -34,6 +34,9 @@ spool.setup {
     foreground_color = "auto", -- System label color, or an RGB/RGBA hex color.
     show_mission_control = true,
     show_desktop = true,
+    handle_height = 5, -- pt the handle hangs below the Bar (4-24); also the
+                       -- collapsed collar's reach past a notch.
+    handle_radius = 2.5, -- handle's bottom corners (0 to handle_height).
   },
 }
 

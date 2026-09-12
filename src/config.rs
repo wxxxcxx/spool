@@ -1854,6 +1854,8 @@ mod lua_setup_tests {
         for source in [
             "return { bar = { corner_radius = 0/0 } }",
             "return { bar = { icon_size = math.huge } }",
+            "return { bar = { handle_height = math.huge } }",
+            "return { bar = { handle_radius = 0/0 } }",
         ] {
             let value = lua.load(source).eval().unwrap();
             assert!(config_from_lua(&lua, value).is_err());
@@ -1938,6 +1940,7 @@ mod lua_setup_tests {
             icon_size = 20, label_font_size = 13, foreground_color = "#112233FF",
             inactive_workspace_color = "#00000010", workspace_corner_radius = 6,
             show_mission_control = false, show_desktop = true,
+            handle_height = 12, handle_radius = 6,
         } }"##,
         );
         let preferences = config.bar_preferences();
@@ -1946,6 +1949,12 @@ mod lua_setup_tests {
         assert_eq!(preferences.foreground_color, "#112233FF");
         assert_eq!(preferences.inactive_workspace_color, "#00000010");
         assert!((preferences.toolbar_width() - 38.0).abs() < f64::EPSILON);
+        // The handle is the one piece of Bar geometry with keys of its own.
+        assert!((preferences.handle_height - 12.0).abs() < f64::EPSILON);
+        assert!((preferences.handle_radius - 6.0).abs() < f64::EPSILON);
+        let handle = preferences.handle_metrics();
+        assert!((handle.height - 12.0).abs() < f64::EPSILON);
+        assert!((handle.radius - 6.0).abs() < f64::EPSILON);
     }
 
     #[test]

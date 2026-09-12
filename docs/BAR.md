@@ -27,9 +27,10 @@ menus and status items, which is why the Bar takes that space instead.
 
 One **Bar Handle** sits at the display's centre, and it is the Bar's only control
 of its own: a small tab whose square top edge is glued to the Bar's bottom edge,
-so while expanded it hangs 10pt below the band, over the desktop below. It is
-64pt wide and 10pt tall with 5pt bottom corners on a display without a notch; on
-a notched display it is the Notch's width plus 10pt a side, and 10pt below it,
+so while expanded it hangs `bar.handle_height` below the band, over the desktop
+below. It is 64pt wide and 5pt tall with 2.5pt bottom corners by default on a
+display without a notch; on a notched display it is the Notch's width plus the
+handle's height a side, and the same below it,
 because the middle of the band there is the camera housing and a tab centred
 inside it would be drawn on pixels that do not exist. It is filled like the Bar
 itself — menu-material glass plus `background_color`, with `border_color` and
@@ -47,8 +48,9 @@ guide makes the choice exclusive: the `Transient` flag the Bar used to set means
 `CanJoinAllSpaces` already asks for the other half.
 
 The panel window is therefore the menu-bar band **plus** that handle's overhang:
-10pt for the handle at rest and 3pt more for the room it grows into when hovered,
-so 13pt taller than the menu bar on every display, even while expanded. That
+the handle at rest and 30% of its height more for the room it grows into when
+hovered — 5pt and 1.5pt at the default height, so 6.5pt taller than the menu bar
+on every display, even while expanded. That
 headroom is not optional — the view clips its own drawing, so a window sized to
 the resting handle alone would slice the rounded bottom off the moment the handle
 grew. Its frame never moves.
@@ -95,12 +97,13 @@ grew. Its frame never moves.
   presented frame, and repeated snapshots do not restart motion. Content is
   clipped to its Space and to the band it rides on, so it leaves with the Bar.
 - The Bar Handle answers the pointer by growing, never by changing colour: it
-  gains `HANDLE_HOVER_GROWTH` (8pt of width, 3pt of height) over the same 240ms
-  ease-out as every other transition, centred on itself and growing *away* from
-  the edge it is glued to — the Bar's bottom edge while expanded, the screen's
-  top edge once collapsed — so the join never opens and the handle never lifts
-  off the Bar. A notched display's collar grows the same way, which thickens its
-  ears and its chin. The grown rect contains the resting one, so a pointer that
+  gains `HandleMetrics::HOVER_GROWTH` — an eighth of its own width and a third of
+  its own height, so 8pt and 1.5pt at the shipped 64x5pt shape — over the same
+  240ms ease-out as every other transition, centred on itself and growing *away*
+  from the edge it is glued to — the Bar's bottom edge while expanded, the
+  screen's top edge once collapsed — so the join never opens and the handle never
+  lifts off the Bar. A notched display's collar grows the same way, which thickens
+  its ears and its chin. The grown rect contains the resting one, so a pointer that
   is inside the small shape is still inside the large one: growing can never drop
   the pointer out of hover and flip the handle back and forth every frame. It is
   a frame-loop transition, not a repeating pulse, so it costs nothing once it has
@@ -122,10 +125,12 @@ alternatives it was picked over. `examples/bar_polish_prototype` and
 and `prototype/bar-collapse` branches) explored the capsule and tab shapes this
 design replaced; their settings no longer map onto any constant.
 
-The numbers the prototype settled on live in `src/bar/placement.rs`:
-`HANDLE_WIDTH` (64pt), `HANDLE_HEIGHT` (10pt, which is also how far the collar
-reaches past the Notch and how much taller than the band the panel is), and
-`HANDLE_RADIUS` (5pt, the handle's bottom corners).
+The shape the prototype settled on lives in `src/bar/placement.rs`: a
+`HandleMetrics` resolved from `bar.handle_height` (default 5pt, clamped 4-24pt;
+also how far the collar reaches past the Notch and how much taller than the band
+the panel is) and `bar.handle_radius` (default 2.5pt, clamped to the handle's own
+height). The width is not configurable: 64pt is the width the prototype picked,
+and a notched display derives its collar from the Notch instead.
 - Every Space keeps a slot: the strip never scrolls, and no Space is dropped to
   make room. The focused Space takes whatever the others leave, up to its own
   content width; the rest keep the narrowest slot that still reads as that Space
@@ -213,12 +218,14 @@ disk and every Bar starts expanded.
   screen through the display's top edge, over the shared 240ms ease-out. The
   handle is what stays behind.
 - On a display **without a notch** the handle rides up with the band and comes
-  to rest flush with the screen's top edge: 64x10pt, square where it was glued
-  to the Bar, 5pt rounded at the bottom. It is 10pt below the menu bar before
-  the collapse and 0pt after, and it is the same size throughout — the shape
-  never grows on hover or at rest.
+  to rest flush with the screen's top edge: 64pt wide, `bar.handle_height` tall
+  (5pt by default), square where it was glued to the Bar and rounded at the
+  bottom corners by `bar.handle_radius`. It hangs the same distance below the
+  menu bar before the collapse and 0pt after, and it is the same size throughout:
+  the shape never grows on hover or at rest.
 - On a **notched** display the handle is a collar around the Notch — the Notch's
-  width plus 10pt a side, and 10pt below it — and it does not move at all. The
+  width plus the handle's height a side, and the same below it — and it does not
+  move at all. The
   middle of the band there is the camera housing, so the pixels a centred tab
   would occupy do not exist; the collar's two ears and its chin, outside the
   housing, are what is left on screen, and the collapsed Bar reads as a slightly
@@ -241,7 +248,7 @@ disk and every Bar starts expanded.
 - The panel is ours only where the pointer is on the Bar's own chrome — the band
   while it is there, the handle either way — and ignores mouse events everywhere
   else. So the Apple menu, application menus and status items under a collapsed
-  Bar keep working, and so does the 10pt strip beside the handle: pointing at it
+  Bar keep working, and so does the strip beside the handle: pointing at it
   hands the click to whatever is underneath before it can be swallowed.
 - Everything the Bar does not cover while collapsed is the normal macOS menu
   bar, so the Apple menu, application menus and status items work as usual.
@@ -309,6 +316,9 @@ spool.setup {
     foreground_color = "auto", -- System label color, or an RGB/RGBA hex color.
     show_mission_control = true,
     show_desktop = true,
+    handle_height = 5, -- pt the handle hangs below the Bar (4-24); also the
+                       -- collapsed collar's reach past a notch.
+    handle_radius = 2.5, -- handle's bottom corners (0 to handle_height).
   },
 }
 ```
@@ -329,12 +339,17 @@ separate Bar config file or file polling in the renderer.
 | `workspace_corner_radius` | `4` | Space-background corner radius (0-8pt). |
 | `show_mission_control` | `true` | Show the Mission Control button. |
 | `show_desktop` | `true` | Show the Show Desktop button. Hidden buttons release their width. |
+| `handle_height` | `5` | Point size the Bar Handle hangs below the Bar (4-24pt). On a notched display it is also how far the collapsed collar reaches past the Notch, and it always sets how much taller than the band the panel window is. |
+| `handle_radius` | `2.5` | The handle's bottom corners, 0 to `handle_height`. Above half the height the sides vanish and the bottom reads as a pill. Its top edge never rounds. |
 
 The Bar is the menu bar band: it is exactly as wide and as tall as the menu bar
-on each display, and its handle is a fixed 64x10pt (5pt bottom corners, the
-Notch plus 10pt a side on a notched display), so its geometry is not
-configurable and there are no handle keys to set. `bar.corner_radius` still
-rounds the band's own bottom corners. `embed_in_menu_bar`, `height`,
+on each display, so the band's own geometry is not configurable. The handle is
+the one exception: `bar.handle_height` (4-24pt, default 5) and
+`bar.handle_radius` (0 to the handle's height, default 2.5) are the only Bar
+geometry keys there are — the width stays 64pt, and a notched display's collar
+follows from the Notch. `bar.corner_radius` still rounds the band's own bottom
+corners, and `bar.height` is still the retired band key: it is ignored, not the
+handle. `embed_in_menu_bar`, `height`,
 `top_offset`, `max_width` and `screen_padding` are retired; an `init.lua` that
 still sets them keeps loading and the keys are ignored.
 

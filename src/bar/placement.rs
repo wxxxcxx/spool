@@ -55,21 +55,66 @@ pub fn surface(panel: Rect, gap: Option<Rect>, bias: NotchSide) -> BarSurface {
     }
 }
 
-/// The Bar Handle: a small rounded tab at the display's centre. Its square top
-/// edge is glued to the Bar above it and its bottom corners round, so it reads
-/// as part of the Bar rather than as a separate control.
+/// The Bar Handle's own geometry, resolved from the user's preferences.
 ///
-/// This is its width on a display without a notch. A notched display gets a
-/// collar the width of the notch plus [`HANDLE_HEIGHT`] a side instead, because
-/// the middle of the menu-bar band there is the camera housing: a tab centred
-/// inside it would be drawn on pixels that do not exist.
-pub const HANDLE_WIDTH: f64 = 64.0;
-/// The handle's height, the distance it hangs below the band while expanded,
-/// and — on a notched display — how far the collar reaches past the notch on
-/// every side. It is also what the panel window hangs below the band by.
-pub const HANDLE_HEIGHT: f64 = 10.0;
-/// The handle's bottom corners. Its top edge never rounds.
-pub const HANDLE_RADIUS: f64 = 5.0;
+/// One description, because the handle *is* its height: on a notched display the
+/// same number is how far the collar reaches past the notch on every side, and
+/// on any display it is what the panel window hangs below the band by.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HandleMetrics {
+    /// How wide the handle is on a display without a notch. A notched display
+    /// gets a collar the width of the notch plus [`HandleMetrics::height`] a
+    /// side instead, because the middle of the menu-bar band there is the camera
+    /// housing: a tab centred inside it would be on pixels that do not exist.
+    pub width: f64,
+    /// How far the handle hangs below the Bar's bottom edge.
+    pub height: f64,
+    /// The handle's bottom corners. Its top edge never rounds: it is glued to
+    /// the Bar above it.
+    pub radius: f64,
+}
+
+impl HandleMetrics {
+    /// The shape the Bar ships with: the width a plain display gets, and the
+    /// height and corner the user's preferences default to.
+    pub const DEFAULT: Self = Self {
+        width: 64.0,
+        height: 5.0,
+        radius: 2.5,
+    };
+    /// The narrowest and widest handle a preference may ask for, and the
+    /// matching bounds for its corners: below 4pt it is a hairline the pointer
+    /// cannot reliably hit, above 24pt it is thicker than most menu bars, and a
+    /// corner radius past the handle's own height has nothing left to round.
+    pub const HEIGHT_RANGE: (f64, f64) = (4.0, 24.0);
+    /// How much the handle grows under the pointer, as a fraction of its own
+    /// size: an eighth wider, a third taller. Proportional, so a handle the user
+    /// makes slimmer or taller keeps the feel the default was tuned for.
+    pub const HOVER_GROWTH: (f64, f64) = (0.125, 0.30);
+
+    /// Resolves a preference into geometry, clamping everything the renderer
+    /// cannot draw sensibly. Finite values are already guaranteed by
+    /// [`super::preferences::BarPreferences::validate`].
+    #[must_use]
+    pub fn resolve(height: f64, radius: f64) -> Self {
+        let height = height.clamp(Self::HEIGHT_RANGE.0, Self::HEIGHT_RANGE.1);
+        Self {
+            width: Self::DEFAULT.width,
+            height,
+            radius: radius.clamp(0.0, height),
+        }
+    }
+
+    /// The extra width and height the pointer reveals. Split evenly about the
+    /// handle's centre so it never shifts sideways.
+    #[must_use]
+    pub fn hover_growth(self) -> (f64, f64) {
+        (
+            self.width * Self::HOVER_GROWTH.0,
+            self.height * Self::HOVER_GROWTH.1,
+        )
+    }
+}
 
 /// The menu-bar band at `progress` (1 = expanded), in panel-local coordinates.
 ///
@@ -91,57 +136,59 @@ pub fn band_rect(panel: (f64, f64), progress: f64) -> Rect {
 /// [`BarSurface::notch`], with the origin at the panel's top-left corner and
 /// `y` growing downwards, because a `BarView` is flipped.
 ///
-/// A display with a notch gets a collar hugging it — the notch plus
-/// [`HANDLE_HEIGHT`] on each side and below it — which does not move: the notch
-/// is a hole in the hardware, so the Bar has to stay around it while the band
-/// leaves through the screen's top edge. A display without one gets a small tab
-/// that rides up with the band and comes to rest flush with the screen top.
+/// A display with a notch gets a collar hugging it — the notch plus the handle's
+/// height on each side and below it — which does not move: the notch is a hole in
+/// the hardware, so the Bar has to stay around it while the band leaves through
+/// the screen's top edge. A display without one gets a small tab that rides up
+/// with the band and comes to rest flush with the screen top.
 #[must_use]
-pub fn handle_rect(panel: (f64, f64), notch: Option<Rect>, progress: f64) -> Rect {
+pub fn handle_rect(
+    panel: (f64, f64),
+    notch: Option<Rect>,
+    progress: f64,
+    handle: HandleMetrics,
+) -> Rect {
     let (width, height) = (panel.0.max(1.0), panel.1.max(1.0));
     match notch {
         None => {
-            let tab = HANDLE_WIDTH.min(width);
+            let tab = handle.width.min(width);
             Rect {
                 x: (width - tab) / 2.0,
                 // Expanded it hangs below the band; collapsed it has ridden up
                 // with the band, which moves it by the band's own height.
                 y: progress.clamp(0.0, 1.0) * height,
                 width: tab,
-                height: HANDLE_HEIGHT,
+                height: handle.height,
             }
         }
         Some(notch) => {
-            let collar = (notch.width + HANDLE_HEIGHT * 2.0).clamp(1.0, width);
+            let collar = (notch.width + handle.height * 2.0).clamp(1.0, width);
             let centre = notch.x + notch.width / 2.0;
             Rect {
                 x: (centre - collar / 2.0).clamp(0.0, (width - collar).max(0.0)),
                 y: 0.0,
                 width: collar,
-                height: height + HANDLE_HEIGHT,
+                height: height + handle.height,
             }
         }
     }
 }
 
-/// How much more of the handle the pointer reveals: extra width and extra
-/// height, split evenly about its centre so it never shifts sideways.
+/// The handle's grown rect: the same top edge, the same centre, and the growth
+/// [`HandleMetrics::hover_growth`] asks for.
 ///
 /// It grows *away* from the edge it is glued to — the Bar's bottom edge while
 /// expanded, the screen's top edge once collapsed — because that join has to
 /// stay exactly where it is for the handle to read as part of the Bar. On a
-/// notched display the same deltas thicken the collar's ears and its chin.
-pub const HANDLE_HOVER_GROWTH: (f64, f64) = (8.0, 3.0);
-
-/// The handle's grown rect: the same top edge, the same centre, and
-/// [`HANDLE_HOVER_GROWTH`] more of it.
+/// notched display the same growth thickens the collar's ears and its chin.
 #[must_use]
-pub fn grown_handle_rect(resting: Rect) -> Rect {
+pub fn grown_handle_rect(resting: Rect, handle: HandleMetrics) -> Rect {
+    let (grow_width, grow_height) = handle.hover_growth();
     Rect {
-        x: resting.x - HANDLE_HOVER_GROWTH.0 / 2.0,
+        x: resting.x - grow_width / 2.0,
         y: resting.y,
-        width: resting.width + HANDLE_HOVER_GROWTH.0,
-        height: resting.height + HANDLE_HOVER_GROWTH.1,
+        width: resting.width + grow_width,
+        height: resting.height + grow_height,
     }
 }
 
@@ -152,8 +199,8 @@ pub fn grown_handle_rect(resting: Rect) -> Rect {
 /// held the resting handle would slice the rounded bottom off the moment the
 /// handle grew, leaving it square-cornered.
 #[must_use]
-pub fn window_overhang() -> f64 {
-    HANDLE_HEIGHT + HANDLE_HOVER_GROWTH.1
+pub fn window_overhang(handle: HandleMetrics) -> f64 {
+    handle.height + handle.hover_growth().1
 }
 
 /// The window the Bar is drawn in: the menu-bar band plus [`window_overhang`]
@@ -162,8 +209,8 @@ pub fn window_overhang() -> f64 {
 /// The window frame never moves — only what is drawn inside it does — which is
 /// what keeps the blur behind the Bar from being recomputed every frame.
 #[must_use]
-pub fn window_rect(panel: Rect) -> Rect {
-    let overhang = window_overhang();
+pub fn window_rect(panel: Rect, handle: HandleMetrics) -> Rect {
+    let overhang = window_overhang(handle);
     Rect {
         y: panel.y - overhang,
         height: panel.height + overhang,
@@ -277,20 +324,26 @@ mod tests {
         assert!(zero.notch.is_none(), "a zero-width gap is not a notch");
     }
 
-    #[test]
-    fn a_collapsed_notched_bar_is_a_collar_around_the_notch() {
-        let panel = (1470.0, 34.0);
-        let gap = Rect {
+    /// The notch of a 1470pt display, sized to the mock menu bar.
+    fn gap() -> Rect {
+        Rect {
             x: 646.0,
             y: 0.0,
             width: 179.0,
             height: 34.0,
-        };
+        }
+    }
+
+    #[test]
+    fn a_collapsed_notched_bar_is_a_collar_around_the_notch() {
+        let panel = (1470.0, 34.0);
+        let gap = gap();
+        let handle = HandleMetrics::DEFAULT;
         for progress in [0.0, 0.5, 1.0] {
-            let rect = handle_rect(panel, Some(gap), progress);
-            assert!((rect.width - (179.0 + HANDLE_HEIGHT * 2.0)).abs() < f64::EPSILON);
+            let rect = handle_rect(panel, Some(gap), progress, handle);
+            assert!((rect.width - (179.0 + handle.height * 2.0)).abs() < f64::EPSILON);
             assert!(
-                (rect.height - (34.0 + HANDLE_HEIGHT)).abs() < f64::EPSILON,
+                (rect.height - (34.0 + handle.height)).abs() < f64::EPSILON,
                 "the collar reaches below the band, where the chin shows"
             );
             assert!(
@@ -308,16 +361,17 @@ mod tests {
             width: 40.0,
             ..gap
         };
-        let rect = handle_rect(panel, Some(edge_gap), 0.0);
+        let rect = handle_rect(panel, Some(edge_gap), 0.0, handle);
         assert!(rect.x >= 0.0 && rect.x + rect.width <= 1470.0);
     }
 
     #[test]
     fn a_plain_handle_hangs_below_the_band_and_rides_up_to_the_screen_top() {
         let panel = (1470.0, 24.0);
-        let expanded = handle_rect(panel, None, 1.0);
-        assert!((expanded.width - HANDLE_WIDTH).abs() < f64::EPSILON);
-        assert!((expanded.height - HANDLE_HEIGHT).abs() < f64::EPSILON);
+        let handle = HandleMetrics::DEFAULT;
+        let expanded = handle_rect(panel, None, 1.0, handle);
+        assert!((expanded.width - handle.width).abs() < f64::EPSILON);
+        assert!((expanded.height - handle.height).abs() < f64::EPSILON);
         assert!(
             (expanded.x + expanded.width / 2.0 - 735.0).abs() < f64::EPSILON,
             "centred on the display"
@@ -327,7 +381,7 @@ mod tests {
             "glued to the band's bottom edge"
         );
 
-        let collapsed = handle_rect(panel, None, 0.0);
+        let collapsed = handle_rect(panel, None, 0.0, handle);
         assert!(
             (collapsed.y - 0.0).abs() < f64::EPSILON,
             "flush with the top"
@@ -339,7 +393,7 @@ mod tests {
         );
 
         // Halfway through the slide it is halfway up the band.
-        let mid = handle_rect(panel, None, 0.5);
+        let mid = handle_rect(panel, None, 0.5, handle);
         assert!((mid.y - 12.0).abs() < f64::EPSILON);
     }
 
@@ -360,14 +414,15 @@ mod tests {
     #[test]
     fn the_window_is_the_band_plus_the_handles_overhang() {
         let panel = panel_rect(screen(), 24.0);
-        let window = window_rect(panel);
+        let overhang = window_overhang(HandleMetrics::DEFAULT);
+        let window = window_rect(panel, HandleMetrics::DEFAULT);
         assert!((window.x - panel.x).abs() < f64::EPSILON);
         assert!((window.width - panel.width).abs() < f64::EPSILON);
         assert!(
-            (window.y - (panel.y - window_overhang())).abs() < f64::EPSILON,
+            (window.y - (panel.y - overhang)).abs() < f64::EPSILON,
             "it hangs below the band, so the handle has room outside it"
         );
-        assert!((window.height - (panel.height + window_overhang())).abs() < f64::EPSILON);
+        assert!((window.height - (panel.height + overhang)).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -376,29 +431,25 @@ mod tests {
         // its grown size, not just its resting one: otherwise hovering slices
         // the rounded bottom off and the handle goes square-cornered.
         let panel = (1470.0, 24.0);
-        let overhang = window_overhang();
+        let handle = HandleMetrics::DEFAULT;
+        let overhang = window_overhang(handle);
         assert!(
-            overhang > HANDLE_HEIGHT,
+            overhang > handle.height,
             "the window carries headroom for the hover growth"
         );
         // In panel-local coordinates the window ends where the band ends plus
         // the overhang: the handle's `y` is measured from the band's top edge.
         let window_bottom = panel.1 + overhang;
-        let grown = grown_handle_rect(handle_rect(panel, None, 1.0));
+        let grown = grown_handle_rect(handle_rect(panel, None, 1.0, handle), handle);
         assert!(
             grown.y + grown.height <= window_bottom + f64::EPSILON,
             "the grown tab fits: {} > {window_bottom}",
             grown.y + grown.height
         );
 
-        let gap = Rect {
-            x: 646.0,
-            y: 0.0,
-            width: 179.0,
-            height: 34.0,
-        };
         let collar_panel = (1470.0, 34.0);
-        let grown_collar = grown_handle_rect(handle_rect(collar_panel, Some(gap), 0.0));
+        let grown_collar =
+            grown_handle_rect(handle_rect(collar_panel, Some(gap()), 0.0, handle), handle);
         assert!(
             grown_collar.y + grown_collar.height <= collar_panel.1 + overhang + f64::EPSILON,
             "the grown collar fits too"
@@ -407,8 +458,9 @@ mod tests {
 
     #[test]
     fn a_hovered_handle_grows_away_from_the_edge_it_is_glued_to() {
-        let resting = handle_rect((1470.0, 24.0), None, 1.0);
-        let grown = grown_handle_rect(resting);
+        let handle = HandleMetrics::DEFAULT;
+        let resting = handle_rect((1470.0, 24.0), None, 1.0, handle);
+        let grown = grown_handle_rect(resting, handle);
         assert!(
             (grown.y - resting.y).abs() < f64::EPSILON,
             "the glued top edge does not move: no seam, and no lift off the Bar"
@@ -417,21 +469,20 @@ mod tests {
             (grown.x + grown.width / 2.0 - (resting.x + resting.width / 2.0)).abs() < f64::EPSILON,
             "it grows about its own centre"
         );
-        assert!((grown.width - resting.width - HANDLE_HOVER_GROWTH.0).abs() < f64::EPSILON);
-        assert!((grown.height - resting.height - HANDLE_HOVER_GROWTH.1).abs() < f64::EPSILON);
+        let (grow_width, grow_height) = handle.hover_growth();
+        assert!((grown.width - resting.width - grow_width).abs() < f64::EPSILON);
+        assert!((grown.height - resting.height - grow_height).abs() < f64::EPSILON);
+        assert!(
+            (grow_width - 8.0).abs() < f64::EPSILON && (grow_height - 1.5).abs() < f64::EPSILON,
+            "the growth is proportional: a slimmer handle grows less"
+        );
         // Growing must not break the hit test: the resting shape is inside it.
         assert!(grown.x <= resting.x);
         assert!(grown.y + grown.height >= resting.y + resting.height);
 
         // The collar grows the same way, which thickens its ears and its chin.
-        let gap = Rect {
-            x: 646.0,
-            y: 0.0,
-            width: 179.0,
-            height: 34.0,
-        };
-        let collar = handle_rect((1470.0, 34.0), Some(gap), 0.0);
-        let grown_collar = grown_handle_rect(collar);
+        let collar = handle_rect((1470.0, 34.0), Some(gap()), 0.0, handle);
+        let grown_collar = grown_handle_rect(collar, handle);
         assert!((grown_collar.y - collar.y).abs() < f64::EPSILON);
         assert!(grown_collar.x < collar.x);
         assert!(grown_collar.x + grown_collar.width > collar.x + collar.width);
@@ -444,16 +495,60 @@ mod tests {
         // see around a collapsed notched Bar is the collar outside it. It has
         // to clear the notch on the two sides and below, and it does so by the
         // handle's own height.
-        let gap = Rect {
-            x: 646.0,
-            y: 0.0,
-            width: 179.0,
-            height: 34.0,
-        };
-        let collar = handle_rect((1470.0, 34.0), Some(gap), 0.0);
-        assert!(collar.x <= gap.x - HANDLE_HEIGHT + f64::EPSILON);
-        assert!(collar.x + collar.width >= gap.x + gap.width + HANDLE_HEIGHT - f64::EPSILON);
-        assert!(collar.y + collar.height >= gap.y + gap.height + HANDLE_HEIGHT - f64::EPSILON);
+        let gap = gap();
+        let handle = HandleMetrics::DEFAULT;
+        let collar = handle_rect((1470.0, 34.0), Some(gap), 0.0, handle);
+        assert!(collar.x <= gap.x - handle.height + f64::EPSILON);
+        assert!(collar.x + collar.width >= gap.x + gap.width + handle.height - f64::EPSILON);
+        assert!(collar.y + collar.height >= gap.y + gap.height + handle.height - f64::EPSILON);
+    }
+
+    #[test]
+    fn a_preference_is_clamped_to_a_shape_the_renderer_can_draw() {
+        // The width has no key, so it is always the default.
+        assert!(
+            (HandleMetrics::resolve(10.0, 5.0).width - HandleMetrics::DEFAULT.width).abs()
+                < f64::EPSILON
+        );
+        // Height: below the pointer's business, above most menu bars.
+        assert!(
+            (HandleMetrics::resolve(0.5, 5.0).height - HandleMetrics::HEIGHT_RANGE.0).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (HandleMetrics::resolve(200.0, 5.0).height - HandleMetrics::HEIGHT_RANGE.1).abs()
+                < f64::EPSILON
+        );
+        // The corner can consume the whole handle, and no more: a radius past
+        // the height has nothing left to round.
+        assert!((HandleMetrics::resolve(10.0, 40.0).radius - 10.0).abs() < f64::EPSILON);
+        assert!((HandleMetrics::resolve(10.0, -3.0).radius - 0.0).abs() < f64::EPSILON);
+        // The shipped default: half the height it used to be, and the corner
+        // with it, so the handle keeps the rounded-rectangle silhouette.
+        let default = HandleMetrics::DEFAULT;
+        assert!((default.height - 5.0).abs() < f64::EPSILON);
+        assert!((default.radius - default.height / 2.0).abs() < f64::EPSILON);
+        assert_eq!(
+            HandleMetrics::resolve(default.height, default.radius),
+            default
+        );
+    }
+
+    #[test]
+    fn the_collar_and_the_window_follow_the_configured_height() {
+        // One knob for the handle's thickness: on a notched display that
+        // thickness is the ears and the chin, and it is always what the panel
+        // window hangs below the band by.
+        for height in [4.0, 10.0, 24.0] {
+            let handle = HandleMetrics::resolve(height, height / 2.0);
+            let collar = handle_rect((1470.0, 34.0), Some(gap()), 0.0, handle);
+            assert!((collar.width - (179.0 + height * 2.0)).abs() < f64::EPSILON);
+            assert!((collar.height - (34.0 + height)).abs() < f64::EPSILON);
+            let tab = handle_rect((1470.0, 24.0), None, 1.0, handle);
+            assert!((tab.height - height).abs() < f64::EPSILON);
+            let (_, grow_height) = handle.hover_growth();
+            assert!((window_overhang(handle) - (height + grow_height)).abs() < f64::EPSILON);
+        }
     }
 
     #[test]

@@ -42,6 +42,12 @@ pub struct BarPreferences {
     pub workspace_corner_radius: f64,
     pub show_mission_control: bool,
     pub show_desktop: bool,
+    /// How far the Bar Handle hangs below the Bar. Also how far the collapsed
+    /// collar reaches past a notch, and how much taller than the band the panel
+    /// window is.
+    pub handle_height: f64,
+    /// The Bar Handle's bottom corners. Its top edge never rounds.
+    pub handle_radius: f64,
 }
 
 impl Default for BarPreferences {
@@ -70,6 +76,8 @@ impl Default for BarPreferences {
             workspace_corner_radius: 4.0,
             show_mission_control: true,
             show_desktop: true,
+            handle_height: super::placement::HandleMetrics::DEFAULT.height,
+            handle_radius: super::placement::HandleMetrics::DEFAULT.radius,
         }
     }
 }
@@ -88,6 +96,8 @@ impl BarPreferences {
             ("focus_ring_width", self.focus_ring_width),
             ("label_font_size", self.label_font_size),
             ("workspace_corner_radius", self.workspace_corner_radius),
+            ("handle_height", self.handle_height),
+            ("handle_radius", self.handle_radius),
         ] {
             if !value.is_finite() {
                 return Err(format!("bar.{name} must be finite"));
@@ -104,6 +114,13 @@ impl BarPreferences {
             height: menu_height.clamp(18.0, 64.0),
             ..self.clone()
         }
+    }
+
+    /// The Bar Handle's geometry, as the renderer needs it: the user's two
+    /// numbers, clamped to what can actually be drawn.
+    #[must_use]
+    pub fn handle_metrics(&self) -> super::placement::HandleMetrics {
+        super::placement::HandleMetrics::resolve(self.handle_height, self.handle_radius)
     }
 
     pub fn toolbar_width(&self) -> f64 {

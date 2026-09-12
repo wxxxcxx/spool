@@ -134,12 +134,14 @@ impl ViewState {
     /// still inside the large one: growth can never drop the pointer out of
     /// hover and flip the handle back and forth every frame.
     fn handle_rect(&self) -> Rect {
+        let handle = self.preferences.handle_metrics();
         let resting = super::placement::handle_rect(
             (self.surface.width, self.layout.height),
             self.surface.notch,
             self.chrome.progress(),
+            handle,
         );
-        let grown = super::placement::grown_handle_rect(resting);
+        let grown = super::placement::grown_handle_rect(resting, handle);
         let growth = self.handle_grow.progress();
         Rect {
             x: motion::lerp(resting.x, grown.x, growth),
@@ -155,6 +157,7 @@ impl ViewState {
             self.band_rect(),
             self.handle_rect(),
             self.preferences.corner_radius.clamp(0.0, 20.0),
+            self.preferences.handle_metrics().radius,
         )
     }
 
@@ -575,7 +578,7 @@ impl BarView {
         // pointer, or a hover would clip its rounded bottom off.
         let frame = ns_rect(Rect {
             width: layout.width,
-            height: layout.height + super::placement::window_overhang(),
+            height: layout.height + super::placement::window_overhang(preferences.handle_metrics()),
             ..Rect::default()
         });
         let this = Self::alloc(mtm).set_ivars(BarViewIvars {
@@ -1087,10 +1090,15 @@ impl EasedProgress {
 /// handle's top edge is square because it is glued to the Bar above it (or to
 /// the screen's top edge once the band has gone); only its bottom corners
 /// round, and the band's own bottom corners follow the configured radius.
-fn chrome_path(band: Rect, handle: Rect, corner: f64) -> Retained<NSBezierPath> {
+fn chrome_path(
+    band: Rect,
+    handle: Rect,
+    band_corner: f64,
+    handle_radius: f64,
+) -> Retained<NSBezierPath> {
     let path = NSBezierPath::bezierPath();
-    append_rounded_bottom(&path, band, corner);
-    append_rounded_bottom(&path, handle, super::placement::HANDLE_RADIUS);
+    append_rounded_bottom(&path, band, band_corner);
+    append_rounded_bottom(&path, handle, handle_radius);
     path
 }
 
@@ -1492,7 +1500,7 @@ fn screen_placement(
     );
     let bias = preferences.notch_side;
     (
-        super::placement::window_rect(panel),
+        super::placement::window_rect(panel, preferences.handle_metrics()),
         super::placement::surface(panel, gap, bias),
         preferences,
     )
@@ -2492,7 +2500,9 @@ mod tests {
         );
         assert!(
             expanded_handle.y + expanded_handle.height
-                <= band.height + super::super::placement::window_overhang() + f64::EPSILON,
+                <= band.height
+                    + super::super::placement::window_overhang(state.preferences.handle_metrics(),)
+                    + f64::EPSILON,
             "the panel window has room for it"
         );
 
@@ -2580,16 +2590,15 @@ mod tests {
             width: 180.0,
             height: band.height,
         });
+        let handle = state.preferences.handle_metrics();
         state.set_collapsed(true);
         let collar = state.handle_rect();
         assert!(
-            (collar.width - (180.0 + super::super::placement::HANDLE_HEIGHT * 2.0)).abs()
-                < f64::EPSILON,
+            (collar.width - (180.0 + handle.height * 2.0)).abs() < f64::EPSILON,
             "the collar clears the notch"
         );
         assert!(
-            (collar.height - (band.height + super::super::placement::HANDLE_HEIGHT)).abs()
-                < f64::EPSILON,
+            (collar.height - (band.height + handle.height)).abs() < f64::EPSILON,
             "and reaches below the band, where its chin shows"
         );
         // The middle of the collar sits behind the camera housing, so it is
@@ -2620,7 +2629,12 @@ mod tests {
             width: 64.0,
             height: 10.0,
         };
-        let path = chrome_path(band, handle, 0.0);
+        let path = chrome_path(
+            band,
+            handle,
+            0.0,
+            super::super::placement::HandleMetrics::DEFAULT.radius,
+        );
         assert!(path.containsPoint(NSPoint::new(0.5, 0.5)), "the band fills");
         assert!(
             path.containsPoint(NSPoint::new(735.0, 33.5)),
@@ -2645,14 +2659,24 @@ mod tests {
 
         // Collapsed, the band is off the top edge and the handle is all that is
         // left of the Bar.
-        let collapsed = chrome_path(Rect { y: -24.0, ..band }, Rect { y: 0.0, ..handle }, 0.0);
+        let collapsed = chrome_path(
+            Rect { y: -24.0, ..band },
+            Rect { y: 0.0, ..handle },
+            0.0,
+            super::super::placement::HandleMetrics::DEFAULT.radius,
+        );
         assert!(collapsed.containsPoint(NSPoint::new(735.0, 5.0)));
         assert!(!collapsed.containsPoint(NSPoint::new(400.0, 5.0)));
         assert!(!collapsed.containsPoint(NSPoint::new(735.0, 29.0)));
 
         // The band's own bottom corners follow the configured radius, so a
         // user's `corner_radius` still rounds the Bar itself.
-        let rounded = chrome_path(band, handle, 10.0);
+        let rounded = chrome_path(
+            band,
+            handle,
+            10.0,
+            super::super::placement::HandleMetrics::DEFAULT.radius,
+        );
         assert!(!rounded.containsPoint(NSPoint::new(0.5, band.height - 0.5)));
         assert!(rounded.containsPoint(NSPoint::new(0.5, 0.5)));
     }

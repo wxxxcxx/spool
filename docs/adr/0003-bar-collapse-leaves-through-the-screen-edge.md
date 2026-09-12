@@ -69,7 +69,14 @@ working.
   `CAPSULE_*` / `PLAIN_TAB_*` / `SHOULDER` / `MORPH` constants are gone. The
   Bar's now has one collapse curve, `motion::ease_out` over `motion::DURATION`.
 - `bar.corner_radius` still rounds the band's own bottom corners. The handle's
-  bottom corners are a fixed 5pt, and its geometry has no configuration keys.
+  geometry started out fixed; it now has the Bar's only geometry keys,
+  `bar.handle_height` (default 5pt, halved from the 10pt the prototype picked)
+  and `bar.handle_radius` (default 2.5pt, halved with it so the handle keeps the
+  rounded-rectangle silhouette). The width stays 64pt, hover growth and the
+  panel's overhang are derived from the height, and a notched display's collar
+  reaches past the Notch by that same height. Amended 2026-09-12: the decision
+  above is unchanged, only the "no configuration keys" half of this consequence
+  was, at the user's request.
 - Hover feedback on the handle is a small growth (`HANDLE_HOVER_GROWTH`), not a
   colour change or an outline: anything drawn along its top edge would cut the
   join that makes it read as part of the Bar.
