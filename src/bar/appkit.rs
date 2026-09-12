@@ -41,6 +41,11 @@ const DRAG_RELEASE_GRACE: Duration = Duration::from_millis(250);
 /// blink, which is what makes a hovered control feel alive.
 const BREATH_PERIOD: f64 = 1.8;
 
+/// A breath has to be slow enough to read as breathing rather than as a blink,
+/// and short enough that nobody waits for it. Pinned at compile time so a tuning
+/// pass cannot quietly leave the range.
+const _: () = assert!(BREATH_PERIOD >= 1.0 && BREATH_PERIOD <= 3.0);
+
 /// The shape of the Bar's own collapse.
 ///
 /// The content keeps `BarMotion`'s shared 240ms ease-out; this only shapes the
@@ -83,6 +88,15 @@ const PULSE_SHADOW: &str = "shadowOpacity";
 const PULSE_OPACITY: &str = "opacity";
 const PULSE_SCALE: &str = "transform.scale";
 const PULSE_SCALE_Y: &str = "transform.scale.y";
+
+/// How bright the collapsed Bar's halo pulses, low to high. The prototype's
+/// amplitude dial moves these; both stay below opaque so a hovered Bar never
+/// looks like a second, brighter Bar.
+const GLOW_PULSE: (f64, f64) = (0.35, 1.0);
+/// The same for the highlight under the pointer's toolbar button. It stays
+/// quieter than the halo: a button is a control, the collapsed Bar is the only
+/// thing left on screen.
+const BUTTON_PULSE: (f64, f64) = (0.07, 0.17);
 
 /// How a hovered control breathes.
 ///
@@ -629,7 +643,13 @@ impl BarView {
         layer.setPath(Some(&cg_path));
         layer.setShadowPath(Some(&cg_path));
         if collapsed && hovered {
-            breathe(layer, PULSE_OPACITY, 0.35, 1.0, BREATH_PERIOD);
+            breathe(
+                layer,
+                PULSE_OPACITY,
+                GLOW_PULSE.0,
+                GLOW_PULSE.1,
+                BREATH_PERIOD,
+            );
             let reach = breath_reach(rect.height, view_height);
             if BREATH == Breath::Pulse && reach > 1.0 {
                 breathe(layer, PULSE_SCALE_Y, 1.0, reach, BREATH_PERIOD);
@@ -673,7 +693,13 @@ impl BarView {
                 layer.setFrame(sublayer_rect(parent, view_height, rect));
             }
             if hover_button.as_ref() == Some(&control.action) {
-                breathe(layer, PULSE_OPACITY, 0.07, 0.17, BREATH_PERIOD);
+                breathe(
+                    layer,
+                    PULSE_OPACITY,
+                    BUTTON_PULSE.0,
+                    BUTTON_PULSE.1,
+                    BREATH_PERIOD,
+                );
                 breathe(layer, PULSE_SCALE, 1.0, 1.04, BREATH_PERIOD);
                 layer.setOpacity(0.07);
             } else {
@@ -2624,6 +2650,15 @@ mod tests {
             .chrome
             .advance(Instant::now() + Duration::from_secs(1));
         let collapsed = state.chrome_rect();
+        assert_eq!(
+            collapsed,
+            super::super::placement::collapsed_rect(
+                (band.width, band.height),
+                state.surface.notch,
+                state.hovered,
+            ),
+            "the drawn shape and the halo share one geometry"
+        );
         assert!(
             (collapsed.y - band.y).abs() < f64::EPSILON,
             "the top edge is pinned to the band"
@@ -2637,6 +2672,15 @@ mod tests {
         // what used to make the rectangle appear to jump.
         state.hovered = true;
         let hovered = state.chrome_rect();
+        assert_eq!(
+            hovered,
+            super::super::placement::collapsed_rect(
+                (band.width, band.height),
+                state.surface.notch,
+                true,
+            ),
+            "hovering moves the same geometry the halo follows"
+        );
         assert!((hovered.y - collapsed.y).abs() < f64::EPSILON);
         assert!(hovered.height > collapsed.height, "hover grows the tab");
         assert!((hovered.width - collapsed.width).abs() < f64::EPSILON);
@@ -2804,6 +2848,17 @@ mod tests {
         assert!(
             !pill.containsPoint(NSPoint::new(tab.x + 0.4, tab.height - 0.4)),
             "and its bottom edge is a visible semicircle, not a square end"
+        );
+    }
+
+    #[test]
+    fn the_hover_pulses_stay_inside_their_budget() {
+        for (low, high) in [GLOW_PULSE, BUTTON_PULSE] {
+            assert!(low > 0.0 && low < high && high <= 1.0, "{low}..{high}");
+        }
+        assert!(
+            BUTTON_PULSE.1 < GLOW_PULSE.0,
+            "a button highlight stays quieter than the halo it competes with"
         );
     }
 
