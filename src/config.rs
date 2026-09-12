@@ -574,6 +574,16 @@ impl Config {
         self.options().horizontal_mouse_warp_offset.unwrap_or(0)
     }
 
+    /// Whether Spool re-syncs window state on its own: the heartbeat and the
+    /// full sweep a mouse-up requests. Enabled by default; set the option to
+    /// false to reconcile only what a notification names, plus explicit
+    /// `spool action reconcile-windows` requests.
+    pub fn automatic_reconcile(&self) -> bool {
+        self.options()
+            .automatic_reconcile
+            .is_none_or(|enabled| enabled)
+    }
+
     /// Enables the private, capability-probed Space control adapter.
     /// Off by default; observe-only Space state remains available.
     pub fn space_control_enabled(&self) -> bool {
@@ -693,6 +703,15 @@ pub struct MainOptions {
     pub animation_speed: Option<f64>,
     /// Automatically center the window when switching focus with keyboard.
     pub auto_center: Option<bool>,
+    /// Whether Spool re-syncs tracked window state against macOS on its own.
+    ///
+    /// On by default. This covers the one-second heartbeat and the full sweep a
+    /// mouse-up asks for, both of which read every tracked application's
+    /// accessibility window list. Turning it off leaves the audits that name
+    /// what changed — the per-application notifications and the suspension
+    /// protocol's own confirmation — and leaves
+    /// `spool action reconcile-windows` as the way to ask for a full one.
+    pub automatic_reconcile: Option<bool>,
     /// Height of off-screen window slivers as a ratio (0.0–1.0) of the display height.
     /// Lower values hide the window's corner radius at screen edges.
     /// Default: 1.0 (full height).
@@ -792,6 +811,7 @@ impl Default for MainOptions {
             floating_window_resize_step: None,
             experimental_space_control: None,
             space_switch_animation: None,
+            automatic_reconcile: None,
         }
     }
 }

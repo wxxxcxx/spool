@@ -868,10 +868,12 @@ pub(crate) fn gather_initial_processes(
             Event::ProcessesLoaded | Event::Exit => break,
             Event::ApplicationLaunched { psn, observer } => {
                 let process: BProcess = Process::new(&psn, observer.clone()).into();
-                if process.pid() != 0 {
-                    initial_processes.push(process);
-                } else {
+                if process.pid() == 0 {
                     debug!("Skipping process with PID 0 (likely kernel_task).");
+                } else if crate::ecs::is_own_process(process.pid()) {
+                    debug!("Skipping Spool's own process in the window lifecycle");
+                } else {
+                    initial_processes.push(process);
                 }
             }
             Event::InitialConfig(config) => {

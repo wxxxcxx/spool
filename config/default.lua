@@ -1,6 +1,13 @@
 -- Spool configuration. Changes are hot-reloaded on save.
 spool.setup {
-  options = {},
+  options = {
+    -- Spool re-syncs tracked window state against macOS on its own: a
+    -- one-second heartbeat and a full sweep after every mouse-up. Both read
+    -- every tracked application's accessibility window list. Set false to
+    -- reconcile only what a notification names, and on request with
+    -- `spool action reconcile-windows`.
+    -- automatic_reconcile = true,
+  },
   -- Editable preferences, not built-in window classification. Higher priority
   -- wins per field; equal priorities use rule-name order. Omit a matcher to
   -- match every value. Existing init.lua files are never rewritten on upgrade.

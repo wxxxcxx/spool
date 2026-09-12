@@ -636,6 +636,10 @@ pub(super) fn application_event_trigger(
                     debug!("Skipping process with PID 0 (likely kernel_task).");
                     continue;
                 }
+                if crate::ecs::is_own_process(process.pid()) {
+                    debug!("Skipping Spool's own process in the window lifecycle");
+                    continue;
+                }
                 let timeout = Timeout::new(
                     Duration::from_secs(PROCESS_READY_TIMEOUT_SEC),
                     Some(format!(

@@ -239,18 +239,42 @@ impl WindowStateSync {
 
 #[derive(Debug, Default)]
 struct SyncRequest {
+    /// A full sweep was asked for by name: a manual `reconcile-windows`, or the
+    /// suspension protocol confirming an absence it already suspects.
     all: bool,
+    /// The heartbeat, or an event that says something may have changed
+    /// everywhere rather than which window did. This is the expensive one — it
+    /// reads every tracked application's accessibility window list — so
+    /// `automatic_reconcile = false` drops it while leaving `all` alone.
+    sweep: bool,
+    /// Read every live window's frame back and re-resolve focus. Cheap, and what
+    /// the heartbeat is for: it catches drift whose notification never arrived.
+    /// The option does not drop this, only the per-application sweep.
+    frames: bool,
     pids: HashSet<Pid>,
     frame_ids: HashSet<WinID>,
 }
 
 impl SyncRequest {
-    fn collect(messages: &mut MessageReader<Event>, heartbeat: bool) -> Self {
+    fn collect(messages: &mut MessageReader<Event>, heartbeat: bool, automatic: bool) -> Self {
+        Self::collect_from(messages.read(), heartbeat, automatic)
+    }
+
+    /// The classification itself, over events rather than a reader, so what
+    /// each event asks for can be tested without a world.
+    fn collect_from<'a>(
+        events: impl IntoIterator<Item = &'a Event>,
+        heartbeat: bool,
+        automatic: bool,
+    ) -> Self {
         let mut request = Self {
-            all: heartbeat,
+            // The heartbeat is the expensive pass only while reconciliation is
+            // automatic; its cheap pass runs either way.
+            sweep: heartbeat && automatic,
+            frames: heartbeat,
             ..Self::default()
         };
-        for event in messages.read() {
+        for event in events {
             match event {
                 Event::ReconcileWindows { scope } => match scope {
                     ReconcileScope::Application(pid) => {
@@ -262,7 +286,10 @@ impl SyncRequest {
                     if let Some(pid) = observation.pid {
                         request.pids.insert(pid);
                     } else {
-                        request.all = true;
+                        // Focus moved and the observation cannot say whose. That
+                        // is a reason to re-resolve focus and read frames, not
+                        // to read every application's window list.
+                        request.frames = true;
                     }
                 }
                 Event::WindowMoved { window_id, .. } | Event::WindowResized { window_id, .. } => {
@@ -282,23 +309,34 @@ impl SyncRequest {
                 | Event::SpaceDestroyed { .. }
                 | Event::MissionControlExit
                 | Event::DisplayChanged
-                | Event::SystemWoke { .. } => request.all = true,
+                | Event::SystemWoke { .. } => request.sweep = true,
                 _ => {}
             }
+        }
+        if !automatic {
+            request.sweep = false;
+        }
+        if request.sweeps() {
+            request.frames = true;
         }
         request
     }
 
+    /// Whether this request covers every application.
+    fn sweeps(&self) -> bool {
+        self.all || self.sweep
+    }
+
     fn is_empty(&self) -> bool {
-        !self.all && self.pids.is_empty() && self.frame_ids.is_empty()
+        !self.sweeps() && !self.frames && self.pids.is_empty() && self.frame_ids.is_empty()
     }
 
     fn lifecycle_requested(&self) -> bool {
-        self.all || !self.pids.is_empty()
+        self.sweeps() || !self.pids.is_empty()
     }
 
     fn includes_application(&self, pid: Pid) -> bool {
-        self.all || self.pids.contains(&pid)
+        self.sweeps() || self.pids.contains(&pid)
     }
 }
 
@@ -580,7 +618,7 @@ impl ReconcileState<'_, '_> {
             );
         }
 
-        if request.all {
+        if request.sweeps() {
             let live_applications = self
                 .applications
                 .iter()
@@ -750,12 +788,12 @@ impl ReconcileState<'_, '_> {
             selected.get_or_insert(candidate);
         }
         let Some((app_entity, pid, focused_window)) = selected else {
-            if request.all {
+            if request.sweeps() {
                 sync.focus_absent.clear();
             }
             return;
         };
-        if request.all {
+        if request.sweeps() {
             sync.focus_absent.retain(|entity, _| *entity == app_entity);
         }
         let window_id = match focused_window {
@@ -1064,8 +1102,11 @@ pub(super) fn reconcile_windows(
     mut sync: ResMut<WindowStateSync>,
     mut commands: Commands,
 ) {
+    // `tick` always advances the retry clock; only its heartbeat answer is
+    // something this option may drop.
     let heartbeat = sync.tick(time.delta());
-    let request = SyncRequest::collect(&mut messages, heartbeat);
+    let automatic = config.automatic_reconcile();
+    let request = SyncRequest::collect(&mut messages, heartbeat && automatic, automatic);
     if request.is_empty() {
         return;
     }
@@ -1075,7 +1116,7 @@ pub(super) fn reconcile_windows(
     // Mouse-up and Space signals request a full lifecycle pass immediately,
     // while AX focus may still lag the direct interaction evidence. Audit
     // focus only after the heartbeat debounce or an application-scoped signal.
-    if (heartbeat || !request.pids.is_empty()) && focus_audit_enabled {
+    if (request.frames || !request.pids.is_empty()) && focus_audit_enabled {
         state.audit_frontmost_focus(&request, &mut sync, &mut commands);
     }
     state.reconcile_frames(&request, &audit, &mut sync, &mut commands);
@@ -1324,7 +1365,7 @@ fn should_skip_frame(
 ) -> bool {
     audit.retiring.contains(&entity)
         || unavailable
-        || (!request.all
+        || (!request.frames
             && !request.frame_ids.contains(&window_id)
             && !audit.confirmed.contains(&entity))
         || (request.lifecycle_requested()
@@ -1439,7 +1480,9 @@ mod tests {
     use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
     use super::*;
+    use crate::events::FocusObservation;
     use crate::manager::app::MockApplicationApi;
+    use objc2_core_foundation::CGPoint;
 
     #[derive(Clone, Default)]
     struct LogLevels(Arc<Mutex<Vec<tracing::Level>>>);
@@ -1448,6 +1491,63 @@ mod tests {
         fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
             self.0.lock().unwrap().push(*event.metadata().level());
         }
+    }
+
+    /// The full sweep is what costs: it reads every tracked application's
+    /// accessibility window list — 59 applications on a real desktop — and both
+    /// the one-second heartbeat and every mouse-up ask for one. Turning the
+    /// option off must drop exactly those two, and keep everything that says
+    /// what changed, including the manual request and the suspension protocol's
+    /// own confirmation.
+    #[test]
+    fn automatic_reconciliation_drops_only_the_sweeps() {
+        let mouse_up = Event::MouseUp {
+            point: CGPoint { x: 0.0, y: 0.0 },
+            modifiers: crate::platform::Modifiers::empty(),
+        };
+        let manual = Event::ReconcileWindows {
+            scope: ReconcileScope::All,
+        };
+        let focused = Event::WindowFocused(FocusObservation::resolved(
+            7,
+            11,
+            FocusSource::AccessibilityWindow,
+            1,
+        ));
+        let confirmation = Event::ReconcileWindows {
+            scope: ReconcileScope::Application(11),
+        };
+
+        let on =
+            |events: &[Event], heartbeat| SyncRequest::collect_from(events.iter(), heartbeat, true);
+        let off = |events: &[Event], heartbeat| {
+            SyncRequest::collect_from(events.iter(), heartbeat, false)
+        };
+
+        // The heartbeat keeps its cheap pass either way.
+        assert!(on(&[], true).sweeps());
+        assert!(on(&[], true).frames);
+        assert!(off(&[], true).frames);
+        assert!(!off(&[], true).sweeps());
+        assert!(
+            !off(&[], true).is_empty(),
+            "the heartbeat still has work to do"
+        );
+
+        // A click no longer sweeps.
+        assert!(on(&[mouse_up.clone()], false).sweeps());
+        assert!(!off(&[mouse_up.clone()], false).sweeps());
+        assert!(off(&[mouse_up.clone()], false).is_empty());
+
+        // A request by name is not automatic, and neither is the suspension
+        // protocol's own confirmation of an absence it already suspects.
+        assert!(off(std::slice::from_ref(&manual), false).sweeps());
+        assert!(!off(std::slice::from_ref(&manual), false).is_empty());
+        assert!(off(std::slice::from_ref(&confirmation), false).includes_application(11));
+
+        // A notification that names the application still resolves focus.
+        assert!(off(std::slice::from_ref(&focused), false).includes_application(11));
+        assert!(!off(std::slice::from_ref(&focused), false).is_empty());
     }
 
     #[test]

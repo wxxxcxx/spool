@@ -25,6 +25,16 @@ use derive_more::{Deref, DerefMut};
 use tracing::error;
 use tracing::{Level, instrument, warn};
 
+/// Whether a process is this daemon itself.
+///
+/// Spool must never track its own windows: they are its Bar and overlay
+/// panels, not user windows. Auditing them costs a full accessibility
+/// inventory of this process on every lifecycle heartbeat, and nothing about
+/// them is actionable.
+pub(crate) fn is_own_process(pid: Pid) -> bool {
+    u32::try_from(pid).is_ok_and(|pid| pid == std::process::id())
+}
+
 type ChangedNativeSpaces<'w, 's> = Query<
     'w,
     's,
@@ -50,7 +60,7 @@ use crate::manager::{
     WindowManagerOS,
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
-use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
+use crate::platform::{Modifiers, Pid, PlatformCallbacks, WinID, WorkspaceId};
 
 pub(crate) mod defaults;
 pub mod display;
