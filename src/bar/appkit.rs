@@ -601,7 +601,7 @@ impl BarView {
             rect,
             radius,
             if notched {
-                super::placement::CAPSULE_FLARE
+                super::placement::CAPSULE_TOP_RADIUS
             } else {
                 0.0
             },
@@ -847,12 +847,13 @@ impl BarView {
             preferences.corner_radius.clamp(0.0, 20.0),
             progress,
         );
-        let flare = if notched {
-            motion::lerp(super::placement::CAPSULE_FLARE, 0.0, progress)
+        // The top corners round inwards once the Bar leaves the screen edge.
+        let top_radius = if notched {
+            motion::lerp(super::placement::CAPSULE_TOP_RADIUS, 0.0, progress)
         } else {
             0.0
         };
-        let path = chrome_path(chrome_rect, radius, flare);
+        let path = chrome_path(chrome_rect, radius, top_radius);
         let background = rgba(BarPreferences::rgba(
             &preferences.background_color,
             [0.08, 0.08, 0.09, 0.88],
@@ -1288,28 +1289,31 @@ impl ChromeMotion {
 
 /// The Bar's own outline, in viewport coordinates.
 ///
-/// `radius` rounds the bottom corners and `flare` turns the top ones into the
-/// concave shoulders that spread the black region into the display's top edge.
-/// With the two rounded opposite ways, the side profile reads as an S.
-fn chrome_path(rect: Rect, radius: f64, flare: f64) -> Retained<NSBezierPath> {
+/// `radius` rounds the bottom corners and `top_radius` the top ones. Expanded,
+/// the top radius is zero: the Bar *is* the menu-bar band, so its top corners
+/// are the screen's own. Collapsed, both ends round the same way, which is what
+/// makes the capsule read as a rounded rectangle hanging from the screen edge
+/// instead of a shape that spreads outwards where it meets it.
+fn chrome_path(rect: Rect, radius: f64, top_radius: f64) -> Retained<NSBezierPath> {
     // Circular-arc approximation for a cubic Bezier quadrant.
     const KAPPA: f64 = 0.552_284_749_8;
     let left = rect.x;
     let top = rect.y;
     let right = rect.x + rect.width;
     let bottom = rect.y + rect.height;
-    let r = radius.clamp(0.0, (rect.width / 2.0).min(rect.height));
-    let f = flare.clamp(0.0, (rect.width / 4.0).min(rect.height));
+    let limit = (rect.width / 2.0).min(rect.height);
+    let r = radius.clamp(0.0, limit);
+    let t = top_radius.clamp(0.0, limit);
     let path = NSBezierPath::bezierPath();
-    path.moveToPoint(NSPoint::new(left - f, top));
-    if f > 0.0 {
+    if t > 0.0 {
+        path.moveToPoint(NSPoint::new(left + t, top));
         path.curveToPoint_controlPoint1_controlPoint2(
-            NSPoint::new(left, top + f),
-            NSPoint::new(left - f + f * KAPPA, top),
-            NSPoint::new(left, top + f - f * KAPPA),
+            NSPoint::new(left, top + t),
+            NSPoint::new(left + t - t * KAPPA, top),
+            NSPoint::new(left, top + t - t * KAPPA),
         );
     } else {
-        path.lineToPoint(NSPoint::new(left, top));
+        path.moveToPoint(NSPoint::new(left, top));
     }
     if r > 0.0 {
         path.lineToPoint(NSPoint::new(left, bottom - r));
@@ -1328,12 +1332,12 @@ fn chrome_path(rect: Rect, radius: f64, flare: f64) -> Retained<NSBezierPath> {
         path.lineToPoint(NSPoint::new(left, bottom));
         path.lineToPoint(NSPoint::new(right, bottom));
     }
-    if f > 0.0 {
-        path.lineToPoint(NSPoint::new(right, top + f));
+    if t > 0.0 {
+        path.lineToPoint(NSPoint::new(right, top + t));
         path.curveToPoint_controlPoint1_controlPoint2(
-            NSPoint::new(right + f, top),
-            NSPoint::new(right, top + f - f * KAPPA),
-            NSPoint::new(right + f - f * KAPPA, top),
+            NSPoint::new(right - t, top),
+            NSPoint::new(right, top + t - t * KAPPA),
+            NSPoint::new(right - t + t * KAPPA, top),
         );
     } else {
         path.lineToPoint(NSPoint::new(right, top));
@@ -2729,9 +2733,10 @@ mod tests {
     }
 
     #[test]
-    fn the_collapsed_capsule_has_an_s_profile_and_the_tab_is_rounded() {
-        // Notched: the top corners flare into the screen edge (concave) and the
-        // bottom ones are rounded, so the side profile reads as an S.
+    fn the_collapsed_capsule_rounds_both_ends_inwards() {
+        // Notched: the top corners round inwards exactly like the bottom ones,
+        // so the capsule is a rounded rectangle hanging from the screen edge
+        // rather than a shape that spreads outwards where it meets it.
         let capsule = Rect {
             x: 100.0,
             y: 0.0,
@@ -2741,32 +2746,42 @@ mod tests {
         let path = chrome_path(
             capsule,
             CAPSULE_RADIUS,
-            super::super::placement::CAPSULE_FLARE,
-        );
-        let bounds = view_rect(path.bounds());
-        assert!(
-            (bounds.width - (capsule.width + super::super::placement::CAPSULE_FLARE * 2.0)).abs()
-                < f64::EPSILON,
-            "the shoulders spread past the body: {bounds:?}"
+            super::super::placement::CAPSULE_TOP_RADIUS,
         );
         assert!(
-            path.containsPoint(NSPoint::new(capsule.x + 0.5, 0.5)),
-            "the shoulder keeps the top corner black and flares outwards"
+            (view_rect(path.bounds()).width - capsule.width).abs() < f64::EPSILON,
+            "nothing spreads past the body"
         );
         assert!(
-            !path.containsPoint(NSPoint::new(capsule.x - 6.5, 8.0)),
-            "the shoulder is concave: below the flare there is no black"
-        );
-        assert!(
-            !path.containsPoint(NSPoint::new(capsule.x + 0.5, capsule.height - 0.5)),
-            "the bottom-left corner is rounded"
+            !path.containsPoint(NSPoint::new(capsule.x + 0.5, 0.5)),
+            "the top-left corner is rounded away"
         );
         assert!(
             path.containsPoint(NSPoint::new(capsule.x + 20.0, capsule.height / 2.0)),
             "the body is filled"
         );
+        assert!(
+            !path.containsPoint(NSPoint::new(capsule.x + 0.5, capsule.height - 0.5)),
+            "the bottom-left corner is rounded too"
+        );
+        assert!(
+            !path.containsPoint(NSPoint::new(capsule.x + capsule.width - 0.5, 0.5)),
+            "and so is the top-right"
+        );
 
-        // A plain-screen tab is a pill, so its rounding is unmistakable.
+        // Expanded, the top corners are square: the Bar is the menu-bar band.
+        let band = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1470.0,
+            height: 34.0,
+        };
+        let expanded = chrome_path(band, 10.0, 0.0);
+        assert!(expanded.containsPoint(NSPoint::new(0.5, 0.5)));
+        assert!(!expanded.containsPoint(NSPoint::new(0.5, band.height - 0.5)));
+
+        // A plain-screen tab is only six points tall, so its bottom edge is a
+        // semicircle and its top stays flush with the screen edge.
         let tab = Rect {
             x: 900.0,
             y: 0.0,
@@ -2783,18 +2798,6 @@ mod tests {
             !pill.containsPoint(NSPoint::new(tab.x + 0.4, tab.height - 0.4)),
             "its bottom edge is a visible semicircle, not a square end"
         );
-
-        // Expanded, the band is flush with the screen edge and only its bottom
-        // corners are rounded.
-        let band = Rect {
-            x: 0.0,
-            y: 0.0,
-            width: 1470.0,
-            height: 34.0,
-        };
-        let expanded = chrome_path(band, 10.0, 0.0);
-        assert!(expanded.containsPoint(NSPoint::new(0.5, 0.5)));
-        assert!(!expanded.containsPoint(NSPoint::new(0.5, band.height - 0.5)));
     }
 
     #[test]

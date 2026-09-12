@@ -92,8 +92,8 @@ the URL. Its vocabulary maps onto the code like this:
 
 | Prototype | Code |
 | --- | --- |
-| `sn=sfillet` | `placement::CAPSULE_FLARE` > 0 |
-| `sn=bottom` / `sn=shoulder` | `CAPSULE_FLARE` = 0, with `CAPSULE_RADIUS` raised |
+| `sn=sfillet` | `placement::CAPSULE_TOP_RADIUS` > 0, i.e. the top corners round inwards |
+| `sn=bottom` / `sn=shoulder` | `CAPSULE_TOP_RADIUS` = 0, with `CAPSULE_RADIUS` raised |
 | `sn=capsule` | a gap under the shape, i.e. `collapsed_rect` returning a `y > 0` |
 | `sp=r3` / `r5` / `capsule` | the plain tab's bottom radius in `chrome_path` |
 | `br=bloom` / `pulse` | `BREATH` |
@@ -186,10 +186,12 @@ never written to disk and every Bar starts expanded.
 
 - Collapse a notched display and the Bar's chrome becomes a black capsule
   merged with the camera cutout: the cutout's own width plus 24pt on each side,
-  menu-bar height, opaque. Its bottom corners are rounded and its top corners
-  flare outwards into the display's edge with a concave shoulder, so the side
-  profile reads as an S rather than ending on a square corner. A small expand
-  handle sits inside each end.
+  menu-bar height, opaque. Both ends of it round *inwards*, the top through
+  `CAPSULE_TOP_RADIUS` and the bottom through `CAPSULE_RADIUS`, so the capsule
+  reads as a rounded rectangle hanging from the screen edge. An earlier
+  revision flared the top corners outwards instead; that direction was wrong —
+  the corners recede, they do not spread. A small expand handle sits inside
+  each end.
 - Collapse a display without a cutout and it becomes a 120x6pt tab flush with
   the screen top, horizontally centred, its bottom edge a visible semicircle.
   Hovering grows it to 9pt as the click affordance, and a click anywhere on it

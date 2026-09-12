@@ -61,11 +61,12 @@ pub const PLAIN_TAB_HEIGHT: f64 = 6.0;
 /// Hovering the tab grows it, which is the only affordance it has.
 pub const PLAIN_TAB_HOVER_HEIGHT: f64 = 9.0;
 
-/// How far the collapsed capsule's top corners flare outwards, so the black
-/// region spreads into the display's top edge instead of ending on a square
-/// corner. With the bottom corners rounded the other way, the side profile
-/// reads as an S.
-pub const CAPSULE_FLARE: f64 = 9.0;
+/// The radius of the collapsed capsule's *top* corners.
+///
+/// They round inwards like the bottom ones, so the collapsed Bar reads as a
+/// rounded rectangle hanging from the screen edge rather than as a black region
+/// that spreads outwards where it meets it.
+pub const CAPSULE_TOP_RADIUS: f64 = 12.0;
 
 /// The collapsed Bar, in panel-local coordinates: the same space as
 /// [`BarSurface::notch`], with the origin at the panel's top-left corner and
