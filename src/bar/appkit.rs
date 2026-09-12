@@ -907,11 +907,18 @@ impl BarView {
         // ever recomputed at the panel's fixed size.
         let radius = shape.bottom;
         let path = chrome_path(chrome_rect, shape);
-        let background = rgba(BarPreferences::rgba(
-            &preferences.background_color,
-            [0.08, 0.08, 0.09, 0.88],
-        ));
-        background.setFill();
+        // The expanded Bar's look is the blur behind it, and the default
+        // background colour is deliberately transparent so that blur shows
+        // through. The blur fades out as the Bar collapses, so the collapsed
+        // shape has to be opaque in its own right — the black of the camera
+        // housing it merges with — or nothing would be left on screen. This
+        // fills black in proportion to how much of the blur has gone, then lays
+        // the configured colour over it.
+        let [red, green, blue, alpha] =
+            BarPreferences::rgba(&preferences.background_color, [0.08, 0.08, 0.09, 0.88]);
+        color(0.0, 0.0, 0.0, 1.0 - progress).setFill();
+        path.fill();
+        color(red, green, blue, alpha).setFill();
         path.fill();
         if preferences.border_width > 0.0 {
             let border = rgba(BarPreferences::rgba(

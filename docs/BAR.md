@@ -199,6 +199,11 @@ never written to disk and every Bar starts expanded.
   choice flipped once: the scoop leaves a small notch where it meets the screen
   edge, and the prototype's render beside a photograph of the hardware is what
   settled it. A small expand handle sits inside each end.
+- The collapsed shapes paint their own black. The Bar's configured background
+  colour defaults to fully transparent, because expanded its look *is* the blur
+  behind it; the blur is faded out as the Bar collapses, so the chrome fills
+  opaque black in proportion to how much of the blur has gone and lays the
+  configured colour over that.
 - Collapse a display without a notch and it becomes a 120x6pt tab flush with
   the screen top, horizontally centred, a pill: both ends round, so it reads as
   the same rounded shape the capsule is, minus the notch. Hovering grows it to
