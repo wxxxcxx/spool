@@ -181,8 +181,8 @@ configuration guide.
 When upgrading a v2 state file, inspect the safe fold first, then apply it:
 
 ```shell
-$ spool migrate-state
-$ spool migrate-state --apply
+$ spool service migrate-state
+$ spool service migrate-state --apply
 ```
 
 The dry run does not write. `--apply` first creates the adjacent
@@ -192,15 +192,15 @@ Space in row order. It never creates, deletes, or moves a macOS Space.
 ### Running as a service
 
 ```shell
-$ spool install
-$ spool start
+$ spool service install
+$ spool service start
 ```
 
 Read captured service output, or follow new records without restarting Spool:
 
 ```shell
-$ spool log --tail 200
-$ spool log -f
+$ spool service logs --tail 200
+$ spool service logs -f
 ```
 
 See [Logs and diagnostics](docs/LOGGING.md) for capture limitations and the
@@ -212,14 +212,14 @@ To start Spool from Spotlight, Alfred, Raycast, or another application launcher,
 install the lightweight app wrapper:
 
 ```shell
-$ spool install-app
+$ spool launcher install
 ```
 
 This creates `$HOME/Applications/Spool.app`. Opening the app starts the
 installed Spool launch agent and exits immediately. Remove the wrapper with:
 
 ```shell
-$ spool uninstall-app
+$ spool launcher uninstall
 ```
 
 ### Running in the foreground
@@ -230,134 +230,123 @@ $ spool
 
 ### Dispatching Actions
 
-Spool exposes an `action` subcommand that lets you control the running
-instance from the command line over its authenticated Unix socket. Any
-action that can be bound to a hotkey can also be dispatched programmatically:
-
-```shell
-$ spool action <action> [args...]
-```
-
-`send-cmd` remains accepted as a hidden compatibility alias. New scripts and
-integrations should use `action`.
+Commands are grouped by resource: `window`, `space`, `display`, `app`,
+`session`, `service`, `launcher`, `bar`, and `mouse`. Bare resources show help.
+Controls use the authenticated Unix socket and return an execution admission
+receipt; this does not promise that macOS has finished applying the change.
+The old `action`, `query`, `subscribe`, `launch`, and root service aliases are
+removed in this breaking migration. See [the CLI contract](docs/CLI_IMPLEMENTATION_PLAN.md).
 
 #### Available actions
 
 | Action                     | Description                                      |
 | -------------------------- | ------------------------------------------------ |
-| `window focus <direction\|number\|next\|previous\|tiled\|floating\|other-layer>` | Focus within or between tiled/floating layers; the result is raised when needed |
+| `window focus <direction\|window-id\|next\|previous\|tiled\|floating\|other-layer>` | Focus within or between tiled/floating layers; the result is raised when needed |
 | `window move <direction>`  | Reorder a tiled window or nudge a floating window |
 | `window center`            | Center the focused tiled or floating window      |
 | `window grow width` / `window shrink width` | Cycle tiled width presets or resize a floating window horizontally |
 | `window grow height` / `window shrink height` | Resize a tiled stack member or floating window vertically |
 | `window maximize`          | Toggle tiled full-width or floating maximize/restore |
 | `window toggle floating`   | Toggle between tiled and floating state          |
-| `window equalize`          | Distribute equal heights in the focused stack    |
-| `window balance`           | Make all columns match the focused window width  |
+| `space layout equalize`          | Distribute equal heights in the focused stack    |
+| `space layout balance`           | Make all columns match the focused window width  |
 | `window toggle stack`      | Stack the focused tiled window, or unstack it when already stacked |
-| `window nextdisplay`       | Move the focused window to the next display      |
-| `window nextdisplaysend`   | Move the window to the next display but stay here |
-| `window move-to-space <window-id> <space-id> stay` | Experimentally move a window to a user Space |
-| `window move-to-space <window-id> <space-id> follow` | Move a window, switch to its Space, and focus it after reconciliation |
+| `window move-to-display next --follow`       | Move the focused window to the next display      |
+| `window move-to-display next --stay`   | Move the window to the next display but stay here |
+| `window move-to-space <space-id> --window <window-id> --stay` | Experimentally move a window to a user Space |
+| `window move-to-space <space-id> --window <window-id> --follow` | Move a window, switch to its Space, and focus it after reconciliation |
 | `space focus <space-id>` | Focus a Space when the runtime reports support |
-| `window focus-in-space <window-id> <space-id>` | Focus a window, switching to its Space first when that is not the one on screen |
-| `space create <display-id>` / `space delete <space-id>` | Space lifecycle actions when supported |
+| `window focus <window-id> --space <space-id>` | Focus a window, switching to its Space first when that is not the one on screen |
+| `space create --display <display-id>` / `space delete <space-id>` | Space lifecycle actions when supported |
 | `window snap`              | Snap the focused window into the visible viewport |
-| `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
-| `mission-control`          | Open or close the system Mission Control overview |
-| `show-desktop`             | Toggle the system Show Desktop overview          |
-| `printstate`               | Print the internal ECS state to the debug log    |
-| `quit`                     | Quit Spool                                      |
-| `restart`                  | Restart the Spool service                         |
+| `mouse next-display`        | Warp the mouse pointer to the next display       |
+| `session mission-control`          | Open or close the system Mission Control overview |
+| `session show-desktop`             | Toggle the system Show Desktop overview          |
+| `service dump-state`               | Print the internal ECS state to the debug log    |
+| `service quit`                     | Quit Spool                                      |
+| `service restart`                  | Restart the Spool service                         |
 
 Where `<direction>` is one of: `west`, `east`, `north`, `south`, `first`, `last`.
-Window numbers are 1-based and count columns from left to right.
+Numeric focus selectors are native window IDs. Use `--nth N` for one-based
+navigable order. Layout column selectors use the complete retained layout,
+including unavailable columns. Mutations accept `--window ID` to target a
+window directly without focusing it first.
 
 #### Examples
 
 ```shell
 # Move focus one window to the right.
-$ spool action window focus east
+$ spool window focus east
 
 # Move to the next window in the current tiled/floating tier.
-$ spool action window focus next
+$ spool window focus next
 
 # Move backward in the current tier; the full word is required.
-$ spool action window focus previous
+$ spool window focus previous
 
 # Move the current window left. Tiled windows reorder; floating windows nudge.
-$ spool action window move west
+$ spool window move west
 
 # Center and grow width in one shot (two separate calls).
-$ spool action window center && spool action window grow width
+$ spool window center && spool window grow width
 
 # Balance all columns to the focused window's width.
-$ spool action window balance
+$ spool space layout balance
 
 # Shrink width using the behavior for the focused window type.
-$ spool action window shrink width
+$ spool window shrink width
 
 # Jump to the left-most window.
-$ spool action window focus first
+$ spool window focus first
 
 # Jump to the second window from the left.
-$ spool action window focus 2
+$ spool window focus --nth 2
 
 # Focus an exact Spool-known window id.
-$ spool action window focusid 321
+$ spool window focus 321
 
 # Move that window to a stable Space ID without following it.
-$ spool action window move-to-space 321 42 stay
+$ spool window move-to-space 42 --window 321 --stay
 
 # Move that window, switch to its Space, and focus it.
-$ spool action window move-to-space 321 42 follow
+$ spool window move-to-space 42 --window 321 --follow
 
 # Focus a window that lives on another Space: switch there, then focus it.
-$ spool action window focus-in-space 321 42
+$ spool window focus 321 --space 42
 
 # Focus a stable Space ID on the active display.
-$ spool action space focus 42
+$ spool space focus 42
 ```
 
-### Querying and Subscribing to State
+### Inspecting resources and watching state
 
-Spool exposes a compact tab-separated summary by default, which is convenient
-to read in a terminal or process with `awk`:
+`list` shows summaries and supports filters. `inspect ID` shows detail;
+`--show` replaces the default detail selection. The default source is Spool's
+retained state. `--source native` starts a separate, bounded collector and does
+not connect to the service or feed observations into it.
 
 ```shell
-$ spool query state
-$ spool query spaces
-$ spool query active
-$ spool query on-screen
-$ spool subscribe
+spool window list --title Terminal --on-screen true
+spool display list --source native
+spool space list --source native
+spool app inspect 123 --source native --show windows.ax
+spool window inspect 321 --source native --show ax.AXTitle,cg --timeout 5s --json
+spool window inspect 321 --show geometry.desired --json
+spool space layout inspect --space 42
+spool session watch --json --raw
 ```
 
-Pass `--json` when a script or status bar needs the complete structured state:
+Read JSON uses a versioned envelope with source, resource, status, collection,
+data, and issues. Exit codes: complete 0, failed/not found 1, arguments 2,
+partial 3. Unknown filter evidence keeps a row marked `match_status: unresolved`.
+Native AX and WindowServer records retain separate evidence and provenance;
+window IDs alone do not establish a safe association.
 
-```shell
-$ spool query state --json
-$ spool query spaces --json
-$ spool query active --json
-$ spool query on-screen --json
-$ spool subscribe --json
-```
-
-`query` prints one snapshot and exits. `subscribe` keeps the channel open and
-prints a header followed by one TSV summary row per event; `subscribe --json`
-instead emits one complete JSON object per line. Stable notifications are
-coalesced: window animation frames do not repeatedly publish an unchanged
-visible set. Add `--raw` only while debugging to include the uncoalesced source
-events alongside stable notifications:
-
-```shell
-$ spool subscribe --raw
-$ spool subscribe --json --raw
-```
-
-Events cover focus changes, Space changes, window-list changes, visible-set
-changes, title changes, and display changes. See
-[`docs/QUERY_AND_SUBSCRIBE_FORMAT.md`](docs/QUERY_AND_SUBSCRIBE_FORMAT.md) for the
-full payload contract.
+For migration, update externally managed launch agents through their manager.
+Recognized local installations use `spool service stop`,
+`spool service reinstall`, then `spool service start`. Refresh the GUI launcher
+with `spool launcher install`. Updating files alone does not update a running
+old daemon or its IPC protocol. Unknown ownership is never automatically adopted.
 
 ### Running Client Scripts
 
@@ -368,13 +357,13 @@ the Unix socket:
 
 ```shell
 # Execute a file. Arguments after `--` become arg[1], arg[2], ... in Lua.
-$ spool script arrange.lua -- terminal work
+$ spool script run arrange.lua -- terminal work
 
 # Execute an inline expression.
-$ spool script -e 'print(spool.query_active().focused_window_title)'
+$ spool script run -e 'print(spool.query_active().focused_window_title)'
 
 # Read from standard input.
-$ printf 'print(spool.state.get("mode"))' | spool script -
+$ printf 'print(spool.state.get("mode"))' | spool script run -
 ```
 
 Both the global `spool` value and `require("spool")` refer to the client API.
@@ -394,21 +383,21 @@ Because `action` talks to the running daemon, you can drive Spool from shell
 scripts, `cron` jobs, or other automation tools:
 
 - **Launch-and-arrange workflow.** Open an application and immediately position
-  it: `open -a Safari && sleep 0.5 && spool action window grow width`.
-- **One-key layout reset.** Use `spool action window balance` to make every
+  it: `open -a Safari && sleep 0.5 && spool window grow width`.
+- **One-key layout reset.** Use `spool space layout balance` to make every
   column the same width as the focused window — great for resetting layouts
   after unplugging a monitor or when windows get shuffled.
 - **Integration with other tools.** Pipe focus events from tools like
   [Hammerspoon](https://www.hammerspoon.org) or
-  [skhd](https://github.com/koekeishiya/skhd) into `spool action` for
+  [skhd](https://github.com/koekeishiya/skhd) into resource commands for
   compound actions that go beyond a single hotkey.
 - **Multi-display orchestration.** Move a window to the next display and
   immediately warp the mouse there:
   ```shell
-  spool action window nextdisplay && spool action mouse nextdisplay
+  spool window move-to-display next --follow && spool mouse next-display
   ```
 - **External status integration.** The built-in Bar needs no IPC. Other tools
-  can still use `spool query state --json` and `spool subscribe --json`.
+  can still use `spool session inspect --json` and `spool session watch --json`.
 
 
 ## Future Enhancements

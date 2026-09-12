@@ -5,7 +5,7 @@
 //!
 //! Values travel as postcard — compact, binary, and not self-describing, which
 //! is why [`crate::script_value::ScriptValue`] exists in place of
-//! `serde_json::Value`. JSON is still what `spool query` prints to a terminal,
+//! `serde_json::Value`. JSON is still what resource reads print to a terminal,
 //! but it is not what the two processes speak to each other.
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,52 @@ pub enum Request {
     /// Ask for state events to be pushed as they happen. `raw` adds the
     /// uncoalesced source events used to derive stable notifications.
     Subscribe { raw: bool },
+    /// Ordered execution admission, distinct from transport acknowledgement.
+    Command(CheckedAction),
+    /// Pure projection of retained daemon state; native collection is local.
+    Inspect(crate::inspection::ReadRequest),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CheckedAction {
+    pub request_id: String,
+    #[serde(with = "named_action")]
+    pub action: Action,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionStatus {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionReceipt {
+    pub request_id: String,
+    pub status: AdmissionStatus,
+    pub code: Option<String>,
+    pub message: Option<String>,
+}
+
+impl AdmissionReceipt {
+    #[must_use]
+    pub fn from_result(request_id: String, result: Result<(), String>) -> Self {
+        match result {
+            Ok(()) => Self {
+                request_id,
+                status: AdmissionStatus::Accepted,
+                code: None,
+                message: None,
+            },
+            Err(reason) => Self {
+                request_id,
+                status: AdmissionStatus::Rejected,
+                code: Some(reason.clone()),
+                message: Some(reason.replace('_', " ")),
+            },
+        }
+    }
 }
 
 /// What a client wants of the script-state store.
@@ -94,6 +140,8 @@ pub enum Response {
     /// The request could not be answered. Carries the message a client should
     /// show.
     Error(String),
+    Admission(AdmissionReceipt),
+    Inspection(Box<crate::inspection::Report>),
 }
 
 /// The answer to a [`Request::Query`], one variant per [`StateQueryKind`].

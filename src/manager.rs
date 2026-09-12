@@ -62,6 +62,7 @@ pub use windows::MockWindowApi;
 pub(crate) mod app;
 pub(crate) mod discovery;
 mod display;
+pub(crate) mod inspection;
 mod process;
 mod skylight;
 mod windows;

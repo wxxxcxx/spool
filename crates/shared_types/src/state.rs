@@ -4,7 +4,7 @@
 //! Shared by the daemon and every client: the window manager fills these in from
 //! its ECS world, the Lua module and any status bar deserialize the same types.
 //!
-//! They are the wire format of `spool query …` and `spool subscribe`, so
+//! They are the typed Lua query and `spool session watch` payloads, so
 //! nobody has to poke at untyped JSON to read them.
 
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ impl StateQueryKind {
         ("query_on_screen", StateQueryKind::OnScreen),
     ];
 
-    /// The argv token naming this query (`spool query <token> --json`).
+    /// The stable token naming this typed query.
     #[must_use]
     pub fn token(self) -> &'static str {
         match self {
@@ -71,7 +71,7 @@ impl StateQueryKind {
     }
 }
 
-/// The complete state document (`spool query state --json`).
+/// The complete typed state document (Lua query / watch).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct QueryState {
     pub version: u32,

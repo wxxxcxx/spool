@@ -3,92 +3,30 @@
 //! summary. The daemon and its clients otherwise speak typed postcard values.
 
 use spool_local_ipc::Client;
-use spool_shared_types::commands::{Action, MoveFocus};
-use spool_shared_types::state::{
-    ActiveState, Frame, SpaceKind, SpaceState, StateEvent, StateQueryKind, WindowState,
-};
-use spool_shared_types::wire::{QueryPayload, Request, Response, service_name};
+use spool_shared_types::commands::Action;
+use spool_shared_types::state::{ActiveState, StateEvent};
+use spool_shared_types::wire::{Request, Response, service_name};
+
+#[cfg(test)]
+use spool_shared_types::state::{Frame, SpaceKind, SpaceState, WindowState};
 
 use crate::errors::{Error, Result};
-
-/// Connects to the running daemon.
-///
-/// # Errors
-///
-/// Returns a plain "spool is not running" error when no daemon is running.
-fn connect() -> Result<Client> {
-    Client::connect(&service_name()).map_err(|err| match err {
-        spool_local_ipc::Error::NotRunning => Error::Generic("spool is not running".to_string()),
-        other => Error::from(other),
-    })
-}
-
-/// Parses and dispatches an action, waiting only for daemon acceptance.
-///
-/// # Errors
-///
-/// If the daemon cannot be reached.
-pub fn dispatch_action(argv: impl IntoIterator<Item = String>) -> Result<()> {
-    let argv = argv.into_iter().collect::<Vec<_>>();
-    let borrowed = argv.iter().map(String::as_str).collect::<Vec<_>>();
-    let action = spool_shared_types::argv::parse_action(&borrowed)?;
-
-    if matches!(
-        action,
-        Action::FocusSpace { .. }
-            | Action::MoveWindowToSpace { .. }
-            | Action::CreateSpace { .. }
-            | Action::DeleteSpace { .. }
-    ) {
-        let response = connect()?.call(&Request::Query(StateQueryKind::State))?;
-        let Response::Query(QueryPayload::State(state)) = response else {
-            return Err(unexpected(&response));
-        };
-        let available = match action {
-            Action::FocusSpace { .. } => state.capabilities.focus,
-            Action::MoveWindowToSpace {
-                move_focus: MoveFocus::Follow,
-                ..
-            } => state.capabilities.move_windows && state.capabilities.focus,
-            Action::MoveWindowToSpace { .. } => state.capabilities.move_windows,
-            Action::CreateSpace { .. } => state.capabilities.create,
-            Action::DeleteSpace { .. } => state.capabilities.delete,
-            _ => true,
-        };
-        if !available {
-            return Err(Error::Generic(format!(
-                "Space capability unavailable for '{action:?}'"
-            )));
-        }
-    }
-
-    connect()?.send(&Request::Dispatch(action))?;
-    Ok(())
-}
-
-/// Asks for part of the state document and renders it for the CLI.
-///
-/// # Errors
-///
-/// If the daemon cannot be reached or answers with a failure.
-pub fn query(kind: StateQueryKind, format: OutputFormat) -> Result<String> {
-    let response = connect()?.call(&Request::Query(kind))?;
-
-    match response {
-        Response::Query(payload) => render(&payload, format),
-        other => Err(unexpected(&other)),
-    }
-}
+#[cfg(test)]
+use spool_shared_types::wire::QueryPayload;
 
 /// Streams state events to stdout until interrupted.
 ///
 /// # Errors
 ///
 /// If the daemon cannot be reached.
-pub fn subscribe(format: OutputFormat, raw: bool) -> Result<()> {
+pub fn subscribe(format: OutputFormat, raw: bool, timeout_ms: u64) -> Result<()> {
     use std::io::Write;
 
-    let mut events = connect()?.subscribe(&Request::Subscribe { raw })?;
+    let mut events = Client::connect_with_deadline(
+        &service_name(),
+        std::time::Duration::from_millis(timeout_ms),
+    )?
+    .subscribe(&Request::Subscribe { raw })?;
     let mut stdout = std::io::stdout();
     if format == OutputFormat::Tsv
         && writeln!(
@@ -121,37 +59,6 @@ pub fn subscribe(format: OutputFormat, raw: bool) -> Result<()> {
     Ok(())
 }
 
-/// Runs one client subcommand to completion.
-///
-/// # Errors
-///
-/// Whatever the subcommand reports.
-pub fn run(request: ClientRequest) -> Result<()> {
-    match request {
-        ClientRequest::Action(argv) => dispatch_action(argv),
-        ClientRequest::Query { kind, format } => {
-            println!("{}", query(kind, format)?);
-            Ok(())
-        }
-        ClientRequest::Subscribe { format, raw } => subscribe(format, raw),
-    }
-}
-
-/// What a CLI invocation wants of the daemon, including how to print the
-/// answer. Distinct from [`Request`], which is only what crosses to the daemon.
-#[derive(Debug)]
-pub enum ClientRequest {
-    Action(Vec<String>),
-    Query {
-        kind: StateQueryKind,
-        format: OutputFormat,
-    },
-    Subscribe {
-        format: OutputFormat,
-        raw: bool,
-    },
-}
-
 /// How a CLI query or event stream is rendered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -166,6 +73,7 @@ impl OutputFormat {
     }
 }
 
+#[cfg(test)]
 fn render(payload: &QueryPayload, format: OutputFormat) -> Result<String> {
     match format {
         OutputFormat::Json => payload
@@ -186,6 +94,7 @@ fn render_event(event: &StateEvent, format: OutputFormat) -> Result<String> {
     }
 }
 
+#[cfg(test)]
 fn render_query_tsv(payload: &QueryPayload) -> String {
     let mut sections = Vec::new();
     match payload {
@@ -217,10 +126,12 @@ fn render_query_tsv(payload: &QueryPayload) -> String {
     sections.join("\n\n")
 }
 
+#[cfg(test)]
 fn section(name: &str, body: String) -> String {
     format!("{name}\n{body}")
 }
 
+#[cfg(test)]
 fn render_active(active: &ActiveState) -> String {
     format!(
         "DISPLAY_ID\tSPACE_ID\tWINDOW_ID\tAPP\tBUNDLE_ID\tTITLE\n{}\t{}\t{}\t{}\t{}\t{}",
@@ -233,6 +144,7 @@ fn render_active(active: &ActiveState) -> String {
     )
 }
 
+#[cfg(test)]
 fn render_displays(displays: &[spool_shared_types::state::DisplayState]) -> String {
     let mut lines = vec!["DISPLAY_ID\tACTIVE\tVISIBLE_SPACE_ID".to_string()];
     lines.extend(displays.iter().map(|display| {
@@ -246,6 +158,7 @@ fn render_displays(displays: &[spool_shared_types::state::DisplayState]) -> Stri
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn render_spaces(spaces: &[SpaceState]) -> String {
     let mut lines = vec![
         "SPACE_ID\tDISPLAY_ID\tORDINAL\tKIND\tVISIBLE\tFOCUSED\tWINDOW_COUNT\tWINDOW_IDS"
@@ -277,6 +190,7 @@ fn render_spaces(spaces: &[SpaceState]) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
 const fn space_kind(kind: SpaceKind) -> &'static str {
     match kind {
         SpaceKind::User => "user",
@@ -284,6 +198,7 @@ const fn space_kind(kind: SpaceKind) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn render_space_windows(spaces: &[SpaceState]) -> String {
     let mut lines = vec![window_header(true)];
     for space in spaces {
@@ -297,12 +212,14 @@ fn render_space_windows(spaces: &[SpaceState]) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn render_windows(windows: &[WindowState], space_id: Option<u64>) -> String {
     let mut lines = vec![window_header(false)];
     lines.extend(windows.iter().map(|window| render_window(window, space_id)));
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn window_header(include_space: bool) -> String {
     let prefix = if include_space { "SPACE_ID\t" } else { "" };
     format!(
@@ -310,6 +227,7 @@ fn window_header(include_space: bool) -> String {
     )
 }
 
+#[cfg(test)]
 fn render_window(window: &WindowState, space_id: Option<u64>) -> String {
     let prefix = space_id.map_or_else(String::new, |space_id| format!("{space_id}\t"));
     let (x, y, width, height) = frame_cells(window.frame);
@@ -326,6 +244,7 @@ fn render_window(window: &WindowState, space_id: Option<u64>) -> String {
     )
 }
 
+#[cfg(test)]
 fn frame_cells(frame: Option<Frame>) -> (String, String, String, String) {
     frame.map_or_else(
         || ("-".into(), "-".into(), "-".into(), "-".into()),
@@ -452,12 +371,142 @@ fn text_cell(value: &str) -> String {
         .collect()
 }
 
-/// The daemon answered something this request never asks for.
-fn unexpected(response: &Response) -> Error {
-    match response {
-        Response::Error(message) => Error::Generic(message.clone()),
-        other => Error::Generic(format!("unexpected response: {other:?}")),
+/// Submit exactly once; a transport failure after submission is not a rejection.
+pub(crate) fn checked_action(action: Action, timeout_ms: u64, json: bool) -> Result<u8> {
+    use spool_shared_types::wire::{AdmissionStatus, CheckedAction};
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = Client::connect_with_deadline(
+        &service_name(),
+        std::time::Duration::from_millis(timeout_ms),
+    )
+    .map_err(|error| (false, error))
+    .and_then(|client| {
+        client
+            .call_with_status(&Request::Command(CheckedAction {
+                request_id: request_id.clone(),
+                action,
+            }))
+            .map_err(|failure| (failure.submitted, failure.error))
+    });
+    let (value, success) = match response {
+        Ok(Response::Admission(receipt)) if receipt.request_id == request_id => {
+            let success = receipt.status == AdmissionStatus::Accepted;
+            (serde_json::to_value(receipt)?, success)
+        }
+        Ok(other) => (
+            serde_json::json!({"request_id":request_id,"status":"acceptance_unknown","message":format!("unexpected response: {other:?}")}),
+            false,
+        ),
+        Err((submitted, error)) => (
+            serde_json::json!({"request_id":request_id,"status":if submitted{"acceptance_unknown"}else{"not_submitted"},"message":error.to_string()}),
+            false,
+        ),
+    };
+    if json {
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        println!(
+            "{}{}",
+            value["status"].as_str().unwrap_or("unknown"),
+            value["message"]
+                .as_str()
+                .map_or_else(String::new, |message| format!(": {message}"))
+        );
     }
+    Ok(u8::from(!success))
+}
+pub(crate) fn inspect(
+    request: spool_shared_types::inspection::ReadRequest,
+) -> spool_shared_types::inspection::Report {
+    use spool_shared_types::inspection::Report;
+    match Client::connect_with_deadline(
+        &service_name(),
+        std::time::Duration::from_millis(request.timeout_ms),
+    )
+    .and_then(|client| client.call(&Request::Inspect(request.clone())))
+    {
+        Ok(Response::Inspection(report)) => *report,
+        Ok(other) => Report::failure(&request, "unexpected_response", &format!("{other:?}")),
+        Err(error) => Report::failure(&request, "source_unavailable", &error.to_string()),
+    }
+}
+pub(crate) fn print_report(
+    report: &spool_shared_types::inspection::Report,
+    json: bool,
+) -> Result<()> {
+    use std::io::Write;
+    let mut output = std::io::stdout().lock();
+    if json {
+        writeln!(output, "{}", serde_json::to_string(report)?)?;
+    } else {
+        writeln!(
+            output,
+            "{} {:?} ({:?})",
+            report.resource.token(),
+            report.source,
+            report.status
+        )?;
+        write!(output, "{}", render_report_data(&report.data))?;
+        for issue in &report.issues {
+            writeln!(
+                output,
+                "{}: {} ({})",
+                issue.code,
+                issue.message,
+                issue.target.as_deref().unwrap_or("collection")
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn render_report_data(data: &serde_json::Value) -> String {
+    use std::fmt::Write;
+    let Some(rows) = data.as_array() else {
+        return format!("{data:#}\n");
+    };
+    let mut output = String::new();
+    for (status, heading) in [("matched", "MATCHED"), ("unresolved", "UNRESOLVED")] {
+        let selected = rows
+            .iter()
+            .filter(|row| row["match_status"].as_str().unwrap_or("matched") == status)
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            continue;
+        }
+        let _ = writeln!(output, "{heading}\nID\tPID\tNAME / TITLE\tDETAILS");
+        for row in selected {
+            let identity = row.get("identity").unwrap_or(row);
+            let cell = |value: Option<&serde_json::Value>| {
+                value.filter(|value| !value.is_null()).map_or_else(
+                    || "-".into(),
+                    |value| {
+                        value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_owned)
+                            .replace(['\t', '\n', '\r'], " ")
+                    },
+                )
+            };
+            let id = identity.get("id").or_else(|| identity.get("pid"));
+            let title = row
+                .get("title")
+                .or_else(|| identity.get("name"))
+                .or_else(|| identity.get("title"));
+            let _ = writeln!(
+                output,
+                "{}\t{}\t{}\t{}",
+                cell(id),
+                cell(identity.get("pid")),
+                cell(title),
+                row
+            );
+        }
+    }
+    if rows.is_empty() {
+        output.push_str("No matches.\n");
+    }
+    output
 }
 
 #[cfg(test)]
@@ -625,5 +674,18 @@ mod tests {
             render_event(&event, OutputFormat::Json).unwrap(),
             event.to_json().unwrap().to_string()
         );
+    }
+    #[test]
+    fn inspection_table_handles_both_sources_and_partitions_unknown_matches() {
+        let output = render_report_data(&serde_json::json!([
+            {"id":42,"pid":100,"title":"editor\nnotes","match_status":"matched"},
+            {"identity":{"id":43,"pid":200},"title":"browser","match_status":"unresolved"},
+            {"pid":300,"name":"app","match_status":"matched"}
+        ]));
+        assert!(output.contains("42\t100\teditor notes\t"));
+        assert!(output.contains("300\t300\tapp\t"));
+        let (matched, unresolved) = output.split_once("UNRESOLVED").unwrap();
+        assert!(!matched.contains("43\t200"));
+        assert!(unresolved.contains("43\t200\tbrowser\t"));
     }
 }

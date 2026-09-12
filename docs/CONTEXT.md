@@ -60,8 +60,14 @@ A retained request to tile after temporary capability or native-state uncertaint
 **Layout State**:
 The Spool-owned arrangement of tiled windows, including strip membership, column structure, ordering, and logical sizes.
 
+**Declarative Window Management**:
+Window management in which explicit desired state expresses intent and native observations establish what has actually been realized. A valid desired arrangement remains meaningful while its Space is invisible or its realization is temporarily blocked.
+
 **Navigable Layout**:
 A read-only projection of a Space's retained layout containing available, visible tiled identities, with stack and tab structure preserved. Directional, first/last/numeric, and next/previous tiled focus use this projection; retained unavailable identities are restoration data, not navigation targets. Projection never deletes or reorders the original layout.
+
+**Column Ordinal**:
+A column's one-based position within a Native Space's complete retained layout, including hidden or unavailable retained columns, at the time it is inspected or selected. It identifies a current position, not a persistent column identity, and filtering a view does not renumber it.
 
 **Tiled Stacking Order**:
 A derived bottom-to-top request order for the currently visible active Space.
@@ -156,9 +162,20 @@ _Avoid_: Workspace, virtual workspace
 Spool's current externally readable projection of displays, Native Spaces, Tracked Windows, focus, visibility, and observed geometry. It is a point-in-time value, not an event history.
 _Avoid_: Event state, Lua state
 
+**Desktop Session**:
+The current user's graphical desktop, encompassing applications, windows, displays, Native Spaces, and focus. Its lifetime and identity are independent of a particular Spool daemon run or saved layout.
+_Avoid_: Daemon session, saved session
+
 **State Change Notification**:
 A public, possibly coalesced notification that part of the State Snapshot changed. Consumers use it as an invalidation signal and obtain a fresh State Snapshot whenever exact current state matters.
 _Avoid_: Raw event, event log
+
+**Native Observation**:
+An on-demand, read-only collection of macOS window, display, Space, and focus evidence obtained independently of Spool's running daemon and tracked inventory. It records what the native sources could establish during collection, including uncertainty, rather than an atomic or infallible picture of the desktop.
+_Avoid_: Real state, ground truth
+
+**Native Evidence**:
+A result attributed to a particular native source within a Native Observation, retaining its read outcome and any disagreement with other sources. Correlating evidence with a window does not replace the source results or discard evidence that cannot be correlated.
 
 **Script State**:
 A script-owned persistent key-value store. It remembers script choices across reloads and restarts but is not authoritative window or layout state.

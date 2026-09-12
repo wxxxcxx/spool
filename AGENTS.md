@@ -31,6 +31,7 @@ Spool is built on Bevy and follows a strict Data-Driven Design (ECS).
 
 ## 3. Layout & Workspace Logic
 
+*   **Declarative State-Driven Goal:** Spool's long-term architecture is fully state-driven declarative window management; follow [ADR 0006](docs/adr/0006-declarative-state-driven-window-management.md) in future designs, implementations, and reviews. Commands/configuration/scripts express state transitions, and platform effects reconcile explicit intent with native observations. Separate valid state edits from whether a macOS effect can execute now: invisible Spaces should ultimately accept desired-layout edits without implicit focus or Space switching. Current visible-only mutation restrictions are temporary implementation limitations, not permanent domain rules. Preserve existing native identity/transition/write protections until that separation is implemented, and distinguish accepted state from native completion.
 *   **LayoutStrip:** The core layout data structure is `LayoutStrip` (in `src/ecs/layout.rs`). It manages columns, stacks, and tabs.
 *   **Native Spaces:** Spool owns exactly one `LayoutStrip` per macOS Space. macOS owns topology and visibility; see `src/ecs/native_space.rs` for observation, optional private commands, and reconciliation.
 *   **Coordinate Systems:** Be aware of the difference between Bevy's coordinate system (often Y-up) and macOS/AppKit (Y-down). Use the `Position` and `Size` abstractions to handle conversions.

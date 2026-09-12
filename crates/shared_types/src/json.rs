@@ -6,6 +6,40 @@
 //! `{"tag": "variant", …}` shape afterwards, so the JSON a client sees is
 //! unchanged.
 
+/// Dynamic evidence is ordinary JSON for humans, a bounded JSON string inside
+/// postcard. This preserves unknown native fields without `deserialize_any`.
+pub mod value {
+    use serde::{Deserialize, Serialize};
+
+    /// # Errors
+    /// Returns serialization errors from the chosen wire representation.
+    pub fn serialize<S: serde::Serializer>(
+        value: &serde_json::Value,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            value.serialize(serializer)
+        } else {
+            serde_json::to_string(value)
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer)
+        }
+    }
+
+    /// # Errors
+    /// Rejects malformed JSON or an invalid serialized value.
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<serde_json::Value, D::Error> {
+        if deserializer.is_human_readable() {
+            serde_json::Value::deserialize(deserializer)
+        } else {
+            serde_json::from_str(&String::deserialize(deserializer)?)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
 /// Rewrites serde's externally tagged `{"variant": {…}}` into the flat
 /// `{"tag": "variant", …}` clients are documented to read.
 ///

@@ -22,7 +22,10 @@ use std::sync::mpsc::{self, Receiver as MessageReceiver, SyncSender, TrySendErro
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const PROTOCOL_VERSION: u16 = 5;
+const PROTOCOL_VERSION: u16 = 6;
+// Frozen v5 ClientFrame(version=6, Call, Query(State)). Never dispatched.
+const BOOTSTRAP_BODY: &[u8] = &[6, 1, 1, 0];
+const BOOTSTRAP_FRAME: &[u8] = &[0, 0, 0, 4, 6, 1, 1, 0];
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(2);
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(1);
@@ -398,19 +401,16 @@ fn read_delivery_with_deadline(mut stream: UnixStream, timeout: Duration) -> Res
     stream.set_nonblocking(false).map_err(Error::Io)?;
 
     let mut io = DeadlineIo::new(&mut stream, timeout);
-    let frame: ClientFrame = read_frame(&mut io)?;
-    io.remaining().map_err(map_io_error)?;
-    if frame.version != PROTOCOL_VERSION {
-        let message = format!(
-            "protocol version {} is unsupported; daemon expects {PROTOCOL_VERSION}",
-            frame.version
-        );
+    let bootstrap = read_versioned_payload(&mut io)?;
+    if bootstrap != BOOTSTRAP_BODY {
+        let message = "protocol bootstrap required before a request".to_string();
         _ = write_frame(&mut io, &ServerFrame::Error(message.clone()));
         return Err(Error::Protocol(message));
     }
-    if matches!(frame.mode, RequestMode::Subscribe) {
-        write_frame(&mut io, &ServerFrame::Ack)?;
-    }
+    write_frame(&mut io, &ServerFrame::Ack)?;
+    let payload = read_versioned_payload(&mut io)?;
+    let frame: ClientFrame = postcard::from_bytes(&payload).map_err(|_| Error::Decode)?;
+    io.remaining().map_err(map_io_error)?;
     drop(io);
 
     Ok(match frame.mode {
@@ -428,7 +428,9 @@ fn read_delivery_with_deadline(mut stream: UnixStream, timeout: Duration) -> Res
         },
         RequestMode::Subscribe => Delivery {
             request: frame.request,
-            acknowledgement: None,
+            acknowledgement: Some(Acknowledgement {
+                stream: stream.try_clone().map_err(Error::Io)?,
+            }),
             reply: None,
             subscriber: Some(Subscriber::new(stream)?),
         },
@@ -442,7 +444,29 @@ fn read_delivery_with_deadline(mut stream: UnixStream, timeout: Duration) -> Res
 pub struct Client {
     stream: UnixStream,
     timeout: Duration,
+    started: Instant,
+    submitted: bool,
 }
+
+/// Distinguishes a failed compatibility handshake from an uncertain request.
+#[derive(Debug)]
+pub struct CallFailure {
+    pub submitted: bool,
+    pub error: Error,
+}
+
+impl std::fmt::Display for CallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stage = if self.submitted {
+            "acceptance unknown"
+        } else {
+            "request not submitted"
+        };
+        write!(f, "{stage}: {}", self.error)
+    }
+}
+
+impl std::error::Error for CallFailure {}
 
 impl Client {
     /// Connects to the unique daemon published under `name`.
@@ -455,7 +479,10 @@ impl Client {
         Self::connect_with_deadline(name, DEFAULT_DEADLINE)
     }
 
-    fn connect_with_deadline(name: &str, deadline: Duration) -> Result<Self> {
+    /// # Errors
+    /// Fails if the authenticated service connection cannot be established.
+    pub fn connect_with_deadline(name: &str, deadline: Duration) -> Result<Self> {
+        let started = Instant::now();
         let paths = EndpointPaths::new(name);
         paths.prepare_directory()?;
         let path = paths.socket;
@@ -465,6 +492,8 @@ impl Client {
         Ok(Self {
             stream,
             timeout: deadline,
+            started,
+            submitted: false,
         })
     }
 
@@ -496,6 +525,27 @@ impl Client {
         }
     }
 
+    /// Calls with submission provenance, for controls that must never be retried
+    /// merely because their admission receipt was lost.
+    ///
+    /// # Errors
+    /// A handshake failure is not submitted; a write/response failure may be.
+    pub fn call_with_status(
+        mut self,
+        request: &Request,
+    ) -> std::result::Result<Response, CallFailure> {
+        let result = match self.exchange(RequestMode::Call, request) {
+            Ok(ServerFrame::Response(response)) => Ok(response),
+            Ok(ServerFrame::Error(message)) => Err(Error::Remote(message)),
+            Ok(other) => Err(unexpected_server_frame("response", &other)),
+            Err(error) => Err(error),
+        };
+        result.map_err(|error| CallFailure {
+            submitted: self.submitted,
+            error,
+        })
+    }
+
     /// Converts this connection into a long-lived event stream.
     ///
     /// # Errors
@@ -519,15 +569,26 @@ impl Client {
     }
 
     fn exchange(&mut self, mode: RequestMode, request: &Request) -> Result<ServerFrame> {
-        let mut io = DeadlineIo::new(&mut self.stream, self.timeout);
-        write_frame(
-            &mut io,
-            &ClientFrame {
-                version: PROTOCOL_VERSION,
-                mode,
-                request: request.clone(),
-            },
-        )?;
+        let request_frame = encode_frame(&ClientFrame {
+            version: PROTOCOL_VERSION,
+            mode,
+            request: request.clone(),
+        })?;
+        let remaining = self.timeout.saturating_sub(self.started.elapsed());
+        let mut io = DeadlineIo::new(&mut self.stream, remaining);
+        io.write_all(BOOTSTRAP_FRAME).map_err(map_io_error)?;
+        match read_frame::<ServerFrame>(&mut io)? {
+            ServerFrame::Ack => {}
+            ServerFrame::Error(message) => return Err(Error::Remote(message)),
+            other => {
+                return Err(unexpected_server_frame(
+                    "protocol compatibility acknowledgement",
+                    &other,
+                ));
+            }
+        }
+        self.submitted = true;
+        io.write_all(&request_frame).map_err(map_io_error)?;
         let frame = read_frame(&mut io)?;
         io.remaining().map_err(map_io_error)?;
         Ok(frame)
@@ -981,6 +1042,23 @@ fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 }
 
 fn read_frame<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> Result<T> {
+    let payload = read_payload(reader)?;
+    postcard::from_bytes(&payload).map_err(|_| Error::Decode)
+}
+
+fn read_versioned_payload(io: &mut DeadlineIo<'_>) -> Result<Vec<u8>> {
+    let payload = read_payload(io)?;
+    let (version, _) = postcard::take_from_bytes::<u16>(&payload).map_err(|_| Error::Decode)?;
+    if version != PROTOCOL_VERSION {
+        let message =
+            format!("protocol version {version} is unsupported; daemon expects {PROTOCOL_VERSION}");
+        _ = write_frame(io, &ServerFrame::Error(message.clone()));
+        return Err(Error::Protocol(message));
+    }
+    Ok(payload)
+}
+
+fn read_payload(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut length = [0_u8; 4];
     reader.read_exact(&mut length).map_err(map_io_error)?;
     let length = u32::from_be_bytes(length) as usize;
@@ -991,7 +1069,7 @@ fn read_frame<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> Result<T>
     }
     let mut payload = vec![0; length];
     reader.read_exact(&mut payload).map_err(map_io_error)?;
-    postcard::from_bytes(&payload).map_err(|_| Error::Decode)
+    Ok(payload)
 }
 
 fn map_bind_error(error: io::Error) -> Error {
@@ -1108,6 +1186,11 @@ mod tests {
 
         let delivery = server.recv_blocking().expect("delivery");
         delivery
+            .acknowledgement
+            .expect("subscription admission")
+            .accepted()
+            .expect("accepted");
+        delivery
             .subscriber
             .expect("subscriber")
             .try_send(&StateEvent::DisplayChanged {
@@ -1131,6 +1214,31 @@ mod tests {
         drop(first);
         let second = Server::bind(&name).expect("lock released");
         drop(second);
+    }
+
+    #[test]
+    fn client_negotiates_with_frozen_v5_sentinel_before_submitting_a_request() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let client = thread::spawn(move || {
+            Client {
+                stream,
+                timeout: Duration::from_secs(1),
+                started: Instant::now(),
+                submitted: false,
+            }
+            .call(&Request::Dispatch(
+                spool_shared_types::commands::Action::Quit,
+            ))
+        });
+        // The v5 codec accepts this exact four-byte body, then rejects version 6.
+        let mut header = [0; 4];
+        peer.read_exact(&mut header).unwrap();
+        let mut body = vec![0; u32::from_be_bytes(header) as usize];
+        peer.read_exact(&mut body).unwrap();
+        write_frame(&mut peer, &ServerFrame::Error("daemon expects 5".into())).unwrap();
+        let result = client.join().unwrap();
+        assert_eq!(body, [6, 1, 1, 0]);
+        assert!(matches!(result, Err(Error::Remote(message)) if message == "daemon expects 5"));
     }
 
     #[test]
@@ -1165,6 +1273,7 @@ mod tests {
         stream
             .set_nonblocking(true)
             .expect("inherited listener mode");
+        peer.write_all(BOOTSTRAP_FRAME).expect("bootstrap");
         write_frame(
             &mut peer,
             &ClientFrame {
@@ -1321,6 +1430,8 @@ mod tests {
         peer.set_write_timeout(Some(DEFAULT_DEADLINE))
             .expect("peer write timeout");
         let peer = thread::spawn(move || {
+            let _: ClientFrame = read_frame(&mut peer).expect("bootstrap");
+            write_frame(&mut peer, &ServerFrame::Ack).expect("compatibility acknowledgement");
             let _: ClientFrame = read_frame(&mut peer).expect("request");
             let frame = encode_frame(&ServerFrame::Error("x".repeat(32))).expect("response");
             for byte in frame {
@@ -1331,7 +1442,13 @@ mod tests {
             }
         });
 
-        let result = Client { stream, timeout }.call(&Request::Query(StateQueryKind::State));
+        let result = Client {
+            stream,
+            timeout,
+            started: Instant::now(),
+            submitted: false,
+        }
+        .call(&Request::Query(StateQueryKind::State));
         peer.join().expect("finite peer thread");
         assert!(
             matches!(result, Err(Error::TimedOut)),
@@ -1423,10 +1540,16 @@ mod tests {
             .expect("peer read timeout");
         peer.set_write_timeout(Some(DEFAULT_DEADLINE))
             .expect("peer write timeout");
-        write_frame(&mut peer, &ServerFrame::Ack).expect("queue acknowledgement");
-        let mut events = Client { stream, timeout }
-            .subscribe(&Request::Subscribe { raw: false })
-            .expect("subscribe");
+        write_frame(&mut peer, &ServerFrame::Ack).expect("queue compatibility acknowledgement");
+        write_frame(&mut peer, &ServerFrame::Ack).expect("queue subscription acknowledgement");
+        let mut events = Client {
+            stream,
+            timeout,
+            started: Instant::now(),
+            submitted: false,
+        }
+        .subscribe(&Request::Subscribe { raw: false })
+        .expect("subscribe");
         assert_eq!(events.stream.read_timeout().expect("read timeout"), None);
         let _: ClientFrame = read_frame(&mut peer).expect("request");
         let event = StateEvent::DisplayChanged {
@@ -1446,6 +1569,18 @@ mod tests {
     #[test]
     fn an_incompatible_protocol_version_fails_fast() {
         assert_protocol_version_rejected(PROTOCOL_VERSION + 1);
+    }
+
+    #[test]
+    fn version_mismatch_is_rejected_before_an_unknown_payload_is_decoded() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(&[0, 0, 0, 3, 5, 255, 255]).unwrap();
+        assert!(
+            matches!(read_delivery(stream), Err(Error::Protocol(message)) if message.contains("expects 6"))
+        );
+        assert!(
+            matches!(read_frame::<ServerFrame>(&mut peer).unwrap(), ServerFrame::Error(message) if message.contains("version 5"))
+        );
     }
 
     #[test]

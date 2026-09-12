@@ -1159,6 +1159,14 @@ impl MockState {
         // The mock reads its title from shared state every time, so there's
         // nothing to invalidate — but the call still needs an expectation.
         mw.expect_invalidate_title().return_const(());
+        let s = self.clone();
+        mw.expect_retained_title().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|window| window.title.clone())
+        });
 
         let s = self.clone();
         mw.expect_is_minimized().returning(move || {

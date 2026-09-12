@@ -1,7 +1,7 @@
 //! The Spool action vocabulary.
 //!
 //! Every way of telling the window manager to do something funnels through
-//! [`Action`]: the built-in Bar, the `spool action` interface, an
+//! [`Action`]: the built-in Bar, the resource command interface, an
 //! embedded Lua `init.lua`, and the loadable Lua client module. This crate owns
 //! the types and their argv encoding ([`parse_action`] / [`Action::to_argv`]).
 
@@ -391,4 +391,28 @@ pub enum Action {
         window_id: i32,
         space_id: u64,
     },
+    /// Operates directly on an explicitly selected window, without focusing it.
+    TargetedWindow {
+        window_id: i32,
+        operation: Operation,
+    },
+    /// Resolves the focused window at execution time for a native transfer.
+    MoveFocusedWindowToSpace {
+        space_id: u64,
+        move_focus: MoveFocus,
+    },
+    /// Selects retained layout state by its owning Space and column ordinal.
+    SpaceLayout {
+        space_id: Option<u64>,
+        operation: SpaceLayoutOperation,
+    },
+}
+
+/// Space-owned arrangement; column numbers are one-based retained ordinals.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceLayoutOperation {
+    Equalize { column: Option<usize> },
+    Balance { reference_column: Option<usize> },
+    ToggleTiledVisibility,
 }

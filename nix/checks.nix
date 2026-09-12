@@ -67,6 +67,10 @@
         buildFromConfig configuration (config: config.system.build.run-test);
     in
     {
+      checks.launch-arguments =
+        let result = import ./_launch-arguments-check.nix { inherit lib pkgs self; };
+        in assert builtins.deepSeq result true;
+        pkgs.runCommand "spool-resource-launch-arguments" {} "touch $out";
       checks.darwin-module = makeTest "darwin-module" (
         { config, pkgs, ... }:
         let
@@ -101,6 +105,7 @@
               <service.json jq -e ".KeepAlive.SuccessfulExit == false"
               <service.json jq -e ".Label == \"com.wxxxcxx.spool\""
               <service.json jq -e 'has("MachServices") | not'
+              <service.json jq -e '.ProgramArguments == [.Program, "service", "run"]'
               <service.json jq -e ".ProcessType == \"Interactive\""
               <service.json jq -e ".RunAtLoad == true"
               <service.json jq -e ".StandardErrorPath == \"/tmp/spool.err.log\""

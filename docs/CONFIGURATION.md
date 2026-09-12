@@ -186,7 +186,7 @@ excluded. Windows opened afterward remain visible. Parked tiles are excluded
 from navigation and border/dim overlays. Closing or changing a parked window's
 layout ownership releases its parking state.
 
-The equivalent CLI action is `spool action window toggle tiled-visibility`.
+The equivalent CLI action is `spool space layout toggle tiled-visibility`.
 
 ### Spaces
 
@@ -197,11 +197,11 @@ commands are documented in
 [QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md).
 
 See [QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md) for the
-structured `spool query` responses and `spool subscribe` event stream.
+resource `list`/`inspect` responses and `spool session watch` event stream.
 
 ### Displays
 
-`window nextdisplay`, `window nextdisplaysend` and `mouse nextdisplay` cycle
+`window move-to-display next --follow`, `window move-to-display next --stay` and `mouse next-display` cycle
 through display positions ordered by X, then Y, with display ID breaking ties.
 Window commands start from the focused display; mouse commands start from the
 screen containing the cursor. Up/down focus and tiled movement first use the

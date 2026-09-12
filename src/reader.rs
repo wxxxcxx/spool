@@ -17,6 +17,7 @@ use crate::events::{Event, EventSender, Reply};
 /// Starts the local IPC adapter and feeds decoded requests into the world.
 pub struct RequestReader {
     events: EventSender,
+    lifecycle: crate::lifecycle::Lifecycle,
 }
 
 /// Keeps the singleton lock and Unix listener alive for the main loop.
@@ -27,8 +28,16 @@ pub struct RequestReaderGuard {
 impl RequestReader {
     /// Creates a reader that dispatches received requests through `events`.
     #[must_use]
+    #[cfg(test)]
     pub fn new(events: EventSender) -> Self {
-        Self { events }
+        Self::with_lifecycle(events, crate::lifecycle::Lifecycle::default())
+    }
+
+    pub(crate) fn with_lifecycle(
+        events: EventSender,
+        lifecycle: crate::lifecycle::Lifecycle,
+    ) -> Self {
+        Self { events, lifecycle }
     }
 
     /// Claims the unique Spool instance and starts its Unix socket listener.
@@ -37,6 +46,10 @@ impl RequestReader {
     ///
     /// Returns an error if another Spool instance is already running or the
     /// endpoint cannot be created safely.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exhaustive command/source branches share one admission or capture boundary"
+    )]
     pub fn start(self) -> Result<RequestReaderGuard> {
         self.start_with_service(&service_name())
     }
@@ -61,6 +74,10 @@ impl RequestReader {
         Ok(RequestReaderGuard { _server: guard })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "readiness and response routing share a single delivery boundary"
+    )]
     fn dispatch(&self, delivery: Delivery) {
         let Delivery {
             request,
@@ -69,7 +86,90 @@ impl RequestReader {
             subscriber,
         } = delivery;
 
+        if let Some(reason) = self.lifecycle.rejection() {
+            use crate::commands::Action;
+            use crate::lifecycle::Phase;
+            use spool_shared_types::wire::{AdmissionReceipt, Response};
+            let can_quit = self.lifecycle.phase() != Phase::Stopping;
+            let quitting = can_quit
+                && matches!(&request, Request::Command(command) if command.action == Action::Quit);
+            if let Request::Command(command) = &request {
+                if let Some(reply) = reply {
+                    let result = if quitting {
+                        self.lifecycle.set(Phase::Stopping);
+                        Ok(())
+                    } else {
+                        Err(reason.into())
+                    };
+                    _ = reply.send(&Response::Admission(AdmissionReceipt::from_result(
+                        command.request_id.clone(),
+                        result,
+                    )));
+                    if quitting {
+                        _ = self.events.send(Event::Exit);
+                    }
+                }
+            } else if let Request::Inspect(request) = &request {
+                if let Some(reply) = reply {
+                    _ = reply.send(&Response::Inspection(Box::new(
+                        spool_shared_types::inspection::Report::failure(request, reason, reason),
+                    )));
+                }
+            } else if can_quit && matches!(&request, Request::Dispatch(Action::Quit)) {
+                if let Some(acknowledgement) = acknowledgement {
+                    self.lifecycle.set(Phase::Stopping);
+                    _ = acknowledgement.accepted();
+                    _ = self.events.send(Event::Exit);
+                }
+            } else {
+                if let Some(reply) = reply {
+                    _ = reply.send(&Response::Error(reason.into()));
+                }
+                if let Some(acknowledgement) = acknowledgement {
+                    _ = acknowledgement.rejected(reason);
+                }
+            }
+            return;
+        }
+
         match request {
+            Request::Inspect(request) => answer(
+                self.events.clone(),
+                reply,
+                "resource inspection",
+                move |respond_to| Event::Inspect {
+                    request,
+                    respond_to,
+                },
+            ),
+            Request::Command(request) => {
+                let quitting = matches!(request.action, crate::commands::Action::Quit);
+                let restarting = matches!(request.action, crate::commands::Action::Restart);
+                let events = self.events.clone();
+                answer_then(
+                    self.events.clone(),
+                    reply,
+                    "command admission",
+                    move |respond_to| Event::CheckedActionRequested {
+                        request,
+                        respond_to,
+                    },
+                    move |response| {
+                        if matches!(response, spool_shared_types::wire::Response::Admission(receipt) if receipt.status == spool_shared_types::wire::AdmissionStatus::Accepted)
+                        {
+                            if quitting {
+                                _ = events.send(Event::Exit);
+                            }
+                            if restarting
+                                && let Err(error) =
+                                    crate::platform::service::Service::request_restart()
+                            {
+                                error!(%error, "unable to start admitted service restart");
+                            }
+                        }
+                    },
+                );
+            }
             Request::Dispatch(action) => {
                 acknowledge(dispatch(&self.events, action), acknowledgement, "action");
             }
@@ -114,6 +214,11 @@ impl RequestReader {
             }
             Request::Subscribe { raw } => {
                 if let Some(subscriber) = subscriber {
+                    if let Some(acknowledgement) = acknowledgement
+                        && acknowledgement.accepted().is_err()
+                    {
+                        return;
+                    }
                     _ = send(
                         &self.events,
                         Event::StateSubscribe {
@@ -172,6 +277,16 @@ fn answer(
     what: &'static str,
     request: impl FnOnce(Reply) -> Event + Send + 'static,
 ) {
+    answer_then(events, reply, what, request, |_| {});
+}
+
+fn answer_then(
+    events: EventSender,
+    reply: Option<IpcReply>,
+    what: &'static str,
+    request: impl FnOnce(Reply) -> Event + Send + 'static,
+    after_reply: impl FnOnce(&spool_shared_types::wire::Response) + Send + 'static,
+) {
     let Some(reply) = reply else {
         warn!("{what} did not use call mode");
         return;
@@ -193,6 +308,7 @@ fn answer(
                     if let Err(error) = reply.send(&response) {
                         warn!(%error, "answering {what}");
                     }
+                    after_reply(&response);
                 }
                 Err(error) => error!(%error, "waiting for {what} response"),
             }
@@ -209,6 +325,60 @@ mod tests {
     use spool_shared_types::state::{StateEvent, StateQueryKind};
     use spool_shared_types::wire::{QueryPayload, Request, Response};
     use std::thread;
+
+    #[test]
+    fn permission_wait_rejects_control_and_receipts_quit_before_exit() {
+        use crate::lifecycle::{Lifecycle, Phase};
+        use spool_shared_types::wire::{AdmissionStatus, CheckedAction};
+        let (events, receiver) = EventSender::new();
+        let lifecycle = Lifecycle::starting();
+        lifecycle.set(Phase::WaitingForPermission);
+        let endpoint = service("permission-admission");
+        let _guard = RequestReader::with_lifecycle(events, lifecycle.clone())
+            .start_with_service(&endpoint)
+            .unwrap();
+        let result = Client::connect(&endpoint)
+            .unwrap()
+            .call(&Request::Command(CheckedAction {
+                request_id: "control".into(),
+                action: Action::FocusWindow { window_id: 1 },
+            }))
+            .unwrap();
+        let Response::Admission(receipt) = result else {
+            panic!("admission")
+        };
+        assert_eq!(receipt.status, AdmissionStatus::Rejected);
+        assert_eq!(receipt.code.as_deref(), Some("not_ready"));
+        assert!(receiver.try_recv().is_err());
+        let query = Client::connect(&endpoint)
+            .unwrap()
+            .call(&Request::Query(StateQueryKind::State))
+            .unwrap();
+        assert_eq!(query, Response::Error("not_ready".into()));
+        let watch = Client::connect(&endpoint)
+            .unwrap()
+            .subscribe(&Request::Subscribe { raw: false });
+        assert!(
+            matches!(watch, Err(spool_local_ipc::Error::Remote(message)) if message == "not_ready")
+        );
+        assert!(receiver.try_recv().is_err());
+        let result = Client::connect(&endpoint)
+            .unwrap()
+            .call(&Request::Command(CheckedAction {
+                request_id: "quit".into(),
+                action: Action::Quit,
+            }))
+            .unwrap();
+        let Response::Admission(receipt) = result else {
+            panic!("admission")
+        };
+        assert_eq!(receipt.status, AdmissionStatus::Accepted);
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(Event::Exit)
+        ));
+        assert_eq!(lifecycle.phase(), Phase::Stopping);
+    }
 
     fn service(test: &str) -> String {
         format!(

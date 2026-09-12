@@ -18,6 +18,9 @@
 - [Architecture guide](ARCHITECTURE.md)
 - [Domain glossary](CONTEXT.md)
 - [Architecture decisions](adr/)
+- [Declarative, state-driven window management](adr/0006-declarative-state-driven-window-management.md)
+- [Resource CLI and native inspection design (in progress)](NATIVE_INSPECTION.md)
+- [Resource CLI implementation plan](CLI_IMPLEMENTATION_PLAN.md)
 
 ## Research
 
@@ -36,9 +39,12 @@
 
 ## Reviews
 
+- [Resource CLI and native inspection design review](reviews/resource-cli-design-review-2026-09-13.md)
 - [Main program boundary review](reviews/main-program-boundaries-2026-09-07.md)
 - [Release readiness](reviews/release-readiness.md)
 - [Code reviews and refactor reports](reviews/)
 
 See the [repository README](../README.md) for the project overview and
 [agent instructions](../AGENTS.md) for contribution conventions.
+
+- [Resource CLI implementation review](reviews/resource-cli-implementation-review-2026-09-13.md)

@@ -7,6 +7,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Represents the various types of errors that can occur within the application.
 #[derive(Clone, Debug)]
 pub enum Error {
+    /// Stable command rejection code plus diagnostic context.
+    CommandRejected { code: String, message: String },
     /// Indicates an invalid window operation or state.
     InvalidWindow,
     /// Indicates an issue with the application's configuration, with a descriptive message.
@@ -29,6 +31,26 @@ pub enum Error {
 }
 
 impl Error {
+    pub fn rejected(code: impl Into<String>) -> Self {
+        let code = code.into();
+        let message = code.replace('_', " ");
+        Self::CommandRejected { code, message }
+    }
+
+    pub fn rejection_with_cause(code: &str, cause: impl Display) -> Self {
+        Self::CommandRejected {
+            code: code.into(),
+            message: format!("{}: {cause}", code.replace('_', " ")),
+        }
+    }
+
+    pub fn admission_code(&self) -> &str {
+        match self {
+            Self::CommandRejected { code, .. } => code,
+            _ => "execution_failed",
+        }
+    }
+
     /// Creates a new `InvalidWindow` error with a debug message.
     ///
     /// # Arguments
@@ -62,6 +84,7 @@ impl Display for Error {
     /// Formats the `Error` for display, providing a user-friendly error message.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg = match self {
+            Error::CommandRejected { message, .. } => message.clone(),
             Error::InvalidWindow => "Invalid window".to_string(),
             Error::InvalidConfig(msg) => format!("Invalid configuration: {msg}"),
             Error::ConfigurationWatcher(msg) => format!("Watching config file: {msg}"),

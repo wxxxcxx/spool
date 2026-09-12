@@ -248,7 +248,9 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::WindowSetQuery { .. }
             | Event::StateSubscribe { .. }
             | Event::ScriptState { .. }
-            | Event::FocusRevalidationRequested { .. } => return Err(NotMarshallable),
+            | Event::FocusRevalidationRequested { .. }
+            | Event::CheckedActionRequested { .. }
+            | Event::Inspect { .. } => return Err(NotMarshallable),
         })
     }
 }

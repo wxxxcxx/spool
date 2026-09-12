@@ -84,25 +84,25 @@ fn tail_command(paths: &[PathBuf], args: &LogArgs) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
     use std::fs;
 
     #[test]
     fn cli_accepts_defaults_alias_follow_and_tail() {
-        let cli = crate::Spool::try_parse_from(["spool", "log"]).unwrap();
-        let Some(crate::SubCmd::Log(args)) = cli.subcmd else {
+        let cli = crate::cli::parse_from(["spool", "service", "logs"]).unwrap();
+        let crate::cli::Invocation::Service(crate::cli::ServiceCommand::Logs(args)) = cli else {
             panic!("expected log command");
         };
         assert!(!args.follow);
         assert_eq!(args.tail, "+1");
-        let cli = crate::Spool::try_parse_from(["spool", "logs", "-f", "--tail", "0"]).unwrap();
-        let Some(crate::SubCmd::Log(args)) = cli.subcmd else {
+        let cli =
+            crate::cli::parse_from(["spool", "service", "logs", "-f", "--tail", "0"]).unwrap();
+        let crate::cli::Invocation::Service(crate::cli::ServiceCommand::Logs(args)) = cli else {
             panic!("expected log command");
         };
         assert!(args.follow);
         assert_eq!(args.tail, "0");
-        assert!(crate::Spool::try_parse_from(["spool", "log", "--tail", "oops"]).is_err());
-        assert!(crate::Spool::try_parse_from(["spool", "log", "--tail=-1"]).is_err());
+        assert!(crate::cli::parse_from(["spool", "service", "logs", "--tail", "oops"]).is_err());
+        assert!(crate::cli::parse_from(["spool", "service", "logs", "--tail=-1"]).is_err());
     }
 
     #[test]

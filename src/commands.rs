@@ -10,8 +10,12 @@ use bevy::time::Time;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info};
 
+mod admission;
 mod display_navigation;
 mod query;
+mod space_layout;
+mod targeted;
+mod transfer;
 
 use display_navigation::{DisplayTarget, display_at, select_display, visible_frame};
 
@@ -84,6 +88,8 @@ type StripsWithVisibility<'w, 's> = Query<
 const MIN_RESIZABLE_WINDOW_SIZE: i32 = 100;
 
 pub fn register_commands(app: &mut bevy::app::App) {
+    crate::inspection::register(app);
+    app.init_resource::<crate::lifecycle::Lifecycle>();
     query::register_query_commands(app);
     // Empty store so the mock harness and saveless runs still have one to
     // answer from; the real app overwrites it from disk.
@@ -98,11 +104,38 @@ pub fn register_commands(app: &mut bevy::app::App) {
 
 /// A single reader owns action order. Cached systems flush their deferred
 /// changes and observers before the next action, including nested layout ops.
+#[allow(
+    clippy::too_many_lines,
+    reason = "exhaustive command/source branches share one admission or capture boundary"
+)]
 pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands: Commands) {
     use crate::ecs::native_space::apply_native_space_command;
     use crate::platform::mission_control::SystemOverview;
 
     for event in messages.read() {
+        if let Event::CheckedActionRequested {
+            request,
+            respond_to,
+        } = event
+        {
+            let request = request.clone();
+            let respond_to = respond_to.clone();
+            commands.queue(move |world: &mut bevy::prelude::World| {
+                let result = admission::execute(world, request.action);
+                let mut receipt = spool_shared_types::wire::AdmissionReceipt::from_result(
+                    request.request_id,
+                    result
+                        .as_ref()
+                        .copied()
+                        .map_err(|error| error.admission_code().to_owned()),
+                );
+                if let Err(error) = result {
+                    receipt.message = Some(error.to_string());
+                }
+                _ = respond_to.try_send(spool_shared_types::wire::Response::Admission(receipt));
+            });
+            continue;
+        }
         let Event::ActionRequested { action } = event else {
             if matches!(event, Event::LayoutSpaceRequested { .. }) {
                 commands.run_system_cached_with(apply_native_space_command, event.clone());
@@ -110,9 +143,26 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
             continue;
         };
         match action {
+            Action::SpaceLayout { .. }
+            | Action::TargetedWindow { .. }
+            | Action::MoveFocusedWindowToSpace { .. } => {
+                let action = action.clone();
+                commands.queue(move |world: &mut bevy::prelude::World| {
+                    if let Err(reason) = admission::execute(world, action) {
+                        debug!(%reason, "command rejected");
+                    }
+                });
+            }
             Action::Window(operation) => match operation {
                 Operation::Focus(_) | Operation::FocusStep(_) => {
-                    commands.run_system_cached_with(command_move_focus, operation.clone());
+                    let operation = operation.clone();
+                    commands.queue(move |world: &mut bevy::prelude::World| {
+                        match world.run_system_cached_with(command_move_focus, operation) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(reason)) => debug!(%reason, "command rejected"),
+                            Err(error) => error!(%error, "command execution failed"),
+                        }
+                    });
                 }
                 Operation::Move(direction) => {
                     commands.run_system_cached_with(command_move_window, direction.clone());
@@ -137,7 +187,15 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
                 Operation::FocusTiled => commands.run_system_cached(command_focus_tiled),
                 Operation::FocusOtherLayer => commands.run_system_cached(command_focus_other_layer),
                 Operation::ToggleTiledVisibility => {
-                    commands.run_system_cached(crate::ecs::tiled_visibility::toggle);
+                    commands.queue(|world: &mut bevy::prelude::World| {
+                        match world
+                            .run_system_cached_with(crate::ecs::tiled_visibility::toggle, None)
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(reason)) => debug!(%reason, "command rejected"),
+                            Err(error) => error!(%error, "command execution failed"),
+                        }
+                    });
                 }
             },
             Action::Mouse(MouseMove::ToNextDisplay) => {
@@ -580,6 +638,10 @@ fn log_focus_navigation(
 /// # Returns
 ///
 /// `Some(Entity)` with the entity of the newly focused window, otherwise `None`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "exhaustive command/source branches share one admission or capture boundary"
+)]
 fn command_move_focus(
     In(operation): In<Operation>,
     windows: Windows,
@@ -588,17 +650,27 @@ fn command_move_focus(
     window_manager: Res<WindowManager>,
     focus: Res<FocusCoordinator>,
     mut commands: Commands,
-) {
+) -> crate::errors::Result<()> {
     let operation = &operation;
 
     let direction = match operation {
         Operation::Focus(direction) => Some(direction),
         Operation::FocusStep(_) => None,
-        _ => return,
+        _ => return Err(crate::errors::Error::rejected("invalid_focus_operation")),
     };
 
     let navigation_strip = windows.navigable_strip(active_display.active_strip());
     let active_strip = &navigation_strip;
+    if let Some(Direction::Nth(index)) = direction {
+        let target = active_strip
+            .get(*index)
+            .ok()
+            .and_then(|column| column.top())
+            .ok_or_else(|| crate::errors::Error::rejected("column_out_of_range"))?;
+        commands.focus_entity(target, true);
+        commands.ensure_visible(target);
+        return Ok(());
+    }
 
     // On a fullscreen space, west returns to the last column in the workspace.
     if focus_from_native_fullscreen(
@@ -608,14 +680,14 @@ fn command_move_focus(
         &workspaces,
         &mut commands,
     ) {
-        return;
+        return Ok(());
     }
 
     let Some(focused_entity) = focus
         .navigation_entity(active_strip.id())
         .or_else(|| windows.focused().map(|(_, entity)| entity))
     else {
-        return;
+        return Err(crate::errors::Error::rejected("no_focused_window"));
     };
 
     log_focus_navigation(
@@ -636,11 +708,11 @@ fn command_move_focus(
             &active_display,
             &mut commands,
         );
-        return;
+        return Ok(());
     }
 
     let Some(direction) = direction else {
-        return;
+        return Ok(());
     };
 
     if windows
@@ -660,7 +732,7 @@ fn command_move_focus(
         ) {
             commands.focus_entity(entity, true);
         }
-        return;
+        return Ok(());
     }
 
     // If focus is on a window that no longer lives in the active strip
@@ -706,7 +778,7 @@ fn command_move_focus(
         // missing amount; the confirmed-focus path remains responsible for
         // border/dim state and any configured auto-centering.
         commands.ensure_visible(entity);
-        return;
+        return Ok(());
     }
 
     if let Some(target) = DisplayTarget::from_direction(direction) {
@@ -715,6 +787,7 @@ fn command_move_focus(
             (Some(active_display.display().id()), target),
         );
     }
+    Ok(())
 }
 
 pub(crate) fn command_focus_floating(
@@ -1559,7 +1632,7 @@ fn move_to_display(
             .find(|candidate| eligible(*candidate))
     });
 
-    transactions.submit_display_move(
+    _ = transactions.submit_display_move(
         DisplayMovePlan {
             members,
             target,
@@ -1578,24 +1651,55 @@ fn move_to_display(
     );
 }
 
-/// Moves the mouse pointer to the next available display.
-#[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn focus_other_display(
+#[derive(bevy::ecs::system::SystemParam)]
+struct MouseContext<'w, 's> {
+    windows: Windows<'w, 's>,
+    layout_strips:
+        Query<'w, 's, (&'static LayoutStrip, &'static ChildOf), Without<PendingSpaceDestruction>>,
+    displays: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static Display,
+            Option<&'static crate::ecs::DockPosition>,
+        ),
+    >,
+    topology: ResMut<'w, NativeTopology>,
+    window_manager: Res<'w, WindowManager>,
+    config: Res<'w, Config>,
+    commands: Commands<'w, 's>,
+}
+
+/// The typed legacy adapter uses the same resolved execution path.
+fn focus_other_display(input: In<(Option<u32>, DisplayTarget)>, context: MouseContext) {
+    if let Err(reason) = checked_focus_other_display(input, context) {
+        debug!(%reason,"mouse command rejected");
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "validates source and destination before a single mouse effect"
+)]
+fn checked_focus_other_display(
     In((source, target)): In<(Option<u32>, DisplayTarget)>,
-    windows: Windows,
-    layout_strips: Query<(&LayoutStrip, &ChildOf), Without<PendingSpaceDestruction>>,
-    displays: Query<(Entity, &Display, Option<&crate::ecs::DockPosition>)>,
-    mut topology: ResMut<NativeTopology>,
-    window_manager: Res<WindowManager>,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
+    context: MouseContext,
+) -> crate::errors::Result<()> {
+    let MouseContext {
+        windows,
+        layout_strips,
+        displays,
+        mut topology,
+        window_manager,
+        config,
+        mut commands,
+    } = context;
     if !topology.refresh_for_command(&window_manager) {
-        return;
+        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
     }
     if source.is_some_and(|id| topology.active_display() != Some(id)) {
-        return;
+        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
     }
     let Some(source_id) = source.or_else(|| {
         display_at(
@@ -1603,19 +1707,19 @@ fn focus_other_display(
             topology.known_displays().map(|(display, _)| display),
         )
     }) else {
-        return;
+        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
     };
     let Some(target_id) = select_display(
         source_id,
         target,
         topology.known_displays().map(|(display, _)| display),
     ) else {
-        return;
+        return Ok(());
     };
     for id in [source_id, target_id] {
         let mut matches = displays.iter().filter(|(_, display, _)| display.id() == id);
         let Some((_, display, _)) = matches.next() else {
-            return;
+            return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
         };
         if matches.next().is_some()
             || !topology
@@ -1625,32 +1729,32 @@ fn focus_other_display(
                 .visible_space(id)
                 .is_none_or(|space| topology.visible_display_for_space(space) != Some(id))
         {
-            return;
+            return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
         }
     }
     let Some((display_entity, other, dock)) = displays
         .iter()
         .find(|(_, display, _)| display.id() == target_id)
     else {
-        return;
+        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
     };
     let Some(viewport) = other.checked_actual_display_bounds(dock, &config) else {
-        return;
+        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
     };
     let Some(space_id) = topology.visible_space(target_id) else {
-        return;
+        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
     };
     let mut matches = layout_strips
         .iter()
         .filter(|(strip, _)| strip.id() == space_id);
     let Some((other_strip, child)) = matches.next() else {
-        return;
+        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
     };
     if matches.next().is_some() || child.parent() != display_entity {
-        return;
+        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
     }
     let Ok(memberships) = topology.observe_memberships(&window_manager) else {
-        return;
+        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
     };
     let candidate = other_strip
         .all_windows()
@@ -1675,6 +1779,7 @@ fn focus_other_display(
     if let Some((entity, _, _)) = candidate {
         commands.focus_entity(entity, true);
     }
+    Ok(())
 }
 
 /// Distributes heights equally among all windows in the currently focused stack.

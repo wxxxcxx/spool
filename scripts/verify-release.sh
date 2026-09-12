@@ -42,11 +42,11 @@ build_candidate() {
 
 build_candidate without-lua --no-default-features
 build_candidate default
-"$artifacts/default/spool" script --help >/dev/null
+"$artifacts/default/spool" script run --help >/dev/null
 
 cargo build -p spool-lua --lib --target "$host" --release --no-default-features --features module --locked
 install -m 755 "$CARGO_TARGET_DIR/$host/release/libspool_lua.dylib" "$artifacts/lua/spool.so"
-"$artifacts/default/spool" script "$repo_root/scripts/verify-lua-module.lua" -- "$artifacts/lua/spool.so"
+"$artifacts/default/spool" script run "$repo_root/scripts/verify-lua-module.lua" -- "$artifacts/lua/spool.so"
 (
   cd "$artifacts"
   shasum -a 256 default/spool without-lua/spool lua/spool.so >SHA256SUMS

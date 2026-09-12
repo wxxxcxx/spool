@@ -2450,9 +2450,9 @@ fn test_dont_focus() {
 }
 
 #[test]
-fn test_focus_window_by_number() {
-    assert!(parse_action(&["window", "focus", "0"]).is_err());
-    let action = parse_action(&["window", "focus", "2"]).unwrap();
+fn test_focus_window_by_ordinal() {
+    assert!(parse_action(&["window", "focus", "--nth", "0"]).is_err());
+    let action = parse_action(&["window", "focus", "--nth", "2"]).unwrap();
 
     TestHarness::new()
         .with_windows(3)

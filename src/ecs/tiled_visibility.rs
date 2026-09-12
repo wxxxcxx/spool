@@ -1,17 +1,17 @@
 //! Action-owned parking is separate from native hiding/minimization: retained
 //! strip membership preserves columns, stacks and tabs while geometry moves.
 use bevy::prelude::*;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::focus::{FocusCoordinator, FocusSignal};
 use super::layout::LayoutStrip;
-use super::params::{ActiveDisplay, Windows};
+use super::params::Windows;
 use super::topology::NativeTopology;
 use super::{
     Floating, Initializing, LayoutPosition, MissionControlActive, SpawnCommandsExt,
     WindowVisibility,
 };
-use crate::manager::WindowManager;
+use crate::manager::{Display, WindowManager};
 use crate::platform::WorkspaceId;
 
 #[derive(Component)]
@@ -80,37 +80,64 @@ fn parking_side(
 pub(crate) struct RestoringTile(bool);
 
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "validate all parked members before publishing one toggle"
+)]
 pub(crate) fn toggle(
-    active: ActiveDisplay,
+    In(selected_space): In<Option<WorkspaceId>>,
+    strips: Query<(&LayoutStrip, &ChildOf, Has<super::ActiveWorkspaceMarker>)>,
+    displays: Query<&Display>,
     windows: Windows,
     parked: Query<(Entity, &ParkedTile)>,
-    topology: Res<NativeTopology>,
+    mut topology: ResMut<NativeTopology>,
     manager: Res<WindowManager>,
     focus: Res<FocusCoordinator>,
     overview: Option<Res<MissionControlActive>>,
     initializing: Option<Res<Initializing>>,
     exiting: Option<Res<super::exit_restore::ExitInProgress>>,
     mut commands: Commands,
-) {
-    let space = active.active_strip().id();
+) -> crate::errors::Result<()> {
+    let mut matches = strips
+        .iter()
+        .filter(|(strip, _, active)| selected_space.map_or(*active, |id| strip.id() == id));
+    let (strip, parent, _) = matches
+        .next()
+        .ok_or_else(|| crate::errors::Error::rejected("layout_not_found"))?;
+    if matches.next().is_some() {
+        return Err(crate::errors::Error::rejected("ambiguous_layout"));
+    }
+    let display = displays
+        .get(parent.parent())
+        .map_err(|error| crate::errors::Error::rejection_with_cause("display_not_found", error))?;
+    let space = strip.id();
+    if !topology.refresh_for_command(&manager) {
+        return Err(crate::errors::Error::rejected("topology_unresolved"));
+    }
     if initializing.is_some()
         || exiting.is_some()
         || overview.is_some_and(|overview| overview.0)
-        || active.fullscreen().is_some()
-        || topology.visible_space(active.display().id()) != Some(space)
+        || topology.is_fullscreen(space)
+        || topology.visible_display_for_space(space) != Some(display.id())
     {
-        return;
+        return Err(crate::errors::Error::rejected("space_not_writable"));
     }
-    let Ok(membership) = topology.observe_memberships(&manager).inspect_err(|error| {
-        warn!(%error, "unable to resolve Space for tiled visibility toggle");
-    }) else {
-        return;
-    };
+    let membership = topology.observe_memberships(&manager).map_err(|error| {
+        crate::errors::Error::rejection_with_cause("native_operation_rejected", error)
+    })?;
     let owned = parked
         .iter()
         .filter(|(_, parked)| parked.space == space)
         .collect::<Vec<_>>();
     if !owned.is_empty() {
+        if owned.iter().any(|(entity, _)| {
+            !windows.layout_is_writable(*entity)
+                || windows
+                    .get(*entity)
+                    .is_none_or(|window| membership.unique_space(window.id()) != Some(space))
+        }) {
+            return Err(crate::errors::Error::rejected("window_unavailable"));
+        }
         for (entity, parked) in owned {
             let Some((window, _, state)) = windows.get_tracked(entity) else {
                 continue;
@@ -131,13 +158,14 @@ pub(crate) fn toggle(
                 space, "restoring action-parked tile"
             );
         }
-        return;
+        return Ok(());
     }
 
     let focused = focus.snapshot().confirmed_entity();
-    let anchor = parking_anchor(&windows, &focus, active.active_strip(), active.bounds());
+    let anchor = parking_anchor(&windows, &focus, strip, display.bounds());
     let mut hid_focus = false;
-    for entity in active.active_strip().all_windows() {
+    let mut proposed = Vec::new();
+    for entity in strip.all_windows() {
         let Some((window, _, state)) = windows.get_tracked(entity) else {
             continue;
         };
@@ -151,19 +179,20 @@ pub(crate) fn toggle(
             continue;
         }
         let restore_focus = focused == Some(entity);
-        let (Ok(index), Some(frame)) = (
-            active.active_strip().index_of(entity),
-            windows.moving_frame(entity),
-        ) else {
+        let (Ok(index), Some(frame)) = (strip.index_of(entity), windows.moving_frame(entity))
+        else {
             continue;
         };
-        let side = parking_side(index, anchor, frame, active.bounds());
+        let side = parking_side(index, anchor, frame, display.bounds());
         hid_focus |= restore_focus;
-        commands.entity(entity).insert(ParkedTile {
-            space,
-            restore_focus,
-            side,
-        });
+        proposed.push((
+            entity,
+            ParkedTile {
+                space,
+                restore_focus,
+                side,
+            },
+        ));
         debug!(
             window_id = window.id(),
             space,
@@ -171,9 +200,13 @@ pub(crate) fn toggle(
             "parking tile at screen edge"
         );
     }
+    for (entity, parked) in proposed {
+        commands.entity(entity).insert(parked);
+    }
     if hid_focus {
         commands.run_system_cached(crate::commands::command_focus_floating);
     }
+    Ok(())
 }
 
 /// Focus only after the normal physical target has replaced the parking target.

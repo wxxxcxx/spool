@@ -7,7 +7,7 @@ This guide distinguishes two kinds of script:
 - A **configuration script** is the long-lived `init.lua` described below. It
   declares configuration and registers callbacks inside the daemon's Lua
   worker.
-- A **client script** is an on-demand program run with `spool script`. It gets
+- A **client script** is an on-demand program run with `spool script run`. It gets
   the socket-backed query, state, command, window-set, and subscription
   interfaces, but not `setup`, `bind`, or `on`. Each invocation uses a fresh
   Lua runtime in the CLI process, so it cannot block or mutate the
@@ -15,9 +15,9 @@ This guide distinguishes two kinds of script:
   including the default build.
 
 ```shell
-spool script task.lua -- first-argument second-argument
-spool script -e 'print(spool.query_active().focused_window_title)'
-printf 'print(spool.state.get("mode"))' | spool script -
+spool script run task.lua -- first-argument second-argument
+spool script run -e 'print(spool.query_active().focused_window_title)'
+printf 'print(spool.state.get("mode"))' | spool script run -
 ```
 
 Arguments after `--` are available as `arg[1]`, `arg[2]`, and so on; `arg[0]`
@@ -60,7 +60,7 @@ Builds without the `lua` feature use built-in defaults only.
 
 ```lua
 spool.on("window_focused", function(event, ws)
-  spool.run("window balance")
+  spool.run("space layout balance")
 end)
 
 spool.bind("alt+j", spool.action.window.focus_east)
@@ -181,7 +181,7 @@ end)
 
 ## 4. Querying State
 
-Inside a `spool.on` handler or a `spool.bind` callback, the script can read the same state documents `spool query …` returns — no round trip, no `io.popen`:
+Inside a `spool.on` handler or a `spool.bind` callback, the script can read the stable typed v3 state documents (independent of the resource CLI envelope) — no round trip, no `io.popen`:
 
 ```lua
 spool.on("window_focused", function(event, ws)
@@ -244,8 +244,8 @@ Reach for `mutate` whenever the new value depends on the old one. It reads, runs
 Keys are plain strings; values can be strings, numbers, booleans, or JSON-shaped tables. The store is saved in `$XDG_STATE_HOME/spool/script-state.json`. A client script reads and writes the same store:
 
 ```shell
-spool script -e 'print(spool.state.get("pads.term"))'
-spool script -e 'spool.state.set("mode", "compact")'
+spool script run -e 'print(spool.state.get("pads.term"))'
+spool script run -e 'spool.state.set("mode", "compact")'
 ```
 
 Keys must be nonempty and at most 512 bytes. Numbers must be finite. Values may

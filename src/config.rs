@@ -1570,7 +1570,7 @@ fn test_parse_resize_commands() {
 #[test]
 fn test_parse_restart_command() {
     assert!(matches!(
-        parse_action(&["restart"]).unwrap(),
+        parse_action(&["service", "restart"]).unwrap(),
         Action::Restart
     ));
 }

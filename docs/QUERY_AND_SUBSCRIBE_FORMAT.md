@@ -4,40 +4,22 @@ Spool exposes its macOS Space model over its local Unix socket. A Space's
 `space_id` is the identity used by commands and integrations; `ordinal` is only
 its current zero-based order on one display.
 
-## CLI output modes
+## Resource CLI and typed state
 
-Without an option, `query` prints the main fields as tab-separated tables.
-`subscribe` prints this header once and then one tab-separated summary row per
-event:
+The public read commands are resource `list` and `inspect`; events use
+`spool session watch [--json] [--raw]`. CLI reads use the versioned envelope in
+[the CLI contract](CLI_IMPLEMENTATION_PLAN.md), with independently collected
+native data documented in [Native inspection](NATIVE_INSPECTION.md).
+
+The v3 state shapes below remain the **typed Lua query and watch event** contract.
+They are not the new resource-read JSON envelope. Lua `query_state`,
+`query_spaces`, `query_active`, and `query_on_screen` remain available.
+
+Watch JSON is newline-delimited. Its default summary escapes tabs/newlines and
+uses `-` for missing cells:
 
 ```text
 EVENT\tDISPLAY_ID\tSPACE_ID\tWINDOW_ID\tBUNDLE_ID\tTITLE\tDETAILS
-```
-
-Tabs, carriage returns, and line feeds inside textual values are replaced with
-spaces so every event remains exactly one row. Missing values are printed as
-`-`. The complete-state summary is split into `ACTIVE`, `CAPABILITIES`,
-`DISPLAYS`, `SPACES`, and `WINDOWS` sections. Partial queries print only their
-relevant table.
-
-```shell
-spool query state
-spool query spaces
-spool query active
-spool query on-screen
-spool subscribe
-```
-
-Pass `--json` for the complete machine-readable data model. Query results are
-one JSON value; subscriptions are newline-delimited JSON with one object per
-event:
-
-```shell
-spool query state --json
-spool query spaces --json
-spool query active --json
-spool query on-screen --json
-spool subscribe --json
 ```
 
 State-change notifications are coalesced invalidations. In particular, the
@@ -49,8 +31,8 @@ For diagnostics, add `--raw`. Raw mode keeps the stable notifications and also
 prints each uncoalesced source event received by the daemon:
 
 ```shell
-spool subscribe --raw
-spool subscribe --json --raw
+spool session watch --raw
+spool session watch --json --raw
 ```
 
 Raw events are intentionally noisy and are not a stable automation interface.
@@ -60,7 +42,7 @@ The remainder of this document defines that full JSON contract.
 
 ## Complete state
 
-`spool query state --json` returns:
+`spool session inspect --json` returns:
 
 ```json
 {
@@ -157,11 +139,11 @@ when the subscription requested `--raw`.
 Use IDs obtained from `query spaces`, never ordinal positions:
 
 ```shell
-spool action space focus SPACE_ID
-spool action window move-to-space WINDOW_ID SPACE_ID stay
-spool action window move-to-space WINDOW_ID SPACE_ID follow
-spool action space create DISPLAY_ID
-spool action space delete SPACE_ID
+spool space focus SPACE_ID
+spool window move-to-space WINDOW_ID SPACE_ID stay
+spool window move-to-space WINDOW_ID SPACE_ID follow
+spool space create DISPLAY_ID
+spool space delete SPACE_ID
 ```
 
 The CLI checks capabilities before dispatching these actions. In the current

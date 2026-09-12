@@ -1,13 +1,14 @@
-//! The argv encoding of an [`Action`]: `["window", "focus", "east"]`.
+//! The tokens encoding of an [`Action`]: `["window", "focus", "east"]`.
 //!
-//! This is the argument shape of `spool action` and Lua's `spool.run`, so parsing and formatting live
+//! This is the resource control argument shape shared by the CLI and Lua's `spool.run`, so parsing and formatting live
 //! together here and are checked against each other by round-trip tests.
 
 use crate::commands::{
     Action, Direction, FocusStep, MouseMove, MoveFocus, Operation, ResizeAxis, ResizeDirection,
+    SpaceLayoutOperation,
 };
 
-/// Why an argv vector is not an action. Consumers wrap this in their own error
+/// Why an tokens vector is not an action. Consumers wrap this in their own error
 /// type; the message is already user-facing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError(String);
@@ -17,8 +18,8 @@ impl ParseError {
         Self(message.into())
     }
 
-    fn invalid(argv: &[&str]) -> Self {
-        Self(format!("invalid action '{argv:?}'"))
+    fn invalid(tokens: &[&str]) -> Self {
+        Self(format!("invalid action '{tokens:?}'"))
     }
 }
 
@@ -37,240 +38,382 @@ type Result<T> = std::result::Result<T, ParseError>;
 ///
 /// # Errors
 ///
-/// Returns [`ParseError`] if `argv` is not a recognized action encoding.
-pub fn parse_action(argv: &[&str]) -> Result<Action> {
-    let action = *argv.first().unwrap_or(&"");
-    Ok(match action {
-        "printstate" => Action::PrintState,
-        "reconcile-windows" => Action::ReconcileWindows,
-        "mission-control" if argv.len() == 1 => Action::MissionControl,
-        "show-desktop" if argv.len() == 1 => Action::ShowDesktop,
-        "bar" => parse_bar_action(&argv[1..])?,
-        "window" => parse_window_action(&argv[1..])?,
-        "space" => parse_space_action(&argv[1..])?,
-        "mouse" => Action::Mouse(parse_mouse_move(&argv[1..])?),
-        "quit" => Action::Quit,
-        "restart" => Action::Restart,
-        _ => return Err(ParseError::new(format!("unhandled action '{argv:?}'"))),
-    })
-}
-
-fn parse_i32(input: &str, what: &str) -> Result<i32> {
-    input
-        .parse()
-        .map_err(|_| ParseError::new(format!("invalid {what} '{input}'")))
-}
-
-fn parse_u32(input: &str, what: &str) -> Result<u32> {
-    input
-        .parse()
-        .map_err(|_| ParseError::new(format!("invalid {what} '{input}'")))
-}
-
-fn parse_u64(input: &str, what: &str) -> Result<u64> {
-    input
-        .parse()
-        .map_err(|_| ParseError::new(format!("invalid {what} '{input}'")))
-}
-
-fn parse_window_action(argv: &[&str]) -> Result<Action> {
-    match *argv.first().unwrap_or(&"") {
-        "focusid" if argv.len() == 2 => Ok(Action::FocusWindow {
-            window_id: parse_i32(argv[1], "window id")?,
+/// Returns [`ParseError`] if `tokens` is not a recognized action encoding.
+pub fn parse_action(tokens: &[&str]) -> Result<Action> {
+    match tokens {
+        ["service", "quit"] => Ok(Action::Quit),
+        ["service", "restart"] => Ok(Action::Restart),
+        ["service", "dump-state"] => Ok(Action::PrintState),
+        ["window", "reconcile"] => Ok(Action::ReconcileWindows),
+        ["session", "mission-control"] => Ok(Action::MissionControl),
+        ["session", "show-desktop"] => Ok(Action::ShowDesktop),
+        ["bar", "toggle-collapse"] => Ok(Action::ToggleBarCollapse),
+        ["mouse", "next-display"] => Ok(Action::Mouse(MouseMove::ToNextDisplay)),
+        ["window", rest @ ..] => parse_window_action(rest),
+        ["space", "layout", rest @ ..] => parse_layout_action(rest),
+        ["space", "focus", id] => Ok(Action::FocusSpace {
+            space_id: positive(id, "Space ID")?,
         }),
-        "focus-in-space" if argv.len() == 3 => Ok(Action::FocusWindowInSpace {
-            window_id: parse_i32(argv[1], "window id")?,
-            space_id: parse_u64(argv[2], "space id")?,
+        ["space", "delete", id] => Ok(Action::DeleteSpace {
+            space_id: positive(id, "Space ID")?,
         }),
-        "move-to-space" if argv.len() == 4 => {
-            let move_focus = match argv[3] {
-                "follow" => MoveFocus::Follow,
-                "stay" => MoveFocus::Stay,
-                other => {
-                    return Err(ParseError::new(format!(
-                        "invalid move focus behavior '{other}'"
-                    )));
-                }
-            };
-            Ok(Action::MoveWindowToSpace {
-                window_id: parse_i32(argv[1], "window id")?,
-                space_id: parse_u64(argv[2], "space id")?,
-                move_focus,
-            })
+        ["space", "create", "--display", id] => Ok(Action::CreateSpace {
+            display_id: positive(id, "display ID")?,
+        }),
+        _ => Err(ParseError::invalid(tokens)),
+    }
+}
+
+fn positive<T: std::str::FromStr + PartialOrd + Default>(value: &str, name: &str) -> Result<T> {
+    value
+        .parse::<T>()
+        .ok()
+        .filter(|n| *n > T::default())
+        .ok_or_else(|| ParseError::new(format!("{name} must be a positive integer: '{value}'")))
+}
+
+type Options<'a> = std::collections::BTreeMap<&'a str, &'a str>;
+
+fn options<'a>(
+    tokens: &[&'a str],
+    values: &[&str],
+    flags: &[&str],
+) -> Result<(Vec<&'a str>, Options<'a>)> {
+    let mut positional = Vec::new();
+    let mut options = Options::new();
+    let mut args = tokens.iter().copied();
+    while let Some(arg) = args.next() {
+        if values.contains(&arg) {
+            let value = args
+                .next()
+                .filter(|v| !v.starts_with("--"))
+                .ok_or_else(|| ParseError::new(format!("missing value for {arg}")))?;
+            if options.insert(arg, value).is_some() {
+                return Err(ParseError::new(format!("duplicate {arg}")));
+            }
+        } else if flags.contains(&arg) {
+            if options.insert(arg, "").is_some() {
+                return Err(ParseError::new(format!("duplicate {arg}")));
+            }
+        } else if arg.starts_with('-') {
+            return Err(ParseError::new(format!("unsupported option {arg}")));
+        } else {
+            positional.push(arg);
         }
-        _ => Ok(Action::Window(parse_operation(argv)?)),
+    }
+    Ok((positional, options))
+}
+
+fn move_focus(options: &Options<'_>) -> Result<MoveFocus> {
+    match (
+        options.contains_key("--follow"),
+        options.contains_key("--stay"),
+    ) {
+        (true, false) => Ok(MoveFocus::Follow),
+        (false, true) => Ok(MoveFocus::Stay),
+        _ => Err(ParseError::new("specify exactly one of --follow or --stay")),
     }
 }
 
-fn parse_space_action(argv: &[&str]) -> Result<Action> {
-    match argv {
-        ["focus", space_id] => Ok(Action::FocusSpace {
-            space_id: parse_u64(space_id, "space id")?,
-        }),
-        ["create", display_id] => Ok(Action::CreateSpace {
-            display_id: parse_u32(display_id, "display id")?,
-        }),
-        ["delete", space_id] => Ok(Action::DeleteSpace {
-            space_id: parse_u64(space_id, "space id")?,
-        }),
-        _ => Err(ParseError::invalid(argv)),
-    }
-}
-
-/// Parses a window operation (e.g. `["focus", "east"]`).
-fn parse_operation(argv: &[&str]) -> Result<Operation> {
-    if argv == ["focus", "other", "layer"] {
-        return Ok(Operation::FocusOtherLayer);
-    }
-
-    let action = *argv.first().unwrap_or(&"");
-    let err = || ParseError::invalid(argv);
-    let argument = || argv.get(1).ok_or_else(err).copied();
-
-    Ok(match action {
-        "focus" => match argument()? {
+fn parse_window_action(tokens: &[&str]) -> Result<Action> {
+    let (args, opts) = options(
+        tokens,
+        &["--window", "--space", "--nth"],
+        &["--follow", "--stay"],
+    )?;
+    let window_id = opts
+        .get("--window")
+        .map(|v| positive(v, "window ID"))
+        .transpose()?;
+    if args.first() == Some(&"focus") {
+        if window_id.is_some() || opts.contains_key("--follow") || opts.contains_key("--stay") {
+            return Err(ParseError::invalid(tokens));
+        }
+        if let Some(nth) = opts.get("--nth") {
+            if args.len() != 1 || opts.len() != 1 {
+                return Err(ParseError::invalid(tokens));
+            }
+            let ordinal: usize = positive(nth, "window ordinal")?;
+            return Ok(Action::Window(Operation::Focus(Direction::Nth(
+                ordinal - 1,
+            ))));
+        }
+        let [_, target] = args.as_slice() else {
+            return Err(ParseError::invalid(tokens));
+        };
+        if let Ok(window_id) = positive::<i32>(target, "window ID") {
+            return match opts.get("--space") {
+                Some(space) => Ok(Action::FocusWindowInSpace {
+                    window_id,
+                    space_id: positive(space, "Space ID")?,
+                }),
+                None => Ok(Action::FocusWindow { window_id }),
+            };
+        }
+        if !opts.is_empty() {
+            return Err(ParseError::invalid(tokens));
+        }
+        return Ok(Action::Window(match *target {
             "floating" => Operation::FocusFloating,
             "tiled" => Operation::FocusTiled,
             "other-layer" => Operation::FocusOtherLayer,
             "next" => Operation::FocusStep(FocusStep::Next),
             "previous" => Operation::FocusStep(FocusStep::Previous),
-            direction => Operation::Focus(Direction::parse_positional(direction)?),
-        },
-        "move" => Operation::Move(Direction::parse(argument()?)?),
-        "center" => Operation::Center,
-        "grow" | "shrink" => {
-            if argv.len() != 2 {
-                return Err(err());
-            }
-            Operation::Resize {
-                axis: ResizeAxis::parse(argument()?)?,
-                direction: ResizeDirection::parse(action)?,
-            }
+            other => Operation::Focus(Direction::parse(other)?),
+        }));
+    }
+    if opts.contains_key("--space") || opts.contains_key("--nth") {
+        return Err(ParseError::invalid(tokens));
+    }
+    let operation = match args.as_slice() {
+        ["move-to-space", space] => {
+            let space_id = positive(space, "Space ID")?;
+            let move_focus = move_focus(&opts)?;
+            return Ok(match window_id {
+                Some(window_id) => Action::MoveWindowToSpace {
+                    window_id,
+                    space_id,
+                    move_focus,
+                },
+                None => Action::MoveFocusedWindowToSpace {
+                    space_id,
+                    move_focus,
+                },
+            });
         }
-        "maximize" => Operation::Maximize,
-        "toggle" => match argument()? {
-            "floating" => Operation::ToggleFloating,
-            "stack" => Operation::ToggleStack,
-            "tiled-visibility" => Operation::ToggleTiledVisibility,
-            _ => return Err(err()),
+        ["move-to-display", "next"] => Operation::ToNextDisplay(move_focus(&opts)?),
+        _ => {
+            if opts.contains_key("--follow") || opts.contains_key("--stay") {
+                return Err(ParseError::invalid(tokens));
+            }
+            parse_operation(&args)?
+        }
+    };
+    Ok(match window_id {
+        Some(window_id) => Action::TargetedWindow {
+            window_id,
+            operation,
         },
-        "equalize" => Operation::Equalize,
-        "balance" => Operation::Balance,
-        "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
-        "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
-        "snap" => Operation::Snap,
-        _ => return Err(err()),
+        None => Action::Window(operation),
     })
 }
 
-/// Parses a mouse action (e.g. `["nextdisplay"]`).
-fn parse_bar_action(argv: &[&str]) -> Result<Action> {
-    match *argv.first().unwrap_or(&"") {
-        "toggle-collapse" => Ok(Action::ToggleBarCollapse),
-        _ => Err(ParseError::new(format!("invalid bar action '{argv:?}'"))),
-    }
+fn parse_operation(tokens: &[&str]) -> Result<Operation> {
+    Ok(match tokens {
+        ["move", direction] => Operation::Move(Direction::parse(direction)?),
+        ["center"] => Operation::Center,
+        [direction @ ("grow" | "shrink"), axis] => Operation::Resize {
+            axis: ResizeAxis::parse(axis)?,
+            direction: ResizeDirection::parse(direction)?,
+        },
+        ["maximize"] => Operation::Maximize,
+        ["snap"] => Operation::Snap,
+        ["toggle", "floating"] => Operation::ToggleFloating,
+        ["toggle", "stack"] => Operation::ToggleStack,
+        _ => return Err(ParseError::invalid(tokens)),
+    })
 }
 
-fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
-    match *argv.first().unwrap_or(&"") {
-        "nextdisplay" => Ok(MouseMove::ToNextDisplay),
-        _ => Err(ParseError::new(format!("invalid mouse action '{argv:?}'"))),
+fn parse_layout_action(tokens: &[&str]) -> Result<Action> {
+    let (args, opts) = options(tokens, &["--space", "--column", "--reference-column"], &[])?;
+    let space_id = opts
+        .get("--space")
+        .map(|v| positive(v, "Space ID"))
+        .transpose()?;
+    let operation = match args.as_slice() {
+        ["equalize"] if !opts.contains_key("--reference-column") => {
+            SpaceLayoutOperation::Equalize {
+                column: opts
+                    .get("--column")
+                    .map(|v| positive(v, "column ordinal"))
+                    .transpose()?,
+            }
+        }
+        ["balance"] if !opts.contains_key("--column") => SpaceLayoutOperation::Balance {
+            reference_column: opts
+                .get("--reference-column")
+                .map(|v| positive(v, "column ordinal"))
+                .transpose()?,
+        },
+        ["toggle", "tiled-visibility"]
+            if !opts.contains_key("--column") && !opts.contains_key("--reference-column") =>
+        {
+            SpaceLayoutOperation::ToggleTiledVisibility
+        }
+        _ => return Err(ParseError::invalid(tokens)),
+    };
+    if opts.is_empty() {
+        return Ok(Action::Window(match operation {
+            SpaceLayoutOperation::Equalize { .. } => Operation::Equalize,
+            SpaceLayoutOperation::Balance { .. } => Operation::Balance,
+            SpaceLayoutOperation::ToggleTiledVisibility => Operation::ToggleTiledVisibility,
+        }));
     }
+    Ok(Action::SpaceLayout {
+        space_id,
+        operation,
+    })
 }
 
 impl Action {
-    /// The argv encoding of this action, as understood by [`parse_action`].
-    ///
-    /// Internal-only actions have no encoding and yield `None`.
+    /// The resource tokens encoding shared by CLI controls and Lua's `spool.run`.
+    /// Internal-only actions have no public encoding.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exhaustive command/source branches share one admission or capture boundary"
+    )]
     pub fn to_argv(&self) -> Option<Vec<String>> {
-        let argv = match self {
-            Action::Window(operation) => {
-                let mut argv = vec!["window".to_string()];
-                argv.extend(operation.to_argv());
-                argv
+        let owned = |tokens: &[&str]| tokens.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let follow = |value: &MoveFocus| match value {
+            MoveFocus::Follow => "--follow",
+            MoveFocus::Stay => "--stay",
+        };
+        Some(match self {
+            Self::Window(Operation::SetWidth(_))
+            | Self::Lua(_)
+            | Self::Layout(_)
+            | Self::ReorderColumn { .. }
+            | Self::MoveColumnToSpace { .. } => return None,
+
+            Self::Window(Operation::Equalize) => owned(&["space", "layout", "equalize"]),
+            Self::Window(Operation::Balance) => owned(&["space", "layout", "balance"]),
+            Self::Window(Operation::ToggleTiledVisibility) => {
+                owned(&["space", "layout", "toggle", "tiled-visibility"])
             }
-            Action::Mouse(MouseMove::ToNextDisplay) => {
-                vec!["mouse".to_string(), "nextdisplay".to_string()]
+            Self::Window(operation) => {
+                let mut tokens = owned(&["window"]);
+                tokens.extend(operation.to_argv());
+                tokens
             }
-            Action::FocusWindow { window_id } => {
-                vec![
-                    "window".to_string(),
-                    "focusid".to_string(),
-                    window_id.to_string(),
-                ]
+            Self::TargetedWindow {
+                window_id,
+                operation,
+            } => {
+                if !matches!(
+                    operation,
+                    Operation::Move(_)
+                        | Operation::Center
+                        | Operation::Resize { .. }
+                        | Operation::Maximize
+                        | Operation::Snap
+                        | Operation::ToggleFloating
+                        | Operation::ToggleStack
+                        | Operation::ToNextDisplay(_)
+                ) {
+                    return None;
+                }
+                let mut tokens = Self::Window(operation.clone()).to_argv()?;
+                tokens.extend(["--window".into(), window_id.to_string()]);
+                tokens
             }
-            Action::FocusSpace { space_id } => vec![
-                "space".to_string(),
-                "focus".to_string(),
-                space_id.to_string(),
-            ],
-            Action::FocusWindowInSpace {
+            Self::SpaceLayout {
+                space_id,
+                operation,
+            } => {
+                let mut tokens = owned(&["space", "layout"]);
+                match operation {
+                    SpaceLayoutOperation::Equalize { column } => {
+                        tokens.push("equalize".into());
+                        if let Some(n) = column {
+                            tokens.extend(["--column".into(), n.to_string()]);
+                        }
+                    }
+                    SpaceLayoutOperation::Balance { reference_column } => {
+                        tokens.push("balance".into());
+                        if let Some(n) = reference_column {
+                            tokens.extend(["--reference-column".into(), n.to_string()]);
+                        }
+                    }
+                    SpaceLayoutOperation::ToggleTiledVisibility => {
+                        tokens.extend(owned(&["toggle", "tiled-visibility"]));
+                    }
+                }
+                if let Some(id) = space_id {
+                    tokens.extend(["--space".into(), id.to_string()]);
+                }
+                tokens
+            }
+            Self::Mouse(MouseMove::ToNextDisplay) => owned(&["mouse", "next-display"]),
+            Self::FocusWindow { window_id } => {
+                vec!["window".into(), "focus".into(), window_id.to_string()]
+            }
+            Self::FocusWindowInSpace {
                 window_id,
                 space_id,
             } => vec![
-                "window".to_string(),
-                "focus-in-space".to_string(),
+                "window".into(),
+                "focus".into(),
                 window_id.to_string(),
+                "--space".into(),
                 space_id.to_string(),
             ],
-            Action::MoveWindowToSpace {
+            Self::FocusSpace { space_id } => {
+                vec!["space".into(), "focus".into(), space_id.to_string()]
+            }
+            Self::MoveWindowToSpace {
                 window_id,
                 space_id,
                 move_focus,
             } => vec![
-                "window".to_string(),
-                "move-to-space".to_string(),
-                window_id.to_string(),
+                "window".into(),
+                "move-to-space".into(),
                 space_id.to_string(),
-                match move_focus {
-                    MoveFocus::Follow => "follow",
-                    MoveFocus::Stay => "stay",
-                }
-                .to_string(),
+                "--window".into(),
+                window_id.to_string(),
+                follow(move_focus).into(),
             ],
-            Action::CreateSpace { display_id } => vec![
-                "space".to_string(),
-                "create".to_string(),
+            Self::MoveFocusedWindowToSpace {
+                space_id,
+                move_focus,
+            } => vec![
+                "window".into(),
+                "move-to-space".into(),
+                space_id.to_string(),
+                follow(move_focus).into(),
+            ],
+            Self::CreateSpace { display_id } => vec![
+                "space".into(),
+                "create".into(),
+                "--display".into(),
                 display_id.to_string(),
             ],
-            Action::DeleteSpace { space_id } => vec![
-                "space".to_string(),
-                "delete".to_string(),
-                space_id.to_string(),
-            ],
-            Action::Quit => vec!["quit".to_string()],
-            Action::Restart => vec!["restart".to_string()],
-            Action::PrintState => vec!["printstate".to_string()],
-            Action::ReconcileWindows => vec!["reconcile-windows".to_string()],
-            Action::MissionControl => vec!["mission-control".to_string()],
-            Action::ShowDesktop => vec!["show-desktop".to_string()],
-            Action::ToggleBarCollapse => vec!["bar".to_string(), "toggle-collapse".to_string()],
-            Action::Lua(_)
-            | Action::Layout(_)
-            | Action::ReorderColumn { .. }
-            | Action::MoveColumnToSpace { .. } => return None,
-        };
-        Some(argv)
+            Self::DeleteSpace { space_id } => {
+                vec!["space".into(), "delete".into(), space_id.to_string()]
+            }
+            Self::Quit => owned(&["service", "quit"]),
+            Self::Restart => owned(&["service", "restart"]),
+            Self::PrintState => owned(&["service", "dump-state"]),
+            Self::ReconcileWindows => owned(&["window", "reconcile"]),
+            Self::MissionControl => owned(&["session", "mission-control"]),
+            Self::ShowDesktop => owned(&["session", "show-desktop"]),
+            Self::ToggleBarCollapse => owned(&["bar", "toggle-collapse"]),
+        })
     }
 }
 
 impl Operation {
-    /// The argv tail following `window`, e.g. `["focus", "east"]`.
+    /// The tokens tail following `window`, e.g. `["focus", "east"]`.
     fn to_argv(&self) -> Vec<String> {
         let owned = |args: &[&str]| args.iter().map(|arg| (*arg).to_string()).collect();
         match self {
+            Operation::Focus(Direction::Nth(index)) => {
+                vec!["focus".into(), "--nth".into(), (index + 1).to_string()]
+            }
             Operation::Focus(direction) => vec!["focus".to_string(), direction.token()],
             Operation::FocusStep(step) => owned(&["focus", step.token()]),
             Operation::FocusOtherLayer => owned(&["focus", "other-layer"]),
             Operation::Move(direction) => vec!["move".to_string(), direction.token()],
             Operation::Center => owned(&["center"]),
             Operation::Resize { axis, direction } => owned(&[direction.token(), axis.token()]),
-            // `SetWidth` comes from window rules, not from the CLI action syntax; it has
-            // no argv verb, so encode it as the equivalent full-width toggle.
-            Operation::SetWidth(_) | Operation::Maximize => owned(&["maximize"]),
-            Operation::ToNextDisplay(MoveFocus::Follow) => owned(&["nextdisplay"]),
-            Operation::ToNextDisplay(MoveFocus::Stay) => owned(&["nextdisplaysend"]),
+            Operation::SetWidth(_) => Vec::new(),
+            Operation::Maximize => owned(&["maximize"]),
+            Operation::ToNextDisplay(MoveFocus::Follow) => {
+                owned(&["move-to-display", "next", "--follow"])
+            }
+            Operation::ToNextDisplay(MoveFocus::Stay) => {
+                owned(&["move-to-display", "next", "--stay"])
+            }
             Operation::Equalize => owned(&["equalize"]),
             Operation::Balance => owned(&["balance"]),
             Operation::ToggleFloating => owned(&["toggle", "floating"]),
@@ -287,10 +430,51 @@ impl Operation {
 mod tests {
     use super::*;
 
+    #[test]
+    fn resource_focus_distinguishes_native_id_from_layout_ordinal() {
+        assert_eq!(
+            parse_action(&["window", "focus", "42"]).unwrap(),
+            Action::FocusWindow { window_id: 42 }
+        );
+        assert_eq!(
+            parse_action(&["window", "focus", "--nth", "2"]).unwrap(),
+            Action::Window(Operation::Focus(Direction::Nth(1)))
+        );
+        assert!(parse_action(&["window", "focus", "42", "--nth", "2"]).is_err());
+        assert!(parse_action(&["window", "focusid", "42"]).is_err());
+    }
+
+    #[test]
+    fn resource_actions_enforce_scope_and_remove_legacy_paths() {
+        assert_eq!(parse_action(&["service", "quit"]).unwrap(), Action::Quit);
+        assert_eq!(
+            parse_action(&["space", "layout", "balance"]).unwrap(),
+            Action::Window(Operation::Balance)
+        );
+        assert!(parse_action(&["window", "center", "--window", "42"]).is_ok());
+        assert!(
+            parse_action(&[
+                "space", "layout", "equalize", "--space", "9", "--column", "2"
+            ])
+            .is_ok()
+        );
+        for args in [
+            vec!["quit"],
+            vec!["window", "balance"],
+            vec!["window", "center", "extra"],
+            vec!["window", "move-to-display", "next"],
+            vec!["space", "layout", "equalize", "--column", "0"],
+            vec!["space", "layout", "balance", "--column", "2"],
+        ] {
+            assert!(parse_action(&args).is_err(), "accepted {args:?}");
+        }
+        assert!(Action::Window(Operation::SetWidth(0.5)).to_argv().is_none());
+    }
+
     fn round_trip(action: &Action) -> Action {
-        let argv = action.to_argv().expect("action should encode to argv");
-        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
-        parse_action(&borrowed).unwrap_or_else(|err| panic!("re-parsing {argv:?}: {err}"))
+        let tokens = action.to_argv().expect("action should encode to tokens");
+        let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        parse_action(&borrowed).unwrap_or_else(|err| panic!("re-parsing {tokens:?}: {err}"))
     }
 
     #[test]
@@ -329,7 +513,7 @@ mod tests {
             assert_eq!(
                 format!("{reparsed:?}"),
                 format!("{action:?}"),
-                "argv round-trip changed {operation:?}"
+                "tokens round-trip changed {operation:?}"
             );
         }
     }
@@ -366,9 +550,9 @@ mod tests {
     #[test]
     fn system_overview_actions_parse_and_round_trip_without_extra_arguments() {
         for name in ["mission-control", "show-desktop"] {
-            let action = parse_action(&[name]).expect("system overview action");
-            assert_eq!(action.to_argv().unwrap(), vec![name]);
-            assert!(parse_action(&[name, "unexpected"]).is_err());
+            let action = parse_action(&["session", name]).expect("system overview action");
+            assert_eq!(action.to_argv().unwrap(), vec!["session", name]);
+            assert!(parse_action(&["session", name, "unexpected"]).is_err());
         }
     }
 

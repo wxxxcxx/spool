@@ -173,6 +173,8 @@ pub trait WindowApi: Send + Sync {
     fn frame(&self) -> IRect;
     fn element(&self) -> Option<CFRetained<AXUIWrapper>>;
     fn title(&self) -> Result<String>;
+    /// Reads only the retained title. Never fetches AX data on a cache miss.
+    fn retained_title(&self) -> Option<String>;
     /// Drops the cached title so the next [`Self::title`] reads it afresh.
     /// Called when the app reports the title changed.
     fn invalidate_title(&self);
@@ -840,6 +842,10 @@ impl WindowApi for WindowOS {
 
     fn invalidate_title(&self) {
         self.title.force_write().take();
+    }
+
+    fn retained_title(&self) -> Option<String> {
+        self.title.force_read().clone()
     }
 
     fn identifier(&self) -> Result<String> {

@@ -620,7 +620,9 @@ mod tests {
     fn event_handler_receives_event_and_queues_command() {
         let world = TestWorld::default();
         let runtime = world
-            .runtime(r#"spool.on("space_changed", function(e) spool.run("window balance") end)"#)
+            .runtime(
+                r#"spool.on("space_changed", function(e) spool.run("space layout balance") end)"#,
+            )
             .unwrap();
         let (name, table) = convert::event_to_lua(runtime.lua(), &Event::SpaceChanged).unwrap();
         let extract = || Ok(Arc::new(test_state()));
@@ -902,7 +904,7 @@ mod tests {
             .runtime(
                 r#"
             spool.bind("alt+b", function()
-              spool.run("window balance")
+              spool.run("space layout balance")
               spool.flash("done", 3.0)
             end)
             "#,

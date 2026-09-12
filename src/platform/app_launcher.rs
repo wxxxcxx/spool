@@ -49,10 +49,10 @@ impl AppLauncher {
         ))?;
         fs::create_dir_all(parent)?;
 
-        let staging_path = parent.join(format!(".{APP_BUNDLE_NAME}.new"));
-        if staging_path.exists() {
-            fs::remove_dir_all(&staging_path)?;
-        }
+        let staging_path = parent.join(format!(".{APP_BUNDLE_NAME}.{}.new", uuid::Uuid::new_v4()));
+        let _cleanup = scopeguard::guard(staging_path.clone(), |path| {
+            let _ = fs::remove_dir_all(path);
+        });
 
         self.write_bundle(&staging_path)?;
         sign_bundle(&staging_path)?;
@@ -91,6 +91,17 @@ impl AppLauncher {
 }
 
 fn ensure_owned_bundle(app_path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for path in [
+        app_path.to_path_buf(),
+        app_path.join("Contents"),
+        app_path.join("Contents/Info.plist"),
+    ] {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(Error::other("refusing managed or foreign launcher"));
+        }
+    }
     let output = Command::new("/usr/bin/plutil")
         .args([
             "-extract",
@@ -156,7 +167,7 @@ fn info_plist() -> String {
 
 fn launcher_script(spool_path: &Path) -> String {
     format!(
-        "#!/bin/sh\nexec {} start\n",
+        "#!/bin/sh\nexec {} service start\n",
         shell_quote(&spool_path.to_string_lossy())
     )
 }
@@ -207,7 +218,10 @@ mod tests {
     #[test]
     fn launcher_script_quotes_the_spool_path() {
         let script = launcher_script(PathBuf::from("/tmp/Spool's bin").as_path());
-        assert_eq!(script, "#!/bin/sh\nexec '/tmp/Spool'\"'\"'s bin' start\n");
+        assert_eq!(
+            script,
+            "#!/bin/sh\nexec '/tmp/Spool'\"'\"'s bin' service start\n"
+        );
         assert_eq!(shell_quote("spool"), "'spool'");
     }
 
@@ -250,7 +264,7 @@ mod tests {
         let executable = app_path.join("Contents/MacOS").join(APP_EXECUTABLE_NAME);
         assert_eq!(
             fs::read_to_string(&executable).unwrap(),
-            "#!/bin/sh\nexec '/opt/homebrew/bin/spool' start\n"
+            "#!/bin/sh\nexec '/opt/homebrew/bin/spool' service start\n"
         );
         assert_ne!(
             fs::metadata(executable).unwrap().permissions().mode() & 0o111,

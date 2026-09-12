@@ -270,7 +270,7 @@ impl NativeSpaceTransactions {
         source: &LayoutStrip,
         commands: &mut Commands,
         submitted: Duration,
-    ) {
+    ) -> crate::errors::Result<()> {
         let identity = |entity| {
             windows
                 .get_tracked(entity)
@@ -287,7 +287,7 @@ impl NativeSpaceTransactions {
             .map(identity)
             .collect::<Option<Vec<_>>>()
         else {
-            return;
+            return Err(crate::errors::Error::rejected("window_unavailable"));
         };
         let window_ids = members
             .iter()
@@ -298,7 +298,7 @@ impl NativeSpaceTransactions {
             .iter()
             .any(|pending| pending.window_ids.iter().any(|id| window_ids.contains(id)))
         {
-            return;
+            return Err(crate::errors::Error::rejected("native_move_pending"));
         }
         let follow = plan.follow.and_then(identity);
         let source_follow = plan
@@ -344,6 +344,7 @@ impl NativeSpaceTransactions {
                 source_follow,
             }),
         });
+        Ok(())
     }
 }
 
@@ -353,15 +354,17 @@ enum FocusSpacePolicy {
 }
 
 fn focus_window_command(
-    In((window_id, policy, known_space)): In<(WinID, FocusSpacePolicy, Option<WorkspaceId>)>,
-    windows: Windows,
-    window_manager: Res<WindowManager>,
-    mut topology: ResMut<NativeTopology>,
-    mut commands: Commands,
-) {
+    window_id: WinID,
+    policy: FocusSpacePolicy,
+    known_space: Option<WorkspaceId>,
+    windows: &Windows,
+    window_manager: &WindowManager,
+    topology: &mut NativeTopology,
+    commands: &mut Commands,
+) -> crate::errors::Result<()> {
     let Some((_, entity)) = windows.find(window_id) else {
         warn!(window_id, "window is not tracked");
-        return;
+        return Err(crate::errors::Error::rejected("window_not_found"));
     };
     if matches!(policy, FocusSpacePolicy::VisibleOnly) {
         // A caller that drew this window in a Space it can name hands that
@@ -370,22 +373,23 @@ fn focus_window_command(
         // the question the strict path always asked, and an unreadable Space
         // refuses on evidence that path would refuse on.
         let claim = known_space.map(|space_id| {
-            topology.confirm_visible_window_space(&window_manager, window_id, space_id)
+            topology.confirm_visible_window_space(window_manager, window_id, space_id)
         });
         let confirmed = match claim {
             Some(SpaceClaim::Confirmed) => true,
             // An unreadable Space is not evidence that it is visible.
             Some(SpaceClaim::Unavailable) => false,
             Some(SpaceClaim::Refused) | None => topology
-                .observe_visible_window_space(&window_manager, window_id)
+                .observe_visible_window_space(window_manager, window_id)
                 .is_some(),
         };
         if !confirmed {
             warn!(window_id, "cannot confirm a visible Space for window focus");
-            return;
+            return Err(crate::errors::Error::rejected("space_not_visible"));
         }
     }
     commands.focus_entity(entity, true);
+    Ok(())
 }
 
 #[derive(SystemParam)]
@@ -398,12 +402,22 @@ pub(crate) struct NativeSpaceCommandCtx<'w, 's> {
     transactions: bevy::ecs::system::ResMut<'w, NativeSpaceTransactions>,
     time: Res<'w, Time>,
     session: Res<'w, LayoutSession>,
-    topology: Res<'w, NativeTopology>,
+    topology: ResMut<'w, NativeTopology>,
     commands: Commands<'w, 's>,
 }
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceCommandCtx) {
+    if let Err(reason) = execute_native_space_command(In(event), ctx) {
+        debug!(%reason, "native command rejected");
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn execute_native_space_command(
+    In(event): In<Event>,
+    ctx: NativeSpaceCommandCtx,
+) -> crate::errors::Result<()> {
     let NativeSpaceCommandCtx {
         windows,
         spaces,
@@ -413,7 +427,7 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
         mut transactions,
         time,
         session,
-        topology,
+        mut topology,
         mut commands,
     } = ctx;
     let (action, snapshot) = match &event {
@@ -425,7 +439,7 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
                     ?op,
                     "skipping deferred Space command with a stale snapshot identity"
                 );
-                return;
+                return Err(crate::errors::Error::rejected("native_precondition_failed"));
             }
             let action = match *op {
                 LayoutOp::MoveToWorkspace {
@@ -443,11 +457,11 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
                 },
                 LayoutOp::View { space_id } => Action::FocusSpace { space_id },
                 LayoutOp::Focus(window_id) => Action::FocusWindow { window_id },
-                _ => return,
+                _ => return Err(crate::errors::Error::rejected("unsupported_operation")),
             };
             (Cow::Owned(action), Some(snapshot.as_ref()))
         }
-        _ => return,
+        _ => return Err(crate::errors::Error::rejected("unsupported_operation")),
     };
     let action = action.as_ref();
     if let Action::FocusWindow { window_id } = action {
@@ -467,8 +481,15 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
                 .find(|strip| strip.contains(entity))
                 .map(LayoutStrip::id)
         });
-        commands.run_system_cached_with(focus_window_command, (*window_id, policy, known_space));
-        return;
+        return focus_window_command(
+            *window_id,
+            policy,
+            known_space,
+            &windows,
+            &window_manager,
+            &mut topology,
+            &mut commands,
+        );
     }
     if let Action::FocusWindowInSpace {
         window_id,
@@ -482,7 +503,7 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
         // switch needs; the follow waits for the surface to come back.
         let Some((window, entity)) = windows.find_any(*window_id) else {
             warn!(window_id, "window is not tracked");
-            return;
+            return Err(crate::errors::Error::rejected("window_not_found"));
         };
         // The Bar drew this icon from a snapshot, so the window may have moved
         // since. Refuse rather than switch to a Space the window is no longer
@@ -495,7 +516,7 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
                 window_id,
                 space_id, observed, "window is no longer in the Space it was drawn in"
             );
-            return;
+            return Err(crate::errors::Error::rejected("native_precondition_failed"));
         }
         let member = MoveWindowIdentity {
             window_id: *window_id,
@@ -514,8 +535,9 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
                 window_id,
                 space_id, "unable to switch to that Space to focus the window"
             );
+            return Err(crate::errors::Error::rejected("space_focus_rejected"));
         }
-        return;
+        return Ok(());
     }
     let move_request = match action {
         Action::MoveWindowToSpace {
@@ -530,24 +552,24 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
         } => {
             let Some((_, entity)) = windows.find(*window_id) else {
                 warn!(window_id, "window is not tracked");
-                return;
+                return Err(crate::errors::Error::rejected("native_precondition_failed"));
             };
             let Some((_, _, state)) = windows.get_tracked(entity) else {
-                return;
+                return Err(crate::errors::Error::rejected("native_precondition_failed"));
             };
             if state.is_floating() {
                 warn!(
                     window_id,
                     "a floating window does not belong to a tiled column"
                 );
-                return;
+                return Err(crate::errors::Error::rejected("native_precondition_failed"));
             }
             let Some(column) = spaces
                 .iter()
                 .find_map(|strip| strip.column_containing(entity))
             else {
                 warn!(window_id, "window is not in a layout column");
-                return;
+                return Err(crate::errors::Error::rejected("native_precondition_failed"));
             };
             Some((*window_id, *space_id, *move_focus, Some(column)))
         }
@@ -575,17 +597,22 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
                             transactions.cancel_pending_follows();
                         }
                     }
-                    Err(error) => warn!(?action, %error, "Space capability unavailable"),
+                    Err(error) => {
+                        warn!(?action, %error, "Space capability unavailable");
+                        return Err(crate::errors::Error::rejected("native_operation_rejected"));
+                    }
                 }
             } else {
                 warn!(?action, "Space control is disabled");
+                return Err(crate::errors::Error::rejected("capability_unavailable"));
             }
+            return Ok(());
         }
-        return;
+        return Err(crate::errors::Error::rejected("unsupported_operation"));
     };
     if !config.space_control_enabled() {
         warn!("Space control is disabled; enable experimental_space_control");
-        return;
+        return Err(crate::errors::Error::rejected("capability_unavailable"));
     }
     let target_is_known = window_manager
         .present_displays()
@@ -594,11 +621,11 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
         .any(|candidate| candidate == space_id);
     if !target_is_known || window_manager.workspace_is_fullscreen(space_id) {
         warn!(space_id, "target is not a known user Space");
-        return;
+        return Err(crate::errors::Error::rejected("native_precondition_failed"));
     }
     if windows.find(window_id).is_none() {
         warn!(window_id, "window is not tracked");
-        return;
+        return Err(crate::errors::Error::rejected("window_not_found"));
     }
     let members = column.as_ref().map_or_else(
         || {
@@ -615,7 +642,7 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
         .any(|member| windows.get_tracked(*member).is_none())
     {
         warn!(window_id, "column has unavailable members");
-        return;
+        return Err(crate::errors::Error::rejected("native_precondition_failed"));
     }
     for member in members {
         let Some((window, _, _)) = windows.get_tracked(member) else {
@@ -633,7 +660,7 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
             .is_some_and(|(_, entity)| !windows.is_available(entity))
     }) {
         warn!(window_id, "associated window is temporarily unavailable");
-        return;
+        return Err(crate::errors::Error::rejected("native_precondition_failed"));
     }
     if snapshot.is_some_and(|snapshot| {
         window_ids
@@ -644,7 +671,7 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
             window_id,
             "skipping script move with unbound or replaced associated windows"
         );
-        return;
+        return Err(crate::errors::Error::rejected("native_precondition_failed"));
     }
     if transactions
         .moves
@@ -652,7 +679,7 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
         .any(|pending| pending.window_ids.iter().any(|id| window_ids.contains(id)))
     {
         warn!(window_id, "window already has a pending native move");
-        return;
+        return Err(crate::errors::Error::rejected("native_move_pending"));
     }
     let members = window_ids
         .iter()
@@ -709,11 +736,13 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
             {
                 transactions.cancel_pending_follows();
                 transactions.follows.push(pending);
+            } else {
+                return Err(crate::errors::Error::rejected("space_focus_rejected"));
             }
         } else {
             transactions.cancel_follows_for(&window_ids);
         }
-        return;
+        return Ok(());
     }
     let intent = NativeSpaceIntent::MoveWindows {
         window_ids: window_ids.clone(),
@@ -759,8 +788,12 @@ pub(crate) fn apply_native_space_command(In(event): In<Event>, ctx: NativeSpaceC
                 display: None,
             });
         }
-        Err(error) => warn!(%error, "Space operation rejected"),
+        Err(error) => {
+            warn!(%error, "Space operation rejected");
+            return Err(crate::errors::Error::rejected("native_operation_rejected"));
+        }
     }
+    Ok(())
 }
 
 #[derive(SystemParam)]

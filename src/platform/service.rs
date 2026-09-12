@@ -8,6 +8,7 @@ use std::{
 use tracing::{info, warn};
 
 use crate::util::exe_path;
+mod ownership;
 
 /// The bundle identifier for the `spool` service.
 pub const ID: &str = "com.wxxxcxx.spool";
@@ -66,7 +67,7 @@ impl Service {
     /// Checks if the service is currently installed (i.e., its plist file exists).
     #[must_use]
     pub fn is_installed(&self) -> bool {
-        self.plist_path().is_file()
+        fs::symlink_metadata(self.plist_path()).is_ok()
     }
 
     /// Uses the installed agent's actual capture paths, including custom paths.
@@ -108,19 +109,13 @@ impl Service {
             fs::create_dir_all(dir)?;
         }
 
-        if self.is_installed() {
-            warn!(
-                "existing launch agent detected at `{}`, skipping installation",
-                plist_path.display()
-            );
+        if fs::symlink_metadata(plist_path).is_ok() {
+            self.validate_existing()?;
             return Ok(());
         }
-
-        let contents = self.launchd_plist()?;
-        let mut plist = fs::File::create(plist_path)?;
-        plist.write_all(contents.as_bytes())?;
+        ownership::publish(plist_path, self.launchd_plist()?.as_bytes(), None)?;
         info!("installed launch agent to `{}`", plist_path.display());
-        info!("use `spool log -f` to inspect service output");
+        info!("use `spool service logs -f` to inspect service output");
         Ok(())
     }
 
@@ -141,11 +136,13 @@ impl Service {
             return Ok(());
         }
 
-        if let Err(e) = self.stop() {
-            warn!("failed to stop service: {e:?}");
+        let previous = self.owned_existing()?;
+        self.stop()?;
+        if self.owned_existing()? != previous {
+            return Err(Error::other("registration changed during uninstall"));
         }
-
         fs::remove_file(plist_path)?;
+        ownership::remove_stamp(plist_path)?;
         info!(
             "removed existing launch agent at `{}`",
             plist_path.display()
@@ -159,8 +156,20 @@ impl Service {
     ///
     /// `Ok(())` if the service is reinstalled successfully, otherwise `Err(Error)` from underlying install/uninstall operations.
     pub fn reinstall(&self) -> Result<()> {
-        self.uninstall()?;
-        self.install()
+        self.reinstall_after_stop(|| self.stop())
+    }
+
+    fn reinstall_after_stop(&self, stop: impl FnOnce() -> Result<()>) -> Result<()> {
+        if fs::symlink_metadata(self.plist_path()).is_err() {
+            return self.install();
+        }
+        let previous = self.owned_existing()?;
+        let contents = self.launchd_plist()?;
+        stop()?;
+        if self.owned_existing()? != previous {
+            return Err(Error::other("registration changed during reinstall"));
+        }
+        ownership::publish(self.plist_path(), contents.as_bytes(), Some(&previous))
     }
 
     /// Starts the service using `launchctl`.
@@ -173,6 +182,7 @@ impl Service {
         if !self.is_installed() {
             self.install()?;
         }
+        self.validate_existing()?;
         info!("starting service...");
         self.create_log_files()?;
         for args in start_commands(&self.raw, self.is_bootstrapped()?) {
@@ -183,8 +193,8 @@ impl Service {
     }
 
     fn create_log_files(&self) -> Result<()> {
-        for path in [&self.raw.error_log_path, &self.raw.out_log_path] {
-            if !Path::new(path).exists() {
+        for path in self.log_paths()? {
+            if !path.exists() {
                 fs::File::create(path)?;
             }
         }
@@ -193,7 +203,7 @@ impl Service {
 
     fn is_bootstrapped(&self) -> Result<bool> {
         let output = Self::launchctl(&["print", self.raw.service_target.as_str()])?;
-        Ok(output.status.success())
+        bootstrapped_status(&output)
     }
 
     fn run_launchctl(args: &[&str]) -> Result<()> {
@@ -221,7 +231,9 @@ impl Service {
     /// `Ok(())` if the service stops successfully, otherwise `Err(Error)` from `launchctl`.
     pub fn stop(&self) -> Result<()> {
         info!("stopping service...");
-        self.raw.stop()?;
+        if self.is_bootstrapped()? {
+            Self::run_launchctl(&["bootout", self.raw.service_target.as_str()])?;
+        }
         info!("service stopped");
         Ok(())
     }
@@ -232,11 +244,14 @@ impl Service {
     ///
     /// `Ok(())` if the service restarts successfully, otherwise `Err(Error)` from underlying stop/start operations.
     pub fn restart(&self) -> Result<()> {
+        if self.is_installed() {
+            self.validate_existing()?;
+        }
         self.stop()?;
         self.start()
     }
 
-    /// Spawns a detached `spool restart` subprocess.
+    /// Spawns a detached `spool service restart` subprocess.
     /// Used by the in-daemon restart command so launchctl stop/start runs outside
     /// the process being stopped.
     pub fn request_restart() -> Result<()> {
@@ -245,12 +260,46 @@ impl Service {
             "Cannot find current executable path.",
         ))?;
         Command::new(bin_path)
-            .arg("restart")
+            .args(["service", "restart"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
         Ok(())
+    }
+
+    fn expected_path(&self) -> PathBuf {
+        self.home_dir
+            .join("Library/LaunchAgents")
+            .join(format!("{}.plist", self.raw.name))
+    }
+    fn validate_existing(&self) -> Result<()> {
+        let (bytes, document) = ownership::read(self.plist_path())?;
+        let owner = ownership::classify(
+            self.plist_path(),
+            &self.expected_path(),
+            &self.raw.name,
+            &bytes,
+            &document,
+        );
+        if !ownership::validate_arguments(&document)? {
+            return Err(ownership::refusal(self.plist_path(), owner, true));
+        }
+        Ok(())
+    }
+    fn owned_existing(&self) -> Result<Vec<u8>> {
+        let (bytes, document) = ownership::read(self.plist_path())?;
+        let owner = ownership::classify(
+            self.plist_path(),
+            &self.expected_path(),
+            &self.raw.name,
+            &bytes,
+            &document,
+        );
+        if !matches!(owner, ownership::Owner::Local | ownership::Owner::Legacy) {
+            return Err(ownership::refusal(self.plist_path(), owner, false));
+        }
+        Ok(bytes)
     }
 
     /// Serializes the launch agent with the system property-list serializer.
@@ -273,6 +322,7 @@ impl Service {
             "Nice": -20,
             "ProcessType": "Interactive",
             "Program": bin_path,
+            "ProgramArguments": [bin_path,"service","run"],
             "EnvironmentVariables": {
                 "NO_COLOR": "1",
                 "RUST_LOG": rust_log,
@@ -303,6 +353,19 @@ impl Service {
         }
         String::from_utf8(output.stdout).map_err(Error::other)
     }
+}
+
+fn bootstrapped_status(output: &Output) -> Result<bool> {
+    if output.status.success() {
+        return Ok(true);
+    }
+    let error = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(113) && error.contains("Could not find service") {
+        return Ok(false);
+    }
+    Err(Error::other(format!(
+        "launchctl service status is unknown: {error}"
+    )))
 }
 
 fn unique_log_paths(paths: [Option<&str>; 2]) -> Vec<PathBuf> {
@@ -453,5 +516,49 @@ mod tests {
             service.launchd_plist().unwrap_err().kind(),
             ErrorKind::InvalidInput
         );
+    }
+    #[test]
+    fn failed_unload_preserves_registration_and_ownership_bytes() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir(&root).unwrap();
+        let path = root.join("agent.plist");
+        let instance = Service {
+            raw: launchctl::Service::builder()
+                .name("spool-test")
+                .uid("501")
+                .plist_path(path.to_str().unwrap())
+                .build(),
+            bin_path: "/bin/spool".into(),
+            home_dir: root.clone(),
+        };
+        let original = instance.launchd_plist().unwrap();
+        ownership::publish(&path, original.as_bytes(), None).unwrap();
+        let stamp = root.join("agent.plist.spool-owner.json");
+        let original_stamp = fs::read(&stamp).unwrap();
+        let error = instance
+            .reinstall_after_stop(|| Err(Error::other("simulated unload failure")))
+            .unwrap_err();
+        assert!(error.to_string().contains("simulated unload failure"));
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+        assert_eq!(fs::read(&stamp).unwrap(), original_stamp);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unloaded_service_is_successful_but_unknown_launchctl_status_is_not() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut output = Output {
+            status: std::process::ExitStatus::from_raw(113 << 8),
+            stdout: vec![],
+            stderr: b"Could not find service".to_vec(),
+        };
+        assert!(!bootstrapped_status(&output).unwrap());
+        output.status = std::process::ExitStatus::from_raw(1 << 8);
+        assert!(bootstrapped_status(&output).is_err());
+        output.status = std::process::ExitStatus::from_raw(0);
+        assert!(bootstrapped_status(&output).unwrap());
     }
 }

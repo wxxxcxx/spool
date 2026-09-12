@@ -227,9 +227,9 @@ mode when those private operations are unavailable.
 The same overview actions are available outside the Bar:
 
 ```sh
-spool action mission-control
-spool action show-desktop
-spool action bar toggle-collapse
+spool mission-control
+spool show-desktop
+spool bar toggle-collapse
 ```
 
 Lua configuration and client scripts can use `spool.action.mission_control()`,

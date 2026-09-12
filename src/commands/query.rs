@@ -850,7 +850,9 @@ fn raw_state_event(event: &Event) -> Option<StateEvent> {
         | Event::WindowSetQuery { .. }
         | Event::StateSubscribe { .. }
         | Event::ScriptState { .. }
-        | Event::LayoutSpaceRequested { .. } => return None,
+        | Event::LayoutSpaceRequested { .. }
+        | Event::CheckedActionRequested { .. }
+        | Event::Inspect { .. } => return None,
     })
 }
 
@@ -879,7 +881,9 @@ mod tests {
             }
             events
         });
-        let channel = Arc::new(server.recv_blocking().unwrap().subscriber.unwrap());
+        let delivery = server.recv_blocking().unwrap();
+        delivery.acknowledgement.unwrap().accepted().unwrap();
+        let channel = Arc::new(delivery.subscriber.unwrap());
         let mut harness = crate::tests::TestHarness::new()
             .with_windows(1)
             .with_focused_window(0);

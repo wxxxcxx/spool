@@ -1,0 +1,7 @@
+# Independent native observation with source-preserving evidence
+
+Diagnostic native observation is collected read-only by the CLI independently of the running daemon, its tracked window inventory, and its caches, so missing windows and daemon failures remain observable. Results retain each native source's evidence, failures, and disagreements; a correlated window view is a convenience projection that neither selects a single authoritative value nor discards unmatched records. This deliberately accepts independent-process permission and collection costs and a more explicit result model instead of refreshing daemon state or merging native sources into an apparently definitive desktop snapshot.
+
+The first version enumerates displays, native Spaces, and windows across the current GUI session wherever native sources permit, including offscreen and minimized candidates. Native reads do not collect daemon state or perform automatic comparison: callers request Spool state separately when needed. Resource commands select native collection with `--source native`; see [ADR 0005](0005-resource-oriented-cli.md) and [the inspection design](../NATIVE_INSPECTION.md).
+
+Collection is bounded by a configurable time budget and returns available evidence when only partial observation is possible. Read failures, timeouts, and work skipped on budget expiry remain distinct from successful empty results, so one unresponsive application does not require discarding evidence from the rest of the desktop.

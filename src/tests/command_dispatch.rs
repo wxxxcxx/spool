@@ -117,6 +117,281 @@ fn float(harness: &mut TestHarness, id: i32) -> Entity {
 }
 
 #[test]
+fn explicit_center_changes_only_the_selected_window_without_focus() {
+    let mut harness = harness();
+    let selected = float(&mut harness, 1);
+    let focused = find_window_entity(0, harness.world());
+    dispatch(
+        &mut harness,
+        [Action::TargetedWindow {
+            window_id: 1,
+            operation: Operation::Center,
+        }],
+    );
+    assert!(harness.world().get::<RepositionMarker>(selected).is_some());
+    assert!(harness.world().get::<RepositionMarker>(focused).is_none());
+    assert!(harness.world().get::<FocusedMarker>(focused).is_some());
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn explicit_resize_does_not_resize_the_focused_window() {
+    let mut harness = harness();
+    let selected = float(&mut harness, 1);
+    let focused = find_window_entity(0, harness.world());
+    dispatch(
+        &mut harness,
+        [Action::TargetedWindow {
+            window_id: 1,
+            operation: Operation::Resize {
+                axis: crate::commands::ResizeAxis::Width,
+                direction: crate::commands::ResizeDirection::Grow,
+            },
+        }],
+    );
+    assert!(harness.world().get::<ResizeMarker>(selected).is_some());
+    assert!(harness.world().get::<ResizeMarker>(focused).is_none());
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn explicit_maximize_restores_selected_floating_window_without_focus() {
+    let mut harness = harness();
+    let selected = float(&mut harness, 1);
+    let focused = find_window_entity(0, harness.world());
+    let action = Action::TargetedWindow {
+        window_id: 1,
+        operation: Operation::Maximize,
+    };
+    dispatch(&mut harness, [action.clone()]);
+    assert!(harness.world().get::<FullWidthMarker>(selected).is_some());
+    assert!(harness.world().get::<FullWidthMarker>(focused).is_none());
+    dispatch(&mut harness, [action]);
+    assert!(harness.world().get::<FullWidthMarker>(selected).is_none());
+    assert!(harness.world().get::<FocusedMarker>(focused).is_some());
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn explicit_stack_toggle_changes_selected_column_and_preserves_focus() {
+    let mut harness = harness();
+    let selected = find_window_entity(2, harness.world());
+    let focused = find_window_entity(0, harness.world());
+    dispatch(
+        &mut harness,
+        [Action::TargetedWindow {
+            window_id: 2,
+            operation: Operation::ToggleStack,
+        }],
+    );
+    let world = harness.world();
+    let mut strips = world.query::<&crate::ecs::layout::LayoutStrip>();
+    let strip = strips
+        .iter(world)
+        .find(|strip| strip.contains(selected))
+        .unwrap();
+    assert!(matches!(
+        strip.column_containing(selected),
+        Some(crate::ecs::layout::Column::Stack(_))
+    ));
+    assert!(world.get::<FocusedMarker>(focused).is_some());
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn layout_balance_uses_explicit_reference_column_not_focus() {
+    use spool_shared_types::commands::SpaceLayoutOperation;
+    let mut harness = harness();
+    let selected = find_window_entity(2, harness.world());
+    harness
+        .world()
+        .entity_mut(selected)
+        .insert(ResizeMarker(IVec2::new(300, 600)));
+    dispatch(
+        &mut harness,
+        [Action::SpaceLayout {
+            space_id: Some(TEST_WORKSPACE_ID),
+            operation: SpaceLayoutOperation::Balance {
+                reference_column: Some(3),
+            },
+        }],
+    );
+    for id in 0..4 {
+        let entity = find_window_entity(id, harness.world());
+        assert_eq!(
+            harness
+                .world()
+                .get::<ResizeMarker>(entity)
+                .map(|size| size.0.x),
+            Some(300)
+        );
+    }
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn layout_column_out_of_range_does_not_fall_back_to_focus() {
+    use spool_shared_types::commands::SpaceLayoutOperation;
+    let mut harness = harness();
+    dispatch(
+        &mut harness,
+        [Action::SpaceLayout {
+            space_id: Some(TEST_WORKSPACE_ID),
+            operation: SpaceLayoutOperation::Balance {
+                reference_column: Some(99),
+            },
+        }],
+    );
+    for id in 0..4 {
+        let entity = find_window_entity(id, harness.world());
+        assert!(harness.world().get::<ResizeMarker>(entity).is_none());
+    }
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn explicit_layout_visibility_toggle_parks_and_restores_target_space() {
+    use spool_shared_types::commands::SpaceLayoutOperation;
+    let mut harness = harness();
+    let action = Action::SpaceLayout {
+        space_id: Some(TEST_WORKSPACE_ID),
+        operation: SpaceLayoutOperation::ToggleTiledVisibility,
+    };
+    dispatch(&mut harness, [action.clone()]);
+    let entity = find_window_entity(1, harness.world());
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::tiled_visibility::ParkedTile>(entity)
+            .is_some()
+    );
+    dispatch(&mut harness, [action]);
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::tiled_visibility::ParkedTile>(entity)
+            .is_none()
+    );
+}
+
+#[test]
+fn explicit_display_transfer_admits_only_selected_window_without_focusing_it() {
+    let mut harness = TestHarness::new()
+        .with_display(2, IRect::new(1024, 0, 2048, 768), vec![3])
+        .with_windows(4);
+    harness.pump_frames(10);
+    harness.mock_state.focus_window(0);
+    harness.pump_frames(5);
+    harness.mock_state.take_focus_requests();
+    let selected = find_window_entity(1, harness.world());
+    let focused = find_window_entity(0, harness.world());
+    dispatch(
+        &mut harness,
+        [Action::TargetedWindow {
+            window_id: 1,
+            operation: Operation::ToNextDisplay(crate::commands::MoveFocus::Stay),
+        }],
+    );
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::native_space::NativeMoveOwner>(selected)
+            .is_some()
+    );
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::native_space::NativeMoveOwner>(focused)
+            .is_none()
+    );
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn explicit_floating_moves_accumulate_on_selected_window_without_focus() {
+    let mut harness = harness();
+    let selected = float(&mut harness, 1);
+    dispatch(
+        &mut harness,
+        [Action::TargetedWindow {
+            window_id: 1,
+            operation: Operation::Move(Direction::East),
+        }],
+    );
+    let first = harness
+        .world()
+        .get::<RepositionMarker>(selected)
+        .expect("selected window moved")
+        .0;
+    dispatch(
+        &mut harness,
+        [Action::TargetedWindow {
+            window_id: 1,
+            operation: Operation::Move(Direction::East),
+        }],
+    );
+    let second = harness.world().get::<RepositionMarker>(selected).unwrap().0;
+    assert!(second.x > first.x);
+    assert_eq!(second.y, first.y);
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn checked_command_receipt_waits_for_execution_and_rejects_missing_target() {
+    use spool_shared_types::wire::{AdmissionStatus, CheckedAction, Response};
+    let mut harness = harness();
+    let (reply, received) = async_channel::bounded(1);
+    harness
+        .world()
+        .write_message(Event::CheckedActionRequested {
+            request: CheckedAction {
+                request_id: "missing-window".into(),
+                action: Action::TargetedWindow {
+                    window_id: 999,
+                    operation: Operation::Center,
+                },
+            },
+            respond_to: reply,
+        });
+    assert!(received.try_recv().is_err());
+    harness.world().run_schedule(PreUpdate);
+    let Response::Admission(receipt) = received.try_recv().expect("execution receipt") else {
+        panic!("admission response")
+    };
+    assert_eq!(receipt.request_id, "missing-window");
+    assert_eq!(receipt.status, AdmissionStatus::Rejected);
+    assert_eq!(receipt.code.as_deref(), Some("window_not_found"));
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn checked_native_focus_receipt_follows_actual_focus_admission() {
+    use spool_shared_types::wire::{AdmissionStatus, CheckedAction, Response};
+    let mut harness = harness();
+    for (id, expected) in [
+        (1, AdmissionStatus::Accepted),
+        (999, AdmissionStatus::Rejected),
+    ] {
+        let (reply, received) = async_channel::bounded(1);
+        harness
+            .world()
+            .write_message(Event::CheckedActionRequested {
+                request: CheckedAction {
+                    request_id: id.to_string(),
+                    action: Action::FocusWindow { window_id: id },
+                },
+                respond_to: reply,
+            });
+        harness.world().run_schedule(PreUpdate);
+        let Response::Admission(receipt) = received.try_recv().unwrap() else {
+            panic!("admission response")
+        };
+        assert_eq!(receipt.status, expected);
+    }
+    assert_eq!(harness.mock_state.take_focus_requests(), vec![1]);
+}
+
+#[test]
 fn command_batch_floating_moves_accumulate_pending_geometry() {
     use bevy::ecs::system::RunSystemOnce;
     let mut harness = harness();

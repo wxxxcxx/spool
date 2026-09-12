@@ -33,6 +33,7 @@ pub use workspace::WorkspaceObserver;
 pub(crate) mod app_launcher;
 mod display;
 pub(crate) mod input;
+pub(crate) mod inspection;
 pub(crate) mod mission_control;
 pub mod notify;
 mod process;

@@ -36,6 +36,7 @@
               StandardOutPath = "/tmp/spool.log";
               StandardErrorPath = "/tmp/spool.err.log";
               Program = lib.getExe cfg.finalPackage;
+              ProgramArguments = [ (lib.getExe cfg.finalPackage) "service" "run" ];
             };
           };
         };

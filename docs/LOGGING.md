@@ -3,15 +3,15 @@
 ## Available now
 
 ```sh
-spool log                  # All retained launchd output, then exit
-spool log --tail 200        # Last 200 lines from each captured stream
-spool log -f                # History, followed by new output
-spool log -f --tail 0       # Only new output
-spool log -f --tail 100     # Recent context, then follow
-spool log > spool.log       # Export captured output
+spool service logs                  # All retained launchd output, then exit
+spool service logs --tail 200        # Last 200 lines from each captured stream
+spool service logs -f                # History, followed by new output
+spool service logs -f --tail 0       # Only new output
+spool service logs -f --tail 100     # Recent context, then follow
+spool service logs > spool.log       # Export captured output
 ```
 
-`spool logs` is an alias. The interface follows Docker's history-then-follow
+`spool service logs` is an alias. The interface follows Docker's history-then-follow
 model; `--tail` defaults to `all`. This is a local file reader, not a Docker
 logging driver or a new daemon IPC subscription.
 
@@ -33,7 +33,7 @@ if no captured file exists. Permission errors remain errors.
 Limitations:
 
 - This version reads **launchd-captured service output**, not arbitrary process
-  stdout. Foreground `spool launch` output is only in that terminal unless the
+  stdout. Foreground `spool service run` output is only in that terminal unless the
   caller redirects it. It cannot retroactively recover uncaptured output.
 - An edited but not reloaded plist may differ from the running agent's capture
   paths. Reinstall/reload is an operator action, never performed by `log`.
@@ -41,7 +41,7 @@ Limitations:
   `--tail N` limits reading, not disk use. External copy/truncate rotation can
   lose bytes between polling observations; name-following is not a durable cursor.
 - The reader cannot recover DEBUG/TRACE records that the daemon did not emit.
-  `RUST_LOG=debug spool log` changes the reader environment, not the running
+  `RUST_LOG=debug spool service logs` changes the reader environment, not the running
   daemon's filter. The service installer captures `RUST_LOG` in its plist;
   changing service verbosity currently requires an explicitly authorized reload.
 
@@ -51,7 +51,7 @@ Limitations:
 
 For a targeted capture, start the daemon with
 `RUST_LOG=info,spool::focus_diagnostics=debug`. This must be applied to the
-daemon process, not to `spool log`. The category records focus generations,
+daemon process, not to `spool service logs`. The category records focus generations,
 window/entity IDs, changed frame readbacks, overlay targets and rendered
 presentations. It does not include window titles or document contents.
 Per-frame records can be verbose; enable this category only during diagnosis.
@@ -66,7 +66,7 @@ timing. Decorations use a per-transition monotonic clock, independent of the ECS
 frame delta; a newly selected target does not inherit time before its creation.
 
 ```sh
-spool log --tail 2000 | rg 'spool::focus_diagnostics'
+spool service logs --tail 2000 | rg 'spool::focus_diagnostics'
 ```
 
 Compare `frame_commit` readback with the subsequent `overlay_draw` target,
@@ -79,7 +79,7 @@ can still use the requested or last navigation window while AX focus resolves.
 
 When focus returns to the display the user just left, run the daemon with
 `RUST_LOG=info,spool::focus_diagnostics=debug,spool::ecs::native_space=debug` and
-collect `spool subscribe --json --raw` alongside it; the `window_focused` and
+collect `spool session watch --json --raw` alongside it; the `window_focused` and
 `space_changed` rows carry the window IDs that the log refers to by entity.
 
 A bounce reads as a confirmed `focus_observation` for the clicked window,
@@ -105,10 +105,10 @@ when that list changes. It includes read-only fallback icons but no titles.
 Compare this presentation list with `query state`: unavailable tracked windows
 can retain layout identity while no longer being actionable or shown in the Bar.
 
-1. Save `spool log --tail 300` before restarting anything.
-2. Run `spool log -f --tail 100`, reproduce once, and record the time and symptom.
-3. Capture `spool query state --json` and, when relevant,
-   `spool subscribe --json --raw` in another terminal. These are state evidence,
+1. Save `spool service logs --tail 300` before restarting anything.
+2. Run `spool service logs -f --tail 100`, reproduce once, and record the time and symptom.
+3. Capture `spool session inspect --json` and, when relevant,
+   `spool session watch --json --raw` in another terminal. These are state evidence,
    not a replacement for error logs.
 4. Correlate module target, window ID, Space ID, display ID, and macOS error code
    where present. Redact application titles, paths and script output before sharing.

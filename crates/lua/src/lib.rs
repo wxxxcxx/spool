@@ -476,8 +476,8 @@ mod tests {
         let actions = run(r#"
             spool.action.mission_control()
             spool.action.show_desktop()
-            spool.run("mission-control")
-            spool.run({ "show-desktop" })
+            spool.run("session mission-control")
+            spool.run({ "session", "show-desktop" })
         "#)
         .unwrap();
         assert_eq!(
@@ -495,7 +495,7 @@ mod tests {
     fn run_accepts_strings_argv_and_action_tables() {
         let commands = run(r#"
             spool.run("window focus east")
-            spool.run({ "window", "focus", 3 })
+            spool.run({ "window", "focus", "--nth", 3 })
             spool.run({ window = { focus = "east" } })
         "#)
         .unwrap();

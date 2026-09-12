@@ -3,17 +3,19 @@
     reason = "Bevy system and mlua callback signatures are by-value by contract"
 )]
 
+#[cfg(feature = "lua")]
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 #[cfg(feature = "lua")]
 use clap::Args;
-use clap::{Parser, Subcommand};
+
 use tracing::{error, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod accessibility_prompt;
 mod bar;
+mod cli;
 mod client;
 #[cfg(feature = "lua")]
 mod client_script;
@@ -22,6 +24,8 @@ mod config;
 mod ecs;
 mod errors;
 mod events;
+mod inspection;
+mod lifecycle;
 mod logs;
 #[cfg(feature = "lua")]
 mod lua;
@@ -45,8 +49,6 @@ use crate::manager::{check_ax_privilege, request_ax_privilege};
 use crate::menubar::MenuBarManager;
 use crate::platform::PlatformCallbacks;
 use accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
-use client::ClientRequest;
-use ecs::state::StateQueryKind;
 use errors::Result;
 use platform::service;
 use reader::RequestReader;
@@ -60,96 +62,6 @@ pub const VERSION_STRING: &str = concat!(
 );
 #[cfg(not(feature = "lua"))]
 pub const VERSION_STRING: &str = concat!(env!("CARGO_PKG_VERSION"));
-
-/// `Spool` is the main command-line interface structure for the window manager.
-/// It defines the available subcommands for controlling the Spool daemon.
-#[derive(Clone, Debug, Default, Parser)]
-#[command(
-    version = VERSION_STRING,
-    author = clap::crate_authors!(),
-    about = clap::crate_description!(),
-)]
-pub struct Spool {
-    /// The subcommand to execute (e.g., `launch`, `install`, `action`).
-    #[clap(subcommand)]
-    subcmd: Option<SubCmd>,
-}
-
-/// `SubCmd` enumerates the available command-line subcommands for `spool`.
-/// These subcommands allow users to launch the daemon, install/uninstall it as a service,
-/// install/uninstall its app launcher, start/stop/restart the service, or dispatch actions to
-/// a running daemon.
-#[derive(Clone, Debug, Default, Subcommand)]
-pub enum SubCmd {
-    /// Launches the `spool` daemon directly in the console (default behavior).
-    #[default]
-    Launch,
-
-    /// Installs the `spool` daemon as a background service.
-    Install,
-
-    /// Uninstalls the `spool` background service.
-    Uninstall,
-
-    /// Reinstalls the `spool` background service.
-    Reinstall,
-
-    /// Installs a Spool app launcher to `~/Applications`.
-    InstallApp,
-
-    /// Uninstalls the Spool app launcher from `~/Applications`.
-    UninstallApp,
-
-    /// Starts the `spool` background service.
-    Start,
-
-    /// Stops the `spool` background service.
-    Stop,
-
-    /// Restarts the `spool` background service.
-    Restart,
-
-    /// Reads captured service logs, optionally following new output.
-    #[command(alias = "logs")]
-    Log(logs::LogArgs),
-
-    /// Dispatches an action via a Unix socket to the running `spool` daemon.
-    #[command(alias = "send-cmd")]
-    Action {
-        #[arg(trailing_var_arg = true, required = true)]
-        action: Vec<String>,
-    },
-
-    /// Queries structured state from the running daemon.
-    Query {
-        #[clap(subcommand)]
-        query: QueryCmd,
-    },
-
-    /// Subscribes to structured state events from the running daemon.
-    Subscribe {
-        /// Emits complete line-delimited JSON instead of the default TSV summary.
-        #[arg(long)]
-        json: bool,
-        /// Also emits uncoalesced source events for diagnostics.
-        #[arg(long)]
-        raw: bool,
-    },
-
-    /// Runs an isolated Lua client script against the running daemon.
-    #[cfg(feature = "lua")]
-    Script(ScriptCmd),
-
-    /// Inspects or applies the one-time v2-to-v3 Space state migration.
-    MigrateState {
-        /// State file to inspect; defaults to Spool's normal state path.
-        #[arg(long)]
-        path: Option<PathBuf>,
-        /// Write the v3 file after creating the adjacent v2 backup.
-        #[arg(long)]
-        apply: bool,
-    },
-}
 
 #[cfg(feature = "lua")]
 #[derive(Clone, Debug, Args)]
@@ -167,41 +79,34 @@ pub struct ScriptCmd {
     args: Vec<String>,
 }
 
-#[derive(Clone, Debug, Subcommand)]
-pub enum QueryCmd {
-    /// Prints the complete state document.
-    State {
-        /// Emits complete JSON instead of the default TSV summary.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Prints native macOS Spaces and their tracked windows.
-    Spaces {
-        /// Emits complete JSON instead of the default TSV summary.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Prints the active focus/workspace state.
-    Active {
-        /// Emits complete JSON instead of the default TSV summary.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Prints the windows currently visible on screen, slivers excluded.
-    OnScreen {
-        /// Emits complete JSON instead of the default TSV summary.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 /// The main entry point of the `spool` application.
 /// It sets up logging and handles the selected subcommand.
 ///
 /// # Returns
 ///
 /// `Ok(())` if the application runs successfully, otherwise `Err(Error)`.
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(code) => std::process::ExitCode::from(code),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+#[allow(
+    clippy::too_many_lines,
+    reason = "exhaustive command/source branches share one admission or capture boundary"
+)]
+fn run() -> Result<u8> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == inspection::WORKER_ARGUMENT)
+    {
+        inspection::worker_main()?;
+        return Ok(0);
+    }
+    let invocation = cli::parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
@@ -218,10 +123,8 @@ fn main() -> Result<()> {
 
     let service = || service::Service::try_new(service::ID);
 
-    let subcmd = Spool::parse().subcmd.unwrap_or_default();
-
-    match subcmd {
-        SubCmd::Launch => {
+    match invocation {
+        cli::Invocation::Service(cli::ServiceCommand::Run) => {
             let (sender, receiver) = EventSender::new();
             let sender_c = sender.clone();
             // bevy's `TerminalCtrlCHandlerPlugin` was not fast enough. maybe because of its use of `Relaxed` atomic variable?
@@ -229,52 +132,95 @@ fn main() -> Result<()> {
                 let _ = sender_c.send(events::Event::Exit); // just drop the err. we are exiting anyway.
             })
             .expect("setting Ctrl-C handler should succeed");
-            let _command_reader = RequestReader::new(sender.clone()).start()?;
-            if !check_ax_privilege() && !wait_for_accessibility(sender.clone(), &receiver) {
-                return Ok(());
+            let lifecycle = lifecycle::Lifecycle::starting();
+            let _command_reader =
+                RequestReader::with_lifecycle(sender.clone(), lifecycle.clone()).start()?;
+            if lifecycle.phase() == lifecycle::Phase::Stopping {
+                return Ok(0);
+            }
+            if !check_ax_privilege() {
+                lifecycle.set(lifecycle::Phase::WaitingForPermission);
+                if !wait_for_accessibility(sender.clone(), &receiver) {
+                    return Ok(0);
+                }
             }
             match setup_bevy_app(sender, receiver) {
                 Ok(mut app) => {
-                    app.run();
+                    app.insert_resource(lifecycle.clone());
+                    lifecycle.set(lifecycle::Phase::Running);
+                    if lifecycle.phase() != lifecycle::Phase::Stopping {
+                        app.run();
+                    }
+                    lifecycle.set(lifecycle::Phase::Stopping);
                 }
                 Err(err) => {
                     error!(
-                        "Error launching Spool: {err}.\nStopping the service for now. You can restart it again with 'spool restart'."
+                        "Error launching Spool: {err}.\nStopping the service for now. You can restart it again with 'spool service restart'."
                     );
                     service()?.stop()?;
                 }
             }
         }
-        SubCmd::Install => service()?.install()?,
-        SubCmd::Uninstall => service()?.uninstall()?,
-        SubCmd::Reinstall => service()?.reinstall()?,
-        SubCmd::InstallApp => platform::app_launcher::AppLauncher::try_new()?.install()?,
-        SubCmd::UninstallApp => platform::app_launcher::AppLauncher::try_new()?.uninstall()?,
-        SubCmd::Start => service()?.start()?,
-        SubCmd::Stop => service()?.stop()?,
-        SubCmd::Restart => service()?.restart()?,
-        SubCmd::Log(args) => logs::run(&service()?, &args)?,
-        SubCmd::Action { action } => client::run(ClientRequest::Action(action))?,
-        SubCmd::Query { query } => {
-            let (kind, format) = query.request();
-            client::run(ClientRequest::Query { kind, format })?;
+        cli::Invocation::Help(help) => print!("{help}"),
+        cli::Invocation::Service(command) => match command {
+            cli::ServiceCommand::Run => unreachable!(),
+            cli::ServiceCommand::Install => service()?.install()?,
+            cli::ServiceCommand::Uninstall => service()?.uninstall()?,
+            cli::ServiceCommand::Reinstall => service()?.reinstall()?,
+            cli::ServiceCommand::Start => service()?.start()?,
+            cli::ServiceCommand::Stop => service()?.stop()?,
+            cli::ServiceCommand::Restart => service()?.restart()?,
+            cli::ServiceCommand::Logs(args) => logs::run(&service()?, &args)?,
+            cli::ServiceCommand::MigrateState { path, apply } => {
+                let path = path.unwrap_or_else(ecs::state::SpoolState::default_state_file_path);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&ecs::state::SpoolState::migrate_file(
+                        &path, apply
+                    )?)?
+                );
+            }
+        },
+        cli::Invocation::Launcher { install } => {
+            let launcher = platform::app_launcher::AppLauncher::try_new()?;
+            if install {
+                launcher.install()?;
+            } else {
+                launcher.uninstall()?;
+            }
         }
-        SubCmd::Subscribe { json, raw } => client::run(ClientRequest::Subscribe {
-            format: client::OutputFormat::from_json(json),
+        cli::Invocation::Action {
+            action,
+            timeout_ms,
+            json,
+        } => return client::checked_action(action, timeout_ms, json),
+        cli::Invocation::Read { request, json } => {
+            let report = if request.source == spool_shared_types::inspection::Source::Native {
+                let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let signal = cancelled.clone();
+                ctrlc::set_handler(move || {
+                    signal.store(true, std::sync::atomic::Ordering::Release);
+                })
+                .map_err(|error| errors::Error::Generic(error.to_string()))?;
+                inspection::native::collect(request, &cancelled)
+            } else {
+                client::inspect(request)
+            };
+            client::print_report(&report, json)?;
+            return Ok(report.exit_code());
+        }
+        cli::Invocation::Watch {
+            json,
             raw,
-        })?,
+            timeout_ms,
+        } => client::subscribe(client::OutputFormat::from_json(json), raw, timeout_ms)?,
         #[cfg(feature = "lua")]
-        SubCmd::Script(script) => {
+        cli::Invocation::Script(script) => {
             let (source, args) = script.request();
             client_script::run(source, args)?;
         }
-        SubCmd::MigrateState { path, apply } => {
-            let path = path.unwrap_or_else(ecs::state::SpoolState::default_state_file_path);
-            let report = ecs::state::SpoolState::migrate_file(&path, apply)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
     }
-    Ok(())
+    Ok(0)
 }
 
 fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bool {
@@ -316,29 +262,6 @@ fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bo
     }
 }
 
-impl QueryCmd {
-    fn request(&self) -> (StateQueryKind, client::OutputFormat) {
-        match self {
-            QueryCmd::State { json } => (
-                StateQueryKind::State,
-                client::OutputFormat::from_json(*json),
-            ),
-            QueryCmd::Spaces { json } => (
-                StateQueryKind::Spaces,
-                client::OutputFormat::from_json(*json),
-            ),
-            QueryCmd::Active { json } => (
-                StateQueryKind::Active,
-                client::OutputFormat::from_json(*json),
-            ),
-            QueryCmd::OnScreen { json } => (
-                StateQueryKind::OnScreen,
-                client::OutputFormat::from_json(*json),
-            ),
-        }
-    }
-}
-
 #[cfg(feature = "lua")]
 impl ScriptCmd {
     fn request(self) -> (client_script::ScriptSource, Vec<String>) {
@@ -350,74 +273,5 @@ impl ScriptCmd {
             _ => unreachable!("script source must be validated by clap"),
         };
         (source, self.args)
-    }
-}
-
-#[cfg(all(test, feature = "lua"))]
-mod cli_tests {
-    use super::*;
-
-    #[test]
-    fn script_accepts_inline_source_and_arguments_after_separator() {
-        let cli = Spool::try_parse_from(["spool", "script", "-e", "print(arg[1])", "--", "hello"])
-            .unwrap();
-        let Some(SubCmd::Script(script)) = cli.subcmd else {
-            panic!("expected script command");
-        };
-        assert_eq!(
-            script.request(),
-            (
-                client_script::ScriptSource::Inline("print(arg[1])".into()),
-                vec!["hello".into()]
-            )
-        );
-    }
-
-    #[test]
-    fn script_dash_means_standard_input() {
-        let cli = Spool::try_parse_from(["spool", "script", "-"]).unwrap();
-        let Some(SubCmd::Script(script)) = cli.subcmd else {
-            panic!("expected script command");
-        };
-        assert_eq!(
-            script.request(),
-            (client_script::ScriptSource::Stdin, Vec::new())
-        );
-    }
-
-    #[test]
-    fn removed_state_command_is_not_accepted() {
-        assert!(Spool::try_parse_from(["spool", "state", "get", "key"]).is_err());
-    }
-
-    #[test]
-    fn action_is_the_public_dispatch_subcommand() {
-        let cli = Spool::try_parse_from(["spool", "action", "window", "focus", "east"])
-            .expect("action command");
-        assert!(matches!(
-            cli.subcmd,
-            Some(SubCmd::Action { action })
-                if action == ["window", "focus", "east"]
-        ));
-    }
-
-    #[test]
-    fn send_cmd_remains_a_compatibility_alias() {
-        let cli = Spool::try_parse_from(["spool", "send-cmd", "window", "focus", "east"])
-            .expect("compatibility alias");
-        assert!(matches!(cli.subcmd, Some(SubCmd::Action { .. })));
-    }
-
-    #[test]
-    fn subscribe_raw_requests_uncoalesced_source_events() {
-        let cli = Spool::try_parse_from(["spool", "subscribe", "--raw"])
-            .expect("raw subscription option");
-        assert!(matches!(
-            cli.subcmd,
-            Some(SubCmd::Subscribe {
-                json: false,
-                raw: true
-            })
-        ));
     }
 }

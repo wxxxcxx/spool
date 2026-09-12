@@ -10,6 +10,14 @@ use crate::platform::{CFStringRef, ConnID, OSStatus, ProcessSerialNumber, WinID}
 
 #[link(name = "SkyLight", kind = "framework")]
 unsafe extern "C" {
+    /// Returns all Space memberships for the supplied native window IDs.
+    /// ABI and selector 0x7 also used by yabai `src/window.c` `window_space_list`.
+    pub fn SLSCopySpacesForWindows(
+        cid: ConnID,
+        selector: i32,
+        windows: *const CFArray,
+    ) -> *mut CFArray;
+
     /// Retrieves the window ID (`WinID`) associated with an Accessibility UI element.
     ///
     /// # Arguments

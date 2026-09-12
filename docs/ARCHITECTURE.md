@@ -4,6 +4,25 @@ This document provides a high-level overview of Spool's architecture for contrib
 
 ## 1. High-Level Overview
 
+### Long-term declarative architecture
+
+[ADR 0006](adr/0006-declarative-state-driven-window-management.md) establishes
+fully state-driven declarative window management as the direction for future
+design, implementation, and review. Commands, configuration, and scripts express
+state transitions; derived effects reconcile the latest intent with macOS
+observations. State admission and immediate platform executability are separate:
+a valid retained layout should ultimately be editable on an invisible Space,
+with effects applied when native conditions permit, without implicit focus or
+Space switching. Deferred realization retains current desired state rather than
+replaying obsolete commands.
+
+This is an architectural target, not a claim of current feature completeness.
+The first resource-CLI version's visible-only geometry/arrangement mutation gate
+is a temporary implementation limitation. Preserve current write protections
+until state admission and effects are separated. macOS still owns observed
+lifecycle, topology, membership, visibility, and physical geometry; accepted
+intent is distinct from confirmed native completion.
+
 ### Independent Native Window Identity
 
 New discovery produces ordinary layout windows, not application tab groups.
