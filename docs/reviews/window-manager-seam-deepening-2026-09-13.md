@@ -208,6 +208,13 @@ Partitioning is not depth: it redistributes the same knowledge. Depth comes from
 moving *interpretation* behind the seam — the empty-versus-unavailable
 distinction, the accept-versus-complete protocol, the ordering, and the cost.
 
+> Revised after the first two steps landed: `Observation<T>` below is a sketch
+> of the target shape, not a commitment to add it at every seam.
+> `DisplayObservation` already carries per-source evidence for displays, and
+> `Result` already distinguishes an empty membership list from an unreadable
+> one. See [Migration](#migration) for what is actually being introduced and
+> where.
+
 One value type carries unavailability, so it cannot be forgotten:
 
 ```rust
@@ -353,25 +360,39 @@ interface.
 Replace, don't layer. The current 22 methods must not survive as a public
 superset.
 
-1. **Fix the adapter divergence first.** Introduce `Observation<T>` and make
-   both adapters agree on the empty-Space error mode. This is a bug fix
-   independent of the redesign: the test adapter currently cannot observe
-   production behaviour. Add the regression that pins
-   `Err(NotFound)`-means-empty at the interface, whichever way the interface
-   resolves it.
-2. **Introduce `NativeState` as the interface**, with `WindowManagerOS`
-   implementing it directly. Migrate the read callers cluster by cluster —
-   topology and membership first, since that is where the latent `?`
-   propagation lives, then Bar, reconcile, focus, workspace, commands.
-3. **Introduce `NativeSpaceControl`**, folding in the three
+Status: the adapter fix and the display pass-through removal have landed
+(`47d239c`, `5399477`). The plan below is revised from its first draft; the
+revision is recorded rather than silently applied.
+
+1. **Fix the adapter divergence.** Landed. Both adapters answer an empty Space
+   with `Ok(vec![])`, the contract is stated on both membership methods, and
+   the now-unreachable `NotFound` special cases are gone.
+2. **Retire the evidence-collapsing display pass-through.** Landed. This
+   replaces the original step 2, which called for introducing `Observation<T>`
+   here. `DisplayObservation` already *is* the source-preserving carrier — it
+   pairs a `Display` with its own `Result<Vec<WorkspaceId>>` — so a generic
+   `Observation<T>` at this seam would have been a second encoding of the same
+   idea layered on the first, adding surface without adding depth. The
+   invariant violation was in `present_displays`, and deleting it was the
+   deepening.
+3. **Route membership reads through `NativeTopology`.** `NativeTopology` in
+   `ecs/topology.rs` already composes the observation protocol — sample, check
+   completeness, read membership per Space, refuse on failure — and already
+   carries the availability discipline. Several callers bypass it and read
+   `windows_in_workspace` directly. Make it the only membership read path
+   rather than wrapping the raw methods. Introduce a distinct unavailability
+   type only if the membership reads turn out to need one that `Result`
+   cannot express; do not add it by default.
+4. **Cover the preconditions before moving them.** The
+   `native_precondition_failed` rejection for a Space move to an unknown target
+   has no test today. That path is reachable from the test double, so cover it
+   first.
+5. **Introduce `NativeSpaceControl`**, folding in the three
    `space_control_enabled` gates and the accept/verify dance from `overlay.rs`
    and `native_space.rs`.
-4. **Delete the migrated raw read methods** from the public interface as their
-   last caller moves. Old mock expectations on those methods become waste and
-   should be deleted with them.
-5. **Move the four non-window-management methods** out
-   (`setup_config_watcher`, `quit`, `perform_system_overview`, `dim_windows`) to
-   whatever module owns their concern. This is separable and can land last.
+6. **Move the four non-window-management methods** out
+   (`setup_config_watcher`, `quit`, `perform_system_overview`, `dim_windows`).
+   Separable; can land last.
 
 ## Trade-offs
 
@@ -383,11 +404,11 @@ footgun. The accept/verify split gives ADR 0007 a seam to live in.
 
 **Where it is thin.** `pointer()` bundles `cursor_position`, `warp_mouse`, and
 `find_window_at_point`, which are three different concerns; a read-only port
-holding a mutating `warp_mouse` is not obviously right, and `warp_mouse` has 11
-call sites that mostly want "put the pointer here". Consider splitting the
-mutating half out. `session_windows()` is used mostly by inspection and may
-belong with the CLI's independent native observation rather than the daemon
-resource.
+holding a mutating `warp_mouse` is not obviously right, and `warp_mouse` has 5
+production call sites that mostly want "put the pointer here". Consider
+splitting the mutating half out. `session_windows()` is used mostly by
+inspection and may belong with the CLI's independent native observation rather
+than the daemon resource.
 
 **What this does not fix.** The `#[automock]` derive is not the problem and
 removing it is not part of this. The `NonSend` main-thread discipline on the
