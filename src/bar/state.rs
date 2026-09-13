@@ -77,14 +77,11 @@ impl BarStateParams<'_, '_> {
                             .windows_in_workspace(space.id)
                             .map(|ids| ids.into_iter().collect::<HashSet<_>>())
                             .inspect_err(|error| {
-                                // SkyLight reports an empty Space as NotFound.
-                                if !matches!(error, crate::errors::Error::NotFound(_)) {
-                                    warn!(
-                                        space_id = space.id,
-                                        %error,
-                                        "unable to observe Bar membership"
-                                    );
-                                }
+                                warn!(
+                                    space_id = space.id,
+                                    %error,
+                                    "unable to observe Bar membership"
+                                );
                             })
                             .ok()
                     },

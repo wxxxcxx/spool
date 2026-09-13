@@ -370,4 +370,28 @@ mod tests {
             Some(1)
         );
     }
+
+    /// Interface contract: a Space holding no windows is a successful empty
+    /// observation, not a failed read. Only an unreadable Space may make the
+    /// membership scan unavailable. This locks both adapters to the same
+    /// answer, because a scan that treats an empty Space as a failure aborts
+    /// every other Space's membership with it.
+    #[test]
+    fn empty_space_is_an_observation_not_a_failed_read() {
+        let (topology, manager, state) = membership_fixture(vec![1, 2]);
+        state.script_workspace_membership_queries(1, [Ok(vec![10])]);
+        state.script_workspace_membership_queries(2, [Ok(vec![]), Ok(vec![])]);
+
+        let memberships = topology.observe_memberships(&manager).unwrap();
+        assert_eq!(memberships.unique_space(10), Some(1));
+        assert_eq!(memberships.listed_in(2).count(), 0);
+        let empty = manager
+            .windows_in_workspace(2)
+            .expect("an empty Space is a successful read, not a failure");
+        assert!(empty.is_empty());
+
+        // The same scan still refuses when a read genuinely fails.
+        state.script_workspace_membership_queries(1, [Err(())]);
+        assert!(topology.observe_memberships(&manager).is_err());
+    }
 }

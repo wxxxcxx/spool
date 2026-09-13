@@ -779,11 +779,12 @@ impl ReconcileState<'_, '_> {
                 continue;
             };
             let ids = presented.entry(space).or_insert_with(|| {
-                match manager.presentation_windows_in_workspace(space) {
-                    Ok(ids) => Some(ids.into_iter().collect::<HashSet<_>>()),
-                    Err(Error::NotFound(_)) => Some(HashSet::new()),
-                    Err(_) => None,
-                }
+                // An empty Space is `Ok(vec![])`; `None` here means the read
+                // itself failed, which is not evidence of absence.
+                manager
+                    .presentation_windows_in_workspace(space)
+                    .ok()
+                    .map(|ids| ids.into_iter().collect::<HashSet<_>>())
             });
             if ids.as_ref().is_some_and(|ids| !ids.contains(&window.id())) {
                 request_suspension(audit, entity, unavailable.as_deref(), true);

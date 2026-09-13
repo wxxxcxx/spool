@@ -353,10 +353,22 @@ pub trait WindowManagerApi: Send + Sync {
     /// # Returns
     ///
     /// `Ok(Vec<WinID>)` containing the list of window IDs, otherwise `Err(Error)`.
+    ///
+    /// # Contract
+    ///
+    /// A Space that holds no windows is `Ok(vec![])`, never an error. `Err` means
+    /// the read could not be performed and says nothing about the Space's
+    /// contents. Callers must not treat `Err` as an empty membership list, and
+    /// must not treat `Ok(vec![])` as an unavailable Space.
     fn windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>>;
 
     /// Native presentation candidates, excluding ordered-out retained surfaces.
     /// This is Space-local, not an on-screen-only query; inactive Spaces remain eligible.
+    ///
+    /// # Contract
+    ///
+    /// As [`Self::windows_in_workspace`]: an empty result is `Ok(vec![])`, and
+    /// `Err` carries no membership information.
     fn presentation_windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>>;
 
     /// Sends an `Event::Exit` to the event loop, signaling the application to quit.
@@ -960,13 +972,19 @@ fn interactive_owner_from_description(
 /// # Returns
 ///
 /// `Ok(Vec<WinID>)` containing the list of window IDs if successful, otherwise `Err(Error)`.
+///
+/// A Space that holds no windows yields `Ok(vec![])`. Only a read that could not
+/// be performed yields `Err`.
 fn space_window_list_for_connection(
     main_cid: ConnID,
     spaces: &[WorkspaceId],
     cid: Option<ConnID>,
     also_minimized: bool,
 ) -> Result<Vec<WinID>> {
-    let iterator = window_iterator_for_connection(main_cid, spaces, cid, also_minimized)?;
+    let Some(iterator) = window_iterator_for_connection(main_cid, spaces, cid, also_minimized)?
+    else {
+        return Ok(Vec::new());
+    };
     let count = spaces.len();
     let mut window_list = Vec::with_capacity(count);
     let mut floating_candidates = Vec::new();
@@ -1015,12 +1033,18 @@ fn floating_membership_candidate(parent_wid: WinID, attributes: i64, tags: i64) 
     parent_wid == 0 && attributes & 0x2 != 0 && tags & 0x2 != 0
 }
 
+/// Builds the platform window iterator for `spaces`.
+///
+/// `Ok(None)` means the platform listed no windows for these Spaces. That is a
+/// successful empty observation, not a read failure: a Space with no windows
+/// and an unreadable Space must stay distinguishable at the interface, so this
+/// never reports the empty case as an error.
 fn window_iterator_for_connection(
     main_cid: ConnID,
     spaces: &[WorkspaceId],
     cid: Option<ConnID>,
     also_minimized: bool,
-) -> Result<CFRetained<CFType>> {
+) -> Result<Option<CFRetained<CFType>>> {
     let space_list_ref = create_array(spaces, CFNumberType::SInt64Type)?;
 
     let mut set_tags = 0i64;
@@ -1044,10 +1068,7 @@ fn window_iterator_for_connection(
 
     let count = window_list_ref.count();
     if count == 0 {
-        return Err(Error::NotFound(format!(
-            "{}: zero windows returned",
-            function_name!()
-        )));
+        return Ok(None);
     }
 
     let query = unsafe {
@@ -1057,7 +1078,9 @@ fn window_iterator_for_connection(
             count,
         ))
     };
-    Ok(unsafe { CFRetained::from_raw(SLSWindowQueryResultCopyWindows(query.deref().into())) })
+    Ok(Some(unsafe {
+        CFRetained::from_raw(SLSWindowQueryResultCopyWindows(query.deref().into()))
+    }))
 }
 
 pub fn window_iterator_for_id(window_id: WinID) -> Option<CFRetained<CFType>> {
