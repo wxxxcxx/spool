@@ -636,11 +636,18 @@ pub(crate) fn execute_native_space_command(
         warn!("Space control is disabled; enable experimental_space_control");
         return Err(crate::errors::Error::rejected("capability_unavailable"));
     }
-    let target_is_known = window_manager
-        .present_displays()
-        .into_iter()
-        .flat_map(|(_, spaces)| spaces)
-        .any(|candidate| candidate == space_id);
+    let observations = window_manager.observe_displays().map_err(|error| {
+        warn!(space_id, %error, "unable to read the display inventory");
+        crate::errors::Error::rejected("native_precondition_failed")
+    })?;
+    // A display whose Space list could not be read cannot confirm the target,
+    // but its failure is not evidence that the target Space does not exist.
+    let target_is_known = observations.iter().any(|observation| {
+        observation
+            .spaces
+            .as_ref()
+            .is_ok_and(|spaces| spaces.contains(&space_id))
+    });
     if !target_is_known || window_manager.workspace_is_fullscreen(space_id) {
         warn!(space_id, "target is not a known user Space");
         return Err(crate::errors::Error::rejected("native_precondition_failed"));

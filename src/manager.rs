@@ -277,20 +277,21 @@ pub trait WindowManagerApi: Send + Sync {
     ///
     /// A `Vec<WinID>` containing the IDs of associated child windows.
     fn get_associated_windows(&self, window_id: WinID) -> Vec<WinID>;
-    /// Retrieves a list of all currently present displays.
+    /// Retrieves every physical display together with its own Space read.
     ///
     /// # Returns
     ///
-    /// A `Vec<Display>` containing `Display` objects for all present displays.
-    fn present_displays(&self) -> Vec<(Display, Vec<WorkspaceId>)> {
-        self.observe_displays()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(DisplayObservation::into_known_topology)
-            .collect()
-    }
-    /// A failed physical inventory is not an empty inventory. Failed Space
-    /// reads retain their physical display in the successful observation.
+    /// `Ok(Vec<DisplayObservation>)` for all present displays, otherwise
+    /// `Err(Error)` when the physical inventory itself could not be read.
+    ///
+    /// # Contract
+    ///
+    /// A failed physical inventory is not an empty inventory, and a failed
+    /// per-display Space read retains its physical display in the successful
+    /// observation. Callers must distinguish the outer `Err` (no inventory)
+    /// from an `Ok` list that is empty or whose entries carry `Err` Spaces;
+    /// collapsing either into "no displays" loses evidence the native sources
+    /// actually provided.
     fn observe_displays(&self) -> Result<Vec<DisplayObservation>>;
     /// Retrieves the `CGDirectDisplayID` of the active menu bar display.
     ///
@@ -554,11 +555,17 @@ impl WindowManagerOS {
 
     fn focus_native_space(&self, target_space_id: WorkspaceId, animate: bool) -> Result<()> {
         let active_display_id = self.active_display_id()?;
-        let (_, spaces) = self
-            .present_displays()
+        // Only a display whose own Space list was read can confirm that the
+        // target Space lives on it. An unreadable inventory or an unreadable
+        // per-display Space list is reported as such instead of being folded
+        // into "the target Space is not on the active display".
+        let spaces = self
+            .observe_displays()?
             .into_iter()
-            .find(|(display, spaces)| {
-                display.id() == active_display_id && spaces.contains(&target_space_id)
+            .find_map(|observation| {
+                let spaces = observation.spaces.ok()?;
+                (observation.display.id() == active_display_id && spaces.contains(&target_space_id))
+                    .then_some(spaces)
             })
             .ok_or_else(|| {
                 Error::InvalidInput("target Space is not on the active display".to_string())

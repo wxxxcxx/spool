@@ -1720,14 +1720,6 @@ impl MockState {
         let s = self.clone();
         wm.expect_observe_displays()
             .returning(move || s.observe_displays());
-        let s = self.clone();
-        wm.expect_present_displays().returning(move || {
-            s.observe_displays()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(DisplayObservation::into_known_topology)
-                .collect()
-        });
 
         let s = self.clone();
         wm.expect_find_existing_application_windows()

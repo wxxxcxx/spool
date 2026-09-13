@@ -21,12 +21,6 @@ pub struct DisplayObservation {
     pub spaces: Result<Vec<WorkspaceId>>,
 }
 
-impl DisplayObservation {
-    pub fn into_known_topology(self) -> Option<(Display, Vec<WorkspaceId>)> {
-        self.spaces.ok().map(|spaces| (self.display, spaces))
-    }
-}
-
 /// `Display` represents a physical monitor and manages its associated workspaces and window panes.
 /// Each display has a unique ID, bounds, and a collection of `LayoutStrip`s for different spaces.
 #[derive(Clone, Component, Debug, PartialEq, Eq)]
