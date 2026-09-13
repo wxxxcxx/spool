@@ -1842,19 +1842,20 @@ impl DefaultGeometry<'_, '_> {
         if !self.topology.is_complete() {
             return None;
         }
-        let mut owner = None;
-        for (display, spaces) in self.topology.known_displays() {
-            for space in spaces {
-                let members = self.manager.windows_in_workspace(*space).ok()?;
-                if members.contains(&window_id) {
-                    if owner.is_some() {
-                        return None;
-                    }
-                    owner = Some(display.id());
-                }
-            }
+        // One scan answers both halves: which Space lists the window, and which
+        // display owns that Space. A window listed by more than one Space, or a
+        // Space claimed by more than one display, has no unique owner, and a
+        // failed read is not an absent window.
+        let memberships = self.topology.observe_memberships(&self.manager).ok()?;
+        let space = memberships.unique_space(window_id)?;
+        let mut claimants = self
+            .topology
+            .known_displays()
+            .filter(|(_, spaces)| spaces.contains(&space));
+        let owner = claimants.next()?.0.id();
+        if claimants.next().is_some() {
+            return None;
         }
-        let owner = owner?;
         self.displays
             .iter()
             .find(|(display, _)| display.id() == owner)
