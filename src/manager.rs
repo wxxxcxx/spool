@@ -169,6 +169,33 @@ fn native_space_gesture_delta(
     Ok(target.cast_signed() - current.cast_signed())
 }
 
+/// The Space list of the display that has to carry the target Space.
+///
+/// Only the active display's own Space read can confirm that the target Space
+/// lives there. A read that did not happen is reported as a read that did not
+/// happen rather than as "the target Space is not on the active display": the
+/// two call for different responses, and only the second is evidence about the
+/// target.
+fn active_display_spaces(
+    displays: &[DisplayObservation],
+    active_display_id: CGDirectDisplayID,
+    target_space_id: WorkspaceId,
+) -> Result<Vec<WorkspaceId>> {
+    let spaces = displays
+        .iter()
+        .find(|observation| observation.display.id() == active_display_id)
+        .and_then(|observation| observation.spaces.as_ref().ok())
+        .ok_or_else(|| {
+            Error::Generic("the active display's Space list could not be read".to_string())
+        })?;
+    if !spaces.contains(&target_space_id) {
+        return Err(Error::InvalidInput(
+            "target Space is not on the active display".to_string(),
+        ));
+    }
+    Ok(spaces.clone())
+}
+
 fn post_native_space_gesture(delta: isize) -> Result<()> {
     // Private CGEvent fields used by yabai's SIP-on gesture fallback.
     const EVENT_TYPE: CGEventField = CGEventField(55);
@@ -589,21 +616,8 @@ impl WindowManagerOS {
 
     fn focus_native_space(&self, target_space_id: WorkspaceId, animate: bool) -> Result<()> {
         let active_display_id = self.active_display_id()?;
-        // Only a display whose own Space list was read can confirm that the
-        // target Space lives on it. An unreadable inventory or an unreadable
-        // per-display Space list is reported as such instead of being folded
-        // into "the target Space is not on the active display".
-        let spaces = self
-            .observe_displays()?
-            .into_iter()
-            .find_map(|observation| {
-                let spaces = observation.spaces.ok()?;
-                (observation.display.id() == active_display_id && spaces.contains(&target_space_id))
-                    .then_some(spaces)
-            })
-            .ok_or_else(|| {
-                Error::InvalidInput("target Space is not on the active display".to_string())
-            })?;
+        let displays = self.observe_displays()?;
+        let spaces = active_display_spaces(&displays, active_display_id, target_space_id)?;
         let current_space_id = self.active_display_space(active_display_id)?;
         let delta = native_space_gesture_delta(&spaces, current_space_id, target_space_id)?;
         if animate {
@@ -1376,6 +1390,65 @@ mod native_space_runtime_tests {
         assert_eq!(native_space_gesture_delta(&spaces, 20, 20).unwrap(), 0);
         assert!(native_space_gesture_delta(&spaces, 99, 20).is_err());
         assert!(native_space_gesture_delta(&spaces, 20, 99).is_err());
+    }
+
+    fn observed_display(
+        id: CGDirectDisplayID,
+        spaces: Result<Vec<WorkspaceId>>,
+    ) -> DisplayObservation {
+        DisplayObservation {
+            display: Display::new(id, IRect::new(0, 0, 1000, 800), 0),
+            spaces,
+        }
+    }
+
+    #[test]
+    fn active_display_spaces_requires_the_active_display_to_list_the_target() {
+        let displays = [
+            observed_display(1, Ok(vec![10, 20])),
+            observed_display(2, Ok(vec![30, 40])),
+        ];
+        assert_eq!(
+            active_display_spaces(&displays, 1, 20).unwrap(),
+            vec![10, 20]
+        );
+        // The target lives on the other display.
+        assert!(active_display_spaces(&displays, 1, 30).is_err());
+        // No display lists the target at all.
+        assert!(active_display_spaces(&displays, 1, 99).is_err());
+    }
+
+    /// A display whose Space list could not be read is not evidence that the
+    /// target Space is absent, so it must not be reported as a refusal about
+    /// the target. This is the distinction the previous inline version lost.
+    #[test]
+    fn active_display_spaces_separates_an_unreadable_list_from_an_absent_target() {
+        let displays = [
+            observed_display(1, Err(Error::Generic("topology unavailable".into()))),
+            observed_display(2, Ok(vec![30])),
+        ];
+        let unreadable = active_display_spaces(&displays, 1, 30).unwrap_err();
+        assert!(
+            !matches!(unreadable, Error::InvalidInput(_)),
+            "an unreadable Space list was reported as a refusal about the target: {unreadable:?}"
+        );
+
+        let absent = active_display_spaces(&displays, 2, 99).unwrap_err();
+        assert!(
+            matches!(absent, Error::InvalidInput(_)),
+            "a readable list without the target is a refusal: {absent:?}"
+        );
+    }
+
+    /// The active display need not appear in the inventory at all.
+    #[test]
+    fn active_display_spaces_reports_a_display_missing_from_the_inventory() {
+        let displays = [observed_display(2, Ok(vec![30]))];
+        let error = active_display_spaces(&displays, 1, 30).unwrap_err();
+        assert!(
+            !matches!(error, Error::InvalidInput(_)),
+            "a display that was never observed is not a refusal about the target: {error:?}"
+        );
     }
 }
 
