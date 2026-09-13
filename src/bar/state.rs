@@ -5,7 +5,6 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::query::Has;
 use bevy::ecs::system::{Query, Res, SystemParam};
 use spool_shared_types::windowset::ColumnKind;
-use tracing::warn;
 
 use super::BarSnapshot;
 use super::model::{BarColumn, BarSpace, BarWindow};
@@ -14,7 +13,7 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::reconcile::WindowUnavailable;
 use crate::ecs::state::QueryStateParams;
 use crate::ecs::{Floating, FocusedMarker, WindowVisibility};
-use crate::manager::{Application, Window, WindowManager};
+use crate::manager::{Application, Window};
 
 // Presentation must retain tracked identity even while AX operations are suspended.
 // Do not widen the shared `Windows` query used by focus and layout commands.
@@ -38,7 +37,6 @@ pub(crate) struct BarStateParams<'w, 's> {
     strips: Query<'w, 's, &'static LayoutStrip>,
     windows: BarWindows<'w, 's>,
     apps: Query<'w, 's, (Entity, &'static Application)>,
-    window_manager: Res<'w, WindowManager>,
     /// Per-Space selection is presentation state, independent of native focus.
     focus: Option<Res<'w, FocusCoordinator>>,
 }
@@ -46,18 +44,18 @@ pub(crate) struct BarStateParams<'w, 's> {
 impl BarStateParams<'_, '_> {
     pub fn extract(&self) -> crate::errors::Result<BarSnapshot> {
         // One native membership scan serves the state document, the window set
-        // and the Bar's own per-Space membership. A scan that fails publishes
-        // nothing, so each Space falls back to being read on its own rather
-        // than the whole Bar degrading to the retained layout.
-        let memberships = self.state.memberships();
+        // and the Bar's own per-Space membership. A Space that scan could not
+        // cover is read on its own rather than the whole Bar degrading to the
+        // retained layout; that policy lives on the observation epoch, not here.
+        let memberships = self.state.space_memberships();
         let floating_by_window = self.state.floating_windows();
         let mut snapshot = BarSnapshot::from_state(
             &self
                 .state
-                .query_state(&floating_by_window, memberships.as_ref())?,
+                .query_state(&floating_by_window, memberships.scan())?,
             &self
                 .state
-                .window_set(&floating_by_window, memberships.as_ref()),
+                .window_set(&floating_by_window, memberships.scan()),
         );
         let strips = self
             .strips
@@ -71,22 +69,7 @@ impl BarStateParams<'_, '_> {
             .collect::<Vec<_>>();
         for display in &mut snapshot.displays {
             for space in &mut display.spaces {
-                let membership = memberships.as_ref().map_or_else(
-                    || {
-                        self.window_manager
-                            .windows_in_workspace(space.id)
-                            .map(|ids| ids.into_iter().collect::<HashSet<_>>())
-                            .inspect_err(|error| {
-                                warn!(
-                                    space_id = space.id,
-                                    %error,
-                                    "unable to observe Bar membership"
-                                );
-                            })
-                            .ok()
-                    },
-                    |memberships| Some(memberships.listed_in(space.id).collect()),
-                );
+                let membership = memberships.listed_in(space.id);
                 if let Some(strip) = strips.get(&space.id) {
                     self.project_windows(space, strip, &floating, membership.as_ref());
                 }
@@ -222,6 +205,7 @@ mod tests {
     use crate::ecs::native_space::VisibleNativeSpaceMarker;
     use crate::ecs::reconcile::WindowUnavailable;
     use crate::events::Event;
+    use crate::manager::WindowManager;
     use crate::tests::{TEST_WORKSPACE_ID, TestHarness, find_window_entity};
     use bevy::ecs::system::RunSystemOnce;
 

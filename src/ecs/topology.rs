@@ -48,6 +48,46 @@ impl WindowMemberships {
     }
 }
 
+/// Membership answers for one observation epoch, for callers that need a Space
+/// at a time rather than the whole map.
+///
+/// Built from a single complete scan when that scan succeeds, and from a
+/// per-Space read otherwise. A failed scan must not degrade an entire
+/// projection to retained layout, and answering about one Space does not
+/// require reading the others — so which read pays for which answer is decided
+/// here rather than at each call site.
+pub(crate) struct SpaceMemberships<'a> {
+    manager: &'a WindowManager,
+    scan: Option<WindowMemberships>,
+}
+
+impl SpaceMemberships<'_> {
+    /// The complete scan, for read models that need every Space at once.
+    ///
+    /// `None` means the scan failed, and a failed scan publishes no destination
+    /// at all rather than a partial map.
+    pub(crate) fn scan(&self) -> Option<&WindowMemberships> {
+        self.scan.as_ref()
+    }
+
+    /// Windows macOS lists in one Space.
+    ///
+    /// `Some` may be empty: that is a Space holding no windows. `None` means no
+    /// source could answer, which is not an empty Space.
+    pub(crate) fn listed_in(&self, space: WorkspaceId) -> Option<HashSet<WinID>> {
+        if let Some(scan) = &self.scan {
+            return Some(scan.listed_in(space).collect());
+        }
+        self.manager
+            .windows_in_workspace(space)
+            .inspect_err(|error| {
+                warn!(space_id = space, %error, "unable to observe Space membership");
+            })
+            .ok()
+            .map(|ids| ids.into_iter().collect())
+    }
+}
+
 /// The answer to a caller's claim that a window sits in a Space that is
 /// currently on screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +140,16 @@ impl NativeTopology {
     pub(crate) fn is_complete(&self) -> bool {
         self.displays()
             .is_some_and(|displays| displays.iter().all(|entry| entry.spaces.is_ok()))
+    }
+
+    /// Membership answers for this epoch, taken once and asked a Space at a
+    /// time. The scan is attempted once here; Spaces it could not cover are
+    /// read on their own when asked for.
+    pub(crate) fn space_memberships<'a>(&self, manager: &'a WindowManager) -> SpaceMemberships<'a> {
+        SpaceMemberships {
+            manager,
+            scan: self.observe_memberships(manager).ok(),
+        }
     }
 
     pub(crate) fn observe_memberships(&self, manager: &WindowManager) -> Result<WindowMemberships> {
@@ -393,5 +443,46 @@ mod tests {
         // The same scan still refuses when a read genuinely fails.
         state.script_workspace_membership_queries(1, [Err(())]);
         assert!(topology.observe_memberships(&manager).is_err());
+    }
+
+    /// An epoch answers per Space from the one scan it already took, so a
+    /// caller asking about a Space the scan covered pays nothing extra.
+    #[test]
+    fn space_memberships_answers_from_the_scan_without_rereading() {
+        let (topology, manager, state) = membership_fixture(vec![1, 2]);
+        state.script_workspace_membership_queries(1, [Ok(vec![10])]);
+        state.script_workspace_membership_queries(2, [Ok(vec![])]);
+
+        let memberships = topology.space_memberships(&manager);
+        let reads_after_scan = state.workspace_membership_query_count();
+        assert!(memberships.scan().is_some());
+        assert_eq!(memberships.listed_in(1), Some(HashSet::from([10])));
+        assert_eq!(memberships.listed_in(2), Some(HashSet::new()));
+        assert_eq!(
+            state.workspace_membership_query_count(),
+            reads_after_scan,
+            "a Space the scan already covered must not be read a second time"
+        );
+    }
+
+    /// A scan that could not be taken does not make every Space unknown: the
+    /// epoch reads the Space it is asked about, and reports `None` only when
+    /// that read fails too.
+    #[test]
+    fn space_memberships_reads_one_space_when_the_scan_fails() {
+        let (mut topology, manager, state) = membership_fixture(vec![1, 2]);
+        state.script_present_display_topology_queries(1, [Err(())]);
+        topology.sample(&manager, false);
+
+        state.script_workspace_membership_queries(1, [Ok(vec![10])]);
+        state.script_workspace_membership_queries(2, [Err(())]);
+        let memberships = topology.space_memberships(&manager);
+        assert!(memberships.scan().is_none());
+        assert_eq!(memberships.listed_in(1), Some(HashSet::from([10])));
+        assert_eq!(
+            memberships.listed_in(2),
+            None,
+            "an unreadable Space is unknown, not empty"
+        );
     }
 }

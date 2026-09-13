@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::ecs::layout::{Column, ColumnId, LayoutStrip, StackItem, WidthIntent};
 use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
 use crate::ecs::params::Windows;
-use crate::ecs::topology::WindowMemberships;
+use crate::ecs::topology::{SpaceMemberships, WindowMemberships};
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker};
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -390,6 +390,16 @@ impl QueryStateParams<'_, '_> {
     /// scan publishes no destination at all rather than a partial map.
     pub(crate) fn memberships(&self) -> Option<WindowMemberships> {
         self.topology.observe_memberships(&self.window_manager).ok()
+    }
+
+    /// Membership answers for one epoch, asked a Space at a time.
+    ///
+    /// Use this instead of [`Self::memberships`] when the caller also answers
+    /// per-Space questions: it takes the scan once and reads a Space on its own
+    /// when the scan could not cover it, rather than publishing nothing for
+    /// every Space.
+    pub(crate) fn space_memberships(&self) -> SpaceMemberships<'_> {
+        self.topology.space_memberships(&self.window_manager)
     }
 
     /// Tracked floating windows by native window id.
