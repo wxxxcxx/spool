@@ -134,6 +134,72 @@ failed read is indistinguishable from "this window has no children".
 > operations are refused, and that is a design decision this review should not
 > make implicitly.
 
+### Method-by-method failure contract inventory
+
+Reading each implementation against its declaration, rather than trusting the
+counts above. `Failure looks like` is what the *production* adapter actually
+does, not what the doc comment claims.
+
+| Method | Declared | Failure looks like | Failed vs empty/negative distinguishable? | Contract documented? |
+|---|---|---|---|---|
+| `perform_system_overview` | `Result<()>` | `Err` | n/a (effect) | yes |
+| `native_space_capabilities` | `NativeSpaceCapabilities` | infallible class probe | n/a | yes |
+| `perform_native_space_intent` | `Result<()>` | `Err` | n/a (acceptance, not completion) | yes |
+| `new_application` | `Result<Application>` | `Err` | n/a | yes |
+| `get_associated_windows` | `Vec<WinID>` | `NULL` → `vec![]` | **no** | yes (added) |
+| `observe_displays` | `Result<Vec<DisplayObservation>>` | outer `Err`; per-display `Err` | **yes** | yes (added) |
+| `active_display_id` | `Result<u32>` | `Err` | n/a | yes |
+| `active_display_space` | `Result<WorkspaceId>` | `Err` only from the UUID conversion; **the Space read itself is never checked** | **no** | claims Ok/Err the read cannot produce |
+| `workspace_is_fullscreen` | `bool` | **collapses a three-valued domain** | **no** | **no** |
+| `warp_mouse` | `()` | infallible | n/a | yes |
+| `find_existing_application_windows` | `Result<(Vec<Window>, Vec<WinID>)>` | `Err` from the AX list; the *supplementary* inventory failure is **swallowed** by `unwrap_or_default()`, logged at debug | **no**, for the supplementary half | claims Ok/Err |
+| `find_window_at_point` | `Result<WinID>` | `Err(InvalidWindow)` at id `0` | n/a | yes |
+| `windows_in_workspace` | `Result<Vec<WinID>>` | `Err` | **yes** | yes (added) |
+| `presentation_windows_in_workspace` | `Result<Vec<WinID>>` | `Err` | **yes** | yes (added) |
+| `quit` | `Result<()>` | `Err` (channel send) | n/a | yes |
+| `setup_config_watcher` | `Result<Box<dyn Watcher>>` | `Err` | n/a | yes |
+| `cursor_position` | `Option<CGPoint>` | `None` | n/a (no empty case) | yes |
+| `dim_windows` | `()` | silent return on overflow; platform failure only at debug | **no** | no (levels only) |
+| `window_owners_in_session` | `Option<HashMap<WinID, Pid>>` | `None` | n/a | **no** — `None`'s meaning is unstated |
+| `window_order_in_session` | `Option<Vec<(WinID, Pid)>>` | `None` | n/a | yes |
+| `request_window_notifications` | `Result<()>` | `Err`; **also `Ok` without asking on macOS < 15** | **no** | no (short-circuit unstated) |
+
+Three findings from this pass that the aggregate view hid:
+
+1. **A three-valued platform answer is stored as one bit.**
+   `SLSSpaceGetType` documents `0` = user/desktop, `2` = system (e.g.
+   Dashboard), `4` = fullscreen, and documents **no failure value**.
+   `workspace_is_fullscreen` keeps only `== 4`, so a system Space reads as a
+   user Space — and `NativeSpace::kind`, which is derived from that same bool,
+   labels it `SpaceKind::User`. The predicate is not missing an error channel;
+   it is answering a question with more answers than `bool` can hold. `SpaceKind`
+   already exists as the domain vocabulary but has only `User` and `Fullscreen`
+   variants.
+2. **An unchecked read is returned as a value.**
+   `active_display_space` converts the display ID to a UUID (`Result`) and then
+   uses `SLSManagedDisplayGetCurrentSpace`'s return directly, so a failed read
+   arrives as `Ok(0)`. This is the same shape as the three-valued collapse, one
+   step worse: there is not even a check to mis-collapse.
+3. **The `unwrap_or_default` shape survives in a second place.**
+   `find_existing_application_windows` swallows a supplementary inventory
+   failure with `unwrap_or_default()` — the exact pattern deleted from
+   `present_displays` — so an unreadable WindowServer inventory produces "no
+   off-screen windows". It is at least logged at debug, which
+   `present_displays` was not.
+
+A fourth, weaker item: `request_window_notifications` returns `Ok(())` without
+requesting anything on macOS < 15. That is a deliberate version short-circuit
+rather than a failure, but nothing in the interface says so, so a caller cannot
+tell "subscribed" from "not applicable here".
+
+**Decision needed before changing any of this.** For (1), the two candidate
+semantics are: refuse every Space operation whose kind is not `User`
+(recommended — it makes "unreadable or unusual" fail closed and matches how the
+precondition is already used), or model system Spaces explicitly, which means a
+third `SpaceKind` variant and therefore a client-visible change in
+`spool-shared-types`, `client.rs`'s string mapping and `SpaceState.kind` on the
+wire.
+
 ### The two adapters disagree about that error mode
 
 `space_window_list_for_connection` (`src/manager.rs:1046`) returns
