@@ -18,6 +18,29 @@ type PendingTransitions<'w, 's> = Query<
     )>,
 >;
 
+#[derive(bevy::ecs::system::SystemParam)]
+pub(super) struct WidthEditPresentation<'w, 's> {
+    visible: Query<
+        'w,
+        's,
+        &'static crate::ecs::native_space::NativeSpace,
+        With<crate::ecs::native_space::VisibleNativeSpaceMarker>,
+    >,
+    commands: Commands<'w, 's>,
+}
+
+impl WidthEditPresentation<'_, '_> {
+    fn reveal(&mut self, space: u64, entity: Option<Entity>) {
+        if self.visible.iter().any(|native| native.id == space)
+            && let Some(entity) = entity
+        {
+            self.commands
+                .entity(entity)
+                .insert(crate::ecs::EnsureVisibleMarker);
+        }
+    }
+}
+
 /// `None` means this operation belongs to another domain (e.g. floating geometry).
 #[allow(
     clippy::too_many_lines,
@@ -34,6 +57,7 @@ pub(super) fn execute(
     displays: Query<(&Display, Option<&DockPosition>)>,
     config: Res<Config>,
     transitions: PendingTransitions,
+    mut presentation: WidthEditPresentation,
 ) -> Option<crate::errors::Result<()>> {
     let reject = |reason| Some(Err(crate::errors::Error::rejected(reason)));
     let (space, operation) = match action {
@@ -72,7 +96,12 @@ pub(super) fn execute(
             }) {
                 return reject("layout_transition_pending");
             }
-            return edit_window(entity, op, strip.id(), &mut strips, &displays, &config);
+            let space = strip.id();
+            let result = edit_window(entity, op, space, &mut strips, &displays, &config);
+            if result.as_ref().is_some_and(Result::is_ok) {
+                presentation.reveal(space, Some(entity));
+            }
+            return result;
         }
         _ => return None,
     };
@@ -159,6 +188,10 @@ pub(super) fn execute(
             return Err(crate::errors::Error::rejected("invalid_layout_geometry"));
         }
         *strip = proposed;
+        presentation.reveal(
+            strip.id(),
+            strip.get(index).ok().and_then(|column| column.top()),
+        );
         Ok(())
     }))
 }

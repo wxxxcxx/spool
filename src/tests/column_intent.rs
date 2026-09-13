@@ -6,6 +6,70 @@ use bevy::prelude::*;
 use spool_shared_types::commands::{ColumnWidth, SpaceLayoutOperation};
 
 #[test]
+fn increasing_column_width_scrolls_only_the_overflow_into_view() {
+    use crate::commands::{Operation, ResizeAxis, ResizeDirection};
+    let grow = Action::TargetedWindow {
+        window_id: 1,
+        operation: Operation::Resize {
+            axis: ResizeAxis::Width,
+            direction: ResizeDirection::Grow,
+        },
+    };
+    for (actions, width, x) in [
+        (
+            vec![Action::TargetedWindow {
+                window_id: 1,
+                operation: Operation::SetWidth(0.75),
+            }],
+            768,
+            256,
+        ),
+        (
+            vec![Action::SpaceLayout {
+                space_id: Some(TEST_WORKSPACE_ID),
+                operation: SpaceLayoutOperation::SetWidth {
+                    column: 2,
+                    width: ColumnWidth::Points(768.0),
+                },
+            }],
+            768,
+            256,
+        ),
+        (vec![grow.clone()], 512, 400),
+        (vec![grow.clone(), grow], 683, 341),
+        (
+            vec![Action::TargetedWindow {
+                window_id: 1,
+                operation: Operation::SetWidth(1.5),
+            }],
+            1536,
+            0,
+        ),
+    ] {
+        let mut harness = TestHarness::new().with_windows(2).with_focused_window(1);
+        harness.pump_frames(30);
+        assert_eq!(
+            harness.mock_state.actual_window_frame(1).unwrap().min.x,
+            400
+        );
+        harness.mock_state.take_focus_requests();
+        for action in actions {
+            harness
+                .world()
+                .write_message(Event::action_requested(action));
+        }
+        harness.pump_frames(90);
+        let after = harness.mock_state.actual_window_frame(1).unwrap();
+        assert_eq!(after.width(), width);
+        assert_eq!(after.min.x, x);
+        assert!(harness.mock_state.take_focus_requests().is_empty());
+        if width <= TEST_DISPLAY_WIDTH {
+            assert!(after.max.x <= TEST_DISPLAY_WIDTH);
+        }
+    }
+}
+
+#[test]
 fn startup_new_column_preserves_initial_window_width() {
     let mut harness = TestHarness::new().with_window(0, |window| {
         window.frame = IRect::new(0, 0, 900, TEST_WINDOW_HEIGHT);
