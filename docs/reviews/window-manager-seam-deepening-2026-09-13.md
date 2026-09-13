@@ -360,9 +360,10 @@ interface.
 Replace, don't layer. The current 22 methods must not survive as a public
 superset.
 
-Status: the adapter fix and the display pass-through removal have landed
-(`47d239c`, `5399477`). The plan below is revised from its first draft; the
-revision is recorded rather than silently applied.
+Status: steps 1, 2a, 2b and 2c have landed (`47d239c`, `5399477`, `4d8f98a`,
+`5aa9579`, `b16da18`). The plan is revised from its first draft each time the
+investigation contradicts it; the revisions are recorded rather than silently
+applied.
 
 1. **Fix the adapter divergence.** Landed. Both adapters answer an empty Space
    with `Ok(vec![])`, the contract is stated on both membership methods, and
@@ -375,22 +376,34 @@ revision is recorded rather than silently applied.
    idea layered on the first, adding surface without adding depth. The
    invariant violation was in `present_displays`, and deleting it was the
    deepening.
-3. **Route membership reads through `NativeTopology`.** `NativeTopology` in
-   `ecs/topology.rs` already composes the observation protocol — sample, check
-   completeness, read membership per Space, refuse on failure — and already
-   carries the availability discipline. Several callers bypass it and read
-   `windows_in_workspace` directly. Make it the only membership read path
-   rather than wrapping the raw methods. Introduce a distinct unavailability
-   type only if the membership reads turn out to need one that `Result`
-   cannot express; do not add it by default.
-4. **Cover the preconditions before moving them.** The
+3. **Cover the preconditions before moving them.** Landed as step 2b. The
    `native_precondition_failed` rejection for a Space move to an unknown target
-   has no test today. That path is reachable from the test double, so cover it
-   first.
-5. **Introduce `NativeSpaceControl`**, folding in the three
+   had no test; both branches now have one, mutation-checked by neutering the
+   precondition.
+4. **Let the observation epoch own the per-Space membership fallback.**
+   Landed. `SpaceMemberships` answers a Space at a time from one scan, and
+   reads a Space alone when the scan could not be taken. The Bar's inline
+   fallback and its `WindowManager` system param are gone, and
+   `DefaultGeometry::viewport`, which hand-rolled the same scan plus its
+   uniqueness and failure rules, now asks the epoch.
+5. **Deliberately *not* migrating the single-Space callers.** This is the
+   revision step 2c produced. `windows_in_workspace` still has callers in
+   `workspace.rs`, `focus.rs`, `systems.rs`, `commands.rs`, `triggers.rs`,
+   `exit_restore.rs` and `reconcile.rs`, and each asks about exactly one Space.
+   For them the epoch's eager scan is *more* expensive than the one read they
+   need — `focus.rs` caches a per-Space read precisely to avoid paying for
+   Spaces it never asks about, and `systems.rs` runs from `finish_setup`, which
+   has no topology to consult, so the epoch would fall back to those same reads
+   while adding a resource dependency. Their
+   failure policies also differ on purpose (skip, propagate, no filter), so a
+   shared wrapper could only unify them by lying. Routing them through the
+   epoch would trade measured platform cost for indirection, which is the
+   opposite of the goal. The epoch is for callers that need many Spaces; the
+   cheap read is for callers that need one.
+6. **Introduce `NativeSpaceControl`**, folding in the three
    `space_control_enabled` gates and the accept/verify dance from `overlay.rs`
    and `native_space.rs`.
-6. **Move the four non-window-management methods** out
+7. **Move the four non-window-management methods** out
    (`setup_config_watcher`, `quit`, `perform_system_overview`, `dim_windows`).
    Separable; can land last.
 
