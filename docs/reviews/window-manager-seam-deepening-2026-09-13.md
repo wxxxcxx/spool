@@ -278,6 +278,30 @@ two. `MockState` models "this display has no current Space" as
 while production returns `Ok(0)`. The test double already treats the case as a
 failure; production does not.
 
+**What the evidence did to each finding.**
+
+The current-Space one is confirmed and fixed (`568f50d`). Production now
+reports `0` as an error, which is also what the test double always did, so the
+third divergence is closed.
+
+The three-valued one is **retired, not fixed**. The reading-based worry was
+that a `bool` collapses an answer with more values than it can hold. In
+practice the managed list on this OS carried only `0` and `4`. `2`
+(system/Dashboard) is legacy — Dashboard has not shipped for several releases,
+and the repository's own research already warned that the Space-type
+definitions "reflect old system semantics" and cannot be the basis for a
+current data model. `3` appears only for ids that name no Space, and the one
+place a client-supplied id reaches the check
+(`execute_native_space_command`'s precondition) is already guarded by
+`target_is_known` from the observed topology. So `workspace_is_fullscreen`
+classifies every Space the observed list can actually produce, and the 14
+consumers are left alone. The residual gap was that the binding's own
+documentation omitted the `3` sentinel, which is now written down (`dbcc38b`).
+
+That is a negative result, and it is recorded as one: the alternative was
+changing 14 call sites, and in one case the wire format, to defend against a
+value the platform does not produce.
+
 ### The two adapters disagree about that error mode
 
 `space_window_list_for_connection` (`src/manager.rs:1046`) returns
@@ -549,11 +573,12 @@ in it. The interface is 21 methods, down from 22; the target shape sketched
 under [Proposed interface](#proposed-interface) was not reached, and the reasons
 are on the record rather than left as an unexplained shortfall.
 
-**Two defects are open and blocked on evidence, not on effort.** They are the
-three-valued Space kind (see the inventory above) and the unchecked
-current-Space read. Both need one observation each from a live session, listed
-with the inventory. Everything else in this review is either landed or rejected
-with its reasoning.
+**No defects are left open.** The live-session probe settled both. The
+current-Space sentinel is fixed (`568f50d`); the three-valued Space kind was
+retired by the evidence, since the managed list on this OS produces only user
+and fullscreen Spaces and the one place a foreign id reaches the check is
+already guarded. Everything in this review is either landed or rejected with
+its reasoning.
 
 1. **Fix the adapter divergence.** Landed. Both adapters answer an empty Space
    with `Ok(vec![])`, the contract is stated on both membership methods, and
