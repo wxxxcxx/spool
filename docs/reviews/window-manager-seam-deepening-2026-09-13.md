@@ -231,10 +231,12 @@ wire change on the strength of a reading alone.
 ### Runtime evidence
 
 Both questions were settled by a read-only probe against the live session
-(macOS 26.6.2, build 25G83, one display, three Spaces). The probe `dlopen`s
-`SkyLight` and calls `SLSMainConnectionID`, `SLSCopyManagedDisplaySpaces`,
-`SLSSpaceGetType` and `SLSManagedDisplayGetCurrentSpace`. It performs no writes,
-starts no daemon, and does not touch any window.
+(macOS 26.6.2, build 25G83, one display, three Spaces). The probe is kept at
+[`scripts/probe-native-spaces.c`](../../scripts/probe-native-spaces.c) so the
+output below can be reproduced; it `dlopen`s `SkyLight` and calls
+`SLSMainConnectionID`, `SLSCopyManagedDisplaySpaces`, `SLSSpaceGetType` and
+`SLSManagedDisplayGetCurrentSpace`. It performs no writes, starts no daemon,
+and does not touch any window.
 
 Observed Space list, with the type carried by the managed-display dictionary
 cross-checked against `SLSSpaceGetType`:
