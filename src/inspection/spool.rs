@@ -80,6 +80,7 @@ pub(crate) struct Projection<'w, 's> {
     >,
     config: Res<'w, Config>,
     sync: Res<'w, crate::ecs::reconcile::WindowStateSync>,
+    focus: Res<'w, crate::ecs::focus::FocusCoordinator>,
     persistence: ResMut<'w, crate::ecs::state::StatePersistence>,
     lifecycle: Res<'w, crate::lifecycle::Lifecycle>,
 }
@@ -181,7 +182,7 @@ impl Projection<'_, '_> {
         self.strips.iter().take_while(|_| budget.admit()).map(|(strip,parent,native,visible,active)| {
             let display = self.displays.get(parent.parent()).ok().map(|row|row.1.id());
             json!({"identity":{"id":strip.id(),"display_id":recorded(display),"ordinal":recorded(native.map(|space|space.ordinal+1)),"kind":recorded(native.map(|space|space.kind))},
-                "state":{"visible":visible,"active":active},"windows":windows.iter().filter(|row|row["layout"]["space_id"]==strip.id()).map(window_summary).collect::<Vec<_>>()})
+                "state":{"visible":visible,"active":active},"focus":{"preference_window_id":self.focus.preference_entity(strip.id()).and_then(|entity|self.windows.get(entity).ok().map(|row|row.1.id())),"selection_window_id":self.focus.navigation_entity(strip.id()).and_then(|entity|self.windows.get(entity).ok().map(|row|row.1.id()))},"windows":windows.iter().filter(|row|row["layout"]["space_id"]==strip.id()).map(window_summary).collect::<Vec<_>>()})
         }).collect()
     }
 
@@ -336,7 +337,7 @@ pub(crate) fn collect(In(request): In<ReadRequest>, mut state: Projection) -> Re
         Resource::App => state.app_rows(&windows, &capture_budget),
         Resource::SpaceLayout => state.layout_rows(&capture_budget),
         Resource::Session => vec![
-            json!({"identity":{},"active":{"display_id":state.displays.iter().find(|row|row.3).map(|row|row.1.id()),"space_id":state.strips.iter().find(|row|row.4).map(|row|row.0.id()),"window_id":state.windows.iter().find(|row|row.4).map(|row|row.1.id())},"displays":state.display_rows(&capture_budget).iter().map(|row|summary(Resource::Display,row)).collect::<Vec<_>>(),"spaces":state.space_rows(&windows, &capture_budget).iter().map(|row|summary(Resource::Space,row)).collect::<Vec<_>>(),"windows":windows.iter().map(window_summary).collect::<Vec<_>>(),"apps":state.app_rows(&windows, &capture_budget).iter().map(|row|summary(Resource::App,row)).collect::<Vec<_>>(),"capabilities":{"space_control_enabled":state.config.space_control_enabled(),"native":unknown()}}),
+            json!({"identity":{},"focus":state.focus.activation_diagnostics(),"active":{"display_id":state.displays.iter().find(|row|row.3).map(|row|row.1.id()),"space_id":state.strips.iter().find(|row|row.4).map(|row|row.0.id()),"window_id":state.windows.iter().find(|row|row.4).map(|row|row.1.id())},"displays":state.display_rows(&capture_budget).iter().map(|row|summary(Resource::Display,row)).collect::<Vec<_>>(),"spaces":state.space_rows(&windows, &capture_budget).iter().map(|row|summary(Resource::Space,row)).collect::<Vec<_>>(),"windows":windows.iter().map(window_summary).collect::<Vec<_>>(),"apps":state.app_rows(&windows, &capture_budget).iter().map(|row|summary(Resource::App,row)).collect::<Vec<_>>(),"capabilities":{"space_control_enabled":state.config.space_control_enabled(),"native":unknown()}}),
         ],
     };
     rows.sort_by_key(|row| row["identity"]["id"].as_u64().unwrap_or_default());

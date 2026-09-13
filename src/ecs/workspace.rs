@@ -1168,9 +1168,7 @@ fn restore_focus_on_space_activation(
     };
 
     let snapshot = focus.snapshot();
-    if snapshot.requested_entity().is_some_and(eligible)
-        || snapshot.confirmed_entity().is_some_and(eligible)
-    {
+    if snapshot.requested_entity().is_some() || snapshot.confirmed_entity().is_some_and(eligible) {
         return;
     }
 

@@ -262,6 +262,12 @@ mod tests {
             let first = strip.column_state(0).unwrap().id;
             let second = strip.column_state(1).unwrap().id;
             strip
+                .set_width_intent(first, WidthIntent::InheritConfig)
+                .unwrap();
+            strip
+                .set_width_intent(second, WidthIntent::InheritConfig)
+                .unwrap();
+            strip
                 .set_column_default(first, Some(WidthIntent::ViewportRatio(0.75)))
                 .unwrap();
             strip
@@ -298,7 +304,7 @@ mod tests {
         let strip = world.query::<&LayoutStrip>().single(world).unwrap();
         for state in strip.column_states() {
             assert_eq!(state.width, WidthIntent::ViewportRatio(0.75));
-            assert_eq!(state.intent_revision, 1);
+            assert_eq!(state.intent_revision, 2);
         }
         assert_eq!(strip.effective_column_width(0).unwrap().slot, 1000);
         assert_eq!(strip.effective_column_width(1).unwrap().slot, 768);

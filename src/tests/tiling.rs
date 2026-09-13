@@ -8,8 +8,8 @@ use bevy::prelude::*;
 
 use super::*;
 
-// Inherited first preset is one quarter of the available viewport.
-const DEFAULT_TILED_WIDTH: i32 = TEST_DISPLAY_WIDTH / 4;
+// Ordinary columns retain the initial logical window width.
+const DEFAULT_TILED_WIDTH: i32 = TEST_WINDOW_WIDTH;
 
 #[cfg(feature = "lua")]
 #[test]
@@ -35,7 +35,7 @@ fn edge_padding_reload_repositions_and_resizes_existing_windows() {
     assert_window_size!(
         harness.world(),
         0,
-        (TEST_DISPLAY_WIDTH - 16) / 4,
+        TEST_WINDOW_WIDTH,
         TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - 16
     );
 
@@ -49,7 +49,7 @@ fn edge_padding_reload_repositions_and_resizes_existing_windows() {
     assert_window_size!(
         harness.world(),
         0,
-        (TEST_DISPLAY_WIDTH - 8) / 4,
+        TEST_WINDOW_WIDTH,
         TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - 8
     );
 }
@@ -179,14 +179,14 @@ fn test_window_balance() {
     TestHarness::new()
         .with_windows(3)
         .on_iteration(1, |world, _state| {
-            // After grow, window 0 should be 341 (one third of 1024).
-            assert_window_size!(world, 0, 341, 748);
+            // After grow, window 0 should be 512 (one half of 1024).
+            assert_window_size!(world, 0, 512, 748);
         })
         .on_iteration(2, |world, _state| {
             // After balance, all windows should match window 0's width.
-            assert_window_size!(world, 0, 341, 748);
-            assert_window_size!(world, 1, 341, 748);
-            assert_window_size!(world, 2, 341, 748);
+            assert_window_size!(world, 0, 512, 748);
+            assert_window_size!(world, 1, 512, 748);
+            assert_window_size!(world, 2, 512, 748);
         })
         .run(commands);
 }

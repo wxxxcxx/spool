@@ -5,6 +5,54 @@ use crate::events::Event;
 use bevy::prelude::*;
 use spool_shared_types::commands::{ColumnWidth, SpaceLayoutOperation};
 
+#[test]
+fn startup_new_column_preserves_initial_window_width() {
+    let mut harness = TestHarness::new().with_window(0, |window| {
+        window.frame = IRect::new(0, 0, 900, TEST_WINDOW_HEIGHT);
+    });
+    harness.pump_frames(90);
+    assert_eq!(
+        harness.mock_state.actual_window_frame(0).unwrap().width(),
+        900
+    );
+    let world = harness.world();
+    let strip = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .unwrap();
+    assert_eq!(
+        strip.column_state(0).unwrap().width,
+        WidthIntent::Absolute(900.0)
+    );
+}
+
+#[test]
+fn late_new_column_preserves_its_own_width_across_config_reload() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(20);
+    harness = harness.with_window(1, |window| {
+        window.frame = IRect::new(0, 0, 700, TEST_WINDOW_HEIGHT);
+    });
+    harness.pump_frames(90);
+    let config: crate::config::Config = (
+        crate::config::MainOptions {
+            preset_column_widths: vec![0.75],
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    harness.world().insert_resource(config);
+    harness.pump_frames(90);
+    for (id, width) in [(0, TEST_WINDOW_WIDTH), (1, 700)] {
+        assert_eq!(
+            harness.mock_state.actual_window_frame(id).unwrap().width(),
+            width
+        );
+    }
+}
+
 fn edit(harness: &mut TestHarness, space: u64, column: usize, width: ColumnWidth) {
     harness
         .world()

@@ -115,6 +115,17 @@ pub(super) fn execute(world: &mut World, action: Action) -> crate::errors::Resul
             .map_err(|error| {
                 crate::errors::Error::rejection_with_cause("native_operation_rejected", error)
             }),
+        Action::SetSpaceFocusPreference {
+            space_id,
+            window_id,
+        } => world
+            .run_system_cached_with(
+                crate::ecs::focus::set_space_preference,
+                (space_id, window_id),
+            )
+            .map_err(|error| {
+                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
+            })?,
         action @ (Action::FocusWindow { .. }
         | Action::FocusWindowInSpace { .. }
         | Action::FocusSpace { .. }

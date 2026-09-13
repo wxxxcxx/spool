@@ -478,7 +478,7 @@ fn command_batch_does_not_redirect_hidden_pending_focus_to_old_window() {
 }
 
 #[test]
-fn command_batch_cancelled_focus_request_resumes_confirmed_target() {
+fn command_batch_withdrawn_focus_intent_does_not_redirect_to_confirmed_target() {
     let mut harness = harness();
     let old = find_window_entity(0, harness.world());
     let next = find_window_entity(1, harness.world());
@@ -498,13 +498,11 @@ fn command_batch_cancelled_focus_request_resumes_confirmed_target() {
             .resource::<crate::ecs::focus::FocusCoordinator>()
             .snapshot()
             .requested_entity(),
-        None
+        Some(next)
     );
+    let old_width = width_intent(&mut harness, old);
     dispatch(&mut harness, [Action::Window(Operation::SetWidth(0.75))]);
-    assert_eq!(
-        width_intent(&mut harness, old),
-        crate::ecs::layout::WidthIntent::ViewportRatio(0.75)
-    );
+    assert_eq!(width_intent(&mut harness, old), old_width);
     assert!(harness.world().get::<ResizeMarker>(next).is_none());
 }
 

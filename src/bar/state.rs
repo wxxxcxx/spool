@@ -188,9 +188,9 @@ impl BarStateParams<'_, '_> {
 
     /// The window a focus request has already named, if any.
     ///
-    /// A request is dropped as soon as any focus observation is accepted, so
-    /// what is drawn from it and what accessibility confirms agree within a
-    /// frame or two of each other.
+    /// Pending activation is distinct from confirmed focus. Unknown evidence
+    /// retains the request; confirmation, yield or invalidation ends its
+    /// pending presentation without deleting the diagnostic outcome.
     fn requested_focus_entity(&self) -> Option<Entity> {
         self.requested_focus
             .as_ref()

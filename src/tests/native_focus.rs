@@ -6,7 +6,7 @@ use crate::commands::{Action, MoveFocus};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_space::{self, VisibleNativeSpaceMarker};
-use crate::ecs::{Floating, WindowVisibility};
+use crate::ecs::{Floating, SpawnCommandsExt, WindowVisibility};
 use crate::events::Event;
 use crate::platform::WinID;
 
@@ -481,4 +481,169 @@ fn native_focus_script_keeps_explicit_space_activation_policy_and_identity_bindi
         "bound script focus explicitly allows native Space activation"
     );
     assert!(harness.mock_state.native_space_intents().is_empty());
+}
+
+#[test]
+fn activation_attempt_is_not_repeated_by_coordinator_or_automatic_restore() {
+    let mut harness = focus_harness();
+    focus(&mut harness, 0);
+    assert_eq!(harness.mock_state.take_focus_requests(), vec![0]);
+    let target = find_window_entity(0, harness.world());
+    for _ in 0..3 {
+        harness
+            .world()
+            .run_system_once(crate::ecs::focus::reconcile_activation)
+            .unwrap();
+        harness
+            .world()
+            .run_system_once(move |mut commands: Commands| {
+                commands.restore_focus_entity(target, true);
+            })
+            .unwrap();
+    }
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+    focus(&mut harness, 0);
+    assert_eq!(
+        harness.mock_state.take_focus_requests(),
+        vec![0],
+        "new explicit input gets one attempt"
+    );
+}
+
+#[test]
+fn activation_blocked_by_mission_control_only_executes_latest_intent() {
+    let mut harness = focus_harness();
+    harness
+        .world()
+        .resource_mut::<crate::ecs::MissionControlActive>()
+        .0 = true;
+    focus(&mut harness, 0);
+    focus(&mut harness, 0);
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+    harness
+        .world()
+        .resource_mut::<crate::ecs::MissionControlActive>()
+        .0 = false;
+    harness
+        .world()
+        .run_system_once(crate::ecs::focus::reconcile_activation)
+        .unwrap();
+    assert_eq!(harness.mock_state.take_focus_requests(), vec![0]);
+    harness
+        .world()
+        .run_system_once(crate::ecs::focus::reconcile_activation)
+        .unwrap();
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn activation_background_preference_is_state_only_and_space_local() {
+    let mut harness = focus_harness();
+    let before = harness
+        .world()
+        .resource::<crate::ecs::focus::FocusCoordinator>()
+        .snapshot();
+    run_commands(
+        &mut harness,
+        [Action::SetSpaceFocusPreference {
+            space_id: TARGET,
+            window_id: 1,
+        }],
+    );
+    let target = find_window_entity(1, harness.world());
+    let focus = harness
+        .world()
+        .resource::<crate::ecs::focus::FocusCoordinator>();
+    assert_eq!(focus.preference_entity(TARGET), Some(target));
+    assert_eq!(focus.navigation_entity(TARGET), Some(target));
+    assert_eq!(focus.snapshot(), before);
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+    assert!(harness.mock_state.native_space_intents().is_empty());
+}
+
+#[test]
+fn activation_failed_submission_yields_only_after_stable_native_readback() {
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(20);
+    harness.mock_state.take_focus_requests();
+    harness.mock_state.fail_focus_requests(true);
+    focus(&mut harness, 1);
+    assert_eq!(harness.mock_state.take_focus_requests(), vec![1]);
+    // Native focus stays on 0 even though Spool requested 1.
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.focused_window_id = Some(0));
+    let diagnostics = |harness: &mut TestHarness| {
+        harness
+            .world()
+            .resource::<crate::ecs::focus::FocusCoordinator>()
+            .activation_diagnostics()
+    };
+    assert_eq!(
+        diagnostics(&mut harness)["activation"]["submission_failed"],
+        true
+    );
+    harness
+        .world()
+        .resource_mut::<Time>()
+        .advance_by(std::time::Duration::from_millis(250));
+    harness
+        .world()
+        .run_system_once(crate::ecs::focus::activation::verify_activation)
+        .unwrap();
+    assert_eq!(
+        diagnostics(&mut harness)["activation"]["outcome"],
+        "unconfirmed"
+    );
+    harness
+        .world()
+        .resource_mut::<Time>()
+        .advance_by(std::time::Duration::from_millis(750));
+    harness
+        .world()
+        .run_system_once(crate::ecs::focus::activation::verify_activation)
+        .unwrap();
+    assert_eq!(
+        diagnostics(&mut harness)["activation"]["outcome"],
+        "yielded"
+    );
+    harness.mock_state.fail_focus_requests(false);
+    harness
+        .world()
+        .run_system_once(crate::ecs::focus::reconcile_activation)
+        .unwrap();
+    assert!(harness.mock_state.take_focus_requests().is_empty());
+}
+
+#[test]
+fn activation_unknown_exhausts_readback_budget_without_new_writes() {
+    let mut harness = focus_harness();
+    harness.mock_state.fail_focus_requests(true);
+    focus(&mut harness, 0);
+    harness
+        .mock_state
+        .update_app(TEST_PROCESS_ID, |app| app.focused_window_id = None);
+    harness.mock_state.take_focus_requests();
+    for _ in 0..5 {
+        harness
+            .world()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(5));
+        harness
+            .world()
+            .run_system_once(crate::ecs::focus::activation::verify_activation)
+            .unwrap();
+        harness
+            .world()
+            .run_system_once(crate::ecs::focus::reconcile_activation)
+            .unwrap();
+    }
+    let snapshot = harness
+        .world()
+        .resource::<crate::ecs::focus::FocusCoordinator>()
+        .activation_diagnostics();
+    assert_eq!(snapshot["activation"]["outcome"], "unconfirmed");
+    assert_eq!(snapshot["activation"]["readbacks"], 3);
+    assert_eq!(snapshot["activation"]["readback_budget_exhausted"], true);
+    assert!(harness.mock_state.take_focus_requests().is_empty());
 }

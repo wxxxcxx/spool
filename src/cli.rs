@@ -178,6 +178,12 @@ pub(crate) fn command() -> Command {
             Command::new("tiled-visibility").arg(option("space")),
         )));
     let space = inventory("space", &["display", "kind", "visible"])
+        .subcommand(control(
+            Command::new("prefer-focus")
+                .about("Retain a Space focus preference without activating it")
+                .arg(positional("id"))
+                .arg(option("window").required(true)),
+        ))
         .subcommand(control(Command::new("focus").arg(positional("id"))))
         .subcommand(control(
             Command::new("create").arg(option("display").required(true)),

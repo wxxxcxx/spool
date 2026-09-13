@@ -3,6 +3,8 @@
 Label: wayfinder:map
 Status: resolved
 
+后续讨论：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已确认，待进入实现的整体确认）。
+
 ## Destination
 
 明确意图、观测和协调状态的归属与写入权限，确定外部操作、失败和生命周期政策，形成首个完整迁移切片的可实施规格及验收标准。覆盖布局、焦点和 Space 归属，本轮止于规划。
@@ -12,12 +14,12 @@ Status: resolved
 - 本地 Markdown tracker；操作见 [tracker 约定](../../agents/issue-tracker.md)。通过子票 Status、Assignee、Blocked by 查询 frontier，不在此复制开放票列表。
 - 以 [ADR 0006](../../adr/0006-declarative-state-driven-window-management.md) 为方向基线；术语见 [领域词汇](../../CONTEXT.md)。代码现状不是完整目标模型。
 - 每轮读取 woz-wayfinder、woz-domain-modeling，设计模块时结合 woz-codebase-design；人类问题用 woz-grilling。以已读技能和用户持续授权为准，无需重复读取。
-- 本轮连续解决专家一致的决策是用户明确授权；每题三位专家独立投票，不一致的分项保留开放票并在最后汇总。专业建议不能被写成用户逐项亲自确认。
+- 历史规划采用三专家政策；用户已取消该策略，后续直接推进，不启动三专家投票。历史专业建议不等于用户逐项亲自确认。
 - 专家分歧已按用户要求逐项用具体例子解释，并分别获得用户裁决；19张决策票全部解决，规划地图关闭。
 - 开发期无需旧兼容；完整跨重启恢复扩展、安装部署和实际桌面验收不在规划轮范围。用户随后已授权首片代码实现。
 - [状态归属与迁移规格](spec.md)是已定稿的实施导航，决策细节只存子票；首片进展和验证见 [实施记录](implementation.md)。
 
-- 用户在首片完成后明确要求继续；当前按 [排列与 stack 高度如何成为独立意图](issues/20-stack-height.md) 实施下一切片。地图原19张票保持历史结论，新增实施期决策单独记录。
+- 列宽与排列/stack高度已提交；焦点切片的代码差距、实施边界和验收见 [焦点偏好、激活请求与实际焦点的完整迁移切片](issues/21-focus-activation.md)。用户继续授权后已实现焦点切片；最新验证见实施记录。
 
 ## Decisions so far
 
@@ -39,12 +41,14 @@ Status: resolved
 - [外部几何接纳采用哪种稳定采样默认值](issues/12-stability-default.md) — 用户确认按窗口防抖，新相关事件延后计算，静默150ms后新鲜读回。
 - [几何重试与被动确认采用什么预算](issues/14-retry-budget.md) — 用户确认含首次共3次尝试，250ms/1s/5s只读检查，提前成功即结束。
 - [稳定竞争成立前是否允许焦点重试](issues/15-focus-retry.md) — 用户确认每次明确聚焦只尝试一次，之后只读，新操作才可再次发起。
-- [新列默认宽度来自配置还是接纳时观测](issues/18-column-initialization.md) — 用户确认无明确设置或规则的新列默认继承配置，不采纳初始frame为宽度意图。
+- [新列默认宽度来自配置还是接纳时观测](issues/18-column-initialization.md) — 用户2026-09-13纠正：无明确设置或宽度规则的新列一次性采纳初始逻辑宽度，之后保留Absolute意图。
 - [动画在终点前失败如何计入尝试预算](issues/19-animation-budget.md) — 用户确认开始实际调整即占一次，中途失败也计数，整段动画不逐帧扣次。
 
 - [排列与 stack 高度如何成为独立意图](issues/20-stack-height.md) — 三专家一致采用项权重与纯派生，贯通后台排列、版本门和嵌套保存。
 
 - 排列/stack高度切片已按20号票完成并记录，进展与验证见 [实施记录](implementation.md)。用户随后指示不再使用三专家策略。地图原19张票与20号票保持历史结论，实施期决策单独记录。
+
+- [焦点偏好、激活请求与实际焦点的完整迁移切片](issues/21-focus-activation.md) — 已核对独立版本、单次尝试、让权证据与入口替换；焦点代码已实施，目标Space归属事务仍为后续切片。
 
 ## Not yet specified
 

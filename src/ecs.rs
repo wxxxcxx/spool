@@ -749,6 +749,8 @@ impl SpawnCommandsExt for Commands<'_, '_> {
                 entity,
                 raise,
                 kind: focus::FocusRequestKind::Explicit,
+                allow_native_activation: false,
+                native_space: None,
             });
         }
     }
@@ -759,6 +761,8 @@ impl SpawnCommandsExt for Commands<'_, '_> {
                 entity,
                 raise,
                 kind: focus::FocusRequestKind::Automatic,
+                allow_native_activation: false,
+                native_space: None,
             });
         }
     }

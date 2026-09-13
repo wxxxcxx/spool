@@ -78,6 +78,9 @@ A Native Space's preferred focus target, covering tiled and floating windows. It
 **Logical Navigation Selection**:
 The latest accepted navigation choice within a Native Space, which may precede native focus confirmation.
 
+**Space Focus Indication**:
+The visible indication of a Native Space's retained focus choice, independent of whether that Space is globally active. It does not assert that the selected window currently receives keyboard input.
+
 **Confirmed Focus History**:
 A Native Space's record of windows whose focus was confirmed by native observation. An accepted but unconfirmed navigation choice is not a confirmed visit.
 
@@ -97,7 +100,7 @@ The termination of an activation request after fresh evidence establishes stable
 A column's identity within one Spool run, independent of its current ordinal or member order. A destroyed column's identity is not reused.
 
 **Column Width Intent**:
-The original choice of a column's layout-slot width in logical points, as an absolute value, a proportion of its usable viewport, or an inherited configuration default.
+The original choice of a column's layout-slot width in logical points, as an absolute value, a proportion of its usable viewport, or an inherited configuration default. An ordinary new column without an explicit width rule adopts its admitted window's logical width once as an absolute value; later native observations and preset changes do not reseed it.
 
 **Restore Candidate**:
 A saved description of layout intent and possible object associations awaiting validated binding to the current run. Reading a candidate does not restore a window or establish current native topology. A candidate member with no recorded identity hint is an unresolved slot, not an absent association.

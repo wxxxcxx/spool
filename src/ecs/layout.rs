@@ -582,6 +582,9 @@ impl LayoutStrip {
             .find(|state| state.id == id)
             .ok_or_else(|| Error::NotFound("column identity no longer exists".into()))?;
         if state.width == width {
+            // An explicit inherit/reset before first projection is also an
+            // initialization choice, even when its value matches the default.
+            state.width_initialized = true;
             return Ok(false);
         }
         let revision = state
@@ -589,6 +592,7 @@ impl LayoutStrip {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidInput("column intent revision exhausted".into()))?;
         state.width = width;
+        state.width_initialized = true;
         state.restore_width = None;
         state.intent_revision = revision;
         Ok(true)
@@ -599,9 +603,21 @@ impl LayoutStrip {
         id: ColumnId,
         source: Entity,
         width: Option<WidthIntent>,
+        initial_width: i32,
     ) -> Result<bool> {
-        let changed = self.set_column_default(id, width)?;
+        let mut changed = self.set_column_default(id, width)?;
         if let Some(state) = self.column_states.iter_mut().find(|state| state.id == id) {
+            if !state.width_initialized {
+                if width.is_none()
+                    && state.width == WidthIntent::InheritConfig
+                    && state.intent_revision == 0
+                    && initial_width > 0
+                {
+                    state.width = WidthIntent::Absolute(f64::from(initial_width));
+                    changed = true;
+                }
+                state.width_initialized = true;
+            }
             state.config_source = Some(source);
         }
         Ok(changed)
@@ -2485,7 +2501,7 @@ mod tests {
             world.run_system(system).unwrap();
             assert_eq!(
                 world.get::<RepositionMarker>(strip_entity).unwrap().0.x,
-                -1232
+                -1376
             );
             assert!(world.get::<EnsureVisibleMarker>(first).is_none());
             assert!(world.get::<EnsureVisibleMarker>(second).is_none());
@@ -2515,7 +2531,7 @@ mod tests {
         world.run_system(system).unwrap();
         assert_eq!(
             world.get::<RepositionMarker>(strip_entity).unwrap().0,
-            Origin::new(1168 - i32::MAX, 20)
+            Origin::new(1024 - i32::MAX, 20)
         );
     }
 
@@ -2582,7 +2598,7 @@ mod tests {
         world.run_system_once(position_layout_windows).unwrap();
         let frame = world.get::<DesiredWindowFrame>(entity).unwrap().0;
         assert_eq!(frame.min.x, expected_x);
-        assert_eq!(frame.width(), 256);
+        assert_eq!(frame.width(), crate::tests::TEST_WINDOW_WIDTH);
         assert!(checked_frame_size(frame).is_some());
     }
 

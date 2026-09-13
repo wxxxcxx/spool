@@ -351,7 +351,7 @@ native Spaces; missing, floating, and fullscreen endpoints are skipped.
 Snapshots preserve native tab groups even inside vertical stacks. Chained
 `swap`, `stack`, and `unstack` predictions move those groups as whole entries,
 matching replay. `ws:columns()` still returns flat lists of window IDs in layout
-order. Binary clients and the daemon must both use local IPC protocol version 6;
+order. Binary clients and the daemon must both use local IPC protocol version 7;
 versions 2 (flat snapshots), 3 (unbound operations), 4 (numeric actions) and 5
 (pre-height-intent layout operations) are rejected explicitly.
 
@@ -454,3 +454,15 @@ focus, then waits for target visibility before focusing the moved window.
 Cross-display Space focus can be rejected even if the pure prediction selects
 that display. Create/delete and the old hidden-workspace scratchpad pattern are
 not provided by the observe-only core.
+
+### Space focus preference
+
+`spool space prefer-focus 42 --window 123` accepts a Space-local preference without
+native activation, including a retained background Space. It uses the same action
+argv path available to configured commands and Lua action dispatch. Invalid or
+ambiguous identities and mismatched Space membership are rejected. Preferences are
+session-local; saved layout format v6 is unchanged.
+
+Explicit focus still requests activation. Each accepted activation has at most one
+native attempt, followed only by bounded readback. Read `spool session inspect` for
+activation outcome; acceptance does not mean the window became focused.

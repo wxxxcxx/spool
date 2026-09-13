@@ -1545,7 +1545,11 @@ fn native_move_automatic_focus_preserves_pending_follow() {
                 commands.restore_focus_entity(other, true);
             })
             .unwrap();
-        assert_eq!(harness.mock_state.take_focus_requests(), vec![2]);
+        assert_eq!(
+            harness.mock_state.take_focus_requests(),
+            if focus_submitted { vec![] } else { vec![2] },
+            "automatic restoration cannot activate an invisible source Space"
+        );
         reconcile(&mut harness);
         refresh_native_observation(&mut harness);
         reconcile(&mut harness);

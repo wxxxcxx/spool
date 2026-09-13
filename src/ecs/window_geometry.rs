@@ -637,7 +637,11 @@ mod context_tests {
                 preset_column_widths: vec![0.5],
                 ..Default::default()
             },
-            vec![],
+            vec![{
+                let mut rule = crate::config::WindowParams::new(".*", None);
+                rule.width = Some(0.5);
+                rule
+            }],
         )
             .into();
         let mut harness = TestHarness::new().with_config(config).with_windows(1);
@@ -688,7 +692,11 @@ mod context_tests {
                     preset_column_widths: vec![0.75],
                     ..Default::default()
                 },
-                vec![],
+                vec![{
+                    let mut rule = crate::config::WindowParams::new(".*", None);
+                    rule.width = Some(0.75);
+                    rule
+                }],
             )
                 .into();
             harness.world().insert_resource(config);

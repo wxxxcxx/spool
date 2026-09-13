@@ -52,6 +52,7 @@ pub struct ColumnState {
     pub restore_width: Option<WidthIntent>,
     pub(crate) configured_width: Option<WidthIntent>,
     pub(crate) config_source: Option<bevy::ecs::entity::Entity>,
+    pub(crate) width_initialized: bool,
     pub(crate) constraints: Vec<WidthConstraint>,
 }
 
@@ -66,6 +67,7 @@ impl Default for ColumnState {
             restore_width: None,
             configured_width: None,
             config_source: None,
+            width_initialized: false,
             constraints: Vec::new(),
         }
     }
@@ -82,6 +84,7 @@ impl ColumnState {
             restore_width: None,
             configured_width: self.configured_width,
             config_source: None,
+            width_initialized: true,
             constraints: Vec::new(),
         }
     }

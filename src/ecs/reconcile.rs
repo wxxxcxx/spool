@@ -1546,7 +1546,7 @@ fn suspend_window(
     focus: &mut FocusCoordinator,
     commands: &mut Commands,
 ) {
-    focus.observe(FocusSignal::Invalidated { entity });
+    focus.suspend(entity);
     if invalidate_layout_projection {
         for mut strip in workspaces.iter_mut().filter(|strip| strip.contains(entity)) {
             strip.set_changed();

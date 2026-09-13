@@ -51,6 +51,10 @@ pub fn parse_action(tokens: &[&str]) -> Result<Action> {
         ["mouse", "next-display"] => Ok(Action::Mouse(MouseMove::ToNextDisplay)),
         ["window", rest @ ..] => parse_window_action(rest),
         ["space", "layout", rest @ ..] => parse_layout_action(rest),
+        ["space", "prefer-focus", id, "--window", window] => Ok(Action::SetSpaceFocusPreference {
+            space_id: positive(id, "Space ID")?,
+            window_id: positive(window, "window ID")?,
+        }),
         ["space", "focus", id] => Ok(Action::FocusSpace {
             space_id: positive(id, "Space ID")?,
         }),
@@ -389,6 +393,16 @@ impl Action {
                 "--space".into(),
                 space_id.to_string(),
             ],
+            Self::SetSpaceFocusPreference {
+                space_id,
+                window_id,
+            } => vec![
+                "space".into(),
+                "prefer-focus".into(),
+                space_id.to_string(),
+                "--window".into(),
+                window_id.to_string(),
+            ],
             Self::FocusSpace { space_id } => {
                 vec!["space".into(), "focus".into(), space_id.to_string()]
             }
@@ -602,6 +616,10 @@ mod tests {
                 space_id: 99,
             },
             Action::FocusSpace { space_id: 99 },
+            Action::SetSpaceFocusPreference {
+                space_id: 99,
+                window_id: 42,
+            },
             Action::MoveWindowToSpace {
                 window_id: 42,
                 space_id: 99,

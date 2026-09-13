@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -17,7 +17,7 @@ use objc2_foundation::{
     NSString, ns_string,
 };
 
-use crate::manager::move_owned_window_to_space;
+use crate::manager::{move_owned_window_to_space, owned_window_is_in_space};
 use crate::platform::{WinID, WorkspaceId};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -644,6 +644,30 @@ mod tests {
     }
 
     #[test]
+    fn decoration_order_cannot_publish_a_background_border_in_the_current_space() {
+        let membership = Cell::new(1_u64);
+        let safe = order_and_bind_decoration(
+            || membership.set(1),
+            || {
+                membership.set(382);
+                Ok::<_, ()>(())
+            },
+            || Ok(membership.get() == 382),
+        )
+        .unwrap();
+        assert!(
+            safe,
+            "ChatGPT's Space 382 border must not be published in Space 1"
+        );
+    }
+
+    #[test]
+    fn decoration_silent_bind_failure_is_not_permission_to_display() {
+        let safe = order_and_bind_decoration(|| {}, || Ok::<_, ()>(()), || Ok(false)).unwrap();
+        assert!(!safe);
+    }
+
+    #[test]
     fn dim_cutout_and_border_share_the_same_presented_frame() {
         let presented = rect(550.0, 120.0, 240.0, 180.0);
         let style = DecorationStyle {
@@ -933,6 +957,17 @@ mod tests {
     }
 }
 
+/// Native ordering may replace a hidden window's Space association.
+fn order_and_bind_decoration<E>(
+    order: impl FnOnce(),
+    bind: impl FnOnce() -> Result<(), E>,
+    verify: impl FnOnce() -> Result<bool, E>,
+) -> Result<bool, E> {
+    order();
+    bind()?;
+    verify()
+}
+
 // ── Overlay window factory ──────────────────────────────────────────────
 
 fn decoration_overlay_level() -> isize {
@@ -983,8 +1018,8 @@ fn make_overlay_window(
 pub struct OverlayManager {
     mtm: MainThreadMarker,
     /// One persistent transparent decoration surface per ordinary native
-    /// Space. Each surface is moved to that exact Space once, then left for
-    /// `WindowServer` to compose as part of the Space transition.
+    /// Space. Binding is verified after native ordering and periodically audited;
+    /// unconfirmed surfaces stay hidden instead of leaking into another Space.
     decoration_overlays: HashMap<WorkspaceId, DecorationOverlay>,
     hidden: bool,
     needs_render: bool,
@@ -999,6 +1034,63 @@ struct DecorationOverlay {
     style: DecorationStyle,
     ordered: bool,
     needs_order: bool,
+    last_binding_check: Option<Instant>,
+    binding_retry_at: Option<Instant>,
+}
+
+impl DecorationOverlay {
+    /// Keep the surface transparent across `AppKit` ordering and native binding.
+    /// Membership, rather than a void private-API return, authorizes visibility.
+    fn ensure_binding(&mut self, space_id: WorkspaceId) -> bool {
+        let now = Instant::now();
+        if self.binding_retry_at.is_some_and(|retry| now < retry) {
+            return false;
+        }
+        let Ok(window_id) = WinID::try_from(self.window.windowNumber()) else {
+            return false;
+        };
+        if self.ordered
+            && !self.needs_order
+            && self
+                .last_binding_check
+                .is_some_and(|checked| now.duration_since(checked) < Duration::from_secs(1))
+        {
+            return true;
+        }
+        if self.ordered
+            && !self.needs_order
+            && owned_window_is_in_space(window_id, space_id).is_ok_and(|bound| bound)
+        {
+            self.last_binding_check = Some(now);
+            return true;
+        }
+        self.window.setAlphaValue(0.0);
+        let result = order_and_bind_decoration(
+            || self.window.orderFrontRegardless(),
+            || move_owned_window_to_space(window_id, space_id),
+            || owned_window_is_in_space(window_id, space_id),
+        );
+        self.last_binding_check = Some(now);
+        if result.as_ref().is_ok_and(|bound| *bound) {
+            self.window.setAlphaValue(1.0);
+            self.ordered = true;
+            self.needs_order = false;
+            self.binding_retry_at = None;
+            true
+        } else {
+            self.window.orderOut(None::<&AnyObject>);
+            self.ordered = false;
+            self.needs_order = true;
+            self.binding_retry_at = Some(now + Duration::from_secs(1));
+            tracing::warn!(
+                space_id,
+                window_id,
+                ?result,
+                "decoration Space binding unconfirmed; keeping surface hidden"
+            );
+            false
+        }
+    }
 }
 
 impl OverlayManager {
@@ -1106,19 +1198,7 @@ impl OverlayManager {
             };
             let view = DecorationView::new(self.mtm, view_frame, &empty_state);
             window.setContentView(Some(&view));
-            let Ok(window_id) = WinID::try_from(window.windowNumber()) else {
-                window.close();
-                continue;
-            };
-            if let Err(error) = move_owned_window_to_space(window_id, target.space_id) {
-                tracing::warn!(
-                    space_id = target.space_id,
-                    %error,
-                    "unable to bind decoration overlay to native Space"
-                );
-                window.close();
-                continue;
-            }
+            window.setAlphaValue(0.0);
             let presentation = focused
                 .map(|(frame, target_id)| retarget_decoration(None, frame, target_id, false));
             self.decoration_overlays.insert(
@@ -1132,13 +1212,15 @@ impl OverlayManager {
                     style,
                     ordered: false,
                     needs_order: true,
+                    last_binding_check: None,
+                    binding_retry_at: None,
                 },
             );
         }
     }
 
     fn render_decorations(&mut self) {
-        for overlay in self.decoration_overlays.values_mut() {
+        for (&space_id, overlay) in &mut self.decoration_overlays {
             let draw_state = overlay.presentation.as_ref().map_or_else(
                 || DecorationDrawState {
                     style: overlay.style.clone(),
@@ -1160,11 +1242,7 @@ impl OverlayManager {
                         presentation = ?overlay.presentation, local_border = ?draw_state.border_rect,
                         "overlay_draw");
                 }
-                if !overlay.ordered || overlay.needs_order {
-                    overlay.window.orderFrontRegardless();
-                    overlay.ordered = true;
-                }
-                overlay.needs_order = false;
+                overlay.ensure_binding(space_id);
             } else if overlay.ordered {
                 overlay.window.orderOut(None::<&AnyObject>);
                 overlay.ordered = false;

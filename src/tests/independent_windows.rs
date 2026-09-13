@@ -325,5 +325,5 @@ fn complete_inventory_recovers_duplicate_slots_without_writing_the_dormant_root(
     assert_eq!(harness.mock_state.position_write_attempts(0), positions);
     let left = harness.mock_state.actual_window_frame(1).unwrap();
     let right = harness.mock_state.actual_window_frame(2).unwrap();
-    assert_eq!(right.min.x - left.min.x, TEST_DISPLAY_WIDTH / 4);
+    assert_eq!(right.min.x - left.min.x, TEST_WINDOW_WIDTH);
 }

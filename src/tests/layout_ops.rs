@@ -637,7 +637,7 @@ fn script_width_uses_the_owner_display_instead_of_the_focused_display() {
     );
     assert_eq!(
         harness.mock_state.actual_window_frame(0).unwrap().width(),
-        TEST_DISPLAY_WIDTH / 4
+        TEST_WINDOW_WIDTH
     );
     crate::assert_focused!(harness.world(), 0);
 }
@@ -782,7 +782,7 @@ fn script_width_resizes_the_column_not_just_its_reported_ratio() {
     );
     assert_eq!(
         harness.mock_state.actual_window_frame(2).unwrap().width(),
-        TEST_DISPLAY_WIDTH / 4
+        TEST_WINDOW_WIDTH
     );
 }
 

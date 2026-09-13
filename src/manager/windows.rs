@@ -202,8 +202,8 @@ pub trait WindowApi: Send + Sync {
         psn: ProcessSerialNumber,
         currently_focused: &Window,
         focused_psn: ProcessSerialNumber,
-    );
-    fn focus_with_raise(&self, psn: ProcessSerialNumber);
+    ) -> Result<()>;
+    fn focus_with_raise(&self, psn: ProcessSerialNumber) -> Result<()>;
     /// Raises the window in the OS z-order without changing focus. Used to
     /// shuffle the floating-vs-tiled tier order. Best-effort: AX raise can't
     /// lift a window above another app's frontmost window.
@@ -736,13 +736,13 @@ impl WindowOS {
     /// # Arguments
     ///
     /// * `psn` - The process serial number of the application.
-    fn make_key_window(&self, psn: &ProcessSerialNumber) {
+    fn make_key_window(&self, psn: &ProcessSerialNumber) -> Result<()> {
         // Reason: On macOS 14 (Sonoma), CGSEncodeEventRecord serializes the raw event
         // buffer via NSKeyedArchiver, misinterpreting 0xFF fill as an ObjC class pointer,
         // causing SIGABRT. See https://github.com/karinushka/paneru/issues/123
         if macos_major_version() == 14 {
             debug!("make_key_window: skipped on macOS 14 (Sonoma) to prevent crash");
-            return;
+            return Ok(());
         }
         let window_id = self.id();
         let mut event_bytes = [0u8; 0xf8];
@@ -752,10 +752,13 @@ impl WindowOS {
         event_bytes[0x20..0x30].fill(0xff);
 
         event_bytes[0x08] = 0x01;
-        unsafe { SLPSPostEventRecordTo(psn, event_bytes.as_ptr().cast()) };
+        unsafe { SLPSPostEventRecordTo(psn, event_bytes.as_ptr().cast()) }
+            .to_result(function_name!())?;
 
         event_bytes[0x08] = 0x02;
-        unsafe { SLPSPostEventRecordTo(psn, event_bytes.as_ptr().cast()) };
+        unsafe { SLPSPostEventRecordTo(psn, event_bytes.as_ptr().cast()) }
+            .to_result(function_name!())?;
+        Ok(())
     }
 }
 
@@ -993,7 +996,7 @@ impl WindowApi for WindowOS {
         psn: ProcessSerialNumber,
         currently_focused: &Window,
         focused_psn: ProcessSerialNumber,
-    ) {
+    ) -> Result<()> {
         let window_id = self.id();
         debug!("{window_id}");
         if focused_psn == psn {
@@ -1004,7 +1007,8 @@ impl WindowApi for WindowOS {
             event_bytes[0x8a] = 0x02;
             event_bytes[0x3c..0x40].copy_from_slice(&currently_focused.id().to_ne_bytes());
             unsafe {
-                SLPSPostEventRecordTo(&focused_psn, event_bytes.as_ptr().cast());
+                SLPSPostEventRecordTo(&focused_psn, event_bytes.as_ptr().cast())
+                    .to_result(function_name!())?;
             }
 
             // Artificially delay the activation. This is necessary because some
@@ -1014,27 +1018,30 @@ impl WindowApi for WindowOS {
             event_bytes[0x8a] = 0x01;
             event_bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
             unsafe {
-                SLPSPostEventRecordTo(&psn, event_bytes.as_ptr().cast());
+                SLPSPostEventRecordTo(&psn, event_bytes.as_ptr().cast())
+                    .to_result(function_name!())?;
             }
         }
 
         unsafe {
-            _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
+            _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED)
+                .to_result(function_name!())?;
         }
-        self.make_key_window(&psn);
+        self.make_key_window(&psn)
     }
 
     /// Focuses the window and raises it to the front.
     #[instrument(level = Level::DEBUG)]
-    fn focus_with_raise(&self, psn: ProcessSerialNumber) {
+    fn focus_with_raise(&self, psn: ProcessSerialNumber) -> Result<()> {
         let window_id = self.id();
         unsafe {
-            _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED);
+            _SLPSSetFrontProcessWithOptions(&psn, window_id, CPS_USER_GENERATED)
+                .to_result(function_name!())?;
         }
-        self.make_key_window(&psn);
+        self.make_key_window(&psn)?;
         let element_ref = self.ax_element.as_ptr();
         let action = CFString::from_static_str(kAXRaiseAction);
-        unsafe { AXUIElementPerformAction(element_ref, &action) };
+        unsafe { AXUIElementPerformAction(element_ref, &action) }.to_result(function_name!())
     }
 
     #[instrument(level = Level::DEBUG)]

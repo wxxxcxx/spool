@@ -82,6 +82,13 @@ pub(crate) fn move_owned_window_to_space(window_id: WinID, space_id: WorkspaceId
     Ok(())
 }
 
+/// Exact forward membership; a void move call is never completion evidence.
+pub(crate) fn owned_window_is_in_space(window_id: WinID, space_id: WorkspaceId) -> Result<bool> {
+    let id = u64::try_from(window_id)?;
+    let spaces = inspection::window_spaces(id).map_err(Error::Generic)?;
+    Ok(!spaces.is_empty() && spaces.iter().all(|space| *space == space_id))
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(
     clippy::struct_excessive_bools,

@@ -7,6 +7,10 @@ mod platform {
 }
 
 mod manager {
+    pub fn owned_window_is_in_space(_: i32, _: u64) -> Result<bool, &'static str> {
+        Err("the offscreen probe must not query native membership")
+    }
+
     pub fn move_owned_window_to_space(_: i32, _: u64) -> Result<(), &'static str> {
         Err("the offscreen probe must not bind native windows")
     }

@@ -2226,7 +2226,8 @@ pub(super) fn cleanup_timeout_trigger(
     }
 }
 
-/// Rule defaults are derived configuration, never explicit width edits.
+/// Seed ordinary new columns once from their admitted logical window frame.
+/// Explicit rules take precedence; later rule refreshes never reseed intent.
 /// Keep one source per column so stack/tab reordering cannot change the rule.
 pub(super) fn refresh_column_width_defaults(
     mut strips: Query<&mut LayoutStrip>,
@@ -2250,13 +2251,13 @@ pub(super) fn refresh_column_width_defaults(
                 let width = WindowProperties::new(app, window, &config)
                     .width_ratio()
                     .map(WidthIntent::ViewportRatio);
-                Some((state.id, source, width))
+                Some((state.id, source, width, window.frame().width()))
             })
             .collect::<Vec<_>>();
-        for (id, source, width) in updates {
+        for (id, source, width, initial_width) in updates {
             match strip
                 .bypass_change_detection()
-                .set_column_rule(id, source, width)
+                .set_column_rule(id, source, width, initial_width)
             {
                 Ok(true) => strip.set_changed(),
                 Ok(false) => {}

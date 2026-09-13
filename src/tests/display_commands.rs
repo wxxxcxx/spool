@@ -845,7 +845,7 @@ fn cross_display_size_is_part_of_the_transfer_not_an_unbound_timer() {
             .get::<DisplayTransferFrame>(entity)
             .map(|v| v.target.size()),
         Some(IVec2::new(
-            EXT_DISPLAY_WIDTH / 4,
+            TEST_WINDOW_WIDTH,
             EXT_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT
         ))
     );

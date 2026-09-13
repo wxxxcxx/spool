@@ -1,6 +1,6 @@
 # Explicit intent ownership and bounded realization
 
-Status: Accepted design, 2026-09-13; all map decisions resolved through authorized expert consensus or explicit user decisions. Column-width slice implemented; arrangement and stack-height slice in progress.
+Status: Accepted design, 2026-09-13; all map decisions resolved through authorized expert consensus or explicit user decisions. Column-width, arrangement and stack-height slices implemented. Focus activation slice implemented with conservative bounded evidence; see the [focus slice](../wayfinding/declarative-state/issues/21-focus-activation.md).
 
 ## Context
 

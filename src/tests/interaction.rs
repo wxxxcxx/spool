@@ -1,4 +1,4 @@
-const DEFAULT_TILED_WIDTH: i32 = TEST_DISPLAY_WIDTH / 4;
+const DEFAULT_TILED_WIDTH: i32 = TEST_WINDOW_WIDTH;
 
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
@@ -2411,6 +2411,8 @@ fn floating_grid_window_uses_active_display_usable_origin() {
 
 #[test]
 fn test_dont_focus() {
+    // Keep all four columns visible so this tests focus policy, not parking.
+    const DEFAULT_TILED_WIDTH: i32 = TEST_DISPLAY_WIDTH / 4;
     let commands = vec![
         Event::MenuOpened { window_id: 0 }, // 0
         Event::ActionRequested {
@@ -2426,6 +2428,7 @@ fn test_dont_focus() {
 
     let mut params = WindowParams::new(".*", None);
     params.dont_focus = Some(true);
+    params.width = Some(0.25);
     params.index = Some(100);
     let config: Config = (MainOptions::default(), vec![params]).into();
 

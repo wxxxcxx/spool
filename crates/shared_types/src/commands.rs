@@ -314,6 +314,11 @@ pub enum MouseMove {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
+    /// Retains a Space-local focus preference without native activation.
+    SetSpaceFocusPreference {
+        space_id: u64,
+        window_id: i32,
+    },
     /// An action targeting a window with a specific `Operation`.
     Window(Operation),
     /// An action targeting the mouse with a specific `MouseMove`.

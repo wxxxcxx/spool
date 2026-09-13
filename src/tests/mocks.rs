@@ -125,6 +125,7 @@ struct MockStateInner {
     native_space_intents: Vec<crate::manager::NativeSpaceIntent>,
     associated_windows: HashMap<WinID, Vec<WinID>>,
     focus_requests: Vec<WinID>,
+    fail_focus_requests: bool,
     raise_requests: Vec<WinID>,
     window_server_inventory_available: bool,
     window_order_in_session: Option<Vec<(WinID, Pid)>>,
@@ -199,6 +200,7 @@ impl MockState {
                 native_space_intents: Vec::new(),
                 associated_windows: HashMap::new(),
                 focus_requests: Vec::new(),
+                fail_focus_requests: false,
                 raise_requests: Vec::new(),
                 window_server_inventory_available: true,
                 window_order_in_session: None,
@@ -368,9 +370,21 @@ impl MockState {
         std::mem::take(&mut self.inner.force_write().raise_requests)
     }
 
-    fn request_focus(&self, id: WinID) {
-        self.inner.force_write().focus_requests.push(id);
+    pub(crate) fn fail_focus_requests(&self, fail: bool) {
+        self.inner.force_write().fail_focus_requests = fail;
+    }
+
+    fn request_focus(&self, id: WinID) -> crate::errors::Result<()> {
+        let mut inner = self.inner.force_write();
+        inner.focus_requests.push(id);
+        if inner.fail_focus_requests {
+            return Err(crate::errors::Error::Generic(
+                "mock focus submission failure".into(),
+            ));
+        }
+        drop(inner);
         self.focus_window(id);
+        Ok(())
     }
 
     pub fn add_display(&mut self, id: u32, bounds: IRect, workspaces: Vec<WorkspaceId>) {
@@ -1141,9 +1155,8 @@ impl MockState {
         });
 
         let s = self.clone();
-        mw.expect_focus_with_raise().returning(move |_psn| {
-            s.request_focus(id);
-        });
+        mw.expect_focus_with_raise()
+            .returning(move |_psn| s.request_focus(id));
 
         let s = self.clone();
         mw.expect_title().returning(move || {
@@ -1295,9 +1308,7 @@ impl MockState {
         });
         let s = self.clone();
         mw.expect_focus_without_raise()
-            .returning(move |_psn, _focused_window, _focused_psn| {
-                s.request_focus(id);
-            });
+            .returning(move |_psn, _focused_window, _focused_psn| s.request_focus(id));
         let s = self.clone();
         mw.expect_set_padding().returning(move |padding| {
             let mut inner = s.inner.force_write();

@@ -179,6 +179,20 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
             Action::Mouse(MouseMove::ToNextDisplay) => {
                 commands.run_system_cached_with(focus_other_display, (None, DisplayTarget::Next));
             }
+            Action::SetSpaceFocusPreference {
+                space_id,
+                window_id,
+            } => {
+                let action = Action::SetSpaceFocusPreference {
+                    space_id: *space_id,
+                    window_id: *window_id,
+                };
+                commands.queue(move |world: &mut bevy::prelude::World| {
+                    if let Err(reason) = admission::execute(world, action) {
+                        debug!(%reason, "focus preference rejected");
+                    }
+                });
+            }
             Action::FocusWindow { .. }
             | Action::FocusWindowInSpace { .. }
             | Action::FocusSpace { .. }

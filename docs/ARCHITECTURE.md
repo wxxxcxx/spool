@@ -299,7 +299,8 @@ actions. Snapshot identity is checked again at the native command handoff.
 Window mutations select the still-pending focus request before confirmed focus;
 this does not optimistically change `FocusedMarker` or public focus state. An
 unavailable or hidden pending target does not redirect the mutation to the old
-window. Once normal invalidation cancels the request, confirmed focus is again
+window. Temporary AX withdrawal retains the request and cannot redirect edits
+back to the old window. Once confirmed destruction invalidates the request, confirmed focus is again
 eligible. Geometry and strip-relative commands also require the target's active
 Space ownership: tiled membership comes from the strip, floating membership
 from a successful native read. An accepted focus request on another display
@@ -314,7 +315,7 @@ The predicted tree does not make deferred operations synchronous. A Space move
 or view does not guarantee that later layout operations wait for native
 confirmation, and backend focus may reject a target on another display.
 
-Local IPC uses protocol version 6. Dispatch actions carry their snake-case serde
+Local IPC uses protocol version 7. Dispatch actions carry their snake-case serde
 names and payloads as a JSON string inside the postcard envelope, including
 nested operations; enum declaration order no longer determines action meaning.
 Renaming an action or payload field remains a wire contract change. Other
@@ -574,3 +575,40 @@ graph TD
 3.  **Session Restore Tests:** `src/tests/session_restore.rs` covers candidate isolation, trusted atomic import, frozen baselines, and rejection of stale edits or structural changes.
 4.  **FFI Verification:** Manual or semi-automated tests on macOS to ensure the Accessibility API calls behave as expected with native windows.
 5.  **Agent Support:** The `AGENTS.md` file provides project-specific guidance for AI agents to ensure contributions follow these architectural patterns.
+
+## Declarative focus activation
+
+Space preferences and navigation selection are retained separately from confirmed
+history. `space prefer-focus <space-id> --window <window-id>` edits that Space's
+preference and selection without activating a window or switching Spaces. This is
+session-local state; the v6 layout persistence format does not replay activation.
+
+`FocusCoordinator` owns an activation version independent of observation resolution
+generations, bound to a window ID, entity, incarnation and Space. Unknown evidence
+retains pending intent. The main-thread activation coordinator reserves one attempt
+before calling the platform; native failures are reported, and later eligibility or
+notifications never replenish the attempt. Accepted commands are not confirmed focus.
+
+After submission, dedicated readbacks run at 250ms, 1s and 5s, then stop. These are
+engineering defaults, not proven macOS stability timings. Yield requires two matching
+fresh application/window/incarnation samples at least 250ms apart, complete identity
+inventory, visible native membership, and no known Space transaction or Mission
+Control transition. Superseded unresolved attempts remain possible own effects and
+cannot be used as external-yield evidence. This conservative exclusion can leave a
+request unconfirmed; it does not infer human input. Normal observation may still
+confirm the current target after the dedicated readback budget ends.
+
+Session inspection exposes `focus.actual` and `focus.activation` (version, target,
+source, attempted, submission failure, outcome and readback budget). Space inspection
+exposes preference and logical selection. Native inspection remains independent and
+reports native facts. `FocusedMarker` and confirmed history remain observation-only.
+
+### Decoration Space binding
+
+Each Space decoration stays transparent while it is ordered and bound. Forward
+native membership must confirm only its intended Space before alpha is restored;
+a void move submission is not success. Existing surfaces are audited at one-second
+intervals and revalidated after reordering. Unknown or mismatched membership hides
+the surface and limits rebinding to once per second. See the
+[Space overlay binding investigation](reviews/space-overlay-binding-2026-09-13.md)
+for the observed two-overlays-in-one-Space failure and native validation limits.

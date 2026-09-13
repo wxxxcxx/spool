@@ -22,10 +22,10 @@ use std::sync::mpsc::{self, Receiver as MessageReceiver, SyncSender, TrySendErro
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const PROTOCOL_VERSION: u16 = 6;
-// Frozen v5 ClientFrame(version=6, Call, Query(State)). Never dispatched.
-const BOOTSTRAP_BODY: &[u8] = &[6, 1, 1, 0];
-const BOOTSTRAP_FRAME: &[u8] = &[0, 0, 0, 4, 6, 1, 1, 0];
+const PROTOCOL_VERSION: u16 = 7;
+// Frozen v5 ClientFrame(version=7, Call, Query(State)). Never dispatched.
+const BOOTSTRAP_BODY: &[u8] = &[7, 1, 1, 0];
+const BOOTSTRAP_FRAME: &[u8] = &[0, 0, 0, 4, 7, 1, 1, 0];
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(2);
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(1);
@@ -1230,14 +1230,14 @@ mod tests {
                 spool_shared_types::commands::Action::Quit,
             ))
         });
-        // The v5 codec accepts this exact four-byte body, then rejects version 6.
+        // The v5 codec accepts this exact four-byte body, then rejects version 7.
         let mut header = [0; 4];
         peer.read_exact(&mut header).unwrap();
         let mut body = vec![0; u32::from_be_bytes(header) as usize];
         peer.read_exact(&mut body).unwrap();
         write_frame(&mut peer, &ServerFrame::Error("daemon expects 5".into())).unwrap();
         let result = client.join().unwrap();
-        assert_eq!(body, [6, 1, 1, 0]);
+        assert_eq!(body, [7, 1, 1, 0]);
         assert!(matches!(result, Err(Error::Remote(message)) if message == "daemon expects 5"));
     }
 
@@ -1576,7 +1576,7 @@ mod tests {
         let (stream, mut peer) = UnixStream::pair().unwrap();
         peer.write_all(&[0, 0, 0, 3, 5, 255, 255]).unwrap();
         assert!(
-            matches!(read_delivery(stream), Err(Error::Protocol(message)) if message.contains("expects 6"))
+            matches!(read_delivery(stream), Err(Error::Protocol(message)) if message.contains(&format!("expects {PROTOCOL_VERSION}")))
         );
         assert!(
             matches!(read_frame::<ServerFrame>(&mut peer).unwrap(), ServerFrame::Error(message) if message.contains("version 5"))

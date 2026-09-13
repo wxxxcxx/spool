@@ -258,6 +258,10 @@ pub(crate) struct NativeSpaceTransactions {
 }
 
 impl NativeSpaceTransactions {
+    pub(super) fn focus_transition_pending(&self) -> bool {
+        !self.moves.is_empty() || !self.follows.is_empty()
+    }
+
     pub(super) fn cancel_pending_follows(&mut self) {
         for pending in &mut self.moves {
             pending.follow = None;
@@ -376,6 +380,7 @@ fn focus_window_command(
         warn!(window_id, "window is not tracked");
         return Err(crate::errors::Error::rejected("window_not_found"));
     };
+    let mut native_space = None;
     if matches!(policy, FocusSpacePolicy::VisibleOnly) {
         // A caller that drew this window in a Space it can name hands that
         // Space over here, so confirming visibility can skip the scan of every
@@ -386,19 +391,26 @@ fn focus_window_command(
             topology.confirm_visible_window_space(window_manager, window_id, space_id)
         });
         let confirmed = match claim {
-            Some(SpaceClaim::Confirmed) => true,
+            Some(SpaceClaim::Confirmed) => known_space,
             // An unreadable Space is not evidence that it is visible.
-            Some(SpaceClaim::Unavailable) => false,
-            Some(SpaceClaim::Refused) | None => topology
-                .observe_visible_window_space(window_manager, window_id)
-                .is_some(),
+            Some(SpaceClaim::Unavailable) => None,
+            Some(SpaceClaim::Refused) | None => {
+                topology.observe_visible_window_space(window_manager, window_id)
+            }
         };
-        if !confirmed {
+        native_space = confirmed;
+        if confirmed.is_none() {
             warn!(window_id, "cannot confirm a visible Space for window focus");
             return Err(crate::errors::Error::rejected("space_not_visible"));
         }
     }
-    commands.focus_entity(entity, true);
+    commands.trigger(super::focus::FocusWindow {
+        entity,
+        raise: true,
+        kind: super::focus::FocusRequestKind::Explicit,
+        allow_native_activation: matches!(policy, FocusSpacePolicy::AllowNativeActivation),
+        native_space,
+    });
     Ok(())
 }
 
@@ -1075,10 +1087,13 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
                     viewport.min.y.midpoint(viewport.max.y),
                 ));
             }
-            commands.restore_focus_entity(
-                pending.member.entity,
-                pending.visible_display.is_none() || pending.warp_pointer,
-            );
+            commands.trigger(super::focus::FocusWindow {
+                entity: pending.member.entity,
+                raise: pending.visible_display.is_none() || pending.warp_pointer,
+                kind: super::focus::FocusRequestKind::Automatic,
+                allow_native_activation: false,
+                native_space: Some(pending.target_space_id),
+            });
             false
         } else {
             true
