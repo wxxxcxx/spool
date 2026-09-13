@@ -200,6 +200,31 @@ third `SpaceKind` variant and therefore a client-visible change in
 `spool-shared-types`, `client.rs`'s string mapping and `SpaceState.kind` on the
 wire.
 
+**Settled since.** The five contracts above are now written on the trait; the
+two defects are not fixed, because both turn on what the platform actually
+returns and neither could be settled from this machine.
+
+- (1) is narrower than "missing an error channel", and wider than it looks.
+  The 14 consumers of `NativeTopology::is_fullscreen` split in two. Some ask the
+  literal question — "is this a macOS fullscreen Space" — which `== 4` answers
+  correctly for a system Space. Others use *not* fullscreen as a proxy for
+  "eligible user Space", for example `commands/transfer.rs` refusing a transfer
+  whose source or target is fullscreen, and `triggers.rs` filtering Spaces for
+  handling. A system Space passes those filters. So the defect is real if and
+  only if a system Space reaches `SLSCopyManagedDisplaySpaces`'s list and gets a
+  `LayoutStrip`; prior research in `docs/research/` covers fullscreen
+  (`type == 4`) and says nothing about `type == 2`. To settle it: create or
+  enter a system Space (Dashboard), then check whether it appears in
+  `observe_displays`' Space list, receives a strip, and what `SLSSpaceGetType`
+  reports for it.
+- (2) needs one observation: whether `SLSManagedDisplayGetCurrentSpace` ever
+  returns `0` for a display that does have a current Space, for instance during
+  a display reconfiguration. If it does not, the unchecked read is harmless and
+  the only fix worth making is a debug assertion.
+
+Neither is worth a speculative change across 14 call sites or a client-visible
+wire change on the strength of a reading alone.
+
 ### The two adapters disagree about that error mode
 
 `space_window_list_for_connection` (`src/manager.rs:1046`) returns
