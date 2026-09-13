@@ -200,9 +200,12 @@ third `SpaceKind` variant and therefore a client-visible change in
 `spool-shared-types`, `client.rs`'s string mapping and `SpaceState.kind` on the
 wire.
 
-**Settled since.** The five contracts above are now written on the trait; the
-two defects are not fixed, because both turn on what the platform actually
-returns and neither could be settled from this machine.
+**Settled since.** The five contracts above are now written on the trait. Both
+open questions were then settled by running a read-only probe against the live
+session; the results are in [Runtime evidence](#runtime-evidence) below, and
+they change the shape of both defects. The reading-based guesses recorded in
+this block — that the first was about Dashboard Spaces, and that the second
+might be harmless — are superseded by that evidence.
 
 - (1) is narrower than "missing an error channel", and wider than it looks.
   The 14 consumers of `NativeTopology::is_fullscreen` split in two. Some ask the
@@ -224,6 +227,56 @@ returns and neither could be settled from this machine.
 
 Neither is worth a speculative change across 14 call sites or a client-visible
 wire change on the strength of a reading alone.
+
+### Runtime evidence
+
+Both questions were settled by a read-only probe against the live session
+(macOS 26.6.2, build 25G83, one display, three Spaces). The probe `dlopen`s
+`SkyLight` and calls `SLSMainConnectionID`, `SLSCopyManagedDisplaySpaces`,
+`SLSSpaceGetType` and `SLSManagedDisplayGetCurrentSpace`. It performs no writes,
+starts no daemon, and does not touch any window.
+
+Observed Space list, with the type carried by the managed-display dictionary
+cross-checked against `SLSSpaceGetType`:
+
+```
+display identifier=37D8832A-…  spaces=3
+    space id64=1    SLSSpaceGetType=0  dict.type=0  agree=yes
+    space id64=178  SLSSpaceGetType=4  dict.type=4  agree=yes
+    space id64=382  SLSSpaceGetType=0  dict.type=0  agree=yes
+```
+
+The dictionary's own `type` field and `SLSSpaceGetType` agree on every Space,
+so the type is available from either source and neither is guesswork.
+
+Two results matter more than the list itself.
+
+**`SLSSpaceGetType` has an undocumented sentinel, and it is `3`.** Every id
+that names no Space returned `3`:
+
+```
+  id=0  -> 3      id=2  -> 3      id=3  -> 3
+  id=999 -> 3     id=999999 -> 3  id=18446744073709551615 -> 3
+```
+
+The binding documents only `0` = user/desktop, `2` = system, `4` = fullscreen.
+So the real domain is at least four-valued — `0` user, `2` system, `3` absent,
+`4` fullscreen — and `== 4` maps every one of the other three to "not
+fullscreen". This is sharper than the reading-based version of the finding,
+which was about Dashboard Spaces: no Dashboard is reachable on this OS, but
+*absent* ids are trivially reachable, and they read as user Spaces.
+
+**`0` is confirmed as the sentinel for the current-Space read.**
+`SLSManagedDisplayGetCurrentSpace` returned the valid `1` for the real display
+and `0` for an unknown UUID, so `0` means "no answer", not "Space zero".
+`active_display_space` returns it unchecked, so a failed read arrives as
+`Ok(0)` — a Space id that names nothing.
+
+That is also a **third adapter divergence** in the same family as the first
+two. `MockState` models "this display has no current Space" as
+`Err(Error::InvalidWindow)` (`src/tests/mocks.rs`, `expect_active_display_space`),
+while production returns `Ok(0)`. The test double already treats the case as a
+failure; production does not.
 
 ### The two adapters disagree about that error mode
 
