@@ -189,6 +189,18 @@ are in the trait because it is the process's "talk to macOS" bag. Only
 Space logic pays for four methods it never uses, and every test double must
 decide what to do about them.
 
+> **Revised — this section's conclusion did not survive contact.** Two of the
+> four are substituted by tests, which makes them a real seam rather than a
+> pass-through. `dim_windows` has `expect_dim_windows` in
+> `src/tests/exit_restore.rs`, and `perform_system_overview` is substituted by
+> `system_overview_actions_reach_the_platform_once_per_request_even_after_failure`
+> in `src/commands.rs` to check that each request reaches the platform exactly
+> once even after a failure. Moving either one off the trait would put a real
+> Mission Control launch into the test process and delete the only coverage of
+> that dispatch rule. The other two would need `EventSender` to become a Bevy
+> resource; a one-method reduction is not worth new event-channel plumbing. See
+> [Migration](#migration) step 7.
+
 ### Deletion test
 
 | Delete | Result | Verdict |
@@ -360,10 +372,12 @@ interface.
 Replace, don't layer. The current 22 methods must not survive as a public
 superset.
 
-Status: steps 1, 2a, 2b and 2c have landed (`47d239c`, `5399477`, `4d8f98a`,
-`5aa9579`, `b16da18`). The plan is revised from its first draft each time the
-investigation contradicts it; the revisions are recorded rather than silently
-applied.
+Status: steps 1, 2a, 2b, 2c and the capability half of step 6 have landed
+(`47d239c`, `5399477`, `4d8f98a`, `5aa9579`, `b16da18`, `680fe51`). The plan is
+revised from its first draft each time the investigation contradicts it; the
+revisions are recorded rather than silently applied. Two of the original steps
+were rejected outright once the evidence was in — step 5 and step 7 — and those
+rejections are part of the result, not gaps in it.
 
 1. **Fix the adapter divergence.** Landed. Both adapters answer an empty Space
    with `Ok(vec![])`, the contract is stated on both membership methods, and
@@ -400,12 +414,26 @@ applied.
    epoch would trade measured platform cost for indirection, which is the
    opposite of the goal. The epoch is for callers that need many Spaces; the
    cheap read is for callers that need one.
-6. **Introduce `NativeSpaceControl`**, folding in the three
-   `space_control_enabled` gates and the accept/verify dance from `overlay.rs`
-   and `native_space.rs`.
-7. **Move the four non-window-management methods** out
-   (`setup_config_watcher`, `quit`, `perform_system_overview`, `dim_windows`).
-   Separable; can land last.
+6. **Introduce `NativeSpaceControl`.** Landed as `SpaceControl`, but only the
+   capability half, and the rest is deliberately not built. `SpaceControl`
+   computes the effective capability where configuration permission and the
+   platform's own answer meet; the gates and the inspection report now ask the
+   same value instead of disagreeing, and the intent-to-capability mapping lives
+   with it. The proposed `Submission` enum is *not* warranted: once the gate
+   refuses on capability, the only platform refusal left that would map to
+   `Refused` is unreachable, leaving `Submission::Failed` as its only real
+   variant. An enum whose distinguishing variant no producer can produce is
+   surface, not depth.
+7. **Do not move the four non-window-management methods out.** The rationale
+   was that the trait is the process's "talk to macOS" bag and callers pay for
+   four methods they never use. Two of the four turn out to be substituted by
+   tests — `dim_windows` by `src/tests/exit_restore.rs`, `perform_system_overview`
+   by a dispatch test in `src/commands.rs` — which makes them a real seam, and
+   moving the latter would run an actual Mission Control launch inside the test
+   process while deleting that dispatch rule's only coverage. The other two
+   (`quit`, `setup_config_watcher`) need `EventSender` to become a Bevy
+   resource, which is new event-channel plumbing bought for a one-method
+   reduction. Recorded as rejected rather than left undone.
 
 ## Trade-offs
 
@@ -413,7 +441,8 @@ applied.
 single highest-value thing to move behind the seam: it is currently re-derived
 in four modules, one of which gets it wrong, and the mock cannot see the
 production behaviour. The `Scope` parameter removes a silent wrong-choice
-footgun. The accept/verify split gives ADR 0007 a seam to live in.
+footgun. The effective-capability answer stops the gates and the inspection
+report from disagreeing about what the platform can do.
 
 **Where it is thin.** `pointer()` bundles `cursor_position`, `warp_mouse`, and
 `find_window_at_point`, which are three different concerns; a read-only port
