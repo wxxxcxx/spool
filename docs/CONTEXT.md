@@ -63,6 +63,45 @@ The Spool-owned arrangement of tiled windows, including strip membership, column
 **Declarative Window Management**:
 Window management in which explicit desired state expresses intent and native observations establish what has actually been realized. A valid desired arrangement remains meaningful while its Space is invisible or its realization is temporarily blocked.
 
+**Window Management Intent**:
+The latest accepted choice of arrangement or target, distinct from the outcome currently permitted by native constraints. A constrained outcome does not itself replace that choice.
+
+**Effective Layout Target**:
+The layout outcome derived from the latest Window Management Intent under evidenced, currently applicable constraints. It is a derived target, not an independently authored choice or an observed fact.
+
+**Constrained Realization**:
+A layout outcome that meets its Effective Layout Target while an applicable constraint prevents full satisfaction of the original Window Management Intent.
+
+**Space Focus Preference**:
+A Native Space's preferred focus target, covering tiled and floating windows. It is distinct from a request to activate that Space or window now.
+
+**Logical Navigation Selection**:
+The latest accepted navigation choice within a Native Space, which may precede native focus confirmation.
+
+**Confirmed Focus History**:
+A Native Space's record of windows whose focus was confirmed by native observation. An accepted but unconfirmed navigation choice is not a confirmed visit.
+
+**Activation Intent**:
+The current request to activate a particular target in the Desktop Session. It is distinct from actual keyboard focus and from each Space's retained preference.
+
+**Window Placement Intent**:
+A tracked window's desired Native Space association, distinct from its observed native membership.
+
+**External Adjustment**:
+A stable external change accepted as a new Window Management Intent under the applicable domain policy. Acceptance does not establish whether a person or an application caused the change.
+
+**External Focus Yield**:
+The termination of an activation request after fresh evidence establishes stable conflicting focus under the focus policy. It preserves the unfulfilled request's outcome without treating the other window as successful completion of that request.
+
+**Column Identity**:
+A column's identity within one Spool run, independent of its current ordinal or member order. A destroyed column's identity is not reused.
+
+**Column Width Intent**:
+The original choice of a column's layout-slot width in logical points, as an absolute value, a proportion of its usable viewport, or an inherited configuration default.
+
+**Restore Candidate**:
+A saved description of layout intent and possible object associations awaiting validated binding to the current run. Reading a candidate does not restore a window or establish current native topology. A candidate member with no recorded identity hint is an unresolved slot, not an absent association.
+
 **Navigable Layout**:
 A read-only projection of a Space's retained layout containing available, visible tiled identities, with stack and tab structure preserved. Directional, first/last/numeric, and next/previous tiled focus use this projection; retained unavailable identities are restoration data, not navigation targets. Projection never deletes or reorders the original layout.
 
@@ -188,3 +227,21 @@ _Avoid_: Client script
 **Client Script**:
 An on-demand Lua program that queries or controls a running Spool instance and ends when that invocation completes. It cannot register configuration handlers or keybindings.
 _Avoid_: Configuration script
+
+## Stack Height Intent
+
+The positive relative share of vertical space desired by one stack item. A new item has share one. Shares belong to independent frame items, including a native-tab cohort as one item, and survive reordering or temporary absence. Equalizing gives each item the same share. Available space and layout limits determine effective heights without changing these original shares.
+
+## Stack Item Identity
+
+The continuing identity of one independently arranged frame item within a layout. Changing its position or selected native tab does not replace the item. A genuine split creates independent identities; a confirmed destruction ends the corresponding identity.
+
+## Stack Projection Participant
+
+A stack item that currently contributes to layout projection because at least one of its members is available and not ordered out. Only participants reserve vertical space, receive or donate an external height edit, and count toward the stack minimum. A retained item that is not a participant keeps its identity and raw share for a later reappearance.
+
+## Unresolved Member Slot
+
+A retained member position within a stack item whose window identity could not be cached when intent was saved. It preserves the item's member count and order for a later validated binding; it is not an identity, and it never authorizes one.
+
+_Avoid_: Anonymous window, missing window, placeholder identity

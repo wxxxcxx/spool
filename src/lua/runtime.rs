@@ -652,7 +652,8 @@ mod tests {
 
     /// A canned state document to answer queries with.
     fn test_state() -> SpoolQueryState {
-        use crate::ecs::state::{SpaceKind, SpoolActiveState, SpoolSpaceState, SpoolWindowState};
+        use crate::ecs::state::{SpoolActiveState, SpoolSpaceState, SpoolWindowState};
+        use spool_shared_types::state::SpaceKind;
 
         SpoolQueryState {
             version: 3,

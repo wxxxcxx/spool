@@ -19,6 +19,27 @@ pub(super) fn execute(world: &mut World, action: Action) -> crate::errors::Resul
         lifecycle.set(crate::lifecycle::Phase::Stopping);
         return Ok(());
     }
+    let action = world
+        .run_system_cached_with(resolve_default, action)
+        .map_err(|error| {
+            crate::errors::Error::rejection_with_cause("execution_unavailable", error)
+        })??;
+    if let Some(result) = world
+        .run_system_cached_with(super::column_width::execute, action.clone())
+        .map_err(|error| {
+            crate::errors::Error::rejection_with_cause("execution_unavailable", error)
+        })?
+    {
+        return result;
+    }
+    if let Some(result) = world
+        .run_system_cached_with(super::layout_edit::execute, action.clone())
+        .map_err(|error| {
+            crate::errors::Error::rejection_with_cause("execution_unavailable", error)
+        })?
+    {
+        return result;
+    }
     if matches!(
         action,
         Action::TargetedWindow { .. } | Action::Window(_) | Action::SpaceLayout { .. }
@@ -30,11 +51,6 @@ pub(super) fn execute(world: &mut World, action: Action) -> crate::errors::Resul
     {
         return Err(crate::errors::Error::rejected("session_not_writable"));
     }
-    let action = world
-        .run_system_cached_with(resolve_default, action)
-        .map_err(|error| {
-            crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-        })??;
     if let Action::Window(
         operation @ (Operation::FocusFloating | Operation::FocusTiled | Operation::FocusOtherLayer),
     ) = &action
@@ -166,11 +182,6 @@ pub(super) fn execute(world: &mut World, action: Action) -> crate::errors::Resul
             operation: SpaceLayoutOperation::ToggleTiledVisibility,
         } => world
             .run_system_cached_with(crate::ecs::tiled_visibility::toggle, space_id)
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            })?,
-        action @ Action::SpaceLayout { .. } => world
-            .run_system_cached_with(super::space_layout::execute, action)
             .map_err(|error| {
                 crate::errors::Error::rejection_with_cause("execution_unavailable", error)
             })?,

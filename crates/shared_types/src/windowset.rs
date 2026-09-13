@@ -37,6 +37,9 @@ pub struct WindowIdentity {
 pub struct LayoutSnapshot {
     pub session: [u8; 16],
     pub windows: BTreeMap<WinID, WindowIdentity>,
+    pub columns: BTreeMap<WinID, (u64, u64)>,
+    /// Space identity and structure revision for delayed arrangement edits.
+    pub structures: BTreeMap<WinID, (u64, u64)>,
 }
 
 /// Operations and the original identities they address. Hosts validate these
@@ -234,7 +237,7 @@ impl StackItemSet {
 pub struct ColumnSet {
     pub kind: ColumnKind,
     /// Width as a fraction of the display, as the layout engine has it.
-    pub width_ratio: f64,
+    pub width_ratio: Option<f64>,
     /// The selected index in the flattened `windows()` order.
     pub selected: usize,
     pub items: Arc<Vec<StackItemSet>>,
@@ -243,17 +246,17 @@ pub struct ColumnSet {
 impl ColumnSet {
     /// A column holding one window.
     #[must_use]
-    pub fn single(window: WindowRec, width_ratio: f64) -> Self {
+    pub fn single(window: WindowRec, width_ratio: impl Into<Option<f64>>) -> Self {
         Self::from_item(StackItemSet::Single(window), width_ratio)
     }
 
-    fn from_item(item: StackItemSet, width_ratio: f64) -> Self {
+    fn from_item(item: StackItemSet, width_ratio: impl Into<Option<f64>>) -> Self {
         Self {
             kind: match item {
                 StackItemSet::Single(_) => ColumnKind::Single,
                 StackItemSet::Tabs(_) => ColumnKind::Tabs,
             },
-            width_ratio,
+            width_ratio: width_ratio.into(),
             selected: 0,
             items: Arc::new(vec![item]),
         }
@@ -261,10 +264,13 @@ impl ColumnSet {
 
     /// Builds a nonempty column, retaining each native tab group's identity.
     #[must_use]
-    pub fn from_items(items: Vec<StackItemSet>, width_ratio: f64) -> Option<Self> {
+    pub fn from_items(
+        items: Vec<StackItemSet>,
+        width_ratio: impl Into<Option<f64>>,
+    ) -> Option<Self> {
         let mut column = Self {
             kind: ColumnKind::Stack,
-            width_ratio,
+            width_ratio: width_ratio.into(),
             selected: 0,
             items: Arc::new(items),
         };
@@ -739,7 +745,7 @@ impl WindowSet {
             if record.floating {
                 Arc::make_mut(&mut workspace.floating).push(record);
             } else {
-                Arc::make_mut(&mut workspace.columns).push(ColumnSet::single(record, 0.5));
+                Arc::make_mut(&mut workspace.columns).push(ColumnSet::single(record, None));
             }
         }
         if follow {
@@ -832,7 +838,7 @@ impl WindowSet {
             if floating {
                 Arc::make_mut(&mut target.floating).push(record);
             } else {
-                Arc::make_mut(&mut target.columns).push(ColumnSet::single(record, 0.5));
+                Arc::make_mut(&mut target.columns).push(ColumnSet::single(record, None));
             }
         })
     }
@@ -846,7 +852,7 @@ impl WindowSet {
             }
             for_each_column(displays, |column| {
                 if column.kind != ColumnKind::Fullscreen && column.item_of(window).is_some() {
-                    column.width_ratio = ratio;
+                    column.width_ratio = Some(ratio);
                 }
             });
         })
@@ -1327,6 +1333,8 @@ mod tests {
     #[test]
     fn lua_prediction_focus_space_chains_keep_the_original_binding() {
         let identity = LayoutSnapshot {
+            structures: BTreeMap::new(),
+            columns: [(1, (101, 4))].into(),
             session: [19; 16],
             windows: [(
                 1,
@@ -1398,6 +1406,8 @@ mod tests {
     #[test]
     fn transformations_and_branches_retain_the_original_snapshot_identity() {
         let identity = LayoutSnapshot {
+            structures: BTreeMap::new(),
+            columns: [(1, (101, 4))].into(),
             session: [73; 16],
             windows: [(
                 1,
@@ -1423,6 +1433,8 @@ mod tests {
     #[test]
     fn lua_return_conversion_preserves_the_returned_values_snapshot() {
         let identity = LayoutSnapshot {
+            structures: BTreeMap::new(),
+            columns: [(1, (101, 4))].into(),
             session: [73; 16],
             windows: [(
                 1,
@@ -1608,8 +1620,8 @@ mod tests {
             vec![1, 2, 3]
         );
         assert_eq!(
-            source.columns[1].width_ratio.to_bits(),
-            source.columns[0].width_ratio.to_bits()
+            source.columns[1].width_ratio.unwrap().to_bits(),
+            source.columns[0].width_ratio.unwrap().to_bits()
         );
         assert!(split.workspace(2).unwrap().columns.is_empty());
     }
@@ -1748,9 +1760,12 @@ mod tests {
         let columns = &swapped.workspace(1).unwrap().columns;
         assert_eq!(columns[0].selected, 1);
         assert_eq!(columns[0].top().unwrap().id, 3);
-        assert_eq!(columns[0].width_ratio.to_bits(), 0.5_f64.to_bits());
+        assert_eq!(columns[0].width_ratio.unwrap().to_bits(), 0.5_f64.to_bits());
         assert_eq!(columns[1].kind, ColumnKind::Tabs);
-        assert_eq!(columns[1].width_ratio.to_bits(), 0.75_f64.to_bits());
+        assert_eq!(
+            columns[1].width_ratio.unwrap().to_bits(),
+            0.75_f64.to_bits()
+        );
         assert_eq!(
             columns[1]
                 .windows()
@@ -1811,6 +1826,45 @@ mod tests {
             assert_eq!(placed.x, expected);
             assert_eq!(placed.y, expected);
         }
+    }
+
+    #[test]
+    fn sinking_does_not_predict_a_configured_width_without_configuration() {
+        let base = fixture();
+        let sunk = base.float(2).sink(2);
+        let column = sunk
+            .workspace_of(2)
+            .unwrap()
+            .columns
+            .iter()
+            .find(|column| column.item_of(2).is_some())
+            .unwrap();
+        assert_eq!(column.width_ratio, None);
+        let explicit = sunk.width(2, 0.75);
+        let column = explicit
+            .workspace_of(2)
+            .unwrap()
+            .columns
+            .iter()
+            .find(|column| column.item_of(2).is_some())
+            .unwrap();
+        assert_eq!(
+            column.width_ratio.map(f64::to_bits),
+            Some(0.75_f64.to_bits())
+        );
+    }
+
+    #[test]
+    fn moving_to_another_space_does_not_invent_a_default_width_ratio() {
+        let moved = fixture().shift(2, 2);
+        let column = moved
+            .workspace(2)
+            .unwrap()
+            .columns
+            .iter()
+            .find(|column| column.item_of(2).is_some())
+            .unwrap();
+        assert_eq!(column.width_ratio, None);
     }
 
     #[test]

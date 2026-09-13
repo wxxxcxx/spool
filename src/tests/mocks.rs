@@ -45,7 +45,6 @@ pub(crate) struct MockWindowData {
     pub(crate) represented_window_id: Option<WinID>,
     pub(crate) role: String,
     pub(crate) subrole: String,
-    pub(crate) identifier: String,
     pub(crate) is_full_screen: bool,
     pub(crate) resizable: bool,
     pub(crate) movable: bool,
@@ -73,7 +72,6 @@ impl Default for MockWindowData {
             represented_window_id: None,
             role: "AXWindow".to_string(),
             subrole: "AXStandardWindow".to_string(),
-            identifier: "testid".to_string(),
             is_full_screen: false,
             resizable: true,
             movable: true,
@@ -1200,16 +1198,6 @@ impl MockState {
             } else {
                 Err(Error::InvalidWindow)
             }
-        });
-
-        let s = self.clone();
-        mw.expect_identifier().returning(move || {
-            Ok(s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .map(|w| w.identifier.clone())
-                .unwrap_or_default())
         });
 
         let s = self.clone();

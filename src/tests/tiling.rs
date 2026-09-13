@@ -8,6 +8,9 @@ use bevy::prelude::*;
 
 use super::*;
 
+// Inherited first preset is one quarter of the available viewport.
+const DEFAULT_TILED_WIDTH: i32 = TEST_DISPLAY_WIDTH / 4;
+
 #[cfg(feature = "lua")]
 #[test]
 fn edge_padding_reload_repositions_and_resizes_existing_windows() {
@@ -32,7 +35,7 @@ fn edge_padding_reload_repositions_and_resizes_existing_windows() {
     assert_window_size!(
         harness.world(),
         0,
-        TEST_WINDOW_WIDTH,
+        (TEST_DISPLAY_WIDTH - 16) / 4,
         TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - 16
     );
 
@@ -46,7 +49,7 @@ fn edge_padding_reload_repositions_and_resizes_existing_windows() {
     assert_window_size!(
         harness.world(),
         0,
-        TEST_WINDOW_WIDTH,
+        (TEST_DISPLAY_WIDTH - 8) / 4,
         TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT - 8
     );
 }
@@ -107,6 +110,11 @@ fn test_window_shuffle() {
     let mut params = WindowParams::new(".*", None);
     params.vertical_padding = Some(3);
     params.horizontal_padding = Some(2);
+    // This clipping/stacking scenario deliberately uses 400-point columns.
+    params.width = Some(
+        f64::from(logical_width)
+            / f64::from(TEST_DISPLAY_WIDTH - i32::from(PADDING_LEFT + PADDING_RIGHT)),
+    );
     let config: Config = (
         MainOptions {
             padding_left: Some(PADDING_LEFT),
@@ -171,14 +179,14 @@ fn test_window_balance() {
     TestHarness::new()
         .with_windows(3)
         .on_iteration(1, |world, _state| {
-            // After grow, window 0 should be 512 (50% of 1024).
-            assert_window_size!(world, 0, 512, 748);
+            // After grow, window 0 should be 341 (one third of 1024).
+            assert_window_size!(world, 0, 341, 748);
         })
         .on_iteration(2, |world, _state| {
             // After balance, all windows should match window 0's width.
-            assert_window_size!(world, 0, 512, 748);
-            assert_window_size!(world, 1, 512, 748);
-            assert_window_size!(world, 2, 512, 748);
+            assert_window_size!(world, 0, 341, 748);
+            assert_window_size!(world, 1, 341, 748);
+            assert_window_size!(world, 2, 341, 748);
         })
         .run(commands);
 }
@@ -205,8 +213,8 @@ fn test_startup_windows() {
         .with_windows(5)
         .on_iteration(4, |world, _state| {
             assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, DEFAULT_TILED_WIDTH, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 2 * DEFAULT_TILED_WIDTH, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }
@@ -347,8 +355,8 @@ fn test_floating_window_does_not_hold_a_slot_in_the_strip() {
         .on_iteration(0, |world, _state| {
             // Window 0 holds the focus, so it is the one about to float.
             assert_eq!(window_x(world, 0), 0);
-            assert_eq!(window_x(world, 1), TEST_WINDOW_WIDTH);
-            assert_eq!(window_x(world, 2), 2 * TEST_WINDOW_WIDTH);
+            assert_eq!(window_x(world, 1), DEFAULT_TILED_WIDTH);
+            assert_eq!(window_x(world, 2), 2 * DEFAULT_TILED_WIDTH);
         })
         .on_iteration(2, |world, _state| {
             let entity = find_window_entity(0, world);
@@ -364,7 +372,7 @@ fn test_floating_window_does_not_hold_a_slot_in_the_strip() {
                 0,
                 "the tiled windows must close the gap the floating one left"
             );
-            assert_eq!(window_x(world, 2), TEST_WINDOW_WIDTH);
+            assert_eq!(window_x(world, 2), DEFAULT_TILED_WIDTH);
         })
         .run(commands);
 }
@@ -417,10 +425,10 @@ fn shared_move_resize_and_maximize_actions_dispatch_for_floating_windows() {
             assert_window_at!(world, 0, 52, 52);
         })
         .on_iteration(3, |world, _state| {
-            assert_window_size!(world, 0, 440, 598);
+            assert_window_size!(world, 0, DEFAULT_TILED_WIDTH + 40, 598);
         })
         .on_iteration(4, |world, _state| {
-            assert_window_size!(world, 0, 440, 558);
+            assert_window_size!(world, 0, DEFAULT_TILED_WIDTH + 40, 558);
         })
         .on_iteration(5, |world, _state| {
             assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
@@ -428,7 +436,7 @@ fn shared_move_resize_and_maximize_actions_dispatch_for_floating_windows() {
         })
         .on_iteration(6, |world, _state| {
             assert_window_at!(world, 0, 32, 72);
-            assert_window_size!(world, 0, 440, 558);
+            assert_window_size!(world, 0, DEFAULT_TILED_WIDTH + 40, 558);
         })
         .run(commands);
 }
@@ -496,7 +504,7 @@ fn test_rule_floated_window_does_not_hold_a_slot_in_the_strip() {
             );
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                TEST_WINDOW_WIDTH,
+                DEFAULT_TILED_WIDTH,
                 "the tiled windows must close the gap the floating one left"
             );
         })
@@ -543,7 +551,7 @@ fn closed_retained_surface_releases_its_tile_slot() {
     let mut harness = TestHarness::new().with_windows(3).with_focused_window(0);
     harness.pump_frames(20);
     let before = window_x(harness.world(), 2) - window_x(harness.world(), 0);
-    assert_eq!(before, 2 * TEST_WINDOW_WIDTH);
+    assert_eq!(before, 2 * DEFAULT_TILED_WIDTH);
     harness.mock_state.update_window(1, |window| {
         window.visible = false;
         window.ordered_out = true;
@@ -553,7 +561,7 @@ fn closed_retained_surface_releases_its_tile_slot() {
     harness.pump_frames(20);
     assert_eq!(
         window_x(harness.world(), 2) - window_x(harness.world(), 0),
-        TEST_WINDOW_WIDTH,
+        DEFAULT_TILED_WIDTH,
         "a closed retained surface must not leave an empty tile slot"
     );
     let retained = find_window_entity(1, harness.world());
@@ -578,11 +586,11 @@ fn closed_retained_surface_releases_its_tile_slot() {
     assert_eq!(find_window_entity(1, harness.world()), retained);
     assert_eq!(
         window_x(harness.world(), 1) - window_x(harness.world(), 0),
-        TEST_WINDOW_WIDTH
+        DEFAULT_TILED_WIDTH
     );
     assert_eq!(
         window_x(harness.world(), 2) - window_x(harness.world(), 0),
-        2 * TEST_WINDOW_WIDTH
+        2 * DEFAULT_TILED_WIDTH
     );
 }
 
@@ -595,14 +603,14 @@ fn retained_surface_slot_updates_after_delayed_order_out() {
     harness.pump_frames(5);
     assert_eq!(
         window_x(harness.world(), 2) - window_x(harness.world(), 0),
-        2 * TEST_WINDOW_WIDTH
+        2 * DEFAULT_TILED_WIDTH
     );
     harness.mock_state.os_order_out_withdrawn_surface(1);
     // The heartbeat must upgrade an existing suspension even without a close event.
     harness.pump_frames(30);
     assert_eq!(
         window_x(harness.world(), 2) - window_x(harness.world(), 0),
-        TEST_WINDOW_WIDTH
+        DEFAULT_TILED_WIDTH
     );
 }
 
@@ -622,7 +630,7 @@ fn failed_presentation_observation_preserves_tile_until_recovery() {
     harness.pump_frames(20);
     assert_eq!(
         window_x(harness.world(), 2) - window_x(harness.world(), 0),
-        2 * TEST_WINDOW_WIDTH
+        2 * DEFAULT_TILED_WIDTH
     );
     harness
         .mock_state
@@ -630,7 +638,7 @@ fn failed_presentation_observation_preserves_tile_until_recovery() {
     harness.pump_frames(30);
     assert_eq!(
         window_x(harness.world(), 2) - window_x(harness.world(), 0),
-        TEST_WINDOW_WIDTH
+        DEFAULT_TILED_WIDTH
     );
 }
 
@@ -659,7 +667,7 @@ fn test_closing_window_of_live_app_closes_the_gap() {
             let left = window_x(world, 0);
             assert_eq!(
                 window_x(world, 2) - left,
-                2 * TEST_WINDOW_WIDTH,
+                2 * DEFAULT_TILED_WIDTH,
                 "three windows should tile side by side before the close"
             );
             state.os_close_window(1);
@@ -671,7 +679,7 @@ fn test_closing_window_of_live_app_closes_the_gap() {
             );
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                TEST_WINDOW_WIDTH,
+                DEFAULT_TILED_WIDTH,
                 "surviving windows must close the gap left by window 1"
             );
         })
@@ -703,7 +711,7 @@ fn test_window_server_close_of_live_app_closes_the_gap() {
             );
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                TEST_WINDOW_WIDTH,
+                DEFAULT_TILED_WIDTH,
                 "surviving windows must close the WindowServer-confirmed gap"
             );
         })
@@ -730,7 +738,7 @@ fn test_reconcile_removes_a_vanished_window_and_closes_the_gap() {
         .on_iteration(0, |world, state| {
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                2 * TEST_WINDOW_WIDTH
+                2 * DEFAULT_TILED_WIDTH
             );
             state.os_vanish_window(1);
         })
@@ -741,7 +749,7 @@ fn test_reconcile_removes_a_vanished_window_and_closes_the_gap() {
             );
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                TEST_WINDOW_WIDTH,
+                DEFAULT_TILED_WIDTH,
                 "surviving windows must close the reconciled gap"
             );
         })
@@ -769,7 +777,7 @@ fn test_reconcile_removes_vanished_window_with_responsive_stale_ax_handle() {
         .on_iteration(0, |world, state| {
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                2 * TEST_WINDOW_WIDTH
+                2 * DEFAULT_TILED_WIDTH
             );
             state.os_vanish_window_with_stale_ax_handle(1);
         })
@@ -780,7 +788,7 @@ fn test_reconcile_removes_vanished_window_with_responsive_stale_ax_handle() {
             );
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                TEST_WINDOW_WIDTH,
+                DEFAULT_TILED_WIDTH,
                 "surviving windows must close the vanished window's gap"
             );
         })
@@ -810,7 +818,7 @@ fn test_reconcile_suspends_ax_withdrawn_window_without_reflowing_live_surface() 
             );
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                2 * TEST_WINDOW_WIDTH,
+                2 * DEFAULT_TILED_WIDTH,
                 "a live WindowServer surface must retain its declarative layout slot"
             );
         })
@@ -870,7 +878,7 @@ fn test_reconcile_restores_a_temporarily_withdrawn_window() {
         .on_iteration(1, |world, state| {
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                2 * TEST_WINDOW_WIDTH
+                2 * DEFAULT_TILED_WIDTH
             );
             state.os_restore_withdrawn_window(1);
         })
@@ -878,7 +886,7 @@ fn test_reconcile_restores_a_temporarily_withdrawn_window() {
             assert!(window_exists(world, 1));
             assert_eq!(
                 window_x(world, 2) - window_x(world, 0),
-                2 * TEST_WINDOW_WIDTH
+                2 * DEFAULT_TILED_WIDTH
             );
         })
         .run(commands);
@@ -930,7 +938,7 @@ fn test_reconcile_discovers_window_missing_from_ecs() {
     TestHarness::new()
         .with_windows(1)
         .on_iteration(0, |_world, state| {
-            let frame = bevy::math::IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let frame = bevy::math::IRect::new(0, 0, DEFAULT_TILED_WIDTH, TEST_WINDOW_HEIGHT);
             _ = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 99, frame);
         })
         .on_iteration(1, |world, _state| {

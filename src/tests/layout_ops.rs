@@ -91,14 +91,16 @@ fn script_unstack_rejects_an_overflowing_proposed_strip() {
         find_window_entity(0, harness.world()),
         find_window_entity(1, harness.world()),
     ];
-    for &entity in &members {
-        harness
-            .world()
-            .entity_mut(entity)
-            .insert(crate::ecs::Bounds(crate::manager::Size::new(
-                i32::MAX / 2,
-                300,
-            )));
+    {
+        let world = harness.world();
+        let mut strip = world.query::<&mut LayoutStrip>().single_mut(world).unwrap();
+        let id = strip.column_id(members[0]).unwrap();
+        strip
+            .set_width_intent(
+                id,
+                crate::ecs::layout::WidthIntent::Absolute(f64::from(i32::MAX / 2)),
+            )
+            .unwrap();
     }
     let plan = snapshot(&mut harness).unstack(1).plan();
     let before = actual_items(&mut harness);
@@ -116,11 +118,13 @@ fn script_unstack_rejects_an_overflowing_proposed_strip() {
             .get::<crate::ecs::ReshuffleAroundMarker>(members[1])
             .is_none()
     );
-    for entity in members {
-        harness
-            .world()
-            .entity_mut(entity)
-            .insert(crate::ecs::Bounds(crate::manager::Size::new(400, 300)));
+    {
+        let world = harness.world();
+        let mut strip = world.query::<&mut LayoutStrip>().single_mut(world).unwrap();
+        let id = strip.column_id(members[0]).unwrap();
+        strip
+            .set_width_intent(id, crate::ecs::layout::WidthIntent::Absolute(400.0))
+            .unwrap();
     }
     harness.world().resource_mut::<Messages<Event>>().clear();
     let plan = snapshot(&mut harness).unstack(1).plan();
@@ -633,7 +637,7 @@ fn script_width_uses_the_owner_display_instead_of_the_focused_display() {
     );
     assert_eq!(
         harness.mock_state.actual_window_frame(0).unwrap().width(),
-        TEST_WINDOW_WIDTH
+        TEST_DISPLAY_WIDTH / 4
     );
     crate::assert_focused!(harness.world(), 0);
 }
@@ -750,7 +754,7 @@ fn script_width_preserves_an_earlier_queued_height_request() {
             .get::<crate::ecs::ResizeMarker>(entity)
             .unwrap()
             .0,
-        IVec2::new(512, 250)
+        IVec2::new(400, 250)
     );
 }
 
@@ -778,7 +782,7 @@ fn script_width_resizes_the_column_not_just_its_reported_ratio() {
     );
     assert_eq!(
         harness.mock_state.actual_window_frame(2).unwrap().width(),
-        TEST_WINDOW_WIDTH
+        TEST_DISPLAY_WIDTH / 4
     );
 }
 
@@ -795,24 +799,29 @@ fn script_width_rejects_unrepresentable_values_without_mutating_state() {
         let mut harness = TestHarness::new().with_windows(1);
         harness.pump_frames(5);
         let entity = find_window_entity(0, harness.world());
-        let before = harness
-            .world()
-            .get::<crate::ecs::WidthRatio>(entity)
-            .unwrap()
-            .0;
+        let before = {
+            let world = harness.world();
+            let strip = world.query::<&LayoutStrip>().single(world).unwrap();
+            strip
+                .column_state(strip.index_of(entity).unwrap())
+                .unwrap()
+                .width
+        };
         let frame = harness.mock_state.actual_window_frame(0).unwrap();
         let writes = harness.mock_state.frame_write_attempts(0);
         replay(&mut harness, vec![LayoutOp::SetWidth { window: 0, ratio }]);
-        assert_eq!(
-            harness
-                .world()
-                .get::<crate::ecs::WidthRatio>(entity)
-                .unwrap()
-                .0
-                .to_bits(),
-            before.to_bits(),
-            "{ratio}"
-        );
+        {
+            let world = harness.world();
+            let strip = world.query::<&LayoutStrip>().single(world).unwrap();
+            assert_eq!(
+                strip
+                    .column_state(strip.index_of(entity).unwrap())
+                    .unwrap()
+                    .width,
+                before,
+                "{ratio}"
+            );
+        }
         assert_eq!(harness.mock_state.actual_window_frame(0), Some(frame));
         assert_eq!(harness.mock_state.frame_write_attempts(0), writes);
     }
@@ -1137,4 +1146,59 @@ fn script_frame_accepts_negative_origins_and_normalizes_empty_dimensions() {
             IRect::new(-400, -300, -400 + width.max(1), -300 + height.max(1))
         );
     }
+}
+
+#[test]
+fn stale_arrangement_cannot_overwrite_a_newer_structural_edit() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.pump_frames(10);
+    let stale = plan(&mut harness, vec![stack(1, 0)]);
+    replay(&mut harness, vec![LayoutOp::Swap(0, 2)]);
+    let current = columns(&mut harness);
+    replay_plan(&mut harness, stale);
+    assert_eq!(columns(&mut harness), current);
+}
+
+#[test]
+fn unavailable_retained_identity_can_be_rearranged_by_a_fresh_script() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.pump_frames(10);
+    harness.mock_state.os_withdraw_window(1);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(5);
+    let withdrawn = find_window_entity(1, harness.world());
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::reconcile::WindowUnavailable>(withdrawn)
+            .is_some()
+    );
+    let plan = plan(&mut harness, vec![stack(1, 0)]);
+    let writes = harness.mock_state.frame_write_attempts(1);
+    harness
+        .world()
+        .run_system_cached_with(crate::ecs::layout_ops::apply_layout_plan, plan)
+        .unwrap();
+    assert_eq!(columns(&mut harness), vec![vec![0, 1], vec![2]]);
+    assert_eq!(harness.mock_state.frame_write_attempts(1), writes);
+}
+
+#[test]
+fn arrangement_does_not_need_a_native_display_parent() {
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.pump_frames(10);
+    let plan = plan(
+        &mut harness,
+        vec![stack(1, 0), LayoutOp::Unstack(1), LayoutOp::Swap(1, 2)],
+    );
+    let world = harness.world();
+    let strip = world
+        .query_filtered::<Entity, With<LayoutStrip>>()
+        .single(world)
+        .unwrap();
+    world.entity_mut(strip).remove::<ChildOf>();
+    world
+        .run_system_cached_with(crate::ecs::layout_ops::apply_layout_plan, plan)
+        .unwrap();
+    assert_eq!(columns(&mut harness), vec![vec![0], vec![2], vec![1]]);
 }

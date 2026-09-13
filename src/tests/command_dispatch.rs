@@ -14,6 +14,19 @@ fn harness() -> TestHarness {
     harness
 }
 
+fn width_intent(harness: &mut TestHarness, entity: Entity) -> crate::ecs::layout::WidthIntent {
+    let world = harness.world();
+    world
+        .query::<&crate::ecs::layout::LayoutStrip>()
+        .iter(world)
+        .find_map(|strip| {
+            strip
+                .column_state(strip.index_of(entity).ok()?)
+                .map(|state| state.width)
+        })
+        .unwrap()
+}
+
 fn dispatch(harness: &mut TestHarness, actions: impl IntoIterator<Item = Action>) {
     for action in actions {
         harness
@@ -79,8 +92,8 @@ fn command_batch_resize_uses_requested_focus_without_forging_confirmed_focus() {
         ],
     );
     assert_eq!(
-        harness.world().get::<ResizeMarker>(next).map(|v| v.0.x),
-        Some(768)
+        width_intent(&mut harness, next),
+        crate::ecs::layout::WidthIntent::ViewportRatio(0.75)
     );
     assert!(harness.world().get::<ResizeMarker>(old).is_none());
     assert!(harness.world().get::<FocusedMarker>(old).is_some());
@@ -103,8 +116,8 @@ fn command_batch_invalid_action_does_not_block_later_actions() {
     let next = find_window_entity(1, harness.world());
     assert_eq!(harness.mock_state.take_focus_requests(), vec![1]);
     assert_eq!(
-        harness.world().get::<ResizeMarker>(next).map(|v| v.0.x),
-        Some(512)
+        width_intent(&mut harness, next),
+        crate::ecs::layout::WidthIntent::ViewportRatio(0.5)
     );
 }
 
@@ -203,10 +216,19 @@ fn layout_balance_uses_explicit_reference_column_not_focus() {
     use spool_shared_types::commands::SpaceLayoutOperation;
     let mut harness = harness();
     let selected = find_window_entity(2, harness.world());
-    harness
-        .world()
-        .entity_mut(selected)
-        .insert(ResizeMarker(IVec2::new(300, 600)));
+    {
+        let world = harness.world();
+        for mut strip in world
+            .query::<&mut crate::ecs::layout::LayoutStrip>()
+            .iter_mut(world)
+        {
+            if let Some(id) = strip.column_id(selected) {
+                strip
+                    .set_width_intent(id, crate::ecs::layout::WidthIntent::Absolute(300.0))
+                    .unwrap();
+            }
+        }
+    }
     dispatch(
         &mut harness,
         [Action::SpaceLayout {
@@ -219,11 +241,8 @@ fn layout_balance_uses_explicit_reference_column_not_focus() {
     for id in 0..4 {
         let entity = find_window_entity(id, harness.world());
         assert_eq!(
-            harness
-                .world()
-                .get::<ResizeMarker>(entity)
-                .map(|size| size.0.x),
-            Some(300)
+            width_intent(&mut harness, entity),
+            crate::ecs::layout::WidthIntent::Absolute(300.0)
         );
     }
     assert!(harness.mock_state.take_focus_requests().is_empty());
@@ -483,8 +502,8 @@ fn command_batch_cancelled_focus_request_resumes_confirmed_target() {
     );
     dispatch(&mut harness, [Action::Window(Operation::SetWidth(0.75))]);
     assert_eq!(
-        harness.world().get::<ResizeMarker>(old).map(|v| v.0.x),
-        Some(768)
+        width_intent(&mut harness, old),
+        crate::ecs::layout::WidthIntent::ViewportRatio(0.75)
     );
     assert!(harness.world().get::<ResizeMarker>(next).is_none());
 }

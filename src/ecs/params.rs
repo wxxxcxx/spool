@@ -16,7 +16,7 @@ use crate::{
         ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, FlashMessage, Floating,
         FocusedMarker, FullWidthMarker, Initializing, LayoutPosition, NativeFullscreenMarker,
         ObservedWindowFrame, Position, PresentedWindowFrame, RepositionMarker, ResizeMarker,
-        Scrolling, WidthRatio, WindowFrameMotion, WindowVisibility, layout::LayoutStrip,
+        Scrolling, WindowFrameMotion, WindowVisibility, layout::LayoutStrip,
         reconcile::WindowUnavailable,
     },
     manager::{Display, Origin, Size, Window},
@@ -136,58 +136,6 @@ impl ActiveDisplay<'_, '_> {
     }
 }
 
-/// A Bevy `SystemParam` that provides mutable access to the currently active `Display` and other displays.
-/// It allows systems to modify the active display and its associated `LayoutStrip`s.
-#[derive(SystemParam)]
-pub struct ActiveDisplayMut<'w, 's> {
-    strip: Single<'w, 's, &'static mut LayoutStrip, With<ActiveWorkspaceMarker>>,
-    /// The single active `Display` component, marked with `ActiveDisplayMarker`.
-    display: Single<
-        'w,
-        's,
-        (&'static mut Display, Entity, Option<&'static DockPosition>),
-        With<ActiveDisplayMarker>,
-    >,
-    /// A query for all other `Display` components that are not marked as active.
-    other_displays: Query<
-        'w,
-        's,
-        (Entity, &'static mut Display, Option<&'static DockPosition>),
-        Without<ActiveDisplayMarker>,
-    >,
-}
-
-impl ActiveDisplayMut<'_, '_> {
-    pub fn display(&self) -> &Display {
-        &self.display.0
-    }
-
-    pub fn dock(&self) -> Option<&DockPosition> {
-        self.display.2
-    }
-
-    pub(crate) fn other_contexts(
-        &self,
-    ) -> impl Iterator<Item = (Entity, &Display, Option<&DockPosition>)> {
-        self.other_displays.iter()
-    }
-
-    pub fn active_strip(&mut self) -> &mut LayoutStrip {
-        &mut self.strip
-    }
-
-    /// Reads the strip for command planning without marking it changed.
-    pub fn active_strip_ref(&self) -> &LayoutStrip {
-        &self.strip
-    }
-
-    /// Returns the `IRect` representing the bounds of the active display, correctly padded by
-    /// potential dock position and or padding configuration.
-    pub fn actual_bounds(&self, config: &Config) -> IRect {
-        self.display().actual_display_bounds(self.dock(), config)
-    }
-}
-
 /// Work that needs prompt ticks; used by the event pump to bound its sleep.
 #[derive(SystemParam)]
 pub struct FrameActivity<'w, 's> {
@@ -244,7 +192,6 @@ type WindowPlacements<'w, 's> = Query<
         Option<&'static ObservedWindowFrame>,
         Option<&'static PresentedWindowFrame>,
         Option<&'static DesiredWindowFrame>,
-        &'static WidthRatio,
         Option<&'static RepositionMarker>,
         Option<&'static ResizeMarker>,
     ),
@@ -294,17 +241,8 @@ pub struct Windows<'w, 's> {
     all: AllWindows<'w, 's>,
     available: AvailableWindows<'w, 's>,
     focus: FocusedWindows<'w, 's>,
-    previous_size: Query<
-        'w,
-        's,
-        (
-            &'static Window,
-            Entity,
-            &'static WidthRatio,
-            &'static FullWidthMarker,
-        ),
-        With<FullWidthMarker>,
-    >,
+    previous_size:
+        Query<'w, 's, (&'static Window, Entity, &'static FullWidthMarker), With<FullWidthMarker>>,
     positions: WindowPlacements<'w, 's>,
     reassigned: ReassignedWindows<'w, 's>,
     parked: Query<'w, 's, (), With<super::tiled_visibility::ParkedTile>>,
@@ -353,6 +291,11 @@ impl Windows<'_, '_> {
 
     /// Retained source membership is not permission to mutate a layout while
     /// native reassignment owns its geometry and captured column structure.
+    /// State-domain admission and the Lua layout operations share this gate.
+    pub(crate) fn layout_transition_pending(&self, entity: Entity) -> bool {
+        self.reassigned.contains(entity)
+    }
+
     pub(crate) fn layout_is_writable(&self, entity: Entity) -> bool {
         self.available.contains(entity) && !self.reassigned.contains(entity)
     }
@@ -387,6 +330,16 @@ impl Windows<'_, '_> {
                 visibility,
             },
         ))
+    }
+
+    pub(crate) fn get_any(&self, entity: Entity) -> Option<&Window> {
+        self.all.get(entity).ok().map(|(window, _, _, _, _)| window)
+    }
+
+    pub(crate) fn iter_any(&self) -> impl Iterator<Item = (&Window, Entity)> {
+        self.all
+            .iter()
+            .map(|(window, entity, _, _, _)| (window, entity))
     }
 
     pub fn get(&self, entity: Entity) -> Option<&Window> {
@@ -494,19 +447,10 @@ impl Windows<'_, '_> {
             .map(|(window, entity, _, _, _)| (window, entity))
     }
 
-    pub fn tiled_iter(&self) -> impl Iterator<Item = (&Window, Entity, &ChildOf)> {
-        self.available
-            .iter()
-            .filter_map(|(window, entity, childof, floating, visibility)| {
-                (!floating && visibility.is_none() && !self.parked.contains(entity))
-                    .then_some((window, entity, childof))
-            })
-    }
-
     pub fn full_width(&self, entity: Entity) -> Option<&FullWidthMarker> {
         self.previous_size
             .get(entity)
-            .map(|(_, _, _, marker)| marker)
+            .map(|(_, _, marker)| marker)
             .ok()
     }
 
@@ -514,26 +458,19 @@ impl Windows<'_, '_> {
         self.positions
             .get(entity)
             .ok()
-            .map(|(_, origin, _, _, _, _, _, _, _)| origin.0)
+            .map(|(_, origin, _, _, _, _, _, _)| origin.0)
     }
 
     pub fn size(&self, entity: Entity) -> Option<Size> {
         self.positions
             .get(entity)
             .ok()
-            .map(|(_, _, size, _, _, _, _, _, _)| size.0)
-    }
-
-    pub fn width_ratio(&self, entity: Entity) -> Option<f64> {
-        self.positions
-            .get(entity)
-            .ok()
-            .map(|(_, _, _, _, _, _, ratio, _, _)| ratio.0)
+            .map(|(_, _, size, _, _, _, _, _)| size.0)
     }
 
     /// Physical facts never fall back to an animation sample or layout intent.
     pub(crate) fn observed_frame(&self, entity: Entity) -> Option<IRect> {
-        let (_, _, _, observed, _, _, _, _, _) = self.positions.get(entity).ok()?;
+        let (_, _, _, observed, _, _, _, _) = self.positions.get(entity).ok()?;
         observed.map(|frame| frame.0)
     }
 
@@ -542,7 +479,7 @@ impl Windows<'_, '_> {
         self.positions
             .get(entity)
             .ok()
-            .map(|(_, origin, size, observed, presented, _, _, _, _)| {
+            .map(|(_, origin, size, observed, presented, _, _, _)| {
                 observed
                     .map(|frame| frame.0)
                     .or_else(|| presented.map(|frame| frame.0))
@@ -551,7 +488,7 @@ impl Windows<'_, '_> {
     }
 
     pub fn moving_frame(&self, entity: Entity) -> Option<IRect> {
-        let (_, origin, size, _, _, desired, _, reposition, resize) =
+        let (_, origin, size, _, _, desired, reposition, resize) =
             self.positions.get(entity).ok()?;
         let frame = match desired {
             Some(desired) => desired.0,
@@ -566,7 +503,7 @@ impl Windows<'_, '_> {
 
     /// Layout inputs including commands queued earlier in this frame.
     pub fn requested_frame(&self, entity: Entity) -> Option<IRect> {
-        let (_, origin, size, _, _, _, _, reposition, resize) = self.positions.get(entity).ok()?;
+        let (_, origin, size, _, _, _, reposition, resize) = self.positions.get(entity).ok()?;
         super::window_frame::checked_window_frame(
             reposition.map_or(origin.0, |request| request.0),
             resize.map_or(size.0, |request| request.0),
@@ -577,6 +514,31 @@ impl Windows<'_, '_> {
         self.positions
             .get(entity)
             .ok()
-            .map(|(layout_position, _, _, _, _, _, _, _, _)| layout_position)
+            .map(|(layout_position, _, _, _, _, _, _, _)| layout_position)
+    }
+}
+
+/// Retained frame items participating in layout projection. Temporary AX
+/// uncertainty can retain a slot; confirmed ordered-out windows do not.
+#[derive(SystemParam)]
+pub(crate) struct LayoutParticipants<'w, 's> {
+    windows: Query<
+        'w,
+        's,
+        Option<&'static WindowUnavailable>,
+        (
+            With<Window>,
+            Without<super::workspace::WindowSpaceReassignmentPending>,
+        ),
+    >,
+}
+impl LayoutParticipants<'_, '_> {
+    pub(crate) fn contains(&self, entity: Entity) -> bool {
+        self.windows
+            .get(entity)
+            .is_ok_and(|state| state.is_none_or(|state| !state.excludes_from_layout_projection()))
+    }
+    pub(crate) fn height_blocked(&self, strip: &LayoutStrip) -> bool {
+        strip.height_projection_is_blocked_for(&|entity| self.contains(entity))
     }
 }

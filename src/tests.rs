@@ -1,9 +1,11 @@
+mod column_intent;
 mod command_dispatch;
 mod cross_display_focus;
 mod display;
 mod display_commands;
 mod exit_restore;
 mod harness;
+mod height_intent;
 mod independent_windows;
 mod interaction;
 #[cfg(feature = "lua")]

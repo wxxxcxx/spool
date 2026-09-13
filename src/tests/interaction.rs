@@ -1,3 +1,5 @@
+const DEFAULT_TILED_WIDTH: i32 = TEST_DISPLAY_WIDTH / 4;
+
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
 
@@ -2422,8 +2424,6 @@ fn test_dont_focus() {
         }, // 3
     ];
 
-    let offscreen_right = TEST_DISPLAY_WIDTH - 5;
-
     let mut params = WindowParams::new(".*", None);
     params.dont_focus = Some(true);
     params.index = Some(100);
@@ -2434,16 +2434,16 @@ fn test_dont_focus() {
     harness
         .on_iteration(1, move |world, state| {
             let origin = Origin::new(0, 0);
-            let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let size = Size::new(DEFAULT_TILED_WIDTH, TEST_WINDOW_HEIGHT);
             let frame = IRect::from_corners(origin, origin + size);
             let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 3, frame);
             world.trigger(SpawnWindowTrigger::new(vec![window]));
         })
         .on_iteration(3, move |world, _| {
             assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 3, offscreen_right, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, DEFAULT_TILED_WIDTH, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 2 * DEFAULT_TILED_WIDTH, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 3, 3 * DEFAULT_TILED_WIDTH, TEST_MENUBAR_HEIGHT);
             assert_focused!(world, 0);
         })
         .run(commands);
@@ -2537,11 +2537,11 @@ fn test_offscreen_windows_preserve_height() {
     TestHarness::new()
         .with_windows(5)
         .on_iteration(1, move |world, _state| {
-            assert_window_size!(world, 4, TEST_WINDOW_WIDTH, expected_height);
-            assert_window_size!(world, 3, TEST_WINDOW_WIDTH, expected_height);
-            assert_window_size!(world, 2, TEST_WINDOW_WIDTH, expected_height);
-            assert_window_size!(world, 1, TEST_WINDOW_WIDTH, expected_height);
-            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, expected_height);
+            assert_window_size!(world, 4, DEFAULT_TILED_WIDTH, expected_height);
+            assert_window_size!(world, 3, DEFAULT_TILED_WIDTH, expected_height);
+            assert_window_size!(world, 2, DEFAULT_TILED_WIDTH, expected_height);
+            assert_window_size!(world, 1, DEFAULT_TILED_WIDTH, expected_height);
+            assert_window_size!(world, 0, DEFAULT_TILED_WIDTH, expected_height);
         })
         .run(commands);
 }
@@ -2567,12 +2567,16 @@ fn test_sliver_smaller_than_edge_padding() {
     let top_edge = TEST_MENUBAR_HEIGHT + i32::from(PADDING);
     let right_edge = TEST_DISPLAY_WIDTH - i32::from(PADDING);
     let offscreen_right = TEST_DISPLAY_WIDTH - i32::from(SLIVER);
-    let offscreen_left = i32::from(SLIVER) - TEST_WINDOW_WIDTH;
+    let column_width = TEST_WINDOW_WIDTH;
+    let offscreen_left = i32::from(SLIVER) - column_width;
     let left_edge = i32::from(PADDING);
 
     let config: Config = (
         MainOptions {
             sliver_width: Some(SLIVER),
+            preset_column_widths: vec![
+                f64::from(column_width) / f64::from(TEST_DISPLAY_WIDTH - i32::from(2 * PADDING)),
+            ],
             padding_top: Some(PADDING),
             padding_bottom: Some(PADDING),
             padding_left: Some(PADDING),
@@ -2588,17 +2592,17 @@ fn test_sliver_smaller_than_edge_padding() {
         .with_windows(5)
         .on_iteration(2, move |world, _state| {
             assert_window_at!(world, 0, left_edge, top_edge);
-            assert_window_at!(world, 1, left_edge + TEST_WINDOW_WIDTH, top_edge);
-            assert_window_at!(world, 2, left_edge + 2 * TEST_WINDOW_WIDTH, top_edge);
+            assert_window_at!(world, 1, left_edge + column_width, top_edge);
+            assert_window_at!(world, 2, left_edge + 2 * column_width, top_edge);
             assert_window_at!(world, 3, offscreen_right, top_edge);
             assert_window_at!(world, 4, offscreen_right, top_edge);
         })
         .on_iteration(3, move |world, _state| {
             assert_window_at!(world, 0, offscreen_left, top_edge);
             assert_window_at!(world, 1, offscreen_left, top_edge);
-            assert_window_at!(world, 2, right_edge - 3 * TEST_WINDOW_WIDTH, top_edge);
-            assert_window_at!(world, 3, right_edge - 2 * TEST_WINDOW_WIDTH, top_edge);
-            assert_window_at!(world, 4, right_edge - TEST_WINDOW_WIDTH, top_edge);
+            assert_window_at!(world, 2, right_edge - 3 * column_width, top_edge);
+            assert_window_at!(world, 3, right_edge - 2 * column_width, top_edge);
+            assert_window_at!(world, 4, right_edge - column_width, top_edge);
         })
         .run(commands);
 }
@@ -2628,6 +2632,9 @@ fn test_scrolling() {
     let config: Config = (
         MainOptions {
             swipe_gesture_fingers: Some(3),
+            preset_column_widths: vec![
+                f64::from(TEST_WINDOW_WIDTH) / f64::from(TEST_DISPLAY_WIDTH),
+            ],
             ..Default::default()
         },
         vec![],
@@ -2639,7 +2646,7 @@ fn test_scrolling() {
         .with_windows(3)
         .on_iteration(3, move |world, _state| {
             assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
         })
         .on_iteration(5, move |world, _state| {
@@ -2754,8 +2761,8 @@ fn test_window_swap_brings_focused_into_view() {
     )
         .into();
 
-    let centered = (TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH) / 2;
-    let right_edge = TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH;
+    let centered = (TEST_DISPLAY_WIDTH - DEFAULT_TILED_WIDTH) / 2;
+    let right_edge = TEST_DISPLAY_WIDTH - DEFAULT_TILED_WIDTH;
 
     TestHarness::new()
         .with_config(config)
@@ -2768,7 +2775,7 @@ fn test_window_swap_brings_focused_into_view() {
             assert_window_at!(
                 world,
                 4,
-                right_edge - TEST_WINDOW_WIDTH,
+                right_edge - DEFAULT_TILED_WIDTH,
                 TEST_MENUBAR_HEIGHT
             );
             assert_focused!(world, 0);
@@ -2807,7 +2814,7 @@ fn test_window_swap_keeps_strip_when_in_view() {
         .with_windows(2)
         .on_iteration(2, |world, _state| {
             assert_window_at!(world, 1, 0, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 0, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, DEFAULT_TILED_WIDTH, TEST_MENUBAR_HEIGHT);
             assert_focused!(world, 1);
         })
         .run(commands);

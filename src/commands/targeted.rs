@@ -2,11 +2,9 @@
 
 use bevy::prelude::*;
 
-use super::{Action, Direction, Operation, ResizeAxis};
+use super::{Action, Direction, Operation};
 use crate::config::Config;
-use crate::ecs::layout::{
-    Column, LayoutStrip, centered_origin_in_viewport, clamp_origin_to_viewport,
-};
+use crate::ecs::layout::{Column, LayoutStrip, clamp_origin_to_viewport};
 use crate::ecs::params::Windows;
 use crate::ecs::topology::NativeTopology;
 use crate::ecs::{
@@ -120,54 +118,7 @@ pub(super) fn execute(
                 );
                 return Ok(());
             }
-            if !windows.layout_column_is_writable(strip, entity) {
-                return Err(crate::errors::Error::rejected("column_unavailable"));
-            }
-            let Some(other) = super::get_window_in_direction(&direction, entity, strip) else {
-                return Ok(());
-            };
-            if !super::writable_column_range(&windows, strip, entity, other) {
-                return Err(crate::errors::Error::rejected("column_unavailable"));
-            }
-            let index = strip.index_of(entity).map_err(|error| {
-                crate::errors::Error::rejection_with_cause("layout_membership_unresolved", error)
-            })?;
-            let target_index = strip.index_of(other).map_err(|error| {
-                crate::errors::Error::rejection_with_cause("layout_membership_unresolved", error)
-            })?;
-            let mut proposed = strip.clone();
-            match index.cmp(&target_index) {
-                std::cmp::Ordering::Equal => {
-                    if let Some(Column::Stack(stack)) = proposed.get_column_mut(index) {
-                        let a = stack
-                            .iter()
-                            .position(|item| item.contains(entity))
-                            .ok_or_else(|| {
-                                crate::errors::Error::rejected("layout_membership_unresolved")
-                            })?;
-                        let b = stack
-                            .iter()
-                            .position(|item| item.contains(other))
-                            .ok_or_else(|| {
-                                crate::errors::Error::rejected("layout_membership_unresolved")
-                            })?;
-                        stack.swap(a, b);
-                    }
-                }
-                std::cmp::Ordering::Less => {
-                    for index in index..target_index {
-                        proposed.swap(index, index + 1);
-                    }
-                }
-                std::cmp::Ordering::Greater => {
-                    for index in (target_index..index).rev() {
-                        proposed.swap(index, index + 1);
-                    }
-                }
-            }
-            commands.entity(strip_entity).insert(proposed);
-            commands.ensure_visible(entity);
-            Ok(())
+            Err(crate::errors::Error::rejected("invalid_geometry_domain"))
         }
         Operation::ToggleFloating => {
             if pending_retiles.contains(entity) {
@@ -209,48 +160,6 @@ pub(super) fn execute(
             }
             Ok(())
         }
-        Operation::ToggleStack => {
-            if !state.is_tiled() || !windows.layout_column_is_writable(strip, entity) {
-                return Err(crate::errors::Error::rejected("column_unavailable"));
-            }
-            let mut proposed = strip.clone();
-            let stacked = matches!(strip.column_containing(entity), Some(Column::Stack(_)));
-            let changed = if stacked {
-                proposed.unstack(entity)
-            } else {
-                let index = strip.index_of(entity).map_err(|error| {
-                    crate::errors::Error::rejection_with_cause(
-                        "layout_membership_unresolved",
-                        error,
-                    )
-                })?;
-                if index > 0
-                    && strip.get(index - 1).is_ok_and(|column| {
-                        column
-                            .window_iter()
-                            .any(|member| !windows.layout_is_writable(member))
-                    })
-                {
-                    return Err(crate::errors::Error::rejected("column_unavailable"));
-                }
-                proposed.stack(entity)
-            }
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("ineligible_layout_entry", error)
-            })?;
-            if !changed {
-                return Ok(());
-            }
-            if !proposed.accepts_column_widths(|_, column| {
-                column.width(&|member| windows.requested_frame(member))
-            }) {
-                return Err(crate::errors::Error::rejected("invalid_layout_geometry"));
-            }
-            commands.entity(strip_entity).insert(proposed);
-            commands.entity(entity).remove::<FullWidthMarker>();
-            commands.reshuffle_around(entity);
-            Ok(())
-        }
         Operation::Maximize => {
             if state.is_tiled() && !windows.layout_column_is_writable(strip, entity) {
                 return Err(crate::errors::Error::rejected("column_unavailable"));
@@ -281,23 +190,11 @@ pub(super) fn execute(
             } else {
                 viewport
             };
-            let mut proposed = strip.clone();
-            let changed = if state.is_tiled() && !restoring {
-                proposed.unstack(entity).map_err(|error| {
-                    crate::errors::Error::rejection_with_cause("ineligible_layout_entry", error)
-                })?
-            } else {
-                false
-            };
-            let sizes = if state.is_floating() {
-                vec![(entity, target.size())]
-            } else {
-                super::column_resize_plan(&windows, &proposed, entity, target)
-                    .ok_or_else(|| crate::errors::Error::rejected("column_unavailable"))?
-            };
-            if changed {
-                commands.entity(strip_entity).insert(proposed);
+            // Tiled maximize is admitted by the column intent domain.
+            if !state.is_floating() {
+                return Err(crate::errors::Error::rejected("invalid_geometry_domain"));
             }
+            let sizes = vec![(entity, target.size())];
             super::apply_column_sizes(sizes, &mut commands);
             if !restoring {
                 commands.entity(entity).insert(FullWidthMarker {
@@ -343,8 +240,7 @@ pub(super) fn execute(
             }
             Ok(())
         }
-        Operation::Resize { axis, direction } => {
-            let operation = Operation::Resize { axis, direction };
+        operation @ (Operation::Resize { .. } | Operation::SetWidth(_)) => {
             if state.is_floating() {
                 let target = super::floating_resize_frame(&operation, frame, viewport, &config)
                     .ok_or_else(|| crate::errors::Error::rejected("invalid_geometry"))?;
@@ -355,46 +251,7 @@ pub(super) fn execute(
                 }
                 return Ok(());
             }
-            if !windows.layout_column_is_writable(strip, entity) {
-                return Err(crate::errors::Error::rejected("column_unavailable"));
-            }
-            if axis == ResizeAxis::Height {
-                if !matches!(strip.column_containing(entity), Some(Column::Stack(_))) {
-                    return Err(crate::errors::Error::rejected("not_a_stack"));
-                }
-                if super::resize_tiled_height(
-                    entity,
-                    frame,
-                    viewport,
-                    direction,
-                    strip,
-                    &config,
-                    &mut commands,
-                ) {
-                    commands.entity(entity).remove::<FullWidthMarker>();
-                }
-                return Ok(());
-            }
-            let ratio = super::tiled_width_ratio(
-                &operation,
-                f64::from(frame.width()) / f64::from(viewport.width()),
-                &config,
-            )
-            .ok_or_else(|| crate::errors::Error::rejected("invalid_width"))?;
-            let width = super::checked_ratio_width(ratio, viewport.width())
-                .ok_or_else(|| crate::errors::Error::rejected("invalid_width"))?;
-            let size = frame.size().with_x(width);
-            let target = super::checked_window_frame(
-                centered_origin_in_viewport(frame, size, viewport),
-                size,
-            )
-            .ok_or_else(|| crate::errors::Error::rejected("invalid_geometry"))?;
-            let sizes = super::column_resize_plan(&windows, strip, entity, target)
-                .ok_or_else(|| crate::errors::Error::rejected("column_unavailable"))?;
-            super::apply_column_sizes(sizes, &mut commands);
-            commands.reposition_entity(entity, target.min);
-            commands.reshuffle_around(entity);
-            Ok(())
+            Err(crate::errors::Error::rejected("invalid_geometry_domain"))
         }
         _ => Err(crate::errors::Error::rejected(
             "unsupported explicit operation",

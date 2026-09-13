@@ -290,7 +290,20 @@ fn stacking_never_raises_another_spaces_windows() {
 
 #[test]
 fn changing_focus_updates_both_edge_priorities_without_focus_requests() {
-    let mut harness = TestHarness::new().with_windows(5).with_focused_window(2);
+    // Preserve this test's explicit two-edge-overlap geometry independently
+    // of the default inherited column width.
+    let config: crate::config::Config = (
+        crate::config::MainOptions {
+            preset_column_widths: vec![400.0 / f64::from(super::TEST_DISPLAY_WIDTH)],
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(5)
+        .with_focused_window(2);
     harness.pump_frames(20);
     // Focusing 3 first exposes the old right-edge overlap, then scrolling
     // exposes the new left-edge overlap. Neither pass raises isolated panes.

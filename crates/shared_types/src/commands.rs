@@ -408,10 +408,20 @@ pub enum Action {
     },
 }
 
+/// Original column slot width, independent of observed window geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnWidth {
+    Inherit,
+    Points(f64),
+    Ratio(f64),
+}
+
 /// Space-owned arrangement; column numbers are one-based retained ordinals.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpaceLayoutOperation {
+    SetWidth { column: usize, width: ColumnWidth },
     Equalize { column: Option<usize> },
     Balance { reference_column: Option<usize> },
     ToggleTiledVisibility,

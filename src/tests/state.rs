@@ -5,15 +5,13 @@ use bevy::ecs::system::RunSystemOnce as _;
 
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::state::{
-    QueryStateParams, SavedDisplay, SavedRect, SavedSpace, SpoolState, StateFilePath,
-    periodic_state_save,
+    QueryStateParams, SpoolState, StateFilePath, StatePersistence, periodic_state_save,
 };
 use crate::events::Event;
 use crate::tests::{
-    TEST_DISPLAY_HEIGHT, TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_MENUBAR_HEIGHT,
-    TEST_WORKSPACE_ID, TestHarness,
+    TEST_DISPLAY_HEIGHT, TEST_DISPLAY_ID, TEST_DISPLAY_WIDTH, TEST_WORKSPACE_ID, TestHarness,
 };
-use spool_shared_types::state::{SpaceKind, StateQueryKind};
+use spool_shared_types::state::StateQueryKind;
 
 const FLOAT_SPACE: u64 = TEST_WORKSPACE_ID + 1;
 
@@ -478,97 +476,6 @@ fn test_dir(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn v3_state_serializes_without_virtual_workspace_fields() {
-    let state = SpoolState {
-        version: 3,
-        timestamp: 123,
-        active_display_id: Some(TEST_DISPLAY_ID),
-        displays: vec![SavedDisplay {
-            display_id: TEST_DISPLAY_ID,
-            bounds: SavedRect {
-                min_x: 0,
-                min_y: TEST_MENUBAR_HEIGHT,
-                max_x: TEST_DISPLAY_WIDTH,
-                max_y: TEST_DISPLAY_HEIGHT,
-            },
-            active: true,
-            space_ids: vec![TEST_WORKSPACE_ID],
-        }],
-        spaces: vec![SavedSpace {
-            space_id: TEST_WORKSPACE_ID,
-            display_id: Some(TEST_DISPLAY_ID),
-            ordinal: Some(0),
-            kind: SpaceKind::User,
-            active: true,
-            columns: Vec::new(),
-        }],
-    };
-
-    let value = serde_json::to_value(&state).unwrap();
-    assert_eq!(value["version"], 3);
-    assert!(value.get("spaces").is_some());
-    assert!(value.get("workspaces").is_none());
-    assert!(!value.to_string().contains("virtual_index"));
-    assert!(!value.to_string().contains("active_virtual_index"));
-}
-
-#[test]
-fn v2_migration_dry_run_is_read_only_and_apply_backs_up_then_folds() {
-    let dir = test_dir("state-migration");
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("state.json");
-    let legacy = serde_json::json!({
-        "version": 2,
-        "timestamp": 123,
-        "active_display_id": TEST_DISPLAY_ID,
-        "displays": [{
-            "display_id": TEST_DISPLAY_ID,
-            "bounds": {
-                "min_x": 0,
-                "min_y": TEST_MENUBAR_HEIGHT,
-                "max_x": TEST_DISPLAY_WIDTH,
-                "max_y": TEST_DISPLAY_HEIGHT
-            },
-            "active": true,
-            "workspace_ids": [TEST_WORKSPACE_ID]
-        }],
-        "workspaces": [{
-            "workspace_id": TEST_WORKSPACE_ID,
-            "display_id": TEST_DISPLAY_ID,
-            "active_virtual_index": 1,
-            "strips": [
-                {"virtual_index": 1, "columns": []},
-                {"virtual_index": 0, "columns": []}
-            ]
-        }]
-    });
-    let original = serde_json::to_string_pretty(&legacy).unwrap();
-    fs::write(&path, &original).unwrap();
-
-    let dry_run = SpoolState::migrate_file(&path, false).unwrap();
-    assert!(dry_run.needs_migration);
-    assert_eq!(dry_run.native_spaces, 1);
-    assert_eq!(dry_run.virtual_rows, 2);
-    assert!(!dry_run.applied);
-    assert_eq!(fs::read_to_string(&path).unwrap(), original);
-    assert!(!dry_run.backup_path.exists());
-
-    let applied = SpoolState::migrate_file(&path, true).unwrap();
-    assert!(applied.applied);
-    assert!(applied.backup_path.exists());
-    assert_eq!(fs::read_to_string(&applied.backup_path).unwrap(), original);
-
-    let migrated = SpoolState::load_from_file(&path).unwrap();
-    assert_eq!(migrated.version, 3);
-    assert_eq!(migrated.spaces.len(), 1);
-    assert_eq!(migrated.spaces[0].space_id, TEST_WORKSPACE_ID);
-    assert_eq!(migrated.spaces[0].ordinal, Some(0));
-    assert!(migrated.spaces[0].active);
-
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
 fn query_tokens_only_expose_v3_native_space_contract() {
     assert_eq!(StateQueryKind::tokens(), "state, spaces, active, on-screen");
     assert!(StateQueryKind::parse("virtual-workspaces").is_none());
@@ -621,121 +528,6 @@ fn test_harness_state_saves_never_touch_the_user_path() {
 }
 
 #[test]
-fn unavailable_display_topology_does_not_replace_the_last_good_state() {
-    let mut harness = TestHarness::new().with_windows(1);
-    harness.pump_frames(15);
-    let path = harness
-        .world()
-        .resource::<StateFilePath>()
-        .as_path()
-        .to_path_buf();
-
-    harness
-        .world()
-        .run_system_once(periodic_state_save)
-        .expect("initial periodic state save");
-    let mut seeded = SpoolState::load_from_file(&path).expect("saved state");
-    seeded.timestamp = 0;
-    seeded
-        .save_to_file(&path)
-        .expect("seed deterministic timestamp");
-    let last_good = fs::read(&path).expect("last good state");
-
-    harness.mock_state.remove_display(TEST_DISPLAY_ID);
-    harness.world().write_message(Event::SystemWoke {
-        msg: "test unavailable display topology".to_string(),
-    });
-    harness.pump_frames(5);
-    assert_eq!(
-        harness
-            .world()
-            .query::<&crate::manager::Display>()
-            .iter(harness.world())
-            .count(),
-        1,
-        "an empty active-display sample while asleep must preserve the last good display projection"
-    );
-    assert_eq!(
-        harness
-            .world()
-            .query::<&LayoutStrip>()
-            .iter(harness.world())
-            .count(),
-        1,
-        "an empty active-display sample must not orphan or delete Space state"
-    );
-    harness
-        .world()
-        .run_system_once(periodic_state_save)
-        .expect("periodic state save while topology is unavailable");
-
-    assert_eq!(
-        fs::read(&path).expect("preserved state"),
-        last_good,
-        "a transiently empty display projection must not overwrite the last trustworthy layout"
-    );
-}
-
-#[test]
-fn incomplete_native_space_observation_preserves_periodic_and_exit_snapshots() {
-    use crate::ecs::state::cleanup_on_exit;
-    use crate::ecs::topology::NativeTopology;
-    use bevy::app::AppExit;
-
-    for exiting in [false, true] {
-        let mut harness = TestHarness::new().with_windows(1);
-        harness.pump_frames(5);
-        let path = harness
-            .world()
-            .resource::<StateFilePath>()
-            .as_path()
-            .to_path_buf();
-        harness
-            .world()
-            .run_system_once(periodic_state_save)
-            .unwrap();
-        let mut saved = SpoolState::load_from_file(&path).unwrap();
-        saved.timestamp = 0;
-        saved.save_to_file(&path).unwrap();
-        let before = fs::read(&path).unwrap();
-        harness
-            .mock_state
-            .script_present_display_topology_queries(TEST_DISPLAY_ID, [Err(())]);
-        harness.world().write_message(Event::SpaceChanged);
-        harness.pump_frames(1);
-        assert!(!harness.world().resource::<NativeTopology>().is_complete());
-        if exiting {
-            harness.world().write_message(AppExit::Success);
-            harness.world().run_system_once(cleanup_on_exit).unwrap();
-        } else {
-            harness
-                .world()
-                .run_system_once(periodic_state_save)
-                .unwrap();
-        }
-        assert_eq!(fs::read(&path).unwrap(), before, "exiting={exiting}");
-
-        harness
-            .world()
-            .resource_mut::<bevy::ecs::message::Messages<AppExit>>()
-            .clear();
-        harness.world().write_message(Event::SpaceChanged);
-        harness.pump_frames(1);
-        assert!(harness.world().resource::<NativeTopology>().is_complete());
-        if exiting {
-            harness.world().write_message(AppExit::Success);
-            harness.world().run_system_once(cleanup_on_exit).unwrap();
-        } else {
-            harness
-                .world()
-                .run_system_once(periodic_state_save)
-                .unwrap();
-        }
-        assert!(SpoolState::load_from_file(&path).unwrap().timestamp > 0);
-    }
-}
-
-#[test]
 fn query_state_uses_the_ecs_projection_when_platform_topology_is_temporarily_unavailable() {
     let mut harness = TestHarness::new().with_windows(1);
     harness.pump_frames(15);
@@ -759,8 +551,177 @@ fn query_state_uses_the_ecs_projection_when_platform_topology_is_temporarily_una
     assert_eq!(state.spaces[0].windows.len(), 1);
 }
 
+fn extract_query_state(
+    params: QueryStateParams,
+) -> crate::errors::Result<crate::ecs::state::SpoolQueryState> {
+    params.extract()
+}
+
+fn intent_snapshot(width: crate::ecs::layout::WidthIntent) -> SpoolState {
+    use crate::ecs::layout::ColumnId;
+    use crate::ecs::state::{INTENT_STATE_VERSION, SavedColumn, SavedSpace};
+    SpoolState {
+        version: INTENT_STATE_VERSION,
+        revision: 0,
+        spaces: vec![SavedSpace {
+            space_id: TEST_WORKSPACE_ID,
+            columns: vec![SavedColumn {
+                column_id: ColumnId(1),
+                width,
+                kind: spool_shared_types::windowset::ColumnKind::Single,
+                items: vec![crate::ecs::state::SavedItem {
+                    item_id: 1000,
+                    weight: 1.0,
+                    tabs: false,
+                    members: Vec::new(),
+                }],
+            }],
+        }],
+    }
+}
+
 #[test]
-fn trustworthy_space_without_windows_is_still_persisted() {
+fn intent_file_preserves_raw_values_and_rejects_old_formats_without_rewriting() {
+    use crate::ecs::layout::WidthIntent;
+    let dir = test_dir("raw-intent");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.json");
+    let mut writer = StatePersistence::default();
+    for width in [
+        WidthIntent::Absolute(800.0),
+        WidthIntent::ViewportRatio(0.75),
+        WidthIntent::InheritConfig,
+    ] {
+        let snapshot = writer.capture(intent_snapshot(width)).unwrap();
+        assert!(writer.commit(&snapshot, &path).unwrap());
+        let candidate = SpoolState::load_from_file(&path).unwrap();
+        assert_eq!(candidate.spaces[0].columns[0].width, width);
+        let json = fs::read_to_string(&path).unwrap();
+        for forbidden in [
+            "frame",
+            "observed",
+            "presented",
+            "effective",
+            "animation",
+            "active",
+            "displays",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "unexpected persisted projection: {forbidden}"
+            );
+        }
+    }
+    for old in [
+        r#"{"version":2,"workspaces":[]}"#,
+        r#"{"version":3,"spaces":[]}"#,
+        r#"{"version":4,"revision":1,"spaces":[]}"#,
+        // v5 held member hints directly instead of one slot per retained
+        // member; the member count is unrecoverable, so it is not migrated.
+        r#"{"version":5,"revision":1,"spaces":[]}"#,
+        "broken",
+    ] {
+        fs::write(&path, old).unwrap();
+        assert!(SpoolState::load_from_file(&path).is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), old);
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "loading must not migrate or back up old state"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn stale_save_cannot_replace_newer_intent_and_failure_stays_dirty() {
+    use crate::ecs::layout::WidthIntent;
+    let dir = test_dir("save-revisions");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.json");
+    let mut writer = StatePersistence::default();
+    let older = writer
+        .capture(intent_snapshot(WidthIntent::Absolute(800.0)))
+        .unwrap();
+    let newer = writer
+        .capture(intent_snapshot(WidthIntent::Absolute(900.0)))
+        .unwrap();
+    assert!(writer.is_dirty());
+    assert!(!writer.commit(&older, &path).unwrap());
+    assert!(!path.exists());
+    assert!(writer.commit(&newer, &path).unwrap());
+    assert!(!writer.is_dirty());
+    assert!(!writer.commit(&older, &path).unwrap());
+    assert_eq!(SpoolState::load_from_file(&path).unwrap(), newer);
+    let newest = writer
+        .capture(intent_snapshot(WidthIntent::Absolute(950.0)))
+        .unwrap();
+    let blocker = dir.join("not-a-directory");
+    fs::write(&blocker, "block").unwrap();
+    assert!(writer.commit(&newest, &blocker.join("state.json")).is_err());
+    assert!(writer.is_dirty());
+    assert_eq!(writer.saved_revision(), Some(newer.revision));
+    assert_eq!(SpoolState::load_from_file(&path).unwrap(), newer);
+    assert!(writer.commit(&newest, &path).unwrap());
+    assert_eq!(writer.saved_revision(), Some(newest.revision));
+    assert!(!writer.is_dirty());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn invalid_intent_snapshot_is_not_admitted_to_the_save_writer() {
+    use crate::ecs::layout::WidthIntent;
+    let mut writer = StatePersistence::default();
+    for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(
+            writer
+                .capture(intent_snapshot(WidthIntent::Absolute(invalid)))
+                .is_err()
+        );
+    }
+    assert_eq!(writer.accepted_revision(), 0);
+    assert!(!writer.is_dirty());
+}
+
+#[test]
+fn accepted_width_can_be_saved_while_native_topology_is_unavailable() {
+    use crate::ecs::layout::WidthIntent;
+    use crate::ecs::topology::NativeTopology;
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(5);
+    let path = harness
+        .world()
+        .resource::<StateFilePath>()
+        .as_path()
+        .to_path_buf();
+    harness
+        .mock_state
+        .script_present_display_topology_queries(TEST_DISPLAY_ID, [Err(())]);
+    harness.world().write_message(Event::SpaceChanged);
+    harness.pump_frames(1);
+    assert!(!harness.world().resource::<NativeTopology>().is_complete());
+    {
+        let mut query = harness.world().query::<&mut LayoutStrip>();
+        let mut strip = query.single_mut(harness.world()).unwrap();
+        let id = strip.column_state(0).unwrap().id;
+        strip
+            .set_width_intent(id, WidthIntent::Absolute(800.0))
+            .unwrap();
+    }
+    harness
+        .world()
+        .run_system_once(periodic_state_save)
+        .unwrap();
+    let saved = SpoolState::load_from_file(&path).unwrap();
+    assert_eq!(
+        saved.spaces[0].columns[0].width,
+        WidthIntent::Absolute(800.0)
+    );
+    assert!(!harness.world().resource::<StatePersistence>().is_dirty());
+}
+
+#[test]
+fn accepted_empty_space_intent_is_persisted_without_active_projection() {
     let mut harness = TestHarness::new();
     harness.pump_frames(10);
     let path = harness
@@ -768,54 +729,211 @@ fn trustworthy_space_without_windows_is_still_persisted() {
         .resource::<StateFilePath>()
         .as_path()
         .to_path_buf();
-
     harness
         .world()
         .run_system_once(periodic_state_save)
-        .expect("periodic state save");
-    let state = SpoolState::load_from_file(&path).expect("saved empty layout state");
-
-    assert_eq!(state.active_display_id, Some(TEST_DISPLAY_ID));
-    assert_eq!(state.displays.len(), 1);
+        .unwrap();
+    let state = SpoolState::load_from_file(&path).unwrap();
     assert_eq!(state.spaces.len(), 1);
-    assert!(state.spaces[0].active);
     assert!(state.spaces[0].columns.is_empty());
 }
 
 #[test]
-fn incomplete_v3_topology_is_not_loaded_as_restore_state() {
-    let dir = test_dir("incomplete-v3-state");
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("state.json");
-    SpoolState {
-        version: 3,
-        timestamp: 123,
-        active_display_id: Some(TEST_DISPLAY_ID),
-        displays: vec![SavedDisplay {
-            display_id: TEST_DISPLAY_ID,
-            bounds: SavedRect {
-                min_x: 0,
-                min_y: TEST_MENUBAR_HEIGHT,
-                max_x: TEST_DISPLAY_WIDTH,
-                max_y: TEST_DISPLAY_HEIGHT,
-            },
-            active: true,
-            space_ids: Vec::new(),
-        }],
-        spaces: Vec::new(),
+fn capture_publishes_new_acceptance_before_durable_save() {
+    use crate::ecs::layout::WidthIntent;
+    use crate::ecs::state::capture_state_changes;
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(5);
+    let path = harness
+        .world()
+        .resource::<StateFilePath>()
+        .as_path()
+        .to_path_buf();
+    harness
+        .world()
+        .run_system_once(periodic_state_save)
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    let saved_revision = harness
+        .world()
+        .resource::<StatePersistence>()
+        .saved_revision();
+    {
+        let mut query = harness.world().query::<&mut LayoutStrip>();
+        let mut strip = query.single_mut(harness.world()).unwrap();
+        let id = strip.column_state(0).unwrap().id;
+        strip
+            .set_width_intent(id, WidthIntent::Absolute(812.0))
+            .unwrap();
     }
-    .save_to_file(&path)
-    .unwrap();
-
-    assert!(
-        SpoolState::load_from_file(&path).is_none(),
-        "an incomplete topology snapshot must not influence startup layout"
+    harness
+        .world()
+        .run_system_once(capture_state_changes)
+        .unwrap();
+    let persistence = harness.world().resource::<StatePersistence>();
+    assert!(persistence.is_dirty());
+    assert_eq!(persistence.saved_revision(), saved_revision);
+    assert!(Some(persistence.accepted_revision()) > saved_revision);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "capture cannot perform a durable save"
     );
-    fs::remove_dir_all(dir).unwrap();
 }
 
-fn extract_query_state(
-    params: QueryStateParams,
-) -> crate::errors::Result<crate::ecs::state::SpoolQueryState> {
-    params.extract()
+#[test]
+fn saved_revision_floor_does_not_import_a_prior_sessions_intent() {
+    use crate::ecs::layout::WidthIntent;
+    let mut writer = StatePersistence::starting_after(73);
+    assert_eq!(writer.saved_revision(), None);
+    assert!(!writer.is_dirty());
+    let current = writer
+        .capture(intent_snapshot(WidthIntent::InheritConfig))
+        .unwrap();
+    assert_eq!(current.revision, 74);
+    assert_eq!(
+        current.spaces[0].columns[0].width,
+        WidthIntent::InheritConfig
+    );
+    assert!(writer.is_dirty());
+}
+
+#[test]
+fn persistence_tracks_arrangement_and_raw_height_without_native_geometry() {
+    use crate::ecs::layout::LayoutStrip;
+    use crate::ecs::state::SpoolState;
+    let mut world = bevy::prelude::World::new();
+    let first = world.spawn_empty().id();
+    let second = world.spawn_empty().id();
+    let mut strip = LayoutStrip::new(TEST_WORKSPACE_ID);
+    strip.append(first);
+    strip.append(second);
+    let capture = |strip: &LayoutStrip| SpoolState::from_layouts([strip], |_| None);
+    let mut persistence = StatePersistence::default();
+    persistence.capture(capture(&strip)).unwrap();
+    let first_revision = persistence.accepted_revision();
+    strip.stack(second).unwrap();
+    let stacked = persistence.capture(capture(&strip)).unwrap();
+    assert!(persistence.accepted_revision() > first_revision);
+    assert_eq!(
+        stacked.spaces[0].columns[0].kind,
+        spool_shared_types::windowset::ColumnKind::Stack
+    );
+    assert_eq!(stacked.spaces[0].columns[0].items.len(), 2);
+    strip.set_height_weight(first, 3.0).unwrap();
+    let changed = persistence.capture(capture(&strip)).unwrap();
+    assert_eq!(
+        changed.spaces[0].columns[0].items[0].weight.to_bits(),
+        3.0_f64.to_bits()
+    );
+    let revision = persistence.accepted_revision();
+    assert!(!strip.set_height_weight(first, 3.0).unwrap());
+    persistence.capture(capture(&strip)).unwrap();
+    assert_eq!(persistence.accepted_revision(), revision);
+    assert!(changed.valid());
+    let roundtrip: SpoolState =
+        serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+    assert_eq!(roundtrip, changed);
+}
+
+#[test]
+fn malformed_height_candidates_are_rejected() {
+    use crate::ecs::layout::WidthIntent;
+    for weight in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let mut state = intent_snapshot(WidthIntent::InheritConfig);
+        state.spaces[0].columns[0].items[0].weight = weight;
+        assert!(!state.valid());
+    }
+    let mut state = intent_snapshot(WidthIntent::InheritConfig);
+    state.spaces[0].columns[0].kind = spool_shared_types::windowset::ColumnKind::Stack;
+    assert!(
+        !state.valid(),
+        "a stack must contain at least two independent slots"
+    );
+}
+
+/// A retained member whose identity is not resolvable at save time must stay
+/// an explicit slot, never a fabricated hint and never a silently shortened
+/// member list.
+#[test]
+fn unresolved_members_are_persisted_as_explicit_slots() {
+    use crate::ecs::layout::LayoutStrip;
+    let mut world = bevy::prelude::World::new();
+    let first = world.spawn_empty().id();
+    let second = world.spawn_empty().id();
+    let mut strip = LayoutStrip::new(TEST_WORKSPACE_ID);
+    strip.append(first);
+    strip.append(second);
+    strip.stack(second).unwrap();
+    let unresolved = SpoolState::from_layouts([&strip], |_| None);
+    assert!(unresolved.valid());
+    let item = &unresolved.spaces[0].columns[0].items[0];
+    assert_eq!(
+        item.members.len(),
+        1,
+        "a stack item keeps one slot per retained member"
+    );
+    assert!(item.members[0].hint.is_none());
+    let encoded = serde_json::to_value(&unresolved).unwrap();
+    assert_eq!(
+        encoded["spaces"][0]["columns"][0]["items"][0]["members"][0]["hint"],
+        serde_json::Value::Null,
+        "an unresolved member is an explicit null hint, not an omitted slot"
+    );
+    let roundtrip: SpoolState = serde_json::from_value(encoded).unwrap();
+    assert_eq!(roundtrip, unresolved);
+
+    let mut seen = 0;
+    let mixed = SpoolState::from_layouts([&strip], |entity| {
+        seen += 1;
+        (entity == first).then(|| crate::ecs::state::SavedWindow {
+            window_id: 7,
+            pid: 11,
+            bundle_id: "fixture".into(),
+        })
+    });
+    let members = &mixed.spaces[0].columns[0].items[0].members;
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].hint.as_ref().unwrap().window_id, 7);
+    assert!(
+        seen >= 2,
+        "the provider must be consulted for every retained member"
+    );
+}
+
+#[test]
+fn saved_native_tabs_remain_one_height_slot_inside_a_stack() {
+    use crate::ecs::layout::LayoutStrip;
+    let mut world = bevy::prelude::World::new();
+    let first = world.spawn_empty().id();
+    let tab = world.spawn_empty().id();
+    let lower = world.spawn_empty().id();
+    let mut strip = LayoutStrip::new(TEST_WORKSPACE_ID);
+    strip.append(first);
+    strip.append(tab);
+    strip.convert_to_tabs(first, tab).unwrap();
+    strip.append(lower);
+    strip.stack(lower).unwrap();
+    strip.set_height_weight(tab, 2.0).unwrap();
+    let saved = SpoolState::from_layouts([&strip], |entity| {
+        Some(crate::ecs::state::SavedWindow {
+            window_id: if entity == first {
+                1
+            } else if entity == tab {
+                2
+            } else {
+                3
+            },
+            pid: 42,
+            bundle_id: "fixture".into(),
+        })
+    });
+    assert!(saved.valid());
+    let items = &saved.spaces[0].columns[0].items;
+    assert_eq!(items.len(), 2);
+    assert!(items[0].tabs);
+    assert_eq!(items[0].members.len(), 2);
+    assert_eq!(items[0].weight.to_bits(), 2.0_f64.to_bits());
+    assert!(!items[1].tabs);
+    assert_eq!(items[1].members.len(), 1);
 }

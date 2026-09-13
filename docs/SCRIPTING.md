@@ -70,7 +70,7 @@ spool.bind("alt+j", spool.action.window.focus_east)
 
 ## 2. Configuration from Lua (`spool.setup`)
 
-`spool.setup{...}` declares the whole configuration: `options`, `bar`, `padding`, `swipe`, `decorations`, `restore`, and `windows`. Merge all sections into one call; a later call replaces the earlier table.
+`spool.setup{...}` declares the whole configuration: `options`, `bar`, `padding`, `swipe`, `decorations`, and `windows`. Merge all sections into one call; a later call replaces the earlier table.
 
 ```lua
 spool.setup {
@@ -85,7 +85,6 @@ spool.setup {
   decorations = {
     active = { border = { enabled = true, color = "#89b4fa", width = 2.0 } },
   },
-  restore = { enabled = true, startup_grace_ms = 2000 },
   windows = {
     -- keys are just rule names; `title` is a required regex
     term = { title = "kitty", floating = true, bindings_passthrough = { "ctrl+alt+h" } },
@@ -325,11 +324,23 @@ Each method returns a new window set:
 - `ws:tab(id, onto)`
 - `ws:unstack(id)`
 
+`ws:width(id, ratio)` edits retained column intent, including background Spaces.
+The captured column identity and intent revision prevent stale results from editing
+a replacement column. Window-set column `width_ratio` is a projection of the raw
+intent, not the observed or constraint-clamped frame. For an absolute width with an
+unknown viewport it is absent (`nil` in Lua, `null` on the wire).
+
 `ws:stack(id, onto)` targets the named column in the same native Space; it does
 not mean "stack onto the column to the left". It moves the named stack item,
 keeping an existing native tab group together. Missing, floating, self, and
 same-column targets do not rearrange the strip. `ws:unstack(id)` splits a stack
 item next to its source column without changing native Space membership.
+
+Moving or regrouping an item preserves its stack item identity and its raw height
+share. A genuine split gives each new item an independent identity that copies the
+original share, and `ws:unstack(id)` does the same. Stack item identities and shares
+are retained intent: they are not derived from any observed frame, and an item that is
+temporarily unavailable or ordered out keeps them for a later reappearance.
 
 `ws:swap(a, b)` exchanges named entries within the same native Space, including
 entries in one stack. Unrelated stacked siblings stay in place. During replay,
@@ -340,8 +351,9 @@ native Spaces; missing, floating, and fullscreen endpoints are skipped.
 Snapshots preserve native tab groups even inside vertical stacks. Chained
 `swap`, `stack`, and `unstack` predictions move those groups as whole entries,
 matching replay. `ws:columns()` still returns flat lists of window IDs in layout
-order. Binary clients and the daemon must both use local IPC protocol version 4;
-versions 2 (flat snapshots) and 3 (unbound operations) are rejected explicitly.
+order. Binary clients and the daemon must both use local IPC protocol version 6;
+versions 2 (flat snapshots), 3 (unbound operations), 4 (numeric actions) and 5
+(pre-height-intent layout operations) are rejected explicitly.
 
 Returned operations retain the original snapshot's daemon-session, ECS-entity,
 and native-incarnation bindings. A closed/replaced window is not targeted just

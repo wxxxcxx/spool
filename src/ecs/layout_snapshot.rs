@@ -16,11 +16,44 @@ impl Default for LayoutSession {
 }
 
 impl LayoutSession {
-    pub(crate) fn capture(&self, windows: &Windows) -> LayoutSnapshot {
+    pub(crate) fn capture<'a>(
+        &self,
+        windows: &Windows,
+        strips: impl Iterator<Item = &'a super::layout::LayoutStrip>,
+    ) -> LayoutSnapshot {
+        let strips = strips.collect::<Vec<_>>();
         LayoutSnapshot {
-            session: self.0,
-            windows: windows
+            structures: strips
                 .iter()
+                .flat_map(|strip| {
+                    strip
+                        .columns()
+                        .flat_map(|column| column.window_iter())
+                        .filter_map(|entity| {
+                            Some((
+                                windows.get_any(entity)?.id(),
+                                (strip.id(), strip.structure_revision()),
+                            ))
+                        })
+                })
+                .collect(),
+            session: self.0,
+            columns: strips
+                .iter()
+                .flat_map(|strip| {
+                    strip.columns().enumerate().flat_map(|(index, column)| {
+                        let state = strip.column_state(index);
+                        column.window_iter().filter_map(move |entity| {
+                            Some((
+                                windows.get_any(entity)?.id(),
+                                (state?.id.0, state?.intent_revision),
+                            ))
+                        })
+                    })
+                })
+                .collect(),
+            windows: windows
+                .iter_any()
                 .map(|(window, entity)| {
                     (
                         window.id(),
@@ -52,7 +85,7 @@ pub(crate) fn matches_window(
     let Some(identity) = snapshot.windows.get(&id) else {
         return false;
     };
-    windows.find(id).is_some_and(|(window, entity)| {
+    windows.find_any(id).is_some_and(|(window, entity)| {
         entity.to_bits() == identity.entity && window.incarnation() == identity.incarnation
     })
 }

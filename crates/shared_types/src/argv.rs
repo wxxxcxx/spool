@@ -4,8 +4,8 @@
 //! together here and are checked against each other by round-trip tests.
 
 use crate::commands::{
-    Action, Direction, FocusStep, MouseMove, MoveFocus, Operation, ResizeAxis, ResizeDirection,
-    SpaceLayoutOperation,
+    Action, ColumnWidth, Direction, FocusStep, MouseMove, MoveFocus, Operation, ResizeAxis,
+    ResizeDirection, SpaceLayoutOperation,
 };
 
 /// Why an tokens vector is not an action. Consumers wrap this in their own error
@@ -221,6 +221,31 @@ fn parse_layout_action(tokens: &[&str]) -> Result<Action> {
         .map(|v| positive(v, "Space ID"))
         .transpose()?;
     let operation = match args.as_slice() {
+        ["width", value] if !opts.contains_key("--reference-column") => {
+            let column = opts
+                .get("--column")
+                .ok_or_else(|| ParseError::new("width requires --column"))
+                .and_then(|value| positive(value, "column ordinal"))?;
+            let width = if *value == "inherit" {
+                ColumnWidth::Inherit
+            } else {
+                let (value, ratio) = value
+                    .strip_suffix('%')
+                    .map_or((*value, false), |v| (v, true));
+                let number = value
+                    .parse::<f64>()
+                    .map_err(|_| ParseError::new("invalid width"))?;
+                if !number.is_finite() || number <= 0.0 {
+                    return Err(ParseError::new("width must be positive and finite"));
+                }
+                if ratio {
+                    ColumnWidth::Ratio(number / 100.0)
+                } else {
+                    ColumnWidth::Points(number)
+                }
+            };
+            SpaceLayoutOperation::SetWidth { column, width }
+        }
         ["equalize"] if !opts.contains_key("--reference-column") => {
             SpaceLayoutOperation::Equalize {
                 column: opts
@@ -244,6 +269,9 @@ fn parse_layout_action(tokens: &[&str]) -> Result<Action> {
     };
     if opts.is_empty() {
         return Ok(Action::Window(match operation {
+            SpaceLayoutOperation::SetWidth { .. } => {
+                unreachable!("width requires an explicit column")
+            }
             SpaceLayoutOperation::Equalize { .. } => Operation::Equalize,
             SpaceLayoutOperation::Balance { .. } => Operation::Balance,
             SpaceLayoutOperation::ToggleTiledVisibility => Operation::ToggleTiledVisibility,
@@ -313,6 +341,19 @@ impl Action {
             } => {
                 let mut tokens = owned(&["space", "layout"]);
                 match operation {
+                    SpaceLayoutOperation::SetWidth { column, width } => {
+                        let value = match width {
+                            ColumnWidth::Inherit => "inherit".into(),
+                            ColumnWidth::Points(value) => value.to_string(),
+                            ColumnWidth::Ratio(value) => format!("{}%", value * 100.0),
+                        };
+                        tokens.extend([
+                            "width".into(),
+                            value,
+                            "--column".into(),
+                            column.to_string(),
+                        ]);
+                    }
                     SpaceLayoutOperation::Equalize { column } => {
                         tokens.push("equalize".into());
                         if let Some(n) = column {
@@ -469,6 +510,32 @@ mod tests {
             assert!(parse_action(&args).is_err(), "accepted {args:?}");
         }
         assert!(Action::Window(Operation::SetWidth(0.5)).to_argv().is_none());
+    }
+
+    #[test]
+    fn column_width_tokens_preserve_original_units() {
+        for (value, width) in [
+            ("800", ColumnWidth::Points(800.0)),
+            ("75%", ColumnWidth::Ratio(0.75)),
+            ("inherit", ColumnWidth::Inherit),
+        ] {
+            let action = parse_action(&[
+                "space", "layout", "width", value, "--column", "2", "--space", "77",
+            ])
+            .unwrap();
+            assert_eq!(
+                action,
+                Action::SpaceLayout {
+                    space_id: Some(77),
+                    operation: SpaceLayoutOperation::SetWidth { column: 2, width }
+                }
+            );
+            assert_eq!(round_trip(&action), action);
+        }
+        for value in ["0", "-1", "NaN", "inf", "0%"] {
+            assert!(parse_action(&["space", "layout", "width", value, "--column", "1"]).is_err());
+        }
+        assert!(parse_action(&["space", "layout", "width", "800"]).is_err());
     }
 
     fn round_trip(action: &Action) -> Action {

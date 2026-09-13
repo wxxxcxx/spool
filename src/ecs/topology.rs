@@ -73,14 +73,9 @@ pub(crate) struct NativeTopology {
     fullscreen: HashSet<WorkspaceId>,
     active_display: Option<u32>,
     explicit_removal: bool,
-    refresh_requested: bool,
 }
 
 impl NativeTopology {
-    pub(crate) fn request_refresh(&mut self) {
-        self.refresh_requested = true;
-    }
-
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -215,7 +210,6 @@ impl NativeTopology {
     }
 
     fn sample(&mut self, manager: &WindowManager, explicit_removal: bool) {
-        self.refresh_requested = false;
         self.generation = self.generation.wrapping_add(1);
         self.explicit_removal = explicit_removal;
         self.visible.clear();
@@ -289,11 +283,7 @@ pub(crate) fn refresh_topology(
         explicit_removal |= matches!(event, Event::DisplayRemoved { .. });
     }
     *since_audit = since_audit.saturating_add(time.delta());
-    if topology.generation() != 0
-        && !topology.refresh_requested
-        && !invalidated
-        && *since_audit < HEARTBEAT
-    {
+    if topology.generation() != 0 && !invalidated && *since_audit < HEARTBEAT {
         return;
     }
     *since_audit = Duration::ZERO;

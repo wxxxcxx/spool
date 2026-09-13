@@ -102,6 +102,19 @@ fn source_layout(harness: &mut TestHarness, source: Entity) -> String {
     format!("{:?}", harness.world().get::<LayoutStrip>(source).unwrap())
 }
 
+fn retained_width(harness: &mut TestHarness, entity: Entity) -> crate::ecs::layout::WidthIntent {
+    let world = harness.world();
+    world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .find_map(|strip| {
+            strip
+                .column_state(strip.index_of(entity).ok()?)
+                .map(|state| state.width)
+        })
+        .unwrap()
+}
+
 #[test]
 fn native_move_layout_admission_allows_unrelated_columns() {
     use crate::commands::Operation;
@@ -134,11 +147,9 @@ fn native_move_layout_admission_allows_unrelated_columns() {
         );
     }
     for entity in extra {
-        assert!(
-            harness
-                .world()
-                .get::<crate::ecs::ResizeMarker>(entity)
-                .is_some()
+        assert_eq!(
+            retained_width(&mut harness, entity),
+            crate::ecs::layout::WidthIntent::ViewportRatio(0.75)
         );
     }
 }
@@ -285,7 +296,11 @@ fn native_move_layout_admission_keeps_independent_script_operations() {
     let (mut harness, source, members) = column_harness();
     let extra = add_source_windows(&mut harness, &[2])[0];
     submit(&mut harness, MoveFocus::Stay);
-    let before = source_layout(&mut harness, source);
+    let before = harness
+        .world()
+        .get::<LayoutStrip>(source)
+        .unwrap()
+        .structure_revision();
     let mut plan = script_set(&mut harness).plan();
     plan.ops = vec![
         LayoutOp::Unstack(1),
@@ -295,7 +310,14 @@ fn native_move_layout_admission_keeps_independent_script_operations() {
         },
     ];
     dispatch_action(&mut harness, Action::Layout(plan));
-    assert_eq!(source_layout(&mut harness, source), before);
+    assert_eq!(
+        harness
+            .world()
+            .get::<LayoutStrip>(source)
+            .unwrap()
+            .structure_revision(),
+        before
+    );
     for entity in members {
         assert!(
             harness
@@ -304,11 +326,9 @@ fn native_move_layout_admission_keeps_independent_script_operations() {
                 .is_none()
         );
     }
-    assert!(
-        harness
-            .world()
-            .get::<crate::ecs::ResizeMarker>(extra)
-            .is_some()
+    assert_eq!(
+        retained_width(&mut harness, extra),
+        crate::ecs::layout::WidthIntent::ViewportRatio(0.75)
     );
 }
 

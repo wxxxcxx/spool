@@ -42,9 +42,9 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
 - **Built-in workspace Bar:** The Rust Bar runs inside the Spool process on
   every display, showing all Spaces, the current Space's column layout,
   floating windows, fullscreen/empty state, and exact focused window.
-- **Startup session restore:** Restores tracked window layouts, virtual
-  workspaces, and display assignments from the last saved state when Spool
-  starts.
+- **Layout intent persistence:** Saves original column widths independently of
+  native execution. Startup reads isolated candidates; automatic restoration
+  across daemon restarts is not provided.
 - **Focus follows mouse on MacOS:** Very useful for people who would like to
   avoid an extra click.
 - **Sliding windows with touchpad:** Using a touchpad is quite natural for
@@ -161,33 +161,18 @@ Changes made to the active configuration file are automatically reloaded while
 Spool is running. This is useful for tweaking keyboard bindings and other
 settings without restarting the application.
 
-### Startup session restore
+### Layout intent persistence
 
-Spool saves tracked window layout state to the user state directory
+Spool saves original column width intent to the user state directory
 (`$XDG_STATE_HOME/spool/state.json`, usually
-`~/.local/state/spool/state.json`) and loads it when Spool starts. During the
-startup restore window, Spool matches reopened windows to the saved session and
-restores their layout placement, Space, and display assignment
-where possible.
+`~/.local/state/spool/state.json`). The file retains inherited, absolute-point,
+and viewport-ratio widths, including edits to currently invisible Spaces.
 
-Restore is startup-only. After the configured startup grace period expires, new
-or unmatched windows follow the normal configuration and window-rule behavior.
-Saved windows that are not present are ignored by default and the restored
-layout is compacted around the windows that were found. The behavior is
-configured with `spool.setup { restore = { ... } }`; see the
-**[Session Restore](docs/CONFIGURATION.md#session-restore)** section in the
-configuration guide.
-
-When upgrading a v2 state file, inspect the safe fold first, then apply it:
-
-```shell
-$ spool service migrate-state
-$ spool service migrate-state --apply
-```
-
-The dry run does not write. `--apply` first creates the adjacent
-`state.v2.backup.json`, then folds each old virtual row into its owning native
-Space in row order. It never creates, deletes, or moves a macOS Space.
+Startup reads saved data as isolated candidates. Windows and Spaces initialize
+from current native observations and configuration; saved widths are not
+reapplied automatically. Previous file formats are ignored without migration.
+See [Layout Intent Persistence](docs/CONFIGURATION.md#layout-intent-persistence)
+for the current boundary.
 
 ### Running as a service
 

@@ -35,7 +35,11 @@ use crate::platform::{Pid, WinID, WindowIncarnation};
 
 const CONFIRMATION_DELAY: Duration = Duration::from_millis(250);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
-const FRAME_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+const FRAME_CHECKPOINTS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+];
 const MAX_FRAME_ATTEMPTS: u8 = 3;
 const MAX_APPLICATION_AX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
@@ -50,7 +54,42 @@ struct ApplicationAxRetry {
 struct FrameConvergence {
     target: IRect,
     attempts: u8,
-    retry_after: Option<Duration>,
+    incarnation: Option<WindowIncarnation>,
+    intent: Option<(super::layout::ColumnId, u64, u64, u64)>,
+    active: bool,
+    blocked: bool,
+    confirmed: bool,
+    issued_at: Duration,
+    next_checkpoint: usize,
+}
+
+impl FrameConvergence {
+    fn new(target: IRect, incarnation: Option<WindowIncarnation>) -> Self {
+        Self {
+            target,
+            incarnation,
+            intent: None,
+            attempts: 0,
+            active: false,
+            blocked: false,
+            confirmed: false,
+            issued_at: Duration::ZERO,
+            next_checkpoint: FRAME_CHECKPOINTS.len(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "diagnostic projection keeps execution and readback facets independently visible"
+)]
+pub(crate) struct FrameProgress {
+    pub(crate) attempts: u8,
+    pub(crate) active: bool,
+    pub(crate) blocked: bool,
+    pub(crate) confirmed: bool,
+    pub(crate) checks_pending: bool,
 }
 
 /// Coalesces unreliable macOS notifications with a low-frequency inventory
@@ -69,6 +108,19 @@ pub(crate) struct WindowStateSync {
 }
 
 impl WindowStateSync {
+    pub(crate) fn frame_progress(&self, entity: Entity) -> Option<FrameProgress> {
+        self.frame_convergence
+            .get(&entity)
+            .map(|round| FrameProgress {
+                attempts: round.attempts,
+                active: round.active,
+                blocked: round.blocked
+                    || round.attempts >= MAX_FRAME_ATTEMPTS && !round.active && !round.confirmed,
+                confirmed: round.confirmed,
+                checks_pending: round.next_checkpoint < FRAME_CHECKPOINTS.len(),
+            })
+    }
+
     pub(crate) fn forget_window(&mut self, entity: Entity) {
         self.frame_convergence.remove(&entity);
         self.window_observers.remove(&entity);
@@ -178,62 +230,101 @@ impl WindowStateSync {
         if !frames_equivalent(frame, target) {
             return false;
         }
-        self.frame_convergence.remove(&entity);
+        // Keep the completed round: identical goals and later noise cannot
+        // replenish its budget. A fresh observation still confirms exhaustion.
+        if let Some(round) = self.frame_convergence.get_mut(&entity) {
+            if round.target != target {
+                let intent = round.intent;
+                *round = FrameConvergence::new(target, round.incarnation);
+                round.intent = intent;
+            }
+            round.confirmed = true;
+            round.blocked = false;
+            round.active = false;
+            round.next_checkpoint = FRAME_CHECKPOINTS.len();
+        }
         true
     }
 
-    pub(crate) fn admit_frame_correction(
+    /// Bind the projection to the current domain edit without spending budget.
+    pub(crate) fn bind_frame_intent(
         &mut self,
         entity: Entity,
-        window_id: WinID,
-        frame: IRect,
+        incarnation: WindowIncarnation,
         target: IRect,
-        now: Duration,
-    ) -> bool {
-        if self.confirm_frame_convergence(entity, frame, target) {
-            return false;
-        }
-
-        let convergence = self
+        intent: (super::layout::ColumnId, u64, u64, u64),
+    ) {
+        let round = self
             .frame_convergence
             .entry(entity)
-            .or_insert(FrameConvergence {
-                target,
-                attempts: 0,
-                retry_after: None,
-            });
-        if convergence.target != target {
-            *convergence = FrameConvergence {
-                target,
-                attempts: 0,
-                retry_after: None,
-            };
+            .or_insert_with(|| FrameConvergence::new(target, Some(incarnation)));
+        if round.intent != Some(intent)
+            || round.target != target
+            || round.incarnation != Some(incarnation)
+        {
+            *round = FrameConvergence::new(target, Some(incarnation));
+            round.intent = Some(intent);
         }
+    }
 
-        if convergence.attempts >= MAX_FRAME_ATTEMPTS {
-            let retry_after = convergence
-                .retry_after
-                .get_or_insert(now.saturating_add(FRAME_RETRY_COOLDOWN));
-            if now >= *retry_after {
-                convergence.attempts = 0;
-                convergence.retry_after = None;
-            } else {
-                debug!(
-                    window_id,
-                    ?target,
-                    ?frame,
-                    ?retry_after,
-                    "window frame remains constrained during retry cooldown"
-                );
-                return false;
+    /// Called only after all execution gates, immediately before a native write.
+    /// One normal animation stream shares its token through its endpoint.
+    pub(crate) fn begin_frame_attempt(
+        &mut self,
+        entity: Entity,
+        incarnation: WindowIncarnation,
+        target: IRect,
+        now: Duration,
+        correction: bool,
+    ) -> bool {
+        let round = self
+            .frame_convergence
+            .entry(entity)
+            .or_insert_with(|| FrameConvergence::new(target, Some(incarnation)));
+        if round.target != target || round.incarnation != Some(incarnation) {
+            *round = FrameConvergence::new(target, Some(incarnation));
+        }
+        if round.blocked || round.confirmed {
+            return false;
+        }
+        if round.active {
+            return !correction;
+        }
+        if round.attempts >= MAX_FRAME_ATTEMPTS {
+            return false;
+        }
+        round.attempts += 1;
+        round.active = true;
+        round.issued_at = now;
+        round.next_checkpoint = 0;
+        true
+    }
+
+    pub(crate) fn finish_frame_attempt(&mut self, entity: Entity, target: IRect, blocked: bool) {
+        if let Some(round) = self.frame_convergence.get_mut(&entity)
+            && round.target == target
+        {
+            round.active = false;
+            round.blocked |= blocked;
+        }
+    }
+
+    fn due_frame_checks(&mut self) -> Vec<Entity> {
+        let mut due = Vec::new();
+        for (entity, round) in &mut self.frame_convergence {
+            let elapsed = self.elapsed.saturating_sub(round.issued_at);
+            let mut ready = false;
+            while round.next_checkpoint < FRAME_CHECKPOINTS.len()
+                && elapsed >= FRAME_CHECKPOINTS[round.next_checkpoint]
+            {
+                round.next_checkpoint += 1;
+                ready = true;
+            }
+            if ready {
+                due.push(*entity);
             }
         }
-
-        convergence.attempts += 1;
-        if convergence.attempts >= MAX_FRAME_ATTEMPTS {
-            convergence.retry_after = Some(now.saturating_add(FRAME_RETRY_COOLDOWN));
-        }
-        true
+        due
     }
 }
 
@@ -254,6 +345,7 @@ struct SyncRequest {
     frames: bool,
     pids: HashSet<Pid>,
     frame_ids: HashSet<WinID>,
+    checkpoint_only_ids: HashSet<WinID>,
 }
 
 impl SyncRequest {
@@ -856,6 +948,16 @@ impl ReconcileState<'_, '_> {
         sync: &mut WindowStateSync,
         commands: &mut Commands,
     ) {
+        let height_participants = self
+            .windows
+            .iter()
+            .filter_map(|row| {
+                (row.3
+                    .is_none_or(|state| !state.excludes_from_layout_projection())
+                    && !row.11.4)
+                    .then_some(row.0)
+            })
+            .collect::<HashSet<_>>();
         let native_fullscreen_windows = self
             .workspaces
             .iter()
@@ -889,7 +991,7 @@ impl ReconcileState<'_, '_> {
             }
             let unavailable = unavailable.is_some() && !audit.confirmed.contains(&entity);
             if should_skip_frame(request, audit, entity, window_id, unavailable) {
-                if unavailable || audit.retiring.contains(&entity) {
+                if audit.retiring.contains(&entity) {
                     sync.frame_convergence.remove(&entity);
                 }
                 if unavailable {
@@ -937,15 +1039,40 @@ impl ReconcileState<'_, '_> {
                     .workspaces
                     .iter()
                     .any(|strip| strip.is_inactive_tab(entity));
-            if native_fullscreen || inactive_tab {
-                sync.frame_convergence.remove(&entity);
-            }
             if inactive_tab {
                 commands
                     .entity(entity)
                     .remove::<(WindowFrameCorrection, WindowFrameCommitSuspended)>();
             }
-            let can_adopt_frame = visibility.is_none()
+            let owning_strip = self.workspaces.iter().find(|strip| strip.contains(entity));
+            let projection_blocked = owning_strip.as_ref().is_some_and(|strip| {
+                strip.projection_is_blocked()
+                    || strip.height_projection_is_blocked_for(&|member| {
+                        height_participants.contains(&member)
+                    })
+            });
+            if !floating
+                && !projection_blocked
+                && let Some(strip) = owning_strip
+                && let Some(state) = strip
+                    .index_of(entity)
+                    .ok()
+                    .and_then(|index| strip.column_state(index))
+            {
+                sync.bind_frame_intent(
+                    entity,
+                    window.incarnation(),
+                    desired.0,
+                    (
+                        state.id,
+                        state.intent_revision,
+                        strip.structure_revision(),
+                        state.height_revision,
+                    ),
+                );
+            }
+            let can_adopt_frame = !projection_blocked
+                && visibility.is_none()
                 && !repositioning
                 && !resizing
                 && !presenting
@@ -955,11 +1082,12 @@ impl ReconcileState<'_, '_> {
             if !floating && can_adopt_frame {
                 let target = desired.0;
                 if sync.confirm_frame_convergence(entity, frame, target) {
-                    presented.bypass_change_detection().0 = frame;
                     if let Ok(mut entity_commands) = commands.get_entity(entity) {
                         entity_commands.try_remove::<WindowFrameCommitSuspended>();
                     }
-                } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                } else if !request.checkpoint_only_ids.contains(&window_id)
+                    && let Ok(mut entity_commands) = commands.get_entity(entity)
+                {
                     entity_commands.try_insert(WindowFrameCorrection(target));
                 }
             } else if floating {
@@ -1103,7 +1231,16 @@ pub(super) fn reconcile_windows(
     // The heartbeat always reads frames; collect gates only its full sweep.
     let heartbeat = sync.tick(time.delta());
     let automatic = config.automatic_reconcile();
-    let request = SyncRequest::collect(&mut messages, heartbeat, automatic);
+    let mut request = SyncRequest::collect(&mut messages, heartbeat, automatic);
+    for entity in sync.due_frame_checks() {
+        if let Ok((_, window, ..)) = state.windows.get(entity) {
+            let id = window.id();
+            if !request.all && !request.frame_ids.contains(&id) {
+                request.checkpoint_only_ids.insert(id);
+            }
+            request.frame_ids.insert(id);
+        }
+    }
     if request.is_empty() {
         return;
     }
@@ -1292,7 +1429,7 @@ fn suspend_windows_missing_from_window_server(
     app_entity: Entity,
     pid: Pid,
     windows: &mut Query<ReconcileWindowData>,
-    sync: &mut WindowStateSync,
+    _sync: &mut WindowStateSync,
     audit: &mut LifecycleAudit,
 ) {
     for (entity, window, parent, unavailable, ..) in windows.iter_mut() {
@@ -1302,7 +1439,6 @@ fn suspend_windows_missing_from_window_server(
         {
             continue;
         }
-        sync.frame_convergence.remove(&entity);
         request_suspension(audit, entity, unavailable.as_deref(), true);
     }
 }
@@ -1607,5 +1743,96 @@ mod tests {
             3
         );
         assert!(!levels.contains(&tracing::Level::ERROR));
+    }
+    #[test]
+    fn animation_attempt_covers_all_frames_and_failed_retries_are_bounded() {
+        let entity = World::new().spawn_empty().id();
+        let mut sync = WindowStateSync::default();
+        let target = IRect::new(0, 0, 900, 600);
+        for tick in 0..60 {
+            assert!(sync.begin_frame_attempt(
+                entity,
+                7,
+                target,
+                Duration::from_millis(tick * 16),
+                false
+            ));
+        }
+        assert_eq!(sync.frame_convergence[&entity].attempts, 1);
+        sync.finish_frame_attempt(entity, target, false);
+        for expected in [2, 3] {
+            assert!(sync.begin_frame_attempt(entity, 7, target, Duration::from_secs(1), true));
+            assert_eq!(sync.frame_convergence[&entity].attempts, expected);
+            sync.finish_frame_attempt(entity, target, false);
+        }
+        for seconds in [5, 30, 300] {
+            sync.tick(Duration::from_secs(seconds));
+            assert!(!sync.begin_frame_attempt(entity, 7, target, sync.elapsed, true));
+            assert!(!sync.begin_frame_attempt(entity, 7, target, sync.elapsed, false));
+        }
+        assert!(sync.confirm_frame_convergence(entity, target, target));
+        assert_eq!(sync.frame_convergence[&entity].attempts, 3);
+        let new_target = IRect::new(0, 0, 1000, 600);
+        assert!(sync.begin_frame_attempt(entity, 7, new_target, sync.elapsed, false));
+        assert_eq!(sync.frame_convergence[&entity].attempts, 1);
+    }
+
+    #[test]
+    fn read_checkpoints_are_relative_bounded_and_cancel_on_confirmation() {
+        let entity = World::new().spawn_empty().id();
+        let target = IRect::new(0, 0, 900, 600);
+        let mut sync = WindowStateSync::default();
+        assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, false));
+        for (millis, due) in [
+            (249, false),
+            (250, true),
+            (999, false),
+            (1000, true),
+            (4999, false),
+            (5000, true),
+            (60000, false),
+        ] {
+            sync.elapsed = Duration::from_millis(millis);
+            assert_eq!(sync.due_frame_checks().contains(&entity), due);
+            assert_eq!(
+                sync.frame_convergence[&entity].attempts, 1,
+                "reading never starts an attempt"
+            );
+        }
+        let target = IRect::new(0, 0, 1000, 600);
+        assert!(sync.begin_frame_attempt(entity, 7, target, sync.elapsed, false));
+        assert!(sync.confirm_frame_convergence(entity, target, target));
+        sync.tick(Duration::from_secs(10));
+        assert!(sync.due_frame_checks().is_empty());
+    }
+
+    #[test]
+    fn unknown_conflict_stops_writes_without_spending_remaining_budget() {
+        let entity = World::new().spawn_empty().id();
+        let target = IRect::new(0, 0, 900, 600);
+        let mut sync = WindowStateSync::default();
+        assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, false));
+        sync.finish_frame_attempt(entity, target, true);
+        assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::from_secs(10), true));
+        assert_eq!(sync.frame_convergence[&entity].attempts, 1);
+        assert!(sync.confirm_frame_convergence(entity, target, target));
+    }
+    #[test]
+    fn newer_height_intent_gets_its_own_budget_even_with_the_same_effective_frame() {
+        let entity = Entity::from_bits(1);
+        let target = IRect::new(0, 0, 800, 200);
+        let mut sync = WindowStateSync::default();
+        let first = (super::super::layout::ColumnId(1), 0, 0, 0);
+        sync.bind_frame_intent(entity, 7, target, first);
+        for _ in 0..3 {
+            assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true));
+            sync.finish_frame_attempt(entity, target, false);
+        }
+        assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true));
+        sync.bind_frame_intent(entity, 7, target, first);
+        assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true));
+        sync.bind_frame_intent(entity, 7, target, (first.0, 0, 0, 1));
+        assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true));
+        assert_eq!(sync.frame_progress(entity).unwrap().attempts, 1);
     }
 }

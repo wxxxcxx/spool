@@ -8,11 +8,39 @@ use crate::ecs::focus::FocusCoordinator;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{
     Bounds, Floating, FocusedMarker, ObservedWindowFrame, Position, PresentedWindowFrame,
-    ResizeMarker, SpawnWindowTrigger, WindowDefaultsPending,
+    SpawnWindowTrigger, WindowDefaultsPending,
 };
 use crate::manager::{Application, Window};
 
 use super::*;
+
+fn set_column_width_intent(harness: &mut TestHarness, entity: Entity, width: i32) {
+    use crate::ecs::layout::WidthIntent;
+    let world = harness.world();
+    let mut strips = world.query::<&mut LayoutStrip>();
+    for mut strip in strips.iter_mut(world) {
+        if let Some(id) = strip.column_id(entity) {
+            strip
+                .set_width_intent(id, WidthIntent::Absolute(f64::from(width)))
+                .unwrap();
+            return;
+        }
+    }
+    panic!("test window must belong to a column");
+}
+
+fn reconciliation_fixture_config() -> Config {
+    (
+        MainOptions {
+            preset_column_widths: vec![
+                f64::from(TEST_WINDOW_WIDTH) / f64::from(TEST_DISPLAY_WIDTH),
+            ],
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into()
+}
 
 #[test]
 fn application_ax_failure_backs_off_event_storms_and_recovers() {
@@ -201,6 +229,11 @@ fn frame_audit_leaves_physical_writes_to_the_presentation_committer() {
         .get::<crate::ecs::DesiredWindowFrame>(entity)
         .unwrap()
         .0;
+    let target = IRect::from_corners(target.min, target.max + IVec2::new(100, 0));
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(crate::ecs::DesiredWindowFrame(target));
     let drift = IRect::from_corners(
         target.min + IVec2::new(80, 50),
         target.max + IVec2::new(180, 150),
@@ -761,7 +794,9 @@ fn visibility_events_skip_a_stale_application_after_pid_reuse() {
 
 #[test]
 fn window_state_sync_missed_close_without_notification_clears_focus_and_slot() {
-    let mut harness = TestHarness::new().with_windows(3);
+    let mut harness = TestHarness::new()
+        .with_config(reconciliation_fixture_config())
+        .with_windows(3);
     harness.pump_frames(10);
 
     harness.mock_state.focus_window(1);
@@ -962,7 +997,7 @@ fn floating_move_notification_adopts_the_complete_observed_frame() {
 }
 
 #[test]
-fn window_state_sync_tiled_frame_drift_reapplies_layout_intent() {
+fn window_state_sync_unknown_drift_after_completion_preserves_intent_without_fighting() {
     let mut harness = TestHarness::new().with_windows(1);
     harness.pump_frames(15);
 
@@ -978,8 +1013,8 @@ fn window_state_sync_tiled_frame_drift_reapplies_layout_intent() {
 
     harness.pump_frames(20);
 
-    assert_eq!(harness.mock_state.actual_window_frame(0), Some(desired));
-    assert_eq!(harness.mock_state.cached_window_frame(0), Some(desired));
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(drifted));
+    assert_eq!(harness.mock_state.cached_window_frame(0), Some(drifted));
     assert_eq!(
         harness.world().get::<Position>(entity).expect("position").0,
         desired_position,
@@ -996,7 +1031,7 @@ fn window_state_sync_tiled_frame_drift_reapplies_layout_intent() {
             .get::<crate::ecs::ObservedWindowFrame>(entity)
             .expect("confirmed frame")
             .0,
-        desired
+        drifted
     );
 }
 
@@ -1017,6 +1052,11 @@ fn window_frame_commit_publishes_confirmed_geometry_without_notification() {
     }
 
     // Mock geometry writes deliberately emit no AX move/resize notification.
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(crate::ecs::DesiredWindowFrame(target));
+
     harness.pump_frames(1);
 
     assert_eq!(harness.mock_state.actual_window_frame(0), Some(target));
@@ -1055,6 +1095,11 @@ fn failed_geometry_setter_preserves_a_successful_followup_readback() {
             .0 = target;
     }
 
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(crate::ecs::DesiredWindowFrame(target));
+
     harness.pump_frames(1);
 
     assert_eq!(harness.mock_state.actual_window_frame(0), Some(target));
@@ -1092,6 +1137,11 @@ fn failed_geometry_setter_and_followup_read_invalidate_the_overlay_projection() 
         .get_mut::<PresentedWindowFrame>()
         .expect("presented frame")
         .0 = target;
+
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(crate::ecs::DesiredWindowFrame(target));
 
     harness.pump_frames(1);
 
@@ -1561,6 +1611,7 @@ fn mouse_resize_gesture_does_not_cross_a_reused_window_id() {
     let config: Config = (
         MainOptions {
             mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            preset_column_widths: vec![0.5],
             animation_speed: Some(10000.0),
             ..Default::default()
         },
@@ -1624,6 +1675,7 @@ fn mouse_resize_coalesces_one_frame_of_input_into_one_commit() {
     let config: Config = (
         MainOptions {
             mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            preset_column_widths: vec![0.5],
             ..Default::default()
         },
         vec![],
@@ -1658,6 +1710,7 @@ fn mouse_resize_request_is_discarded_if_space_migration_starts_before_commit() {
     let config: Config = (
         MainOptions {
             mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            preset_column_widths: vec![0.5],
             ..Default::default()
         },
         vec![],
@@ -1700,6 +1753,7 @@ fn mouse_resize_failed_readback_preserves_physical_truth_without_settling_intent
     let config: Config = (
         MainOptions {
             mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            preset_column_widths: vec![0.5],
             ..Default::default()
         },
         vec![],
@@ -1759,6 +1813,7 @@ fn floating_mouse_resize_commits_confirmed_intent_without_replaying_it() {
     let config: Config = (
         MainOptions {
             mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            preset_column_widths: vec![0.5],
             ..Default::default()
         },
         vec![],
@@ -1814,6 +1869,7 @@ fn configured_mouse_resize_updates_the_dragged_window_live_but_defers_its_neighb
         MainOptions {
             animation_speed: Some(10000.0),
             mouse_resize_modifier: Some(crate::platform::Modifiers::CMD),
+            preset_column_widths: vec![0.5],
             ..Default::default()
         },
         vec![],
@@ -1915,7 +1971,9 @@ fn tiled_move_burst_defers_layout_adoption_until_geometry_settles() {
 
 #[test]
 fn window_state_sync_stale_ax_inventory_suspends_without_losing_layout_state() {
-    let mut harness = TestHarness::new().with_windows(3);
+    let mut harness = TestHarness::new()
+        .with_config(reconciliation_fixture_config())
+        .with_windows(3);
     harness.pump_frames(10);
 
     let stale = find_window_entity(1, harness.world());
@@ -2645,7 +2703,9 @@ fn transient_window_server_omission_reflows_available_stack_members_and_recovers
 
 #[test]
 fn transient_window_server_omission_restores_projection_without_mutating_layout() {
-    let mut harness = TestHarness::new().with_windows(3);
+    let mut harness = TestHarness::new()
+        .with_config(reconciliation_fixture_config())
+        .with_windows(3);
     harness.pump_frames(15);
 
     harness
@@ -3018,7 +3078,10 @@ fn default_read_failures_also_obey_the_retry_budget() {
 #[test]
 fn changing_partial_default_writes_do_not_restart_the_budget() {
     let mut params = WindowParams::new(".*", None);
-    params.width = Some(0.5);
+    // Tiled width rules are now column intent, not native default writes.
+    // A floating grid still exercises the complete native defaults transaction.
+    params.floating = Some(true);
+    params.grid = Some("1:1:0:0:1:1".to_string());
     let config: Config = (MainOptions::default(), vec![params]).into();
     let mut harness = TestHarness::new().with_config(config);
     harness.pump_frames(30);
@@ -3233,13 +3296,28 @@ fn window_state_sync_bounds_retries_for_a_constrained_tiled_window() {
     );
     harness.mock_state.os_set_window_frame_silently(0, drifted);
     harness.mock_state.constrain_frame_writes(0, true);
+    let old_target = harness
+        .world()
+        .get::<crate::ecs::DesiredWindowFrame>(entity)
+        .unwrap()
+        .0;
+    harness.world().entity_mut(entity).insert((
+        crate::ecs::DesiredWindowFrame(IRect::from_corners(
+            old_target.min,
+            old_target.max + IVec2::new(20, 0),
+        )),
+        PresentedWindowFrame(IRect::from_corners(
+            old_target.min,
+            old_target.max + IVec2::new(20, 0),
+        )),
+    ));
     let baseline_attempts = harness.mock_state.frame_write_attempts(0);
 
     harness.pump_frames(45);
 
     assert_eq!(
         harness.mock_state.frame_write_attempts(0) - baseline_attempts,
-        3
+        1
     );
     assert_eq!(harness.mock_state.actual_window_frame(0), Some(drifted));
     assert_eq!(
@@ -3251,16 +3329,14 @@ fn window_state_sync_bounds_retries_for_a_constrained_tiled_window() {
         desired_bounds
     );
 
-    // A temporary minimum-size constraint must not permanently poison future
-    // tiling. The next bounded retry burst should recover after its cooldown.
+    // Unknown competing readback is not a proven minimum-size constraint.
+    // Merely waiting or making the mock writable does not grant another round.
     harness.mock_state.constrain_frame_writes(0, false);
     harness.pump_frames(60);
+    assert_eq!(harness.mock_state.actual_window_frame(0), Some(drifted));
     assert_eq!(
-        harness.mock_state.actual_window_frame(0),
-        Some(IRect::from_corners(
-            desired_position,
-            desired_position + desired_bounds
-        ))
+        harness.mock_state.frame_write_attempts(0) - baseline_attempts,
+        1
     );
 }
 
@@ -3278,6 +3354,21 @@ fn unrelated_window_events_do_not_reset_frame_retry_budget() {
     );
     harness.mock_state.os_set_window_frame_silently(0, drifted);
     harness.mock_state.constrain_frame_writes(0, true);
+    let old_target = harness
+        .world()
+        .get::<crate::ecs::DesiredWindowFrame>(entity)
+        .unwrap()
+        .0;
+    harness.world().entity_mut(entity).insert((
+        crate::ecs::DesiredWindowFrame(IRect::from_corners(
+            old_target.min,
+            old_target.max + IVec2::new(20, 0),
+        )),
+        PresentedWindowFrame(IRect::from_corners(
+            old_target.min,
+            old_target.max + IVec2::new(20, 0),
+        )),
+    ));
     let baseline_attempts = harness.mock_state.frame_write_attempts(0);
     let other_entity = find_window_entity(1, harness.world());
     let other_incarnation = harness
@@ -3299,7 +3390,7 @@ fn unrelated_window_events_do_not_reset_frame_retry_budget() {
 
     assert_eq!(
         harness.mock_state.frame_write_attempts(0) - baseline_attempts,
-        3,
+        1,
         "activity from another window must not turn bounded retries into an unbounded loop"
     );
 }
@@ -3318,13 +3409,28 @@ fn changing_constrained_readbacks_do_not_reset_frame_retry_budget() {
     );
     harness.mock_state.os_set_window_frame_silently(0, drifted);
     harness.mock_state.progress_frame_writes(0, true);
+    let old_target = harness
+        .world()
+        .get::<crate::ecs::DesiredWindowFrame>(entity)
+        .unwrap()
+        .0;
+    harness.world().entity_mut(entity).insert((
+        crate::ecs::DesiredWindowFrame(IRect::from_corners(
+            old_target.min,
+            old_target.max + IVec2::new(20, 0),
+        )),
+        PresentedWindowFrame(IRect::from_corners(
+            old_target.min,
+            old_target.max + IVec2::new(20, 0),
+        )),
+    ));
     let baseline_attempts = harness.mock_state.frame_write_attempts(0);
 
     harness.pump_frames(45);
 
     assert_eq!(
         harness.mock_state.frame_write_attempts(0) - baseline_attempts,
-        3,
+        1,
         "changing partial readbacks for one target must still share one bounded retry budget"
     );
     assert_ne!(
@@ -3364,17 +3470,14 @@ fn failed_ax_writes_stop_the_animation_commit_loop_and_preserve_readback() {
     // frame then walks the window through a series of unintended geometries.
     harness.mock_state.reject_frame_writes(0, true);
     let baseline_attempts = harness.mock_state.frame_write_attempts(0);
-    harness
-        .world()
-        .entity_mut(entity)
-        .insert(ResizeMarker(target));
+    set_column_width_intent(&mut harness, entity, target.x);
 
     harness.pump_frames(50);
 
     let attempts = harness.mock_state.frame_write_attempts(0) - baseline_attempts;
     assert!(
-        attempts <= 4,
-        "one animation write plus the three-attempt reconciliation budget is allowed, but per-frame commits are not; got {attempts} writes"
+        attempts == 3,
+        "the initial animation and retries share a three-attempt budget; got {attempts} writes"
     );
     assert!(
         harness.world().get::<ObservedWindowFrame>(entity).is_some(),
@@ -3399,11 +3502,8 @@ fn suspended_animation_commit_recovers_through_bounded_reconciliation() {
     let original = harness.world().get::<Bounds>(entity).expect("bounds").0;
     let target = original + IVec2::new(240, 0);
     harness.mock_state.reject_frame_writes(0, true);
-    harness
-        .world()
-        .entity_mut(entity)
-        .insert(ResizeMarker(target));
-    harness.pump_frames(10);
+    set_column_width_intent(&mut harness, entity, target.x);
+    harness.pump_frames(1);
 
     assert!(
         harness
@@ -3488,10 +3588,7 @@ fn constrained_resize_animation_preserves_tiled_bounds_intent() {
     let original = harness.world().get::<Bounds>(entity).expect("bounds").0;
     let target = original + IVec2::new(240, 0);
     harness.mock_state.constrain_frame_writes(0, true);
-    harness
-        .world()
-        .entity_mut(entity)
-        .insert(ResizeMarker(target));
+    set_column_width_intent(&mut harness, entity, target.x);
 
     harness.pump_frames(50);
 

@@ -95,11 +95,6 @@ pub fn set_lua_keybinds(keys: Vec<(u8, Modifiers, u32)>) {
     LUA_KEYBINDS.store(Arc::new(keys));
 }
 
-#[cfg(all(test, feature = "lua"))]
-pub(crate) fn lua_keybinds() -> Vec<(u8, Modifiers, u32)> {
-    LUA_KEYBINDS.load().as_ref().clone()
-}
-
 const SWIPE_THRESHOLD: f64 = 0.001;
 const GESTURE_MINIMAL_FINGERS: usize = 3;
 

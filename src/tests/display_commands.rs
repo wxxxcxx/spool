@@ -309,9 +309,11 @@ fn cross_display_waits_for_native_membership_before_committing() {
         harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0,
         harness
             .world()
-            .get::<crate::ecs::WidthRatio>(entity)
+            .get::<LayoutStrip>(source)
             .unwrap()
-            .0,
+            .column_state(0)
+            .unwrap()
+            .width,
     );
     dispatch(&mut harness, Operation::ToNextDisplay(MoveFocus::Follow));
     for _ in 0..3 {
@@ -340,9 +342,11 @@ fn cross_display_waits_for_native_membership_before_committing() {
                 harness.world().get::<crate::ecs::Bounds>(entity).unwrap().0,
                 harness
                     .world()
-                    .get::<crate::ecs::WidthRatio>(entity)
+                    .get::<LayoutStrip>(source)
                     .unwrap()
-                    .0,
+                    .column_state(0)
+                    .unwrap()
+                    .width,
             ),
             source_frame
         );
@@ -840,7 +844,10 @@ fn cross_display_size_is_part_of_the_transfer_not_an_unbound_timer() {
             .world()
             .get::<DisplayTransferFrame>(entity)
             .map(|v| v.target.size()),
-        Some(IVec2::new(750, EXT_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT))
+        Some(IVec2::new(
+            EXT_DISPLAY_WIDTH / 4,
+            EXT_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT
+        ))
     );
     assert_eq!(
         harness
@@ -1051,12 +1058,17 @@ fn cross_display_rejects_an_overflowing_destination_strip() {
         .with_workspace_window(2, EXT_WORKSPACE_ID, |_| {})
         .with_workspace_window(3, EXT_WORKSPACE_ID, |_| {});
     harness.pump_frames(10);
+    let destination = strip(&mut harness, EXT_WORKSPACE_ID);
     for id in [2, 3] {
         let entity = find_window_entity(id, harness.world());
-        harness
-            .world()
-            .entity_mut(entity)
-            .insert(crate::ecs::Bounds(IVec2::new(i32::MAX / 2, 500)));
+        let mut layout = harness.world().get_mut::<LayoutStrip>(destination).unwrap();
+        let column = layout.column_id(entity).unwrap();
+        layout
+            .set_width_intent(
+                column,
+                crate::ecs::layout::WidthIntent::Absolute(f64::from(i32::MAX / 2)),
+            )
+            .unwrap();
     }
     let source = strip(&mut harness, TEST_WORKSPACE_ID);
     let entity = find_window_entity(0, harness.world());

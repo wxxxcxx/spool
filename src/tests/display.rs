@@ -589,7 +589,7 @@ fn test_multi_display_no_height_crosstalk() {
 
     harness
         .on_iteration(1, move |world, _state| {
-            assert_window_size!(world, 100, TEST_WINDOW_WIDTH, ext_usable_height);
+            assert_window_size!(world, 100, EXT_DISPLAY_WIDTH / 4, ext_usable_height);
         })
         .on_iteration(2, |world, _state| {
             use crate::ecs::ActiveWorkspaceMarker;
@@ -600,7 +600,7 @@ fn test_multi_display_no_height_crosstalk() {
             }
         })
         .on_iteration(4, move |world, _state| {
-            assert_window_size!(world, 100, TEST_WINDOW_WIDTH, ext_usable_height);
+            assert_window_size!(world, 100, EXT_DISPLAY_WIDTH / 4, ext_usable_height);
         })
         .run(commands);
 }
@@ -1046,7 +1046,7 @@ fn visible_dock_reflows_the_active_strip_to_the_usable_height() {
         expected_height,
         "ECS bounds must be recomputed from the Dock-reduced viewport"
     );
-    assert_window_size!(harness.world(), 0, TEST_WINDOW_WIDTH, expected_height);
+    assert_window_size!(harness.world(), 0, TEST_DISPLAY_WIDTH / 4, expected_height);
 }
 
 #[test]
@@ -1165,8 +1165,8 @@ fn startup_layout_uses_the_visible_dock_height_for_every_column() {
 
     harness.pump_frames(10);
 
-    assert_window_size!(harness.world(), 0, TEST_WINDOW_WIDTH, expected_height);
-    assert_window_size!(harness.world(), 1, TEST_WINDOW_WIDTH, expected_height);
+    assert_window_size!(harness.world(), 0, TEST_DISPLAY_WIDTH / 4, expected_height);
+    assert_window_size!(harness.world(), 1, TEST_DISPLAY_WIDTH / 4, expected_height);
 }
 
 #[test]

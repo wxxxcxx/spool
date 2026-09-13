@@ -1,3 +1,14 @@
+#[path = "height_intent.rs"]
+mod height;
+pub use height::{StackItemId, StackItemState};
+
+#[path = "layout_intent.rs"]
+mod intent;
+pub use intent::{
+    ColumnId, ColumnState, EffectiveColumnWidth, WidthConstraint, WidthIntent,
+    WidthProjectionBlocked, project_column_width,
+};
+
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
 use bevy::ecs::component::Component;
@@ -58,7 +69,7 @@ type LayoutViewports<'w, 's> = Query<
     's,
     (
         Entity,
-        &'static ChildOf,
+        Option<&'static ChildOf>,
         &'static mut LayoutStrip,
         &'static mut Position,
         Option<&'static mut RepositionMarker>,
@@ -229,6 +240,7 @@ impl Plugin for LayoutEventsPlugin {
                     super::window_frame::apply_window_frame_requests,
                     super::tiled_visibility::release_detached,
                     display_viewport_changed,
+                    super::triggers::refresh_column_width_defaults,
                     layout_sizes_changed,
                     layout_strip_changed,
                     reshuffle_layout_strip,
@@ -257,11 +269,36 @@ fn display_viewport_changed(
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    let inherited = WidthIntent::ViewportRatio(
+        config
+            .preset_column_widths()
+            .first()
+            .copied()
+            .unwrap_or(0.5),
+    );
     for (entity, child, mut strip, mut position, pending, previous) in &mut strips {
-        let Ok((display, dock)) = displays.get(child.parent()) else {
+        let Some((display, dock)) = child.and_then(|child| displays.get(child.parent()).ok())
+        else {
+            let changed = strip
+                .bypass_change_detection()
+                .set_width_context(None, inherited);
+            let height_changed = strip.bypass_change_detection().set_height_context(None);
+            if changed || height_changed {
+                strip.set_changed();
+            }
             continue;
         };
         let viewport = display.actual_display_bounds(dock, &config);
+        let size = checked_frame_size(viewport);
+        let changed = strip
+            .bypass_change_detection()
+            .set_width_context(size.map(|size| size.x), inherited);
+        let height_changed = strip
+            .bypass_change_detection()
+            .set_height_context(size.map(|size| size.y));
+        if changed || height_changed {
+            strip.set_changed();
+        }
         if checked_frame_size(viewport).is_none() {
             continue;
         }
@@ -373,7 +410,7 @@ impl DoubleEndedIterator for StackItemIter<'_> {
 }
 
 /// Represents a single panel within a `LayoutStrip`, which can either hold a single window, a stack of items, or a group of tabs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Column {
     /// A panel containing a single window, identified by its `Entity`.
     Single(Entity),
@@ -419,16 +456,6 @@ impl Column {
                 ColumnWindowIter::Stack(items.iter().flat_map(StackItem::window_iter))
             }
         }
-    }
-
-    pub fn width<W>(&self, get_window_frame: &W) -> Option<i32>
-    where
-        W: Fn(Entity) -> Option<IRect>,
-    {
-        self.window_iter()
-            .filter_map(get_window_frame)
-            .map(|frame| frame.width())
-            .max()
     }
 
     /// Returns the entity at the given index, or the last entity if the index exceeds the size.
@@ -504,6 +531,11 @@ impl Iterator for ColumnWindowIter<'_> {
 pub struct LayoutStrip {
     id: WorkspaceId,
     columns: VecDeque<Column>,
+    column_states: VecDeque<ColumnState>,
+    structure_revision: u64,
+    viewport_width: Option<i32>,
+    viewport_height: Option<i32>,
+    inherited_width: WidthIntent,
 }
 
 impl LayoutStrip {
@@ -511,13 +543,228 @@ impl LayoutStrip {
         Self {
             id,
             columns: VecDeque::new(),
+            ..Self::default()
         }
     }
 
     pub fn fullscreen(id: WorkspaceId, entity: Entity) -> Self {
         let mut columns = VecDeque::new();
         columns.push_back(Column::Fullscren(entity));
-        Self { id, columns }
+        let mut strip = Self {
+            id,
+            columns,
+            column_states: VecDeque::from([ColumnState::default()]),
+            ..Self::default()
+        };
+        strip.sync_height_items();
+        strip
+    }
+
+    pub fn column_states(&self) -> impl Iterator<Item = &ColumnState> {
+        self.column_states.iter()
+    }
+    pub fn column_state(&self, index: usize) -> Option<&ColumnState> {
+        self.column_states.get(index)
+    }
+    pub fn column_id(&self, entity: Entity) -> Option<ColumnId> {
+        self.column_state(self.index_of(entity).ok()?)
+            .map(|state| state.id)
+    }
+    pub fn structure_revision(&self) -> u64 {
+        self.structure_revision
+    }
+
+    pub fn set_width_intent(&mut self, id: ColumnId, width: WidthIntent) -> Result<bool> {
+        width.validate()?;
+        let state = self
+            .column_states
+            .iter_mut()
+            .find(|state| state.id == id)
+            .ok_or_else(|| Error::NotFound("column identity no longer exists".into()))?;
+        if state.width == width {
+            return Ok(false);
+        }
+        let revision = state
+            .intent_revision
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("column intent revision exhausted".into()))?;
+        state.width = width;
+        state.restore_width = None;
+        state.intent_revision = revision;
+        Ok(true)
+    }
+
+    pub fn set_column_rule(
+        &mut self,
+        id: ColumnId,
+        source: Entity,
+        width: Option<WidthIntent>,
+    ) -> Result<bool> {
+        let changed = self.set_column_default(id, width)?;
+        if let Some(state) = self.column_states.iter_mut().find(|state| state.id == id) {
+            state.config_source = Some(source);
+        }
+        Ok(changed)
+    }
+
+    pub fn set_column_default(&mut self, id: ColumnId, width: Option<WidthIntent>) -> Result<bool> {
+        if let Some(width) = width {
+            width.validate()?;
+        }
+        let state = self
+            .column_states
+            .iter_mut()
+            .find(|state| state.id == id)
+            .ok_or_else(|| Error::NotFound("column identity no longer exists".into()))?;
+        if state.configured_width == width {
+            return Ok(false);
+        }
+        state.configured_width = width;
+        Ok(true)
+    }
+
+    /// Replace only trusted current constraints; this never edits intent revision.
+    #[allow(
+        dead_code,
+        reason = "trusted capability input seam, deliberately not inferred from failed writes"
+    )]
+    pub fn set_column_constraints(
+        &mut self,
+        id: ColumnId,
+        constraints: Vec<WidthConstraint>,
+    ) -> Result<bool> {
+        let state = self
+            .column_states
+            .iter_mut()
+            .find(|state| state.id == id)
+            .ok_or_else(|| Error::NotFound("column identity no longer exists".into()))?;
+        if state.constraints == constraints {
+            return Ok(false);
+        }
+        state.constraints = constraints;
+        Ok(true)
+    }
+
+    pub fn toggle_full_width(&mut self, id: ColumnId) -> Result<bool> {
+        let state = self
+            .column_states
+            .iter()
+            .find(|state| state.id == id)
+            .ok_or_else(|| Error::NotFound("column identity no longer exists".into()))?;
+        let old = state.width;
+        let restored = state.restore_width;
+        let next = restored.unwrap_or(WidthIntent::ViewportRatio(1.0));
+        let changed = self.set_width_intent(id, next)?;
+        if let Some(state) = self.column_states.iter_mut().find(|state| state.id == id) {
+            state.restore_width = if restored.is_some() { None } else { Some(old) };
+        }
+        Ok(changed)
+    }
+
+    /// Context is derived from this Space's display, never a member's frame.
+    pub fn set_width_context(&mut self, viewport: Option<i32>, inherited: WidthIntent) -> bool {
+        if self.viewport_width == viewport && self.inherited_width == inherited {
+            return false;
+        }
+        self.viewport_width = viewport;
+        self.inherited_width = inherited;
+        true
+    }
+
+    /// Read projection of original width. Unknown viewport never invents a ratio.
+    pub fn width_ratio(&self, index: usize) -> Option<f64> {
+        let state = self.column_state(index)?;
+        let intent = match state.width {
+            WidthIntent::InheritConfig => state.configured_width.unwrap_or(self.inherited_width),
+            explicit => explicit,
+        };
+        match intent {
+            WidthIntent::ViewportRatio(ratio) => Some(ratio),
+            WidthIntent::Absolute(points) => {
+                Some(points / f64::from(self.viewport_width.filter(|width| *width > 0)?))
+            }
+            WidthIntent::InheritConfig => None,
+        }
+    }
+
+    pub fn effective_column_width(
+        &self,
+        index: usize,
+    ) -> std::result::Result<EffectiveColumnWidth, WidthProjectionBlocked> {
+        let state = self
+            .column_states
+            .get(index)
+            .ok_or(WidthProjectionBlocked::InvalidIntent)?;
+        let width = if matches!(self.columns[index], Column::Fullscren(_)) {
+            WidthIntent::ViewportRatio(1.0)
+        } else {
+            state.width
+        };
+        project_column_width(
+            width,
+            state.configured_width.unwrap_or(self.inherited_width),
+            self.viewport_width,
+            state.constraints.iter().copied(),
+        )
+    }
+
+    /// Admission checks known coordinate overflow without conflating an
+    /// unavailable viewport/constraint projection with an invalid state edit.
+    /// Effect eligibility is stricter than admission: an unavailable or
+    /// conflicting derivation must never execute a previous geometry target.
+    pub fn projection_is_blocked(&self) -> bool {
+        self.column_states.len() != self.columns.len()
+            || self
+                .columns()
+                .enumerate()
+                .try_fold(0_i32, |total, (index, _)| {
+                    total.checked_add(self.effective_column_width(index).ok()?.slot)
+                })
+                .is_none()
+    }
+
+    pub fn width_budget_is_valid(&self) -> bool {
+        let mut total = 0_i32;
+        for index in 0..self.len() {
+            match self.effective_column_width(index) {
+                Ok(width) => {
+                    let Some(next) = total.checked_add(width.slot) else {
+                        return false;
+                    };
+                    total = next;
+                }
+                Err(
+                    WidthProjectionBlocked::Unrepresentable | WidthProjectionBlocked::InvalidIntent,
+                ) => return false,
+                Err(_) => {}
+            }
+        }
+        true
+    }
+
+    pub fn width_for_viewport(
+        &self,
+        index: usize,
+        viewport: Option<i32>,
+    ) -> std::result::Result<EffectiveColumnWidth, WidthProjectionBlocked> {
+        let state = self
+            .column_states
+            .get(index)
+            .ok_or(WidthProjectionBlocked::InvalidIntent)?;
+        project_column_width(
+            state.width,
+            state.configured_width.unwrap_or(self.inherited_width),
+            viewport,
+            state.constraints.iter().copied(),
+        )
+    }
+
+    fn structure_changed(&mut self) {
+        self.sync_height_items();
+        self.structure_revision = self
+            .structure_revision
+            .checked_add(1)
+            .expect("layout structure revision exhausted");
     }
 
     /// Finds the index of a window within the pane.
@@ -562,11 +809,14 @@ impl LayoutStrip {
     ///   the window is appended to the end.
     /// * `entity` - Entity of the window to insert.
     pub fn insert_at(&mut self, index: usize, entity: Entity) {
+        self.column_states
+            .insert(index.min(self.len()), ColumnState::default());
         if index >= self.len() {
             self.columns.push_back(Column::Single(entity));
         } else {
             self.columns.insert(index, Column::Single(entity));
         }
+        self.structure_changed();
     }
 
     /// Appends a window ID as a `Single` panel to the end of the pane.
@@ -579,6 +829,8 @@ impl LayoutStrip {
             return;
         }
         self.columns.push_back(Column::Single(entity));
+        self.column_states.push_back(ColumnState::default());
+        self.structure_changed();
     }
 
     /// Moves the complete column containing `entity` to one side of the
@@ -599,12 +851,17 @@ impl LayoutStrip {
         let Some(column) = self.columns.remove(source) else {
             return false;
         };
+        let state = self.column_states.remove(source).expect("column metadata");
         let anchor = if source < anchor { anchor - 1 } else { anchor };
         let destination = match placement {
             Placement::Before => anchor,
             Placement::After => anchor + 1,
         };
         self.columns.insert(destination, column);
+        self.column_states.insert(destination, state);
+        if source != destination {
+            self.structure_changed();
+        }
         source != destination
     }
 
@@ -616,7 +873,12 @@ impl LayoutStrip {
 
     /// Appends an already grouped column, normalizing native fullscreen into a
     /// regular tiled column when it leaves its fullscreen Space.
+    #[cfg(test)]
     pub(crate) fn append_column(&mut self, column: Column) {
+        self.append_column_with_state(column, ColumnState::default());
+    }
+
+    pub(crate) fn append_column_with_state(&mut self, column: Column, state: ColumnState) {
         let column = match column {
             Column::Fullscren(entity) => Column::Single(entity),
             other => other,
@@ -625,10 +887,18 @@ impl LayoutStrip {
             self.remove(entity);
         }
         self.columns.push_back(column);
+        self.column_states.push_back(state);
+        self.structure_changed();
     }
 
     pub(crate) fn append_strip(&mut self, other: &mut Self) {
+        if other.columns.is_empty() {
+            return;
+        }
         self.columns.append(&mut other.columns);
+        self.column_states.append(&mut other.column_states);
+        self.structure_changed();
+        other.structure_changed();
     }
 
     /// Removes `selected` windows and returns the same columns with stacks and
@@ -641,7 +911,30 @@ impl LayoutStrip {
         let mut extracted = Self {
             id: self.id,
             columns: self.columns.clone(),
+            column_states: self.column_states.clone(),
+            ..self.clone()
         };
+        let split_item_ids = self
+            .column_states
+            .iter()
+            .flat_map(|state| &state.height_items)
+            .filter(|item| {
+                item.members.iter().any(|member| selected.contains(member))
+                    && item.members.iter().any(|member| !selected.contains(member))
+            })
+            .map(|item| item.id)
+            .collect::<std::collections::HashSet<_>>();
+        let split_ids = self
+            .columns
+            .iter()
+            .zip(&self.column_states)
+            .filter(|(column, _)| {
+                let members = column.window_iter().collect::<Vec<_>>();
+                members.iter().any(|e| selected.contains(e))
+                    && members.iter().any(|e| !selected.contains(e))
+            })
+            .map(|(_, state)| state.id)
+            .collect::<std::collections::HashSet<_>>();
         for entity in extracted.all_windows() {
             if !selected.contains(&entity) {
                 extracted.remove(entity);
@@ -649,6 +942,20 @@ impl LayoutStrip {
         }
         for entity in selected {
             self.remove(*entity);
+        }
+        for state in self
+            .column_states
+            .iter_mut()
+            .chain(extracted.column_states.iter_mut())
+        {
+            if split_ids.contains(&state.id) {
+                *state = state.split();
+            }
+            for item in &mut state.height_items {
+                if split_item_ids.contains(&item.id) {
+                    *item = item.split();
+                }
+            }
         }
         for column in &mut extracted.columns {
             if let Column::Fullscren(entity) = column {
@@ -684,22 +991,62 @@ impl LayoutStrip {
             return;
         }
 
+        if self
+            .columns
+            .get(index)
+            .is_some_and(|column| column.window_iter().eq(group.iter().copied()))
+        {
+            return;
+        }
+        let preserved = group.iter().find_map(|e| {
+            self.index_of(*e)
+                .ok()
+                .and_then(|i| self.column_states.get(i).cloned())
+        });
         for entity in &group {
             self.remove(*entity);
         }
+        let preserved = preserved.map(|state| {
+            if self
+                .column_states
+                .iter()
+                .any(|existing| existing.id == state.id)
+            {
+                state.split()
+            } else {
+                state
+            }
+        });
 
         let index = index.min(self.len());
         if group.len() == 1 {
             self.insert_at(index, group[0]);
+            if let Some(preserved) = preserved {
+                self.column_states[index] = preserved;
+            }
         } else if index >= self.len() {
+            self.column_states
+                .push_back(preserved.clone().unwrap_or_default());
             self.columns.push_back(Column::Tabs(group));
         } else {
+            self.column_states
+                .insert(index, preserved.clone().unwrap_or_default());
             self.columns.insert(index, Column::Tabs(group));
         }
+        self.structure_changed();
     }
 
     /// Converts a column containing `leader` to a `Tabs` column and adds `follower`.
+    #[cfg(test)]
     pub fn convert_to_tabs(&mut self, leader: Entity, follower: Entity) -> Result<()> {
+        if self
+            .index_of(leader)
+            .ok()
+            .zip(self.index_of(follower).ok())
+            .is_some_and(|(left, right)| left == right)
+        {
+            return Ok(());
+        }
         self.remove(follower);
         let index = self.index_of(leader)?;
         let column = self.columns.remove(index).unwrap();
@@ -730,6 +1077,7 @@ impl LayoutStrip {
                 self.columns.insert(index, Column::Tabs(tabs));
             }
         }
+        self.structure_changed();
         Ok(())
     }
 
@@ -747,6 +1095,7 @@ impl LayoutStrip {
             .and_then(|index| self.columns.remove(index).zip(Some(index)));
 
         if let Some((column, index)) = removed {
+            let count_after_removal = self.columns.len();
             match column {
                 Column::Single(_) | Column::Fullscren(_) => {
                     // Already removed from self.columns.
@@ -786,6 +1135,13 @@ impl LayoutStrip {
                     }
                 }
             }
+            if self.columns.len() == count_after_removal {
+                self.column_states.remove(index);
+            } else if self.column_states[index].config_source == Some(entity) {
+                self.column_states[index].config_source = None;
+                self.column_states[index].configured_width = None;
+            }
+            self.structure_changed();
         }
     }
 
@@ -815,7 +1171,12 @@ impl LayoutStrip {
     /// * `left` - The index of the first panel.
     /// * `right` - The index of the second panel.
     pub fn swap(&mut self, left: usize, right: usize) {
+        if left == right {
+            return;
+        }
         self.columns.swap(left, right);
+        self.column_states.swap(left, right);
+        self.structure_changed();
     }
 
     /// Returns the number of panels in the pane.
@@ -894,6 +1255,10 @@ impl LayoutStrip {
         }
 
         let column_to_stack = self.columns.remove(index).unwrap();
+        let source_state = self.column_states.remove(index).expect("column metadata");
+        self.column_states[index - 1]
+            .height_items
+            .extend(source_state.height_items);
         let items_to_stack = match column_to_stack {
             Column::Fullscren(_) => unreachable!("fullscreen endpoints rejected before removal"),
             Column::Single(id) => vec![StackItem::Single(id)],
@@ -914,6 +1279,7 @@ impl LayoutStrip {
         };
 
         self.columns.insert(index - 1, new_column);
+        self.structure_changed();
         Ok(true)
     }
 
@@ -929,11 +1295,15 @@ impl LayoutStrip {
             return Ok(false);
         };
 
+        let moved_height = self.height_state(entity).cloned();
         for member in item.window_iter() {
             self.remove(member);
         }
         // The target is in another column and cannot have been removed above.
         let target = self.index_of(onto)?;
+        if let Some(state) = moved_height {
+            self.column_states[target].height_items.push(state);
+        }
         match &mut self.columns[target] {
             Column::Single(id) => {
                 self.columns[target] = Column::Stack(vec![StackItem::Single(*id), item]);
@@ -945,6 +1315,7 @@ impl LayoutStrip {
             Column::Stack(items) => items.push(item),
             Column::Fullscren(_) => unreachable!("validated before removing the source"),
         }
+        self.structure_changed();
         Ok(true)
     }
 
@@ -986,6 +1357,7 @@ impl LayoutStrip {
             replace(&mut self.columns[left], first_slot, second_item);
             replace(&mut self.columns[right], second_slot, first_item);
         }
+        self.structure_changed();
         Ok(true)
     }
 
@@ -1010,6 +1382,8 @@ impl LayoutStrip {
             .position(|item| item.contains(entity))
             .ok_or_else(|| Error::NotFound(format!("Entity {entity} not in stack")))?;
         let column = self.columns.remove(index).unwrap();
+        let new_state = self.column_states[index].split();
+        self.column_states.insert(index + 1, new_state);
 
         if let Column::Stack(mut items) = column {
             let removed_item = items.remove(item_index);
@@ -1033,6 +1407,7 @@ impl LayoutStrip {
                 };
                 self.columns.insert(index, new_column);
             }
+            self.structure_changed();
             Ok(true)
         } else {
             unreachable!("validated before removing the source")
@@ -1056,8 +1431,22 @@ impl LayoutStrip {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn get_column_mut(&mut self, index: usize) -> Option<&mut Column> {
         self.columns.get_mut(index)
+    }
+
+    pub fn edit_column(&mut self, index: usize, edit: impl FnOnce(&mut Column)) -> bool {
+        let Some(column) = self.columns.get_mut(index) else {
+            return false;
+        };
+        let before = column.clone();
+        edit(column);
+        if *column == before {
+            return false;
+        }
+        self.structure_changed();
+        true
     }
 
     pub fn all_columns(&self) -> Vec<Entity> {
@@ -1081,56 +1470,46 @@ impl LayoutStrip {
     where
         W: Fn(Entity) -> Option<IRect>,
     {
-        const MIN_WINDOW_HEIGHT: i32 = 200;
-
+        // All eligible columns share one validated projection transaction. A
+        // blocked stack must not publish only a subset of dependent frames.
+        let eligible = |entity| {
+            get_window_frame(entity)
+                .and_then(checked_frame_size)
+                .is_some()
+        };
+        let projection_ready = self.columns.iter().enumerate().all(|(index, _)| {
+            self.effective_stack_heights_for(index, Some(layout_strip_height), &eligible)
+                .is_ok()
+        });
         self.column_positions(get_window_frame)
+            .filter(move |_| projection_ready)
             .filter_map(move |(column, position)| {
-                let items: Vec<StackItem> = match column {
-                    Column::Single(entity) | Column::Fullscren(entity) => {
-                        vec![StackItem::Single(*entity)]
-                    }
-                    Column::Stack(stack) => stack.clone(),
-                    Column::Tabs(tabs) => vec![StackItem::Tabs(tabs.clone())],
-                };
-
-                // Keep the representative geometry paired with the eligible
-                // members. Missing entries must not shift the height-to-item zip.
-                let items = items
-                    .into_iter()
-                    .filter_map(|item| {
-                        let mut members = Vec::new();
-                        let mut representative = None;
-                        for entity in item.window_iter() {
-                            if let Some(size) =
-                                get_window_frame(entity).and_then(checked_frame_size)
-                            {
-                                representative.get_or_insert(size);
-                                members.push(entity);
-                            }
-                        }
-                        Some((members, representative?))
-                    })
-                    .collect::<Vec<_>>();
-                let current_heights = items.iter().map(|(_, size)| size.y).collect::<Vec<_>>();
-
-                let heights =
-                    binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?;
-
-                // The first eligible item is the projection master, matching
-                // column_positions without changing the stored ordering.
-                let column_width = items.first()?.1.x;
-
+                let index = self
+                    .columns
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, column))?;
+                let column_width = self.effective_column_width(index).ok()?.slot;
+                let heights = self
+                    .effective_stack_heights_for(index, Some(layout_strip_height), &eligible)
+                    .ok()?;
+                let items = self.column_height_items(index)?;
                 let mut next_y = 0;
                 let mut frames = Vec::new();
-                for ((members, _), height) in items.into_iter().zip(heights) {
+                for (id, height) in heights {
+                    let item = items.iter().find(|item| item.id == id)?;
                     let frame = checked_window_frame(
                         Origin::new(position, next_y),
-                        Size::new(column_width, height),
+                        Size::new(column_width, height.slot),
                     )?;
                     next_y = frame.max.y;
-                    frames.extend(members.into_iter().map(|entity| (entity, frame)));
+                    frames.extend(
+                        item.members
+                            .iter()
+                            .copied()
+                            .filter(|entity| eligible(*entity))
+                            .map(|entity| (entity, frame)),
+                    );
                 }
-
                 Some(frames)
             })
             .flatten()
@@ -1141,67 +1520,26 @@ impl LayoutStrip {
     where
         W: Fn(Entity) -> Option<IRect>,
     {
-        // Validate the whole projection before exposing its first entry. A
-        // checked but streaming prefix would still move half of an invalid strip.
-        let positions =
-            self.columns()
-                .try_fold((Vec::new(), 0_i32), |(mut positions, left), column| {
-                    let Some(size) = column
-                        .window_iter()
-                        .filter_map(get_window_frame)
-                        .find_map(checked_frame_size)
-                    else {
-                        return Some((positions, left));
-                    };
-                    let right = left.checked_add(size.x)?;
-                    positions.push((column, left));
-                    Some((positions, right))
-                });
+        // A blocked participating width blocks the entire dependent projection.
+        // Retained ordered-out identities keep intent but do not occupy a slot.
+
+        let positions = self.columns().enumerate().try_fold(
+            (Vec::new(), 0_i32),
+            |(mut positions, left), (index, column)| {
+                if !column
+                    .window_iter()
+                    .filter_map(get_window_frame)
+                    .any(|frame| checked_frame_size(frame).is_some())
+                {
+                    return Some((positions, left));
+                }
+                let width = self.effective_column_width(index).ok()?.slot;
+                let right = left.checked_add(width)?;
+                positions.push((column, left));
+                Some((positions, right))
+            },
+        );
         positions.into_iter().flat_map(|(positions, _)| positions)
-    }
-
-    /// Checks the complete strip before a column resize changes layout inputs.
-    pub(crate) fn accepts_column_width<W>(&self, entity: Entity, width: i32, frame: W) -> bool
-    where
-        W: Fn(Entity) -> Option<IRect>,
-    {
-        let Ok(target) = self.index_of(entity) else {
-            return false;
-        };
-        self.accepts_column_widths(|index, column| {
-            if index == target {
-                Some(width)
-            } else {
-                column.width(&frame)
-            }
-        })
-    }
-
-    /// Validates a complete proposed set of widths, without partially applying it.
-    pub(crate) fn accepts_column_widths(
-        &self,
-        mut width: impl FnMut(usize, &Column) -> Option<i32>,
-    ) -> bool {
-        self.columns()
-            .enumerate()
-            .try_fold(0_i32, |total, (index, column)| {
-                let width = width(index, column)?;
-                (width > 0).then_some(())?;
-                total.checked_add(width)
-            })
-            .is_some()
-    }
-
-    pub fn above(&self, entity: Entity) -> Option<Entity> {
-        let index = self.index_of(entity).ok()?;
-        let column = self.get(index).ok()?;
-        match column {
-            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
-            Column::Stack(items) => {
-                let pos = items.iter().position(|item| item.contains(entity))?;
-                (pos > 0).then(|| items[pos - 1].top()).flatten()
-            }
-        }
     }
 
     pub fn tabbed(&self, entity: Entity) -> bool {
@@ -1272,64 +1610,6 @@ fn dedup_entities(entities: &[Entity]) -> Vec<Entity> {
         .copied()
         .filter(|entity| seen.insert(*entity))
         .collect()
-}
-
-fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Option<Vec<i32>> {
-    if min_height <= 0 || total_height <= 0 || heights.iter().any(|height| *height <= 0) {
-        return None;
-    }
-    let mut count = heights.len();
-    let mut output = vec![];
-
-    loop {
-        let mut idx = 0;
-
-        let mut remaining = total_height;
-        while idx < count {
-            let remaining_windows = heights.len() - idx;
-
-            if heights[idx] < remaining {
-                if idx + 1 == count {
-                    output.push(remaining);
-                } else {
-                    output.push(heights[idx]);
-                }
-                remaining -= heights[idx];
-            } else if remaining / min_height >= i32::try_from(remaining_windows).ok()? {
-                output.push(remaining);
-                remaining = 0;
-            } else {
-                break;
-            }
-            idx += 1;
-        }
-
-        if idx == count {
-            break;
-        }
-        count -= 1;
-        output.clear();
-    }
-
-    let remaining = i32::try_from(heights.len() - count).ok()?;
-    if remaining > 0 && count > 0 {
-        count -= 1;
-        output.truncate(count);
-        let sum = output.iter().sum::<i32>();
-        // Integer division (floor) on purpose: rounding here could make the
-        // heights sum past `total_height`.
-        let avg_height = (total_height - sum) / (remaining + 1);
-        if avg_height < min_height {
-            return None;
-        }
-
-        while count < heights.len() {
-            output.push(avg_height);
-            count += 1;
-        }
-    }
-
-    Some(output)
 }
 
 /// Watches for size changes to windows and if they are changed, signals to the layout strip.
@@ -1842,6 +2122,215 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
     use bevy::prelude::*;
 
+    impl LayoutStrip {
+        /// Historical layout fixtures supplied widths as frames. Translate
+        /// those inputs to explicit intent so these tests continue testing
+        /// positioning/height behavior without retaining a production writer.
+        fn fixture_relative_positions<W>(
+            &self,
+            height: i32,
+            frame: &W,
+        ) -> std::vec::IntoIter<(Entity, IRect)>
+        where
+            W: Fn(Entity) -> Option<IRect>,
+        {
+            let mut strip = self.clone();
+            while strip.column_states.len() < strip.columns.len() {
+                strip.column_states.push_back(ColumnState::default());
+            }
+            for (column, state) in strip.columns.iter().zip(&mut strip.column_states) {
+                if let Some(size) = column
+                    .window_iter()
+                    .filter_map(frame)
+                    .find_map(checked_frame_size)
+                {
+                    state.width = WidthIntent::Absolute(f64::from(size.x));
+                } else {
+                    state.width = WidthIntent::Absolute(1.0);
+                }
+            }
+            strip.sync_height_items();
+            strip
+                .relative_positions(height, frame)
+                .collect::<Vec<_>>()
+                .into_iter()
+        }
+    }
+
+    #[test]
+    fn no_op_layout_edits_do_not_invalidate_structural_revision() {
+        let (_, mut strip, entities) = setup_world_and_strip();
+        let revision = strip.structure_revision();
+        strip.swap(0, 0);
+        strip.remove(Entity::PLACEHOLDER);
+        strip.move_column_relative(entities[0], entities[1], Placement::Before);
+        strip.append_tab_group(&[entities[0]]);
+        strip.edit_column(0, |column| column.move_to_front(entities[0]));
+        strip.append_strip(&mut LayoutStrip::default());
+        assert_eq!(strip.structure_revision(), revision);
+    }
+
+    #[test]
+    fn regrouping_part_of_a_column_creates_an_independent_identity() {
+        let (_, mut strip, entities) = setup_world_and_strip();
+        strip.stack(entities[1]).unwrap();
+        let original = strip.column_id(entities[0]).unwrap();
+        strip
+            .set_width_intent(original, WidthIntent::Absolute(800.0))
+            .unwrap();
+        strip.insert_tab_group_at(1, &[entities[1]]);
+        assert_eq!(strip.column_id(entities[0]), Some(original));
+        assert_ne!(strip.column_id(entities[1]), Some(original));
+        assert_eq!(strip.column_states.len(), strip.len());
+        assert_eq!(
+            strip.column_state(1).unwrap().width,
+            WidthIntent::Absolute(800.0)
+        );
+    }
+
+    #[test]
+    fn column_identity_and_intent_survive_reordering_and_membership_changes() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let c = world.spawn_empty().id();
+        let mut strip = LayoutStrip::default();
+        strip.append(a);
+        strip.append(b);
+        strip.append(c);
+        let id = strip.column_id(a).unwrap();
+        strip
+            .set_width_intent(id, WidthIntent::Absolute(800.0))
+            .unwrap();
+        strip.swap(0, 2);
+        assert_eq!(strip.column_id(a), Some(id));
+        let revision = strip.column_state(2).unwrap().intent_revision;
+        assert!(
+            !strip
+                .set_width_intent(id, WidthIntent::Absolute(800.0))
+                .unwrap()
+        );
+        assert_eq!(strip.column_state(2).unwrap().intent_revision, revision);
+        strip.convert_to_tabs(a, b).unwrap();
+        assert_eq!(strip.column_id(b), Some(id));
+        strip.remove(a);
+        assert_eq!(strip.column_id(b), Some(id));
+        assert_eq!(
+            strip
+                .column_state(strip.index_of(b).unwrap())
+                .unwrap()
+                .width,
+            WidthIntent::Absolute(800.0)
+        );
+    }
+
+    #[test]
+    fn split_columns_copy_raw_width_without_sharing_identity_or_constraints() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let mut strip = LayoutStrip::default();
+        strip.append(a);
+        strip.append(b);
+        strip.stack(b).unwrap();
+        let id = strip.column_id(a).unwrap();
+        strip
+            .set_width_intent(id, WidthIntent::Absolute(800.0))
+            .unwrap();
+        strip
+            .set_column_constraints(
+                id,
+                vec![WidthConstraint::Interval {
+                    min: 1000.0,
+                    max: 1200.0,
+                }],
+            )
+            .unwrap();
+        let extracted = strip.take_windows_preserving_layout(&std::collections::HashSet::from([b]));
+        assert_ne!(strip.column_id(a), Some(id));
+        assert_ne!(extracted.column_id(b), Some(id));
+        assert_ne!(strip.column_id(a), extracted.column_id(b));
+        assert_eq!(
+            strip.column_state(0).unwrap().width,
+            WidthIntent::Absolute(800.0)
+        );
+        assert_eq!(
+            extracted.column_state(0).unwrap().width,
+            WidthIntent::Absolute(800.0)
+        );
+        assert_eq!(extracted.effective_column_width(0).unwrap().slot, 800);
+        assert!(
+            strip
+                .set_width_intent(id, WidthIntent::Absolute(900.0))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn layout_uses_one_effective_width_and_never_derives_intent_from_frames() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let mut strip = LayoutStrip::default();
+        strip.append(a);
+        strip.append(b);
+        strip.set_width_context(Some(1600), WidthIntent::Absolute(800.0));
+        let id = strip.column_id(a).unwrap();
+        strip
+            .set_column_constraints(
+                id,
+                vec![WidthConstraint::Interval {
+                    min: 1000.0,
+                    max: 1200.0,
+                }],
+            )
+            .unwrap();
+        let output = strip
+            .relative_positions(600, &|_| Some(IRect::new(0, 0, 350, 400)))
+            .collect::<Vec<_>>();
+        assert_eq!(output[0].1.width(), 1000);
+        assert_eq!(output[1].1.min.x, 1000);
+        assert_eq!(output[1].1.width(), 800);
+        assert_eq!(
+            strip.column_state(0).unwrap().width,
+            WidthIntent::InheritConfig
+        );
+        assert_eq!(strip.column_state(0).unwrap().intent_revision, 0);
+        strip
+            .set_column_constraints(id, vec![WidthConstraint::Unsupported])
+            .unwrap();
+        assert_eq!(
+            strip
+                .relative_positions(600, &|_| Some(IRect::new(0, 0, 350, 400)))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn width_edit_without_viewport_is_accepted_and_full_width_restores_original_mode() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let mut strip = LayoutStrip::default();
+        strip.append(a);
+        let id = strip.column_id(a).unwrap();
+        strip
+            .set_width_intent(id, WidthIntent::ViewportRatio(0.4))
+            .unwrap();
+        assert_eq!(
+            strip.effective_column_width(0),
+            Err(WidthProjectionBlocked::UnknownViewport)
+        );
+        strip.toggle_full_width(id).unwrap();
+        strip.toggle_full_width(id).unwrap();
+        assert_eq!(
+            strip.column_state(0).unwrap().width,
+            WidthIntent::ViewportRatio(0.4)
+        );
+        strip.set_width_context(Some(2000), WidthIntent::Absolute(900.0));
+        assert_eq!(strip.effective_column_width(0).unwrap().slot, 800);
+    }
+
     #[test]
     fn projection_filters_invalid_frames_without_changing_membership() {
         let (_, mut strip, entities) = setup_world_and_strip();
@@ -1861,7 +2350,9 @@ mod tests {
                     IRect::new(0, 0, 400, 300)
                 })
             };
-            let projected = strip.relative_positions(600, &frame).collect::<Vec<_>>();
+            let projected = strip
+                .fixture_relative_positions(600, &frame)
+                .collect::<Vec<_>>();
             assert_eq!(
                 projected,
                 vec![
@@ -1871,28 +2362,9 @@ mod tests {
             );
             assert_eq!(strip.all_windows(), entities);
             for height in [0, -1, i32::MIN] {
-                assert_eq!(strip.relative_positions(height, &frame).count(), 0);
+                assert_eq!(strip.fixture_relative_positions(height, &frame).count(), 0);
             }
         }
-    }
-
-    #[test]
-    fn binpack_rejects_invalid_inputs_without_overflow() {
-        for (heights, minimum, total) in [
-            (vec![0, 300], 100, 600),
-            (vec![i32::MIN, 300], 100, 600),
-            (vec![300, 300], 0, 600),
-            (vec![300, 300], 100, 0),
-            (vec![i32::MAX, i32::MAX], i32::MAX, i32::MAX),
-        ] {
-            assert!(
-                binpack_heights(&heights, minimum, total).is_none_or(|result| result.is_empty())
-            );
-        }
-        assert_eq!(
-            binpack_heights(&[i32::MAX], i32::MAX, i32::MAX),
-            Some(vec![i32::MAX])
-        );
     }
 
     #[test]
@@ -2013,7 +2485,7 @@ mod tests {
             world.run_system(system).unwrap();
             assert_eq!(
                 world.get::<RepositionMarker>(strip_entity).unwrap().0.x,
-                -1376
+                -1232
             );
             assert!(world.get::<EnsureVisibleMarker>(first).is_none());
             assert!(world.get::<EnsureVisibleMarker>(second).is_none());
@@ -2043,7 +2515,7 @@ mod tests {
         world.run_system(system).unwrap();
         assert_eq!(
             world.get::<RepositionMarker>(strip_entity).unwrap().0,
-            Origin::new(1024 - i32::MAX, 20)
+            Origin::new(1168 - i32::MAX, 20)
         );
     }
 
@@ -2110,7 +2582,7 @@ mod tests {
         world.run_system_once(position_layout_windows).unwrap();
         let frame = world.get::<DesiredWindowFrame>(entity).unwrap().0;
         assert_eq!(frame.min.x, expected_x);
-        assert_eq!(frame.width(), 400);
+        assert_eq!(frame.width(), 256);
         assert!(checked_frame_size(frame).is_some());
     }
 
@@ -2197,7 +2669,9 @@ mod tests {
             strip.append(last);
             let before = strip.all_windows();
             let frame = |entity| (entity != entities[missing]).then(|| IRect::new(0, 0, 400, 300));
-            let projected = strip.relative_positions(600, &frame).collect::<Vec<_>>();
+            let projected = strip
+                .fixture_relative_positions(600, &frame)
+                .collect::<Vec<_>>();
             let expected = before
                 .iter()
                 .copied()
@@ -2216,7 +2690,7 @@ mod tests {
             assert_eq!(projected[2].1, IRect::new(400, 0, 800, 600));
             assert_eq!(strip.all_windows(), before);
             let restored = strip
-                .relative_positions(600, &|_| Some(IRect::new(0, 0, 400, 200)))
+                .fixture_relative_positions(600, &|_| Some(IRect::new(0, 0, 400, 200)))
                 .collect::<Vec<_>>();
             assert_eq!(
                 restored
@@ -2237,7 +2711,9 @@ mod tests {
                 StackItem::Single(entities[2]),
             ])]);
             let frame = |entity| (entity != entities[missing]).then(|| IRect::new(0, 0, 400, 300));
-            let projected = strip.relative_positions(600, &frame).collect::<Vec<_>>();
+            let projected = strip
+                .fixture_relative_positions(600, &frame)
+                .collect::<Vec<_>>();
             assert_eq!(
                 projected,
                 vec![
@@ -2261,7 +2737,9 @@ mod tests {
                 300,
             ))
         };
-        let projected = strip.relative_positions(600, &frame).collect::<Vec<_>>();
+        let projected = strip
+            .fixture_relative_positions(600, &frame)
+            .collect::<Vec<_>>();
         assert_eq!(
             projected,
             vec![
@@ -2379,19 +2857,25 @@ mod tests {
     }
 
     #[test]
-    fn column_width_budget_checks_the_entire_strip_and_missing_frames() {
-        let (mut world, strip, entities) = setup_world_and_strip();
-        let frame = |_| Some(IRect::new(0, 0, 400, 500));
-        assert!(strip.accepts_column_width(entities[0], i32::MAX - 800, frame));
-        assert!(!strip.accepts_column_width(entities[0], i32::MAX - 799, frame));
-        assert!(strip.accepts_column_width(entities[1], 2048, frame));
-        for width in [0, -1, i32::MAX] {
-            assert!(!strip.accepts_column_width(entities[1], width, frame));
-        }
-        assert!(!strip.accepts_column_width(world.spawn_empty().id(), 400, frame));
-        assert!(!strip.accepts_column_width(entities[0], 400, |member| {
-            (member != entities[1]).then(|| IRect::new(0, 0, 400, 500))
-        }));
+    fn column_width_budget_checks_explicit_intents_without_observed_frames() {
+        let (_, mut strip, entities) = setup_world_and_strip();
+        strip.set_width_context(None, WidthIntent::Absolute(400.0));
+        let id = strip.column_id(entities[0]).unwrap();
+        strip
+            .set_width_intent(id, WidthIntent::Absolute(f64::from(i32::MAX - 800)))
+            .unwrap();
+        assert!(strip.width_budget_is_valid());
+        strip
+            .set_width_intent(id, WidthIntent::Absolute(f64::from(i32::MAX - 799)))
+            .unwrap();
+        assert!(!strip.width_budget_is_valid());
+        strip
+            .set_width_intent(id, WidthIntent::ViewportRatio(0.5))
+            .unwrap();
+        assert!(
+            strip.width_budget_is_valid(),
+            "unknown viewport blocks projection, not valid intent admission"
+        );
     }
 
     #[test]
@@ -2417,7 +2901,7 @@ mod tests {
         );
         assert!(
             strip
-                .relative_positions(500, &frame)
+                .fixture_relative_positions(500, &frame)
                 .collect::<Vec<_>>()
                 .is_empty()
         );
@@ -2438,7 +2922,9 @@ mod tests {
                 500,
             ))
         };
-        let projected = strip.relative_positions(500, &frame).collect::<Vec<_>>();
+        let projected = strip
+            .fixture_relative_positions(500, &frame)
+            .collect::<Vec<_>>();
         assert_eq!(projected.len(), 3);
         assert_eq!(projected[0].1.min.x, 0);
         assert_eq!(projected[1].1.min.x, i32::MAX - 800);
@@ -2536,27 +3022,6 @@ mod tests {
     }
 
     #[test]
-    fn test_binpack() {
-        const MIN_HEIGHT: i32 = 100;
-        let heights = [300, 300, 300, 300];
-
-        let out = binpack_heights(&heights, MIN_HEIGHT, 1500).unwrap();
-        assert_eq!(out, vec![300, 300, 300, 600]);
-
-        let out = binpack_heights(&heights, MIN_HEIGHT, 1024).unwrap();
-        assert_eq!(out, vec![300, 300, 300, 124]);
-
-        let out = binpack_heights(&heights, MIN_HEIGHT, 800).unwrap();
-        assert_eq!(out, vec![300, 300, 100, 100]);
-
-        let out = binpack_heights(&heights, MIN_HEIGHT, 440).unwrap();
-        assert_eq!(out, vec![110, 110, 110, 110]);
-
-        let out = binpack_heights(&heights, MIN_HEIGHT, 390);
-        assert_eq!(out, None);
-    }
-
-    #[test]
     fn test_layout_positioning() {
         let mut world = World::new();
         let entities = world
@@ -2578,7 +3043,7 @@ mod tests {
         _ = strip.stack(entities[2]);
         let get_window_frame = |_| Some(sizes[0]);
         let out = strip
-            .relative_positions(500, &get_window_frame)
+            .fixture_relative_positions(500, &get_window_frame)
             .collect::<Vec<_>>();
 
         let xpos = out.iter().map(|(_, frame)| frame.min.x).collect::<Vec<_>>();
@@ -2588,7 +3053,7 @@ mod tests {
             .iter()
             .map(|(_, frame)| frame.height())
             .collect::<Vec<_>>();
-        assert_eq!(height, vec![500, 300, 200, 500]);
+        assert_eq!(height, vec![500, 250, 250, 500]);
     }
 
     /// Every single-column window must fill the full viewport height.
@@ -2603,7 +3068,9 @@ mod tests {
         }
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 400));
-        let out: Vec<_> = strip.relative_positions(800, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .fixture_relative_positions(800, &get_window_frame)
+            .collect();
 
         assert_eq!(out.len(), 3);
         for (_, f) in &out {
@@ -2644,7 +3111,9 @@ mod tests {
             }
         };
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .fixture_relative_positions(600, &get_window_frame)
+            .collect();
         assert_eq!(out.len(), 4);
 
         // Every window in the stacked column must adopt the master's width.
@@ -2716,7 +3185,9 @@ mod tests {
 
         // relative_positions should yield e1, e4 (same frame) and e2
         let get_window_frame = |_| Some(IRect::new(0, 0, 100, 100));
-        let out: Vec<_> = strip.relative_positions(400, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .fixture_relative_positions(400, &get_window_frame)
+            .collect();
 
         // We expect e1, e4, e2 from the first column, and e3 from the second.
         assert_eq!(out.len(), 4);
@@ -2745,7 +3216,9 @@ mod tests {
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 250));
 
         // Before unstack: e0 and e1 share 500px height.
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .fixture_relative_positions(500, &get_window_frame)
+            .collect();
         let e1_height = out
             .iter()
             .find(|(e, _)| *e == entities[1])
@@ -2758,7 +3231,9 @@ mod tests {
         strip.unstack(entities[1]).unwrap();
         assert_eq!(strip.len(), 3);
 
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .fixture_relative_positions(500, &get_window_frame)
+            .collect();
         for (_, f) in &out {
             assert_eq!(
                 f.height(),
@@ -2782,21 +3257,27 @@ mod tests {
 
         // Stack: [Stack(e0, e1)]
         strip.stack(entities[1]).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .fixture_relative_positions(500, &get_window_frame)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
         assert_eq!(heights.len(), 2);
 
         // Unstack: [Single(e0), Single(e1)]
         strip.unstack(entities[1]).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .fixture_relative_positions(500, &get_window_frame)
+            .collect();
         for (_, f) in &out {
             assert_eq!(f.height(), 500);
         }
 
         // Re-stack: [Stack(e0, e1)] — e1 stacks onto left neighbor e0
         strip.stack(entities[1]).unwrap();
-        let out: Vec<_> = strip.relative_positions(500, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .fixture_relative_positions(500, &get_window_frame)
+            .collect();
         let heights: Vec<_> = out.iter().map(|(_, f)| f.height()).collect();
         assert_eq!(heights.iter().sum::<i32>(), 500);
         assert_eq!(heights.len(), 2);
@@ -2835,7 +3316,9 @@ mod tests {
             }
         };
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .fixture_relative_positions(600, &get_window_frame)
+            .collect();
         assert_eq!(out.len(), 3);
 
         // Columns must be edge-to-edge: each column starts where the previous ends.
@@ -2871,7 +3354,9 @@ mod tests {
 
         let get_window_frame = |_| Some(IRect::new(0, 0, 300, 600));
 
-        let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
+        let out: Vec<_> = strip
+            .fixture_relative_positions(600, &get_window_frame)
+            .collect();
         let xs: Vec<_> = out.iter().map(|(_, f)| f.min.x).collect();
         assert_eq!(xs, vec![0, 300, 600]);
 
@@ -3011,7 +3496,7 @@ mod tests {
         };
 
         let out = strip
-            .relative_positions(600, &get_window_frame)
+            .fixture_relative_positions(600, &get_window_frame)
             .collect::<Vec<_>>();
 
         assert_eq!(out.len(), 2);

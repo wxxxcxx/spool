@@ -13,7 +13,7 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::Without;
 use bevy::ecs::resource::Resource;
-use bevy::ecs::system::{Commands, Query, Res, SystemParam};
+use bevy::ecs::system::{Commands, Populated, Query, Res, SystemParam};
 use bevy::math::{IRect, IVec2};
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{debug, info, warn};
@@ -180,7 +180,9 @@ fn fullscreen_state(
 /// read and before the entity becomes visible to layout systems.
 #[derive(SystemParam)]
 pub(crate) struct LaunchCapture<'w, 's> {
-    displays: Query<'w, 's, &'static Display>,
+    // Discovery retries early spawns once displays exist. Do not admit a
+    // startup window before its pre-layout launch frame can be captured.
+    displays: Populated<'w, 's, &'static Display>,
     spaces: Query<'w, 's, &'static NativeSpace>,
     window_manager: Res<'w, WindowManager>,
 }

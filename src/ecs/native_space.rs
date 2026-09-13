@@ -25,7 +25,7 @@ use crate::ecs::workspace::{
 };
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, Position,
-    PresentedWindowFrame, PreviousTiledStrip, RefreshWindowSizes, SpawnCommandsExt, WidthRatio,
+    PresentedWindowFrame, PreviousTiledStrip, RefreshWindowSizes, SpawnCommandsExt,
     WindowFrameCommitSuspended, WindowFrameMotion, WindowVisibility,
 };
 use crate::events::Event;
@@ -150,10 +150,20 @@ impl PendingMoveLayout {
         for entity in column.window_iter() {
             remaining.remove(&entity);
         }
+        let sources = sources.collect::<Vec<_>>();
+        let state = column.window_iter().find_map(|entity| {
+            sources.iter().find_map(|strip| {
+                strip
+                    .index_of(entity)
+                    .ok()
+                    .and_then(|index| strip.column_state(index))
+                    .cloned()
+            })
+        });
         let mut captured = LayoutStrip::new(space_id);
-        captured.append_column(column);
+        captured.append_column_with_state(column, state.unwrap_or_default());
         if !remaining.is_empty() {
-            let mut sources = sources.collect::<Vec<_>>();
+            let mut sources = sources;
             sources.sort_unstable_by_key(|strip| strip.id());
             for source in sources {
                 if remaining.is_empty() {
@@ -949,11 +959,6 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
                             PresentedWindowFrame(readback.frame),
                         ))
                         .remove::<(WindowFrameMotion, WindowFrameCommitSuspended)>();
-                    if state.is_tiled() {
-                        commands.entity(entity).insert(WidthRatio(
-                            f64::from(readback.frame.width()) / f64::from(readback.viewport_width),
-                        ));
-                    }
                 }
                 if state.is_tiled() && !state.is_visible() {
                     let index = reassignments

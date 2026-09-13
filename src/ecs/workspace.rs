@@ -24,14 +24,14 @@ use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::reconcile::WindowUnavailable;
 use crate::ecs::topology::WindowMemberships;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Floating,
-    FullscreenDefaultsDeferred, Initializing, NativeFullscreenMarker, PreviousTiledStrip,
-    RefreshWindowSizes, RepositionMarker, ReshuffleAroundMarker, ResizeMarker, SpawnCommandsExt,
-    VerifyWindowPosition, WindowFrameMotion, WindowVisibility,
+    ActiveWorkspaceMarker, DockPosition, EnsureVisibleMarker, Floating, FullscreenDefaultsDeferred,
+    Initializing, NativeFullscreenMarker, PreviousTiledStrip, RefreshWindowSizes, RepositionMarker,
+    ReshuffleAroundMarker, ResizeMarker, SpawnCommandsExt, VerifyWindowPosition, WindowFrameMotion,
+    WindowVisibility,
 };
 use crate::errors::Result;
 use crate::events::Event;
-use crate::manager::{Application, Display, Size, Window, WindowManager};
+use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
 
 pub struct WorkspaceEventsPlugin;
@@ -86,7 +86,7 @@ impl Plugin for WorkspaceEventsPlugin {
                     .after(super::reconcile::reconcile_windows)
                     .before(detect_moved_windows),
                 detect_moved_windows.run_if(not(resource_exists::<Initializing>)),
-                refresh_workspace_window_sizes.run_if(on_timer(Duration::from_millis(
+                reconcile_workspace_refresh.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
                 ))),
             ),
@@ -1037,22 +1037,19 @@ fn windows_not_in_strips<F: Fn(WinID) -> Option<Entity>>(
         })
 }
 
+/// Retained geometry intent only; a viewport refresh reads window identity and
+/// floating ownership, never a storable tiled size.
 type RefreshableWindows<'w, 's> = Query<
     'w,
     's,
-    (
-        Entity,
-        &'static mut Window,
-        &'static mut Bounds,
-        Has<Floating>,
-    ),
+    (Entity, &'static mut Window, Has<Floating>),
     (
         Without<WindowUnavailable>,
         Without<WindowSpaceReassignmentPending>,
     ),
 >;
 
-fn refresh_workspace_window_sizes(
+fn reconcile_workspace_refresh(
     layout_strip: Populated<
         (&RefreshWindowSizes, &LayoutStrip, Entity, &ChildOf),
         Without<PendingSpaceDestruction>,
@@ -1082,20 +1079,14 @@ fn refresh_workspace_window_sizes(
             continue;
         };
 
-        // Resize windows for the new display dimensions.
+        // Retained tiled geometry is derived by the layout projection from the
+        // accepted width/height intent, so a viewport change must not write a
+        // size here: a direct write would bypass declarative intent and can
+        // revive stale frames. Only external inventory is reconciled below.
         for entity in strip.all_windows() {
-            let Ok((_, ref mut window, ref mut bounds, _)) = windows.get_mut(entity) else {
+            let Ok((_, window, _)) = windows.get_mut(entity) else {
                 continue;
             };
-            if bounds.x > viewport.width() || bounds.y > viewport.height() {
-                let clamped_size = Size::new(
-                    bounds.x.clamp(0, viewport.width()),
-                    bounds.y.clamp(0, viewport.height()),
-                );
-                debug!("refreshing window {} size to {clamped_size}", window.id());
-                commands.resize_entity(entity, clamped_size);
-            }
-
             in_workspace.retain(|window_id| *window_id != window.id());
         }
 
@@ -1103,13 +1094,13 @@ fn refresh_workspace_window_sizes(
         let floating = in_workspace
             .into_iter()
             .filter_map(|window_id| {
-                windows.iter().find_map(|(entity, window, _, floating)| {
+                windows.iter().find_map(|(entity, window, floating)| {
                     (window_id == window.id() && floating).then_some(entity)
                 })
             })
             .collect::<Vec<_>>();
         for window_entity in floating {
-            let Ok((_, mut window, _, _)) = windows.get_mut(window_entity) else {
+            let Ok((_, mut window, _)) = windows.get_mut(window_entity) else {
                 continue;
             };
             let Ok(frame) = window.update_frame() else {

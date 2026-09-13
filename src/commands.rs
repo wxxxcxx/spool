@@ -2,18 +2,18 @@ use bevy::app::PreUpdate;
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Has, Or, With, Without};
+use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, In, Query, Res, ResMut};
 use bevy::math::IRect;
-use bevy::time::Time;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info};
 
 mod admission;
+mod column_width;
 mod display_navigation;
+mod layout_edit;
 mod query;
-mod space_layout;
 mod targeted;
 mod transfer;
 
@@ -25,13 +25,11 @@ use crate::ecs::focus::FocusCoordinator;
 use crate::ecs::layout::{
     Column, LayoutStrip, StackItem, centered_origin_in_viewport, clamp_origin_to_viewport,
 };
-use crate::ecs::native_space::{
-    DisplayMovePlan, NativeMoveOwner, NativeSpaceTransactions, VisibleNativeSpaceMarker,
-};
-use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
+use crate::ecs::native_space::VisibleNativeSpaceMarker;
+use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::topology::NativeTopology;
 use crate::ecs::window_frame::{checked_frame_size, checked_window_frame};
-use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPending};
+use crate::ecs::workspace::PendingSpaceDestruction;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Floating, FocusedMarker, FullWidthMarker,
     NativeFullscreenMarker, RaiseWindow, RetilePending, RetileWindow, SendMessageTrigger,
@@ -47,30 +45,6 @@ use crate::util::round_px;
 pub use spool_shared_types::commands::{
     Action, Direction, FocusStep, MouseMove, MoveFocus, Operation, ResizeAxis, ResizeDirection,
 };
-
-/// The visible Space on every display except the focused one.
-type OffscreenStrips<'w, 's> = Query<
-    'w,
-    's,
-    (&'static mut LayoutStrip, &'static ChildOf),
-    (
-        With<VisibleNativeSpaceMarker>,
-        Without<ActiveWorkspaceMarker>,
-        Without<PendingSpaceDestruction>,
-        Without<NativeFullscreenMarker>,
-    ),
->;
-
-type DisplayTransferBlockedWindows<'w, 's> = Query<
-    'w,
-    's,
-    (),
-    Or<(
-        With<NativeMoveOwner>,
-        With<WindowSpaceReassignmentPending>,
-        With<crate::ecs::WindowDefaultsPending>,
-    )>,
->;
 
 /// Every strip alongside whether it is focused and visible on its display.
 type StripsWithVisibility<'w, 's> = Query<
@@ -164,11 +138,19 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
                         }
                     });
                 }
-                Operation::Move(direction) => {
-                    commands.run_system_cached_with(command_move_window, direction.clone());
-                }
-                Operation::Resize { .. } | Operation::SetWidth(_) => {
-                    commands.run_system_cached_with(resize_window, operation.clone());
+                Operation::Move(_)
+                | Operation::ToggleStack
+                | Operation::Equalize
+                | Operation::Resize { .. }
+                | Operation::SetWidth(_)
+                | Operation::Maximize
+                | Operation::Balance => {
+                    let action = action.clone();
+                    commands.queue(move |world: &mut bevy::prelude::World| {
+                        if let Err(reason) = admission::execute(world, action) {
+                            debug!(%reason, "command rejected");
+                        }
+                    });
                 }
                 Operation::ToNextDisplay(move_focus) => {
                     commands.run_system_cached_with(
@@ -177,11 +159,7 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
                     );
                 }
                 Operation::Center => commands.run_system_cached(command_center_window),
-                Operation::Maximize => commands.run_system_cached(maximize_window),
-                Operation::Equalize => commands.run_system_cached(equalize_column),
-                Operation::Balance => commands.run_system_cached(balance_strip),
                 Operation::ToggleFloating => commands.run_system_cached(toggle_floating_window),
-                Operation::ToggleStack => commands.run_system_cached(toggle_stack_handler),
                 Operation::Snap => commands.run_system_cached(snap_window),
                 Operation::FocusFloating => commands.run_system_cached(command_focus_floating),
                 Operation::FocusTiled => commands.run_system_cached(command_focus_tiled),
@@ -906,109 +884,6 @@ fn command_focus_other_layer(
     debug!("focused other layer: floating={focus_floating}");
 }
 
-/// Moves the focused window. Tiled windows are reordered in the strip;
-/// floating windows move geometrically by the configured pixel step.
-#[instrument(level = Level::DEBUG, skip_all)]
-fn command_move_window(
-    In(direction): In<Direction>,
-    windows: Windows,
-    focus: Res<FocusCoordinator>,
-    window_manager: Res<WindowManager>,
-    mut active_display: ActiveDisplayMut,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    let direction = &direction;
-
-    let Some((_, current, state)) = active_command_entity(
-        &windows,
-        &focus,
-        active_display.active_strip_ref(),
-        &window_manager,
-    )
-    .and_then(|entity| windows.get_tracked(entity)) else {
-        return;
-    };
-
-    if state.is_floating() {
-        let Some(frame) = windows.requested_frame(current) else {
-            return;
-        };
-        let step = config.floating_window_move_step();
-        let delta = match direction {
-            Direction::West => bevy::math::IVec2::new(-step, 0),
-            Direction::East => bevy::math::IVec2::new(step, 0),
-            Direction::North => bevy::math::IVec2::new(0, -step),
-            Direction::South => bevy::math::IVec2::new(0, step),
-            Direction::First | Direction::Last | Direction::Nth(_) => return,
-        };
-        let viewport = active_display.actual_bounds(&config);
-        if viewport.width() <= 0 || viewport.height() <= 0 {
-            return;
-        }
-        let requested_origin = Origin::new(
-            frame.min.x.saturating_add(delta.x),
-            frame.min.y.saturating_add(delta.y),
-        );
-        let origin = clamp_origin_to_viewport(requested_origin, frame.size(), viewport);
-        commands.reposition_entity(current, origin);
-        return;
-    }
-
-    if let Some(other) =
-        get_window_in_direction(direction, current, active_display.active_strip_ref())
-        && !writable_column_range(&windows, active_display.active_strip_ref(), current, other)
-    {
-        return;
-    }
-    let active_strip = active_display.active_strip();
-    let mut handler = || {
-        let index = active_strip.index_of(current).ok()?;
-        let other_window = get_window_in_direction(direction, current, active_strip)?;
-        let new_index = active_strip.index_of(other_window).ok()?;
-        debug!(
-            "move {direction:?}: current={current} idx={index}, other={other_window} idx={new_index}, strip_len={}",
-            active_strip.len()
-        );
-
-        if index == new_index
-            && let Some(Column::Stack(stack)) = active_strip.get_column_mut(index)
-        {
-            let pos_a = stack.iter().position(|i| i.contains(current))?;
-            let pos_b = stack.iter().position(|i| i.contains(other_window))?;
-            stack.swap(pos_a, pos_b);
-        } else if index < new_index {
-            (index..new_index).for_each(|idx| active_strip.swap(idx, idx + 1));
-        } else {
-            (new_index..index)
-                .rev()
-                .for_each(|idx| active_strip.swap(idx, idx + 1));
-        }
-        Some(current)
-    };
-
-    // Keep the focused window on-screen, but don't anchor it: if its new
-    // layout slot is already visible with the strip where it is, the strip
-    // stays put and per-window animation slides the window into the slot.
-    // Only when the slot would fall off the edge does the strip scroll —
-    // and only by the shortfall.
-    if let Some(window) = handler() {
-        commands.ensure_visible(window);
-        return;
-    }
-    debug!(
-        "move {direction:?}: handler returned None (focused={:?}, strip_len={})",
-        current,
-        active_strip.len()
-    );
-
-    if get_window_in_direction(direction, current, active_strip).is_none()
-        && let Some(target) = DisplayTarget::from_direction(direction)
-    {
-        commands.run_system_cached_with(move_to_display, (MoveFocus::Follow, target));
-    }
-}
-
 /// Centers the focused window on the active display.
 fn command_center_window(
     windows: Windows,
@@ -1105,45 +980,6 @@ fn checked_ratio_width(ratio: f64, available: i32) -> Option<i32> {
         .then(|| round_px(width))
 }
 
-/// Plans every member before a width change can clear restoration state.
-fn column_resize_plan(
-    windows: &Windows,
-    strip: &LayoutStrip,
-    entity: Entity,
-    target: IRect,
-) -> Option<Vec<(Entity, Size)>> {
-    let size = checked_frame_size(target)?;
-    if !windows.layout_column_is_writable(strip, entity) {
-        return None;
-    }
-    let column = strip.column_containing(entity)?;
-    if matches!(column, Column::Fullscren(_))
-        || !strip.accepts_column_width(entity, size.x, |member| windows.requested_frame(member))
-    {
-        return None;
-    }
-    column
-        .window_iter()
-        .map(|member| {
-            windows.get(member)?;
-            let frame = windows.requested_frame(member)?;
-            let height = if member == entity || matches!(column, Column::Tabs(_)) {
-                size.y
-            } else {
-                frame.height()
-            };
-            let size = Size::new(size.x, height);
-            let origin = if member == entity {
-                target.min
-            } else {
-                frame.min
-            };
-            checked_window_frame(origin, size)?;
-            Some((member, size))
-        })
-        .collect()
-}
-
 fn apply_column_sizes(sizes: Vec<(Entity, Size)>, commands: &mut Commands) {
     for (entity, size) in sizes {
         if let Ok(mut entry) = commands.get_entity(entity) {
@@ -1151,41 +987,6 @@ fn apply_column_sizes(sizes: Vec<(Entity, Size)>, commands: &mut Commands) {
         }
         commands.resize_entity(entity, size);
     }
-}
-
-fn resize_tiled_height(
-    entity: Entity,
-    frame: IRect,
-    viewport: IRect,
-    direction: ResizeDirection,
-    strip: &LayoutStrip,
-    config: &Config,
-    commands: &mut Commands,
-) -> bool {
-    let in_stack = strip
-        .index_of(entity)
-        .ok()
-        .and_then(|index| strip.get(index).ok())
-        .is_some_and(|column| matches!(column, Column::Stack(_)));
-    if !in_stack {
-        return false;
-    }
-
-    let delta = match direction {
-        ResizeDirection::Grow => config.floating_window_resize_step(),
-        ResizeDirection::Shrink => -config.floating_window_resize_step(),
-    };
-    let Some(height) = resized_dimension(frame.height(), delta, viewport.height()) else {
-        return false;
-    };
-    if height == frame.height()
-        || checked_window_frame(frame.min, Size::new(frame.width(), height)).is_none()
-    {
-        return false;
-    }
-    commands.resize_entity(entity, Size::new(frame.width(), height));
-    commands.reshuffle_around(entity);
-    true
 }
 
 fn tiled_width_ratio(operation: &Operation, current: f64, config: &Config) -> Option<f64> {
@@ -1231,215 +1032,6 @@ fn tiled_width_ratio(operation: &Operation, current: f64, config: &Config) -> Op
     }
 }
 
-/// Resizes the focused window using behavior selected by its tiled/floating state.
-fn resize_window(
-    In(operation): In<Operation>,
-    windows: Windows,
-    focus: Res<FocusCoordinator>,
-    window_manager: Res<WindowManager>,
-    active_display: ActiveDisplay,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    let operation = &operation;
-
-    let viewport = active_display.actual_bounds(&config);
-    if checked_frame_size(viewport).is_none() {
-        return;
-    }
-    if let Operation::SetWidth(ratio) = operation
-        && checked_ratio_width(*ratio, viewport.width()).is_none()
-    {
-        return;
-    }
-
-    let Some((_, entity, state)) = active_command_entity(
-        &windows,
-        &focus,
-        active_display.active_strip(),
-        &window_manager,
-    )
-    .and_then(|entity| windows.get_tracked(entity)) else {
-        return;
-    };
-    let Some(frame) = windows.requested_frame(entity) else {
-        return;
-    };
-    if state.is_tiled() && !windows.layout_column_is_writable(active_display.active_strip(), entity)
-    {
-        return;
-    }
-    let (axis, direction) = match operation {
-        Operation::Resize { axis, direction } => (*axis, *direction),
-        Operation::SetWidth(_) => (ResizeAxis::Width, ResizeDirection::Grow),
-        _ => return,
-    };
-    let next_tiled_width = if state.is_tiled() && axis == ResizeAxis::Width {
-        let current = f64::from(frame.width()) / f64::from(viewport.width());
-        tiled_width_ratio(operation, current, &config)
-            .and_then(|ratio| checked_ratio_width(ratio, viewport.width()))
-    } else {
-        None
-    };
-    if let Some(width) = next_tiled_width
-        && !active_display
-            .active_strip()
-            .accepts_column_width(entity, width, |member| windows.requested_frame(member))
-    {
-        return;
-    }
-    if state.is_tiled() && axis == ResizeAxis::Height {
-        if resize_tiled_height(
-            entity,
-            frame,
-            viewport,
-            direction,
-            active_display.active_strip(),
-            &config,
-            &mut commands,
-        ) && let Ok(mut cmds) = commands.get_entity(entity)
-        {
-            cmds.try_remove::<FullWidthMarker>();
-        }
-        return;
-    }
-
-    if state.is_floating() {
-        let Some(target) = floating_resize_frame(operation, frame, viewport, &config)
-            .filter(|target| *target != frame)
-        else {
-            return;
-        };
-        if let Ok(mut cmds) = commands.get_entity(entity) {
-            cmds.try_remove::<FullWidthMarker>();
-        }
-        commands.reposition_entity(entity, target.min);
-        commands.resize_entity(entity, target.size());
-        return;
-    }
-
-    let Some(new_width) = next_tiled_width else {
-        return;
-    };
-    let size = Size::new(new_width, frame.height());
-
-    let origin = centered_origin_in_viewport(frame, size, viewport);
-    let Some(target) = checked_window_frame(origin, size) else {
-        return;
-    };
-    let Some(sizes) = column_resize_plan(&windows, active_display.active_strip(), entity, target)
-    else {
-        return;
-    };
-    apply_column_sizes(sizes, &mut commands);
-    commands.reposition_entity(entity, target.min);
-    commands.reshuffle_around(entity);
-}
-
-fn maximize_window(
-    windows: Windows,
-    focus: Res<FocusCoordinator>,
-    window_manager: Res<WindowManager>,
-    mut active_display: ActiveDisplayMut,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    let Some((_, entity, state)) = active_command_entity(
-        &windows,
-        &focus,
-        active_display.active_strip_ref(),
-        &window_manager,
-    )
-    .and_then(|entity| windows.get_tracked(entity)) else {
-        return;
-    };
-
-    let viewport = active_display.actual_bounds(&config);
-    let Some(viewport_size) = checked_frame_size(viewport) else {
-        return;
-    };
-    let Some(current) = windows.requested_frame(entity) else {
-        return;
-    };
-    let strip = active_display.active_strip_ref();
-    if state.is_tiled() && !windows.layout_column_is_writable(strip, entity) {
-        return;
-    }
-    if state.is_tiled()
-        && strip
-            .column_containing(entity)
-            .is_none_or(|column| matches!(column, Column::Fullscren(_)))
-    {
-        return;
-    }
-    // A native tab group's width belongs to the whole entry, even after focus
-    // selects a different member than the one that originally maximized it.
-    let marker = windows.full_width(entity).or_else(|| {
-        state
-            .is_tiled()
-            .then(|| strip.tab_group(entity))
-            .flatten()
-            .and_then(|members| {
-                members
-                    .into_iter()
-                    .find_map(|member| windows.full_width(member))
-            })
-    });
-    let restoring = marker.is_some();
-    let target = if let Some(marker) = marker {
-        if let Some(frame) = marker.floating_frame {
-            if checked_frame_size(frame).is_none() {
-                return;
-            }
-            frame
-        } else {
-            let Some(width) = checked_ratio_width(marker.width_ratio, viewport_size.x) else {
-                return;
-            };
-            let Some(frame) = checked_window_frame(current.min, viewport_size.with_x(width)) else {
-                return;
-            };
-            frame
-        }
-    } else {
-        viewport
-    };
-    let mut proposed = strip.clone();
-    let layout_changed = if state.is_tiled() && !restoring {
-        match proposed.unstack(entity) {
-            Ok(changed) => changed,
-            Err(error) => {
-                debug!(%error, "skipping maximize: no eligible layout entry");
-                return;
-            }
-        }
-    } else {
-        false
-    };
-    let sizes = if state.is_floating() {
-        vec![(entity, target.size())]
-    } else {
-        let Some(sizes) = column_resize_plan(&windows, &proposed, entity, target) else {
-            return;
-        };
-        sizes
-    };
-    if layout_changed {
-        *active_display.active_strip() = proposed;
-    }
-    apply_column_sizes(sizes, &mut commands);
-    if !restoring && let Ok(mut entry) = commands.get_entity(entity) {
-        entry.try_insert(FullWidthMarker {
-            width_ratio: f64::from(current.width()) / f64::from(viewport_size.x),
-            floating_frame: state.is_floating().then_some(current),
-        });
-    }
-    commands.reposition_entity(entity, target.min);
-    if state.is_tiled() {
-        commands.reshuffle_around(entity);
-    }
-}
-
 /// Toggles the focused window between the tiling layout and floating mode.
 fn toggle_floating_window(
     windows: Windows,
@@ -1479,176 +1071,21 @@ fn move_to_display(
     In((move_focus, target)): In<(MoveFocus, DisplayTarget)>,
     windows: Windows,
     focus: Res<FocusCoordinator>,
-    active_display: ActiveDisplayMut,
-    mut other_workspaces: OffscreenStrips,
-    mut topology: ResMut<NativeTopology>,
-    moving: DisplayTransferBlockedWindows,
-    window_manager: Res<WindowManager>,
-    config: Res<Config>,
-    mut transactions: ResMut<NativeSpaceTransactions>,
-    time: Res<Time>,
     mut commands: Commands,
 ) {
-    let Some((window, entity, state)) = active_command_entity(
-        &windows,
-        &focus,
-        active_display.active_strip_ref(),
-        &window_manager,
-    )
-    .and_then(|entity| windows.get_tracked(entity)) else {
-        return;
-    };
-    let source_id = active_display.active_strip_ref().id();
-    if topology.observe_visible_window_space(&window_manager, window.id()) != Some(source_id)
-        || topology.visible_display_for_space(source_id) != Some(active_display.display().id())
-        || topology.is_fullscreen(source_id)
-    {
-        return;
-    }
-    let Some(target_display_id) = select_display(
-        active_display.display().id(),
-        target,
-        topology.known_displays().map(|(display, _)| display),
-    ) else {
-        return;
-    };
-    let Some((display_entity, other, dock)) = active_display
-        .other_contexts()
-        .find(|(_, display, _)| display.id() == target_display_id)
-    else {
-        debug!("no other display to move window to.");
-        return;
-    };
-    let Some(target_space_id) = topology.visible_space(target_display_id) else {
-        return;
-    };
-    if topology.visible_display_for_space(target_space_id) != Some(target_display_id)
-        || topology.is_fullscreen(target_space_id)
-    {
-        return;
-    }
-    // A fresh native sample cannot authorize use of stale display geometry.
-    for display in [active_display.display(), other] {
-        let Some((observed, _)) = topology
-            .known_displays()
-            .find(|(native, _)| native.id() == display.id())
-        else {
-            return;
-        };
-        if display.clone().update_geometry(observed) {
-            return;
-        }
-    }
-    let Some(source_viewport) = active_display
-        .display()
-        .checked_actual_display_bounds(active_display.dock(), &config)
+    let Some(window_id) = command_entity(&windows, &focus)
+        .and_then(|entity| windows.get(entity))
+        .map(|window| window.id())
     else {
         return;
     };
-    let Some(target_viewport) = other.checked_actual_display_bounds(dock, &config) else {
-        return;
-    };
-    let mut matches = other_workspaces
-        .iter_mut()
-        .filter(|(strip, _)| strip.id() == target_space_id);
-    let Some((target_strip, child)) = matches.next() else {
-        return;
-    };
-    if matches.next().is_some() || child.parent() != display_entity {
-        return;
-    }
-    let Some(frame) = windows.requested_frame(entity) else {
-        return;
-    };
-    let size = if state.is_tiled() {
-        let ratio = f64::from(frame.width()) / f64::from(source_viewport.width());
-        let Some(width) = checked_ratio_width(ratio, target_viewport.width()) else {
-            return;
-        };
-        Size::new(width, target_viewport.height())
-    } else {
-        frame.size()
-    };
-    let origin = centered_origin_in_viewport(target_viewport, size, target_viewport)
-        .with_y(target_viewport.min.y);
-    let Some(target) = checked_window_frame(origin, size) else {
-        return;
-    };
-    let members = if state.is_tiled() {
-        active_display
-            .active_strip_ref()
-            .tab_group(entity)
-            .unwrap_or_else(|| vec![entity])
-    } else {
-        vec![entity]
-    };
-    let Ok(memberships) = topology.observe_memberships(&window_manager) else {
-        return;
-    };
-    if members.iter().any(|member| {
-        moving.contains(*member)
-            || windows
-                .get_tracked(*member)
-                .is_none_or(|(window, _, sibling)| {
-                    !sibling.is_visible()
-                        || sibling.is_tiled() != state.is_tiled()
-                        || memberships.unique_space(window.id()) != Some(source_id)
-                })
-    }) {
-        return;
-    }
-    let mut source = active_display.active_strip_ref().clone();
-    let mut destination = target_strip.clone();
-    if state.is_tiled() {
-        for member in &members {
-            source.remove(*member);
+    commands.queue(move |world: &mut bevy::prelude::World| {
+        match world.run_system_cached_with(transfer::execute, (window_id, move_focus, target)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => debug!(%error, "display transfer rejected"),
+            Err(error) => debug!(%error, "display transfer unavailable"),
         }
-        destination.append_tab_group(&members);
-        if !destination.accepts_column_widths(|_, column| {
-            column.width(&|member| {
-                if members.contains(&member) {
-                    Some(target)
-                } else {
-                    windows.requested_frame(member)
-                }
-            })
-        }) {
-            return;
-        }
-    }
-    let eligible = |candidate| {
-        source.contains(candidate)
-            && !moving.contains(candidate)
-            && windows
-                .get_tracked(candidate)
-                .is_some_and(|(window, _, state)| {
-                    state.is_visible() && memberships.unique_space(window.id()) == Some(source_id)
-                })
-    };
-    let source_neighbour = focus.restoration_entity(source_id, eligible).or_else(|| {
-        source
-            .all_columns()
-            .into_iter()
-            .find(|candidate| eligible(*candidate))
     });
-
-    _ = transactions.submit_display_move(
-        DisplayMovePlan {
-            members,
-            target,
-            viewport: target_viewport,
-            target_space_id,
-            source_display_id: active_display.display().id(),
-            target_display_id,
-            follow: (move_focus == MoveFocus::Follow).then_some(entity),
-            source_neighbour,
-            tiled: state.is_tiled(),
-        },
-        &windows,
-        active_display.active_strip_ref(),
-        &mut commands,
-        time.elapsed(),
-    );
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1782,118 +1219,6 @@ fn checked_focus_other_display(
     Ok(())
 }
 
-/// Distributes heights equally among all windows in the currently focused stack.
-fn equalize_column(
-    windows: Windows,
-    focus: Res<FocusCoordinator>,
-    window_manager: Res<WindowManager>,
-    active_display: ActiveDisplay,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    let Some(entity) = active_command_entity(
-        &windows,
-        &focus,
-        active_display.active_strip(),
-        &window_manager,
-    ) else {
-        return;
-    };
-    let active_strip = active_display.active_strip();
-    let Ok(column) = active_strip
-        .index_of(entity)
-        .and_then(|index| active_strip.get(index))
-    else {
-        return;
-    };
-
-    if let Column::Stack(stack) = column {
-        let viewport = active_display.actual_bounds(&config);
-        let Some(equal_height) = i32::try_from(stack.len())
-            .ok()
-            .and_then(|count| viewport.height().checked_div(count))
-            .filter(|height| *height > 0 && viewport.width() > 0)
-        else {
-            return;
-        };
-        let sizes = stack
-            .iter()
-            .flat_map(StackItem::window_iter)
-            .map(|entity| {
-                windows.layout_is_writable(entity).then_some(())?;
-                let frame = windows.requested_frame(entity)?;
-                let size = frame.size().with_y(equal_height);
-                checked_window_frame(frame.min, size)?;
-                Some((entity, size))
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(sizes) = sizes else {
-            return;
-        };
-        for (entity, size) in sizes {
-            commands.resize_entity(entity, size);
-        }
-    }
-}
-
-/// Makes all columns in the active strip the same width as the focused window.
-fn balance_strip(
-    windows: Windows,
-    focus: Res<FocusCoordinator>,
-    window_manager: Res<WindowManager>,
-    active_display: ActiveDisplay,
-    mut commands: Commands,
-) {
-    let Some(focused_entity) = active_command_entity(
-        &windows,
-        &focus,
-        active_display.active_strip(),
-        &window_manager,
-    ) else {
-        return;
-    };
-    let Some(focused_width) = windows
-        .requested_frame(focused_entity)
-        .map(|frame| frame.width())
-    else {
-        return;
-    };
-
-    let strip = active_display.active_strip();
-    if !strip.accepts_column_widths(|_, column| {
-        if matches!(column, Column::Fullscren(_)) {
-            column.width(&|member| windows.requested_frame(member))
-        } else {
-            Some(focused_width)
-        }
-    }) {
-        return;
-    }
-    let sizes = strip
-        .columns()
-        .filter(|column| !matches!(column, Column::Fullscren(_)))
-        .flat_map(Column::window_iter)
-        .map(|entity| {
-            windows.layout_is_writable(entity).then_some(())?;
-            let frame = windows.requested_frame(entity)?;
-            let size = frame.size().with_x(focused_width);
-            checked_window_frame(frame.min, size)?;
-            Some((entity, size))
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(sizes) = sizes.filter(|sizes| !sizes.is_empty()) else {
-        return;
-    };
-    for (entity, size) in sizes {
-        if let Ok(mut cmds) = commands.get_entity(entity) {
-            cmds.try_remove::<FullWidthMarker>();
-        }
-        commands.resize_entity(entity, size);
-    }
-
-    commands.reshuffle_around(focused_entity);
-}
-
 /// Slides the strip so the focused window is fully visible, snapping to the
 /// nearest edge: left-aligned when the window overflows left, right-aligned
 /// when it overflows right. No resize — the window keeps its current size.
@@ -1955,78 +1280,6 @@ fn snap_window(
     };
     let strip_position = Origin::new(x, y);
     commands.reposition_entity(active_display.active_strip_entity(), strip_position);
-}
-
-#[instrument(level = Level::DEBUG, skip_all)]
-fn toggle_stack_handler(
-    windows: Windows,
-    focus: Res<FocusCoordinator>,
-    window_manager: Res<WindowManager>,
-    mut active_display: ActiveDisplayMut,
-    mut commands: Commands,
-) {
-    if let Some((_, entity, state)) = active_command_entity(
-        &windows,
-        &focus,
-        active_display.active_strip_ref(),
-        &window_manager,
-    )
-    .and_then(|entity| windows.get_tracked(entity))
-        && state.is_tiled()
-        && state.is_visible()
-    {
-        let original = active_display.active_strip_ref();
-        if !windows.layout_column_is_writable(original, entity) {
-            return;
-        }
-        let mut proposed = original.clone();
-        let is_stacked = proposed
-            .index_of(entity)
-            .ok()
-            .and_then(|index| proposed.get(index).ok())
-            .is_some_and(|column| matches!(column, Column::Stack(_)));
-        let changed = if is_stacked {
-            proposed.unstack(entity)
-        } else {
-            let Ok(index) = original.index_of(entity) else {
-                return;
-            };
-            if index > 0
-                && original.get(index - 1).is_ok_and(|column| {
-                    column
-                        .window_iter()
-                        .any(|member| !windows.layout_is_writable(member))
-                })
-            {
-                return;
-            }
-            proposed.stack(entity)
-        };
-        match changed {
-            Ok(true) => {}
-            Ok(false) => return,
-            Err(error) => {
-                debug!(%error, "skipping stack toggle: no eligible layout item");
-                return;
-            }
-        }
-        if !proposed.accepts_column_widths(|_, column| {
-            column.width(&|member| windows.requested_frame(member))
-        }) {
-            return;
-        }
-        *active_display.active_strip() = proposed;
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<FullWidthMarker>();
-        }
-
-        // Stacking/unstacking moves the focused window to a new column slot
-        // (onto the left master, or out to its own column on the right).
-        // Reshuffle around it so it is brought fully back into view; the
-        // edge-clamp in reshuffle_layout_strip keeps the strip pinned so the
-        // leftmost window touches the left edge and the rightmost the right.
-        commands.reshuffle_around(entity);
-    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -2126,6 +1379,21 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
     use bevy::prelude::*;
 
+    fn set_column_width(world: &mut World, entity: Entity, width: f64) {
+        let mut strip = world.query::<&mut LayoutStrip>().single_mut(world).unwrap();
+        let id = strip.column_id(entity).unwrap();
+        strip
+            .set_width_intent(id, crate::ecs::layout::WidthIntent::Absolute(width))
+            .unwrap();
+    }
+    fn column_width(world: &mut World, entity: Entity) -> crate::ecs::layout::WidthIntent {
+        let strip = world.query::<&LayoutStrip>().single(world).unwrap();
+        strip
+            .column_state(strip.index_of(entity).unwrap())
+            .unwrap()
+            .width
+    }
+
     #[test]
     fn maximize_restores_pending_floating_geometry() {
         use crate::ecs::{RepositionMarker, ResizeMarker};
@@ -2189,7 +1457,7 @@ mod tests {
 
     #[test]
     fn native_tabs_share_width_and_restore_after_focus_changes() {
-        use crate::ecs::{RepositionMarker, ResizeMarker};
+        use crate::ecs::layout::WidthIntent;
         use crate::tests::{TestHarness, find_window_entity};
         let mut harness = TestHarness::new().with_windows(2);
         harness.pump_frames(5);
@@ -2202,35 +1470,23 @@ mod tests {
             .unwrap()
             .convert_to_tabs(first, second)
             .unwrap();
-        world.write_message(Event::action_requested(Action::Window(
-            Operation::SetWidth(0.75),
-        )));
-        world.run_system_once(dispatch_actions).unwrap();
-        for member in [first, second] {
-            assert_eq!(
-                world.get::<ResizeMarker>(member).unwrap().0,
-                Size::new(768, 748)
-            );
+        for (operation, expected) in [
+            (Operation::SetWidth(0.75), 0.75),
+            (Operation::Maximize, 1.0),
+            (Operation::Maximize, 0.75),
+        ] {
+            world.resource_mut::<Messages<Event>>().clear();
+            world.write_message(Event::action_requested(Action::Window(operation)));
+            world.run_system_once(dispatch_actions).unwrap();
+            for member in [first, second] {
+                assert_eq!(
+                    column_width(world, member),
+                    WidthIntent::ViewportRatio(expected)
+                );
+            }
+            world.entity_mut(first).remove::<FocusedMarker>();
+            world.entity_mut(second).insert(FocusedMarker);
         }
-        world.resource_mut::<Messages<Event>>().clear();
-        world.write_message(Event::action_requested(Action::Window(Operation::Maximize)));
-        world.run_system_once(dispatch_actions).unwrap();
-        assert!(
-            (world.get::<FullWidthMarker>(first).unwrap().width_ratio - 0.75).abs() < f64::EPSILON
-        );
-        for member in [first, second] {
-            assert_eq!(world.get::<ResizeMarker>(member).unwrap().0.x, 1024);
-        }
-        world.entity_mut(first).remove::<FocusedMarker>();
-        world.entity_mut(second).insert(FocusedMarker);
-        world.resource_mut::<Messages<Event>>().clear();
-        world.write_message(Event::action_requested(Action::Window(Operation::Maximize)));
-        world.run_system_once(dispatch_actions).unwrap();
-        for member in [first, second] {
-            assert_eq!(world.get::<ResizeMarker>(member).unwrap().0.x, 768);
-            assert!(world.get::<FullWidthMarker>(member).is_none());
-        }
-        assert!(world.get::<RepositionMarker>(second).is_some());
         assert_eq!(
             world.query::<&LayoutStrip>().single(world).unwrap().len(),
             1
@@ -2239,7 +1495,6 @@ mod tests {
 
     #[test]
     fn maximize_checks_split_width_budget_before_changing_layout() {
-        use crate::ecs::{RepositionMarker, ResizeMarker};
         use crate::tests::{TestHarness, find_window_entity};
         let mut harness = TestHarness::new().with_windows(3);
         harness.pump_frames(5);
@@ -2251,32 +1506,19 @@ mod tests {
             .unwrap()
             .stack(members[1])
             .unwrap();
-        for (member, width) in members
-            .into_iter()
-            .zip([i32::MAX - 1024, i32::MAX - 1024, 1])
-        {
-            world.entity_mut(member).insert((
-                RepositionMarker(Origin::ZERO),
-                ResizeMarker(Size::new(width, 300)),
-            ));
-        }
+        set_column_width(world, members[0], f64::from(i32::MAX - 1024));
+        set_column_width(world, members[2], 1.0);
         world.write_message(Event::action_requested(Action::Window(Operation::Maximize)));
         world.run_system_once(dispatch_actions).unwrap();
-        let strip = world.query::<&LayoutStrip>().single(world).unwrap();
-        assert_eq!(strip.len(), 2);
         assert_eq!(
-            strip.get(0).unwrap().window_iter().collect::<Vec<_>>(),
-            members[..2]
+            world.query::<&LayoutStrip>().single(world).unwrap().len(),
+            2
         );
         assert_eq!(
-            world.get::<ResizeMarker>(members[0]).unwrap().0.x,
-            i32::MAX - 1024
+            column_width(world, members[0]),
+            crate::ecs::layout::WidthIntent::Absolute(f64::from(i32::MAX - 1024))
         );
-        assert!(world.get::<FullWidthMarker>(members[0]).is_none());
-
-        world
-            .entity_mut(members[1])
-            .insert(ResizeMarker(Size::new(400, 300)));
+        set_column_width(world, members[1], 400.0);
         world.resource_mut::<Messages<Event>>().clear();
         world.write_message(Event::action_requested(Action::Window(Operation::Maximize)));
         world.run_system_once(dispatch_actions).unwrap();
@@ -2284,8 +1526,10 @@ mod tests {
             world.query::<&LayoutStrip>().single(world).unwrap().len(),
             3
         );
-        assert_eq!(world.get::<ResizeMarker>(members[0]).unwrap().0.x, 1024);
-        assert!(world.get::<FullWidthMarker>(members[0]).is_some());
+        assert_eq!(
+            column_width(world, members[0]),
+            crate::ecs::layout::WidthIntent::ViewportRatio(1.0)
+        );
     }
 
     #[test]
@@ -2396,50 +1640,74 @@ mod tests {
     }
 
     #[test]
-    fn resize_height_accumulates_on_pending_dimensions() {
+    fn floating_resize_height_accumulates_on_pending_dimensions() {
+        use crate::tests::find_window_entity;
+        let mut harness =
+            floating_geometry_harness(MainOptions::default(), IRect::new(0, 0, 1024, 768));
+        let entity = find_window_entity(0, harness.world());
+        let step = harness
+            .world()
+            .resource::<Config>()
+            .floating_window_resize_step();
+        let world = harness.world();
+        world
+            .entity_mut(entity)
+            .insert(crate::ecs::ResizeMarker(Size::new(600, 300)));
+        world.write_message(Event::action_requested(Action::Window(Operation::Resize {
+            axis: ResizeAxis::Height,
+            direction: ResizeDirection::Grow,
+        })));
+        world.run_system_once(dispatch_actions).unwrap();
+        assert_eq!(
+            world.get::<crate::ecs::ResizeMarker>(entity).unwrap().0,
+            Size::new(600, 300 + step)
+        );
+    }
+
+    #[test]
+    fn tiled_height_commands_accumulate_raw_intent_without_native_geometry() {
         use crate::tests::{TestHarness, find_window_entity};
-        for floating in [false, true] {
-            let mut harness = if floating {
-                floating_geometry_harness(MainOptions::default(), IRect::new(0, 0, 1024, 768))
-            } else {
-                let mut harness = TestHarness::new().with_windows(2);
-                harness.pump_frames(5);
-                let second = find_window_entity(1, harness.world());
-                let world = harness.world();
-                world
-                    .query::<&mut LayoutStrip>()
-                    .single_mut(world)
-                    .unwrap()
-                    .stack(second)
-                    .unwrap();
-                harness
-            };
-            let entity = find_window_entity(0, harness.world());
-            let step = harness
-                .world()
-                .resource::<Config>()
-                .floating_window_resize_step();
-            harness
-                .world()
-                .entity_mut(entity)
-                .insert(crate::ecs::ResizeMarker(Size::new(600, 300)));
-            harness
-                .world()
-                .write_message(Event::action_requested(Action::Window(Operation::Resize {
-                    axis: ResizeAxis::Height,
-                    direction: ResizeDirection::Grow,
-                })));
-            harness.world().run_system_once(dispatch_actions).unwrap();
-            assert_eq!(
-                harness
-                    .world()
-                    .get::<crate::ecs::ResizeMarker>(entity)
-                    .unwrap()
-                    .0,
-                Size::new(600, 300 + step),
-                "floating={floating}"
-            );
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.pump_frames(10);
+        let first = find_window_entity(0, harness.world());
+        let second = find_window_entity(1, harness.world());
+        let world = harness.world();
+        world
+            .query::<&mut LayoutStrip>()
+            .single_mut(world)
+            .unwrap()
+            .stack(second)
+            .unwrap();
+        let step = world.resource::<Config>().floating_window_resize_step();
+        let viewport = world
+            .run_system_once(|active: ActiveDisplay, config: Res<Config>| {
+                active.actual_bounds(&config).height()
+            })
+            .unwrap();
+        world
+            .entity_mut(first)
+            .insert(crate::ecs::ResizeMarker(Size::new(600, 211)));
+        for _ in 0..2 {
+            admission::execute(
+                world,
+                Action::TargetedWindow {
+                    window_id: 0,
+                    operation: Operation::Resize {
+                        axis: ResizeAxis::Height,
+                        direction: ResizeDirection::Grow,
+                    },
+                },
+            )
+            .unwrap();
         }
+        let strip = world.query::<&LayoutStrip>().single(world).unwrap();
+        let height = strip.effective_stack_heights(0, Some(viewport)).unwrap()[0].requested;
+        assert!((height - (f64::from(viewport) / 2.0 + 2.0 * f64::from(step))).abs() < 0.001);
+        assert_eq!(strip.height_state(first).unwrap().intent_revision, 2);
+        assert_eq!(
+            world.get::<crate::ecs::ResizeMarker>(first).unwrap().0,
+            Size::new(600, 211)
+        );
     }
 
     #[test]
@@ -2756,18 +2024,26 @@ mod tests {
                     250 + i32::try_from(index).unwrap(),
                 )));
         }
+        set_column_width(harness.world(), entities[0], 600.0);
         harness
             .world()
             .write_message(Event::action_requested(Action::Window(Operation::Balance)));
         harness.world().run_system_once(dispatch_actions).unwrap();
         for (index, entity) in entities.into_iter().enumerate() {
             assert_eq!(
+                column_width(harness.world(), entity),
+                crate::ecs::layout::WidthIntent::Absolute(600.0)
+            );
+            assert_eq!(
                 harness
                     .world()
                     .get::<crate::ecs::ResizeMarker>(entity)
                     .unwrap()
                     .0,
-                Size::new(600, 250 + i32::try_from(index).unwrap())
+                Size::new(
+                    if index == 0 { 600 } else { 400 },
+                    250 + i32::try_from(index).unwrap()
+                )
             );
         }
     }
@@ -2821,23 +2097,15 @@ mod tests {
             .map(|id| find_window_entity(id, harness.world()))
             .collect::<Vec<_>>();
         let width = i32::MAX / 3;
-        harness
-            .world()
-            .entity_mut(entities[0])
-            .insert(crate::ecs::ResizeMarker(Size::new(width, 500)));
+        set_column_width(harness.world(), entities[0], f64::from(width));
         harness
             .world()
             .write_message(Event::action_requested(Action::Window(Operation::Balance)));
         harness.world().run_system_once(dispatch_actions).unwrap();
         for entity in entities {
             assert_eq!(
-                harness
-                    .world()
-                    .get::<crate::ecs::ResizeMarker>(entity)
-                    .unwrap()
-                    .0
-                    .x,
-                width
+                column_width(harness.world(), entity),
+                crate::ecs::layout::WidthIntent::Absolute(f64::from(width))
             );
         }
     }
@@ -2858,12 +2126,7 @@ mod tests {
             .unwrap()
             .stack(members[1])
             .unwrap();
-        for &entity in &members {
-            harness
-                .world()
-                .entity_mut(entity)
-                .insert(Bounds(Size::new(i32::MAX / 2, 300)));
-        }
+        set_column_width(harness.world(), members[0], f64::from(i32::MAX / 2));
         harness
             .world()
             .entity_mut(members[1])
@@ -2888,9 +2151,7 @@ mod tests {
                 .get::<crate::ecs::ReshuffleAroundMarker>(members[1])
                 .is_none()
         );
-        for &entity in &members {
-            world.entity_mut(entity).insert(Bounds(Size::new(400, 300)));
-        }
+        set_column_width(world, members[0], 400.0);
         world.resource_mut::<Messages<Event>>().clear();
         world.write_message(Event::action_requested(Action::Window(
             Operation::ToggleStack,
@@ -2910,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn equalize_rejects_unavailable_or_unrepresentable_members_atomically() {
+    fn equalize_ignores_unavailable_or_unrepresentable_native_geometry() {
         use crate::tests::{TestHarness, find_window_entity};
         for unavailable in [false, true] {
             let mut harness = TestHarness::new().with_windows(2);
@@ -2925,6 +2186,12 @@ mod tests {
                 .stack(second)
                 .unwrap();
             world
+                .query::<&mut LayoutStrip>()
+                .single_mut(world)
+                .unwrap()
+                .set_height_weight(first, 3.0)
+                .unwrap();
+            world
                 .entity_mut(first)
                 .insert(crate::ecs::ResizeMarker(Size::new(600, 300)));
             world.entity_mut(second).insert((
@@ -2936,6 +2203,15 @@ mod tests {
             }
             world.write_message(Event::action_requested(Action::Window(Operation::Equalize)));
             world.run_system_once(dispatch_actions).unwrap();
+            let strip = world.query::<&LayoutStrip>().single(world).unwrap();
+            assert_eq!(
+                strip.height_state(first).unwrap().weight.to_bits(),
+                1.0_f64.to_bits()
+            );
+            assert_eq!(
+                strip.height_state(second).unwrap().weight.to_bits(),
+                1.0_f64.to_bits()
+            );
             assert_eq!(
                 world.get::<crate::ecs::ResizeMarker>(first).unwrap().0,
                 Size::new(600, 300)

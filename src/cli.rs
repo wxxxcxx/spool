@@ -5,7 +5,7 @@ use spool_shared_types::{
     commands::Action,
     inspection::{Filter, ReadMode, ReadRequest, Resource, Source},
 };
-use std::{ffi::OsString, path::PathBuf};
+use std::ffi::OsString;
 
 #[derive(Debug)]
 pub(crate) enum Invocation {
@@ -42,7 +42,6 @@ pub(crate) enum ServiceCommand {
     Uninstall,
     Reinstall,
     Logs(crate::logs::LogArgs),
-    MigrateState { path: Option<PathBuf>, apply: bool },
 }
 
 fn flag(name: &'static str) -> Arg {
@@ -159,6 +158,13 @@ pub(crate) fn command() -> Command {
             true,
         ))
         .subcommand(control(
+            Command::new("width")
+                .about("Set column slot width in points, a viewport percentage, or inherit")
+                .arg(positional("value"))
+                .arg(option("column").required(true))
+                .arg(option("space")),
+        ))
+        .subcommand(control(
             Command::new("equalize")
                 .arg(option("space"))
                 .arg(option("column")),
@@ -193,12 +199,7 @@ pub(crate) fn command() -> Command {
     service = service
         .subcommand(control(Command::new("quit")))
         .subcommand(control(Command::new("dump-state")))
-        .subcommand(crate::logs::LogArgs::augment_args(Command::new("logs")))
-        .subcommand(
-            Command::new("migrate-state")
-                .arg(option("path").value_parser(clap::value_parser!(PathBuf)))
-                .arg(flag("apply")),
-        );
+        .subcommand(crate::logs::LogArgs::augment_args(Command::new("logs")));
     let root = Command::new("spool")
         .version(crate::VERSION_STRING)
         .about(clap::crate_description!())
@@ -390,10 +391,6 @@ where
                 "uninstall" => ServiceCommand::Uninstall,
                 "reinstall" => ServiceCommand::Reinstall,
                 "logs" => ServiceCommand::Logs(crate::logs::LogArgs::from_arg_matches(matches)?),
-                "migrate-state" => ServiceCommand::MigrateState {
-                    path: matches.get_one::<PathBuf>("path").cloned(),
-                    apply: boolean(matches, "apply"),
-                },
                 _ => return Err(invalid("unknown service command")),
             };
             return Ok(Invocation::Service(command));

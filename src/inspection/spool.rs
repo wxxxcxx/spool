@@ -65,6 +65,9 @@ pub(crate) struct Projection<'w, 's> {
     geometry: GeometryRows<'w, 's>,
     apps: Query<'w, 's, (Entity, &'static Application)>,
     strips: StripRows<'w, 's>,
+    // Persistence includes retained strips even when their display parent is
+    // temporarily absent; diagnostics must capture the same domain snapshot.
+    all_strips: Query<'w, 's, &'static LayoutStrip>,
     displays: Query<
         'w,
         's,
@@ -76,6 +79,8 @@ pub(crate) struct Projection<'w, 's> {
         ),
     >,
     config: Res<'w, Config>,
+    sync: Res<'w, crate::ecs::reconcile::WindowStateSync>,
+    persistence: ResMut<'w, crate::ecs::state::StatePersistence>,
     lifecycle: Res<'w, crate::lifecycle::Lifecycle>,
 }
 
@@ -117,6 +122,20 @@ impl Budget {
 }
 
 impl Projection<'_, '_> {
+    fn capture_current_intent(&mut self) -> std::io::Result<()> {
+        let snapshot =
+            crate::ecs::state::SpoolState::from_layouts(self.all_strips.iter(), |entity| {
+                let (_, window, parent, ..) = self.windows.get(entity).ok()?;
+                let (_, app) = self.apps.get(parent.parent()).ok()?;
+                Some(crate::ecs::state::SavedWindow {
+                    window_id: window.id(),
+                    pid: app.pid(),
+                    bundle_id: app.bundle_id().unwrap_or_default().clone(),
+                })
+            });
+        self.persistence.capture(snapshot).map(|_| ())
+    }
+
     fn window_rows(&self, budget: &Budget) -> Vec<Value> {
         self.windows.iter().take_while(|_| budget.admit()).map(|(entity, window, parent, floating, focused, hidden, unavailable, parked, previous)| {
             let app = self.apps.get(parent.parent()).ok().map(|(_, app)| app);
@@ -142,7 +161,7 @@ impl Projection<'_, '_> {
             };
             json!({
                 "identity":{"id":window.id(),"pid":recorded(app.map(|app| app.pid())),"title":recorded(window.retained_title()),"bundle_id":recorded(app.and_then(|app| app.bundle_id())),"app_name":recorded(app.map(|app| app.name()))},
-                "geometry":{"desired":recorded(geometry.and_then(|row| row.0).map(|frame_| frame(frame_.0))),"presented":recorded(geometry.and_then(|row| row.1).map(|frame_| frame(frame_.0))),"observed":recorded(observed.map(frame))},
+                "geometry":{"realization": self.sync.frame_progress(entity).map(|progress| json!({"attempts":progress.attempts,"active":progress.active,"blocked":progress.blocked,"confirmed":progress.confirmed,"checks_pending":progress.checks_pending})),"desired":recorded(geometry.and_then(|row| row.0).map(|frame_| frame(frame_.0))),"presented":recorded(geometry.and_then(|row| row.1).map(|frame_| frame(frame_.0))),"observed":recorded(observed.map(frame))},
                 "layout":{"space_id":recorded(space_id),"column":column,"display_id":recorded(display_id),"previous_column":previous.map(|previous| previous.index+1)},
                 "state":{"available":!unavailable,"floating":floating,"focused":focused,"visible":hidden.is_none()&&!parked,"minimized":matches!(hidden,Some(WindowVisibility::Minimized)),"on_screen":recorded(on_screen),"motion":geometry.is_some_and(|row|row.3),"migration":geometry.is_some_and(|row|row.4||row.5),"blockers":{"unavailable":unavailable,"native_move":geometry.is_some_and(|row|row.4),"space_reassignment":geometry.is_some_and(|row|row.5),"parked":parked}}
             })
@@ -177,8 +196,8 @@ impl Projection<'_, '_> {
     fn layout_rows(&self, budget: &Budget) -> Vec<Value> {
         self.strips.iter().take_while(|_| budget.admit()).map(|(strip,parent,_,visible,active)| {
             json!({"identity":{"id":strip.id(),"space_id":strip.id(),"display_id":recorded(self.displays.get(parent.parent()).ok().map(|row|row.1.id()))},
-                "state":{"visible":visible,"active":active},"columns":strip.columns().enumerate().map(|(index,column)| {
-                    json!({"ordinal":index+1,"kind":column_kind(column),"windows":column.window_iter().map(|entity| {
+                "state":{"visible":visible,"active":active,"accepted_revision":self.persistence.accepted_revision(),"saved_revision":self.persistence.saved_revision(),"dirty":self.persistence.is_dirty()},"columns":strip.columns().enumerate().map(|(index,column)| {
+                    json!({"ordinal":index+1,"id":strip.column_state(index).map(|state| state.id.0),"width_intent":strip.column_state(index).map(|state| state.width),"intent_revision":strip.column_state(index).map(|state| state.intent_revision),"width_projection":match strip.effective_column_width(index) { Ok(value) => json!({"effective":value.slot,"requested":value.requested,"constrained":value.constrained}), Err(reason) => json!({"blocked":format!("{reason:?}")}) },"height_revision":strip.column_state(index).map(|state| state.height_revision),"height_items":strip.column_height_items(index).map(|items| items.iter().map(|item|json!({"id":item.id.0,"weight":item.weight,"intent_revision":item.intent_revision,"windows":item.members.iter().filter_map(|entity|self.windows.get(*entity).ok().map(|row|row.1.id())).collect::<Vec<_>>()})).collect::<Vec<_>>()),"height_projection":match strip.effective_stack_heights_for(index,self.displays.get(parent.parent()).ok().and_then(|row|row.1.checked_actual_display_bounds(row.2,&self.config)).map(|bounds|bounds.height()),&|entity|self.windows.get(entity).is_ok_and(|row|!row.6)) {Ok(values)=>json!(values.into_iter().map(|(id,value)|json!({"id":id.0,"requested":value.requested,"effective":value.slot,"constrained":value.constrained})).collect::<Vec<_>>()),Err(reason)=>json!({"blocked":format!("{reason:?}")})},"kind":column_kind(column),"windows":column.window_iter().map(|entity| {
                         self.windows.get(entity).ok().map_or_else(unknown, |row|json!({"id":row.1.id(),"available":!row.6,"visible":row.5.is_none()&&!row.7}))
                     }).collect::<Vec<_>>()})
                 }).collect::<Vec<_>>()})
@@ -269,7 +288,7 @@ fn issue(code: &str, target: &str) -> Issue {
     clippy::too_many_lines,
     reason = "exhaustive command/source branches share one admission or capture boundary"
 )]
-pub(crate) fn collect(In(request): In<ReadRequest>, state: Projection) -> Report {
+pub(crate) fn collect(In(request): In<ReadRequest>, mut state: Projection) -> Report {
     let started = std::time::Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
     let failed = if let Err(error) = request.validate() {
@@ -292,6 +311,13 @@ pub(crate) fn collect(In(request): In<ReadRequest>, state: Projection) -> Report
         Ok(selection) => selection,
         Err(error) => return Report::failure(&request, "invalid_request", &error),
     };
+    // An edit and a query can run in one command batch before PostUpdate.
+    // Capture now so current widths never appear beside a stale clean revision.
+    if request.resource == Resource::SpaceLayout
+        && let Err(error) = state.capture_current_intent()
+    {
+        return Report::failure(&request, "intent_capture_failed", &error.to_string());
+    }
     let capture_budget = Budget {
         started,
         duration: std::time::Duration::from_millis(request.timeout_ms),
@@ -447,6 +473,211 @@ mod tests {
                 harness.mock_state.workspace_membership_query_count()
             ),
             native_reads
+        );
+    }
+
+    #[test]
+    fn layout_inspection_after_an_immediate_edit_reports_unsaved_current_intent() {
+        use crate::commands::Action;
+        use crate::ecs::state::{StateFilePath, StatePersistence, periodic_state_save};
+        use crate::events::Event;
+        use crate::tests::{TEST_WORKSPACE_ID, TestHarness};
+        use bevy::app::PreUpdate;
+        use spool_shared_types::commands::{ColumnWidth, SpaceLayoutOperation};
+
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.pump_frames(10);
+        harness
+            .world()
+            .run_system_once(periodic_state_save)
+            .unwrap();
+        let path = harness
+            .world()
+            .resource::<StateFilePath>()
+            .as_path()
+            .to_path_buf();
+        let saved_bytes = std::fs::read(&path).unwrap();
+        let saved_revision = harness
+            .world()
+            .resource::<StatePersistence>()
+            .saved_revision()
+            .unwrap();
+        harness
+            .world()
+            .write_message(Event::action_requested(Action::SpaceLayout {
+                space_id: Some(TEST_WORKSPACE_ID),
+                operation: SpaceLayoutOperation::SetWidth {
+                    column: 1,
+                    width: ColumnWidth::Points(812.0),
+                },
+            }));
+        harness.world().run_schedule(PreUpdate);
+        // Do not run Update/PostUpdate: this models the next request in the
+        // same IPC batch, before the normal periodic capture system can run.
+        let native_activity = (
+            harness.mock_state.display_observation_count(),
+            harness.mock_state.workspace_membership_query_count(),
+            harness.mock_state.frame_write_attempts(0),
+        );
+        let mut request = ReadRequest::detail(
+            Resource::SpaceLayout,
+            Source::Spool,
+            Some(TEST_WORKSPACE_ID),
+        );
+        request.show = vec!["state".into(), "columns".into()];
+        let report = harness
+            .world()
+            .run_system_once_with(super::collect, request)
+            .unwrap();
+        assert_eq!(
+            report.data["columns"][0]["width_intent"],
+            serde_json::json!({"Absolute": 812.0})
+        );
+        assert_eq!(report.data["state"]["saved_revision"], saved_revision);
+        assert!(report.data["state"]["accepted_revision"].as_u64().unwrap() > saved_revision);
+        assert_eq!(report.data["state"]["dirty"], true);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            saved_bytes,
+            "inspection must not save the new intent"
+        );
+        assert_eq!(
+            native_activity,
+            (
+                harness.mock_state.display_observation_count(),
+                harness.mock_state.workspace_membership_query_count(),
+                harness.mock_state.frame_write_attempts(0),
+            ),
+            "inspection capture must not read or write native state"
+        );
+    }
+
+    /// Raw diagnostics keep every retained item, but the effective projection
+    /// must use the same participant policy as runtime projection. An
+    /// ordered-out sibling reserves no height and cannot create a false block.
+    #[test]
+    fn height_diagnostics_keep_ordered_out_items_raw_without_reserving_effective_height() {
+        use crate::ecs::layout::LayoutStrip;
+        use crate::tests::{TEST_WORKSPACE_ID, TestHarness, find_window_entity};
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.pump_frames(20);
+        let first = find_window_entity(0, harness.world());
+        let second = find_window_entity(1, harness.world());
+        {
+            let world = harness.world();
+            let mut strip = world.query::<&mut LayoutStrip>().single_mut(world).unwrap();
+            strip.stack(second).unwrap();
+            assert_eq!(strip.column_height_items(0).unwrap().len(), 2);
+            assert!(strip.height_viewport().is_some());
+        }
+        harness.mock_state.update_window(1, |window| {
+            window.published = false;
+            window.ordered_out = true;
+            window.visible = false;
+        });
+        harness.pump_frames(40);
+        assert!(
+            harness
+                .world()
+                .get::<super::WindowUnavailable>(second)
+                .is_some_and(super::WindowUnavailable::excludes_from_layout_projection),
+            "the sibling must be ordered out before the diagnostic is captured"
+        );
+        let viewport = {
+            let world = harness.world();
+            let strip = world.query::<&LayoutStrip>().single(world).unwrap();
+            strip
+                .height_viewport()
+                .expect("a resolved display viewport")
+        };
+        let mut request = ReadRequest::detail(
+            Resource::SpaceLayout,
+            Source::Spool,
+            Some(TEST_WORKSPACE_ID),
+        );
+        request.show = vec!["state".into(), "columns".into()];
+        let report = harness
+            .world()
+            .run_system_once_with(super::collect, request)
+            .unwrap();
+        let columns = report.data["columns"].as_array().unwrap();
+        let column = columns
+            .iter()
+            .find(|column| {
+                column["height_items"]
+                    .as_array()
+                    .is_some_and(|items| items.len() == 2)
+            })
+            .expect("the stacked column keeps both raw height items");
+        assert_eq!(
+            column["height_items"].as_array().unwrap().len(),
+            2,
+            "raw diagnostics must keep the ordered-out item"
+        );
+        let projection = column["height_projection"]
+            .as_array()
+            .expect("an ordered-out sibling cannot make the projection infeasible");
+        assert_eq!(
+            projection.len(),
+            1,
+            "only the participating item reserves effective height"
+        );
+        assert_eq!(
+            projection[0]["id"], column["height_items"][0]["id"],
+            "the effective projection must identify its item"
+        );
+        assert_eq!(projection[0]["effective"], viewport);
+        assert_eq!(
+            projection[0]["constrained"], false,
+            "a single participant fills the viewport without a minimum"
+        );
+        let _ = (first, second);
+    }
+
+    #[test]
+    fn height_inspection_captures_current_raw_intent_before_the_next_schedule() {
+        use crate::ecs::layout::LayoutStrip;
+        use crate::ecs::state::StatePersistence;
+        use crate::tests::{TEST_WORKSPACE_ID, TestHarness, find_window_entity};
+        let mut harness = TestHarness::new().with_windows(2);
+        harness.pump_frames(10);
+        let first = find_window_entity(0, harness.world());
+        let second = find_window_entity(1, harness.world());
+        let previous = harness
+            .world()
+            .resource::<StatePersistence>()
+            .accepted_revision();
+        let item_id = {
+            let world = harness.world();
+            let mut strip = world.query::<&mut LayoutStrip>().single_mut(world).unwrap();
+            strip.stack(second).unwrap();
+            strip.set_height_weight(first, 3.0).unwrap();
+            strip.height_state(first).unwrap().id.0
+        };
+        let activity = (
+            harness.mock_state.display_observation_count(),
+            harness.mock_state.frame_write_attempts(0),
+        );
+        let mut request = ReadRequest::detail(
+            Resource::SpaceLayout,
+            Source::Spool,
+            Some(TEST_WORKSPACE_ID),
+        );
+        request.show = vec!["state".into(), "columns".into()];
+        let report = harness
+            .world()
+            .run_system_once_with(super::collect, request)
+            .unwrap();
+        assert_eq!(report.data["columns"][0]["height_items"][0]["id"], item_id);
+        assert_eq!(report.data["columns"][0]["height_items"][0]["weight"], 3.0);
+        assert!(report.data["columns"][0]["height_projection"].is_array());
+        assert!(report.data["state"]["accepted_revision"].as_u64().unwrap() > previous);
+        assert_eq!(
+            activity,
+            (
+                harness.mock_state.display_observation_count(),
+                harness.mock_state.frame_write_attempts(0)
+            )
         );
     }
 }

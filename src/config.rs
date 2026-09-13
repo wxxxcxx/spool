@@ -4,7 +4,7 @@ use bevy::ecs::resource::Resource;
 use objc2_core_foundation::{CFData, CFString};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, de};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 #[cfg(feature = "lua")]
 use std::{
     env,
@@ -453,32 +453,6 @@ impl Config {
         self.options().mouse_resize_modifier
     }
 
-    pub fn restore_enabled(&self) -> bool {
-        self.inner()
-            .restore
-            .as_ref()
-            .and_then(|restore| restore.enabled)
-            .unwrap_or(true)
-    }
-
-    pub fn restore_startup_grace(&self) -> Duration {
-        Duration::from_millis(
-            self.inner()
-                .restore
-                .as_ref()
-                .and_then(|restore| restore.startup_grace_ms)
-                .unwrap_or(2000),
-        )
-    }
-
-    pub fn restore_missing_windows(&self) -> MissingWindowBehavior {
-        self.inner()
-            .restore
-            .as_ref()
-            .and_then(|restore| restore.missing_windows)
-            .unwrap_or(MissingWindowBehavior::Ignore)
-    }
-
     pub fn swipe_scroll_modifier(&self) -> Modifiers {
         let config = self.inner();
         config
@@ -653,6 +627,7 @@ impl From<(MainOptions, Vec<WindowParams>)> for Config {
 
 /// Configuration published atomically to the ECS and input handler.
 #[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
 struct InnerConfig {
     // Defaulted so a config may omit these; otherwise serde requires them.
     #[serde(default)]
@@ -663,20 +638,6 @@ struct InnerConfig {
     decorations: Option<decorations::DecorationsOptions>,
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
-    restore: Option<RestoreOptions>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum MissingWindowBehavior {
-    Ignore,
-}
-
-#[derive(Clone, Debug, Deserialize, Default)]
-pub struct RestoreOptions {
-    pub enabled: Option<bool>,
-    pub startup_grace_ms: Option<u64>,
-    pub missing_windows: Option<MissingWindowBehavior>,
 }
 
 /// `MainOptions` represents the primary configuration options for the window manager.
@@ -1742,38 +1703,10 @@ fn test_window_rules_track() {
 }
 
 #[test]
-fn test_restore_config_defaults() {
-    let config = Config::try_from("{}").expect("config should parse");
-
-    assert!(config.restore_enabled());
-    assert_eq!(config.restore_startup_grace(), Duration::from_secs(2));
-    assert_eq!(
-        config.restore_missing_windows(),
-        MissingWindowBehavior::Ignore
-    );
-}
-
-#[test]
-fn test_restore_config_explicit_values() {
-    let config = Config::try_from(
-        r#"{"restore": {"enabled": false, "startup_grace_ms": 750, "missing_windows": "ignore"}}"#,
-    )
-    .expect("config should parse");
-
-    assert!(!config.restore_enabled());
-    assert_eq!(config.restore_startup_grace(), Duration::from_millis(750));
-    assert_eq!(
-        config.restore_missing_windows(),
-        MissingWindowBehavior::Ignore
-    );
-}
-
-#[test]
-fn test_restore_config_rejects_unsupported_missing_window_policy() {
-    let err = Config::try_from(r#"{"restore": {"missing_windows": "reserve"}}"#)
-        .expect_err("unsupported restore missing-window policy should fail");
-
-    assert!(err.to_string().contains("unknown variant"));
+fn removed_restore_configuration_is_rejected() {
+    let error = Config::try_from(r#"{"restore": {"enabled": true}}"#)
+        .expect_err("removed automatic restore configuration must not silently succeed");
+    assert!(error.to_string().contains("unknown field `restore`"));
 }
 
 #[cfg(all(test, feature = "lua"))]

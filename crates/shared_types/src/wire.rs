@@ -219,6 +219,8 @@ mod tests {
     fn snapshot_bindings_survive_both_postcard_round_trips() {
         use crate::windowset::{LayoutSnapshot, WindowIdentity};
         let identity = LayoutSnapshot {
+            structures: std::collections::BTreeMap::new(),
+            columns: [(7, (101, 4))].into(),
             session: [73; 16],
             windows: [(
                 7,

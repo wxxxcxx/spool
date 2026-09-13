@@ -36,8 +36,8 @@ use crate::ecs::workspace::{PendingSpaceDestruction, WindowSpaceReassignmentPend
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DesiredWindowFrame, DockPosition, FlashMessage, Floating,
     Initializing, LowPowerMode, MissionControlActive, ObservedWindowFrame, Position,
-    PresentedWindowFrame, ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger,
-    WidthRatio, WindowFrameCommitSuspended, WindowFrameMotion, WindowProperties, WindowVisibility,
+    PresentedWindowFrame, ReadDisplayProperties, Scrolling, SendMessageTrigger,
+    WindowFrameCommitSuspended, WindowFrameMotion, WindowProperties, WindowVisibility,
 };
 use crate::events::{Event, FocusSource, InputEvent};
 use crate::manager::discovery::{DiscoveryOwner, WindowDiscovery};
@@ -85,7 +85,6 @@ type PendingWindowFrames<'w, 's> = Query<
         &'static mut Window,
         &'static mut PresentedWindowFrame,
         &'static mut DesiredWindowFrame,
-        &'static mut WidthRatio,
         Option<&'static mut ObservedWindowFrame>,
         (&'static mut Position, &'static mut Bounds),
         (
@@ -430,7 +429,6 @@ pub(crate) fn finish_setup(
     }
 
     commands.remove_resource::<Initializing>();
-    commands.trigger(RestoreWindowState);
 }
 
 /// Handles the event when a new application is launched. It creates a `Process` and `Application` object,
@@ -1504,6 +1502,7 @@ pub(super) fn animate_decoration_overlay(
 
 #[derive(SystemParam)]
 pub(super) struct WindowFrameCommitCtx<'w, 's> {
+    participants: super::params::LayoutParticipants<'w, 's>,
     windows: PendingWindowFrames<'w, 's>,
     layout_strips:
         Query<'w, 's, (&'static LayoutStrip, &'static ChildOf), Without<PendingSpaceDestruction>>,
@@ -1598,6 +1597,7 @@ pub(super) fn commit_default_window_frames(ctx: WindowFrameCommitCtx) {
 )]
 fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
     let WindowFrameCommitCtx {
+        participants,
         mut windows,
         layout_strips,
         displays,
@@ -1614,7 +1614,6 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
         mut window,
         mut presented,
         mut desired,
-        mut width_ratio,
         observed,
         (mut position, mut bounds),
         (default_frame, defaults_pending),
@@ -1672,6 +1671,11 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                 .represented_window_id()
                 .is_ok_and(|id| id == window.id())
         {
+            sync.finish_frame_attempt(entity, desired.0, false);
+            commands
+                .entity(entity)
+                .remove::<WindowFrameMotion>()
+                .insert(WindowFrameCommitSuspended::new(desired.0));
             continue;
         }
         // An inactive native tab is an identity, not another physical window.
@@ -1684,6 +1688,11 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                 .iter()
                 .any(|(strip, _)| strip.is_inactive_tab(entity))
         {
+            sync.finish_frame_attempt(entity, desired.0, false);
+            commands
+                .entity(entity)
+                .remove::<WindowFrameMotion>()
+                .insert(WindowFrameCommitSuspended::new(desired.0));
             continue;
         }
         if default_frame.is_some_and(|request| request.incarnation != window.incarnation()) {
@@ -1711,6 +1720,11 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
             .iter()
             .any(|(strip, _)| strip.is_fullscreen() && strip.contains(entity));
         if native_fullscreen || window.try_is_full_screen().unwrap_or(true) {
+            sync.finish_frame_attempt(entity, desired.0, false);
+            commands
+                .entity(entity)
+                .remove::<WindowFrameMotion>()
+                .insert(WindowFrameCommitSuspended::new(desired.0));
             continue;
         }
         if default_frame.is_none()
@@ -1718,6 +1732,11 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
             && transfer.is_none()
             && settling.contains(entity)
         {
+            sync.finish_frame_attempt(entity, desired.0, false);
+            commands
+                .entity(entity)
+                .remove::<WindowFrameMotion>()
+                .insert(WindowFrameCommitSuspended::new(desired.0));
             continue;
         }
         let target = if let Some(request) = transfer {
@@ -1729,38 +1748,70 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
             presented.bypass_change_detection().0 = request.target;
             request.target
         } else if correcting {
-            let Some(observed) = observed.as_ref() else {
-                continue;
-            };
-            if !sync.admit_frame_correction(
-                entity,
-                window.id(),
-                observed.0,
-                desired.0,
-                time.elapsed(),
-            ) {
-                continue;
-            }
-            presented.bypass_change_detection().0 = desired.0;
             desired.0
         } else {
             presented.0
         };
-        if !floating
-            && transfer.is_none()
-            && default_frame.is_none()
-            && interactive.is_none()
-            && let Some(display_width) = layout_strips
-                .iter()
-                .find_map(|(strip, child)| strip.contains(entity).then_some(child.parent()))
-                .and_then(|display_entity| displays.get(display_entity).ok())
-                .map(|(display, dock)| display.actual_display_bounds(dock, &config).width())
-                .filter(|width| *width > 0)
-        {
-            let desired_ratio = f64::from(desired.0.width()) / f64::from(display_width);
-            if (width_ratio.0 - desired_ratio).abs() > f64::EPSILON {
-                width_ratio.0 = desired_ratio;
+        let coordinated =
+            !floating && default_frame.is_none() && interactive.is_none() && transfer.is_none();
+        if coordinated {
+            // Logical edits to hidden Spaces are valid; native effects wait for
+            // the owning Space to become visible, without activating it.
+            if invisible
+                || !layout_strips.iter().any(|(strip, _)| {
+                    strip.contains(entity)
+                        && !strip.projection_is_blocked()
+                        && !participants.height_blocked(strip)
+                        && topology.visible_display_for_space(strip.id()).is_some()
+                })
+            {
+                sync.finish_frame_attempt(entity, desired.0, false);
+                commands
+                    .entity(entity)
+                    .remove::<WindowFrameMotion>()
+                    .insert(WindowFrameCommitSuspended::new(desired.0));
+                continue;
             }
+            if let Some((strip, _)) = layout_strips
+                .iter()
+                .find(|(strip, _)| strip.contains(entity))
+                && let Some(state) = strip
+                    .index_of(entity)
+                    .ok()
+                    .and_then(|index| strip.column_state(index))
+            {
+                sync.bind_frame_intent(
+                    entity,
+                    window.incarnation(),
+                    desired.0,
+                    (
+                        state.id,
+                        state.intent_revision,
+                        strip.structure_revision(),
+                        state.height_revision,
+                    ),
+                );
+            }
+            if observed.as_ref().is_some_and(|frame| frame.0 == target) {
+                sync.confirm_frame_convergence(entity, target, desired.0);
+                continue;
+            }
+            if !sync.begin_frame_attempt(
+                entity,
+                window.incarnation(),
+                desired.0,
+                time.elapsed(),
+                correcting,
+            ) {
+                commands
+                    .entity(entity)
+                    .remove::<WindowFrameMotion>()
+                    .insert(WindowFrameCommitSuspended::new(desired.0));
+                continue;
+            }
+        }
+        if correcting {
+            presented.bypass_change_detection().0 = target;
         }
         let diagnostic_started =
             tracing::enabled!(target: "spool::focus_diagnostics", tracing::Level::DEBUG)
@@ -1774,6 +1825,19 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
 
         match result {
             Ok(frame) => {
+                if coordinated {
+                    if !super::reconcile::frames_equivalent(frame, target) {
+                        // A successful AX call is not proof of ownership or a
+                        // permanent size constraint. Stop unknown competition.
+                        sync.finish_frame_attempt(entity, desired.0, true);
+                        commands
+                            .entity(entity)
+                            .remove::<WindowFrameMotion>()
+                            .insert(WindowFrameCommitSuspended::new(desired.0));
+                    } else if target == desired.0 {
+                        sync.confirm_frame_convergence(entity, frame, desired.0);
+                    }
+                }
                 if let Some(started) = diagnostic_started
                     && observed.as_ref().map(|observed| observed.0) != Some(frame)
                 {
@@ -1785,7 +1849,6 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                 if let Some(request) = transfer {
                     commands.entity(entity).insert(DisplayTransferReadback {
                         frame,
-                        viewport_width: request.viewport.width(),
                         incarnation: request.incarnation,
                         tiled: request.tiled,
                     });
@@ -1817,13 +1880,29 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                             bounds.0 = frame.size();
                         }
                         desired.set_if_neq(DesiredWindowFrame(frame));
-                    } else {
-                        settling.record(entity, &window, request.start, frame, time.elapsed());
+                    } else if let Some(context) = layout_strips.iter().find_map(|(strip, _)| {
+                        super::window_geometry::GeometryContext::capture(
+                            entity,
+                            desired.0,
+                            config.last_changed().get(),
+                            strip,
+                            &|member| participants.contains(member),
+                        )
+                    }) {
+                        settling.record(
+                            entity,
+                            &window,
+                            request.start,
+                            frame,
+                            time.elapsed(),
+                            context,
+                            true,
+                        );
                     }
                 }
                 if correcting {
-                    // Physical readback is not a new presentation request.
-                    presented.bypass_change_detection().0 = frame;
+                    // Presented remains the requested endpoint; observation
+                    // below independently records what macOS actually did.
                     if sync.confirm_frame_convergence(entity, frame, target) {
                         commands
                             .entity(entity)
@@ -1848,6 +1927,9 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                         write_us = started.elapsed().as_micros(), %error, "frame_commit_failed");
                 }
                 warn!(window_id = window.id(), %error, "unable to commit window frame");
+                if coordinated {
+                    sync.finish_frame_attempt(entity, desired.0, false);
+                }
                 suspend_failed_frame_commit(entity, &mut window, desired.0, &error, &mut commands);
             }
         }

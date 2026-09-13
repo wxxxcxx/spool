@@ -63,6 +63,8 @@ enum ToLua {
         ids: Vec<u32>,
     },
     Reload(PathBuf),
+    #[cfg(test)]
+    RegisteredBinds(Sender<Vec<super::runtime::LuaKeybind>>),
     Shutdown,
 }
 
@@ -481,6 +483,10 @@ fn run(
                     }
                     has_handlers.store(current.borrow().has_event_handlers(), Ordering::Relaxed);
                 }
+                #[cfg(test)]
+                ToLua::RegisteredBinds(reply) => {
+                    let _ = reply.try_send(current.borrow().published_keybinds());
+                }
                 ToLua::Shutdown => break,
             }
         }
@@ -524,8 +530,9 @@ impl Task<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecs::state::{SpaceKind, SpoolActiveState, SpoolSpaceState, SpoolWindowState};
+    use crate::ecs::state::{SpoolActiveState, SpoolSpaceState, SpoolWindowState};
     use crate::lua::convert::WindowSpawnPayload;
+    use spool_shared_types::state::SpaceKind;
     use spool_shared_types::windowset::LayoutOp;
 
     /// How long a test waits for the worker before calling it wedged. Generous:
@@ -543,13 +550,51 @@ mod tests {
         spawn_with_store(LuaSource::Inline(source.to_string()))
     }
 
+    // The event tap registry is process-global and intentionally tracks the
+    // newest daemon runtime. Concurrent unit-test workers must resolve IDs
+    // against their own runtime, not whichever test published most recently.
+    fn registered_binds(worker: &LuaWorker) -> Vec<super::super::runtime::LuaKeybind> {
+        let (reply, response) = bounded(1);
+        worker
+            .to_lua
+            .try_send(ToLua::RegisteredBinds(reply))
+            .unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Ok(binds) = response.try_recv() {
+                return binds;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out reading worker bindings"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn send_binds(worker: &LuaWorker, positions: &[usize]) {
-        let published = crate::platform::input::lua_keybinds();
+        let published = registered_binds(worker);
         worker.send_binds(
             positions
                 .iter()
                 .map(|position| published[position - 1].2)
                 .collect(),
+        );
+    }
+
+    #[test]
+    fn concurrent_test_workers_resolve_their_own_registered_bindings() {
+        let first = worker(
+            r#"
+            spool.bind("alt+a", function() spool.flash("first") end)
+            spool.bind("alt+b", function() spool.flash("second") end)
+        "#,
+        );
+        let _other = worker("");
+        send_binds(&first, &[2]);
+        assert_eq!(
+            next_flash(&first, "the first worker's second binding"),
+            "second"
         );
     }
 
@@ -1084,7 +1129,7 @@ mod tests {
         .unwrap();
 
         let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision());
-        let published = crate::platform::input::lua_keybinds();
+        let published = registered_binds(&worker);
         std::fs::write(
             &script,
             r#"spool.bind("alt+b", spool.action.quit); error("broken reload")"#,
@@ -1096,7 +1141,7 @@ mod tests {
             "a broken script should be reported"
         );
 
-        assert_eq!(crate::platform::input::lua_keybinds(), published);
+        assert_eq!(registered_binds(&worker), published);
         // ...and the bind registered by the working script still dispatches.
         worker.send_binds(vec![published[0].2]);
         assert!(matches!(
@@ -1119,7 +1164,7 @@ mod tests {
         });
         let script = directory.join("init.lua");
         let worker = worker(r#"spool.bind("alt+a", spool.action.window.focus_west)"#);
-        let old_id = crate::platform::input::lua_keybinds()[0].2;
+        let old_id = registered_binds(&worker)[0].2;
 
         std::fs::write(
             &script,
@@ -1136,7 +1181,7 @@ mod tests {
         ));
         assert_eq!(next_flash(&worker, "the reload notice"), "Lua reloaded");
 
-        let new_id = crate::platform::input::lua_keybinds()[1].2;
+        let new_id = registered_binds(&worker)[1].2;
         // The event tap captured old_id before the reload, but the main
         // thread only forwarded that queued event after the reload committed.
         worker.send_binds(vec![old_id, new_id]);
@@ -1287,6 +1332,8 @@ mod tests {
             Some(7),
         )
         .with_snapshot(spool_shared_types::windowset::LayoutSnapshot {
+            structures: std::collections::BTreeMap::new(),
+            columns: [(7, (101, 0))].into(),
             session: [73; 16],
             windows: [(
                 7,

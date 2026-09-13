@@ -859,10 +859,9 @@ fn raw_state_event(event: &Event) -> Option<StateEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecs::state::{
-        Frame, SpaceKind, SpoolDisplayState, SpoolSpaceState, SpoolWindowState,
-    };
+    use crate::ecs::state::{Frame, SpoolDisplayState, SpoolSpaceState, SpoolWindowState};
     use crate::events::Event as SpoolEvent;
+    use spool_shared_types::state::SpaceKind;
 
     #[test]
     fn subscriber_observes_focus_marker_removal_without_a_source_event() {

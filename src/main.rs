@@ -171,15 +171,6 @@ fn run() -> Result<u8> {
             cli::ServiceCommand::Stop => service()?.stop()?,
             cli::ServiceCommand::Restart => service()?.restart()?,
             cli::ServiceCommand::Logs(args) => logs::run(&service()?, &args)?,
-            cli::ServiceCommand::MigrateState { path, apply } => {
-                let path = path.unwrap_or_else(ecs::state::SpoolState::default_state_file_path);
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&ecs::state::SpoolState::migrate_file(
-                        &path, apply
-                    )?)?
-                );
-            }
         },
         cli::Invocation::Launcher { install } => {
             let launcher = platform::app_launcher::AppLauncher::try_new()?;

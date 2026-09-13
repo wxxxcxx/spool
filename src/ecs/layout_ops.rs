@@ -8,94 +8,194 @@
 //! the rest.
 
 use bevy::ecs::entity::Entity;
-use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::query::Without;
 use bevy::ecs::system::{Commands, In, Query, Res};
-use bevy::math::IRect;
 use spool_shared_types::windowset::{LayoutOp, LayoutPlan, LayoutSnapshot};
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::config::Config;
-use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::layout::{LayoutStrip, WidthIntent};
 use crate::ecs::layout_snapshot::{LayoutSession, matches_window};
 use crate::ecs::params::Windows;
 use crate::ecs::window_frame::checked_window_frame;
-use crate::ecs::{DockPosition, Floating, FullWidthMarker, RetileWindow, SpawnCommandsExt, Window};
+use crate::ecs::{Floating, RetileWindow, SpawnCommandsExt, Window};
 use crate::events::Event;
-use crate::manager::{Display, Origin, Size};
+use crate::manager::{Origin, Size};
 
 /// Applies the layout operations a Lua handler returned.
-pub(crate) fn apply_layout_plan(In(plan): In<LayoutPlan>, mut commands: Commands) {
-    // Each cached run flushes its observers before the next operation.
-    for op in &plan.ops {
-        commands.run_system_cached_with(apply_layout_op, (*op, Arc::clone(&plan.snapshot)));
+pub(crate) fn apply_layout_plan(In(plan): In<LayoutPlan>, world: &mut bevy::prelude::World) {
+    let Ok(initial) = world.run_system_cached(capture_column_bindings) else {
+        return;
+    };
+    let Ok(initial_structures) = world.run_system_cached(capture_structure_bindings) else {
+        return;
+    };
+    let stale_structures = plan
+        .snapshot
+        .windows
+        .keys()
+        .filter(|window| initial_structures.get(window) != plan.snapshot.structures.get(window))
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let stale = plan
+        .snapshot
+        .columns
+        .iter()
+        .filter_map(|(window, binding)| (initial.get(window) != Some(binding)).then_some(*window))
+        .collect::<std::collections::HashSet<_>>();
+    let mut snapshot = (*plan.snapshot).clone();
+    // This synchronous transaction does not yield to native events or Lua.
+    // Subsequent operations may address columns created by earlier operations
+    // in this plan, while an already-stale incoming binding stays rejected.
+    for op in plan.ops {
+        if matches!(
+            op,
+            LayoutOp::Swap(..) | LayoutOp::Stack { .. } | LayoutOp::Unstack(_)
+        ) && op
+            .targets()
+            .any(|window| stale_structures.contains(&window))
+        {
+            continue;
+        }
+        if let LayoutOp::SetWidth { window, .. } = op
+            && (stale.contains(&window) || !plan.snapshot.columns.contains_key(&window))
+        {
+            continue;
+        }
+        if let Err(error) =
+            world.run_system_cached_with(apply_layout_op, (op, Arc::new(snapshot.clone())))
+        {
+            debug!(%error, "layout operation unavailable");
+        }
+        if let Ok(columns) = world.run_system_cached(capture_column_bindings) {
+            snapshot.columns = columns;
+        }
+        if let Ok(structures) = world.run_system_cached(capture_structure_bindings) {
+            snapshot.structures = structures;
+        }
     }
 }
 
+fn capture_column_bindings(
+    windows: Windows,
+    strips: Query<&LayoutStrip>,
+) -> std::collections::BTreeMap<crate::platform::WinID, (u64, u64)> {
+    let windows = &windows;
+    strips
+        .iter()
+        .flat_map(|strip| {
+            strip
+                .columns()
+                .enumerate()
+                .flat_map(move |(index, column)| {
+                    let state = strip.column_state(index);
+                    column.window_iter().filter_map(move |entity| {
+                        Some((
+                            windows.get_any(entity)?.id(),
+                            (state?.id.0, state?.intent_revision),
+                        ))
+                    })
+                })
+        })
+        .collect()
+}
+
+fn capture_structure_bindings(
+    windows: Windows,
+    strips: Query<&LayoutStrip>,
+) -> std::collections::BTreeMap<crate::platform::WinID, (u64, u64)> {
+    strips
+        .iter()
+        .flat_map(|strip| {
+            strip
+                .columns()
+                .flat_map(|column| column.window_iter())
+                .filter_map(|entity| {
+                    Some((
+                        windows.get_any(entity)?.id(),
+                        (strip.id(), strip.structure_revision()),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordered identity and domain admission checks precede one operation"
+)]
 fn apply_layout_op(
     In((op, snapshot)): In<(LayoutOp, Arc<LayoutSnapshot>)>,
     windows: Windows,
-    mut workspaces: Query<(&mut LayoutStrip, &ChildOf), Without<Window>>,
-    displays: Query<(&Display, Option<&DockPosition>)>,
-    config: Res<Config>,
+    mut workspaces: Query<&mut LayoutStrip, Without<Window>>,
     session: Res<LayoutSession>,
+    topology: Res<super::topology::NativeTopology>,
     mut commands: Commands,
 ) {
     if !session.accepts(&snapshot, op, &windows) {
         debug!(target: "spool::lua", "skipping {op:?}: snapshot identity is no longer current");
         return;
     }
-    if matches!(
-        op,
-        LayoutOp::Swap(..)
-            | LayoutOp::Stack { .. }
-            | LayoutOp::Unstack(_)
-            | LayoutOp::SetWidth { .. }
-            | LayoutOp::SetFrame { .. }
-    ) && op.targets().any(|id| {
-        windows
-            .find(id)
-            .is_none_or(|(_, entity)| !windows.layout_is_writable(entity))
-    }) {
-        debug!(target: "spool::lua", "skipping {op:?}: native reassignment owns a layout endpoint");
+    if let LayoutOp::SetWidth { window, .. } = op {
+        let current = windows.find_any(window).and_then(|(_, entity)| {
+            workspaces.iter().find_map(|strip| {
+                let state = strip.column_state(strip.index_of(entity).ok()?)?;
+                Some((state.id.0, state.intent_revision))
+            })
+        });
+        let cohort_valid = windows.find_any(window).is_some_and(|(_, entity)| {
+            workspaces
+                .iter()
+                .find(|strip| strip.contains(entity))
+                .is_some_and(|strip| {
+                    strip.column_containing(entity).is_some_and(|column| {
+                        column.window_iter().all(|member| {
+                            !windows.layout_transition_pending(member)
+                                && windows.get_any(member).is_some_and(|window| {
+                                    matches_window(&snapshot, window.id(), &windows)
+                                })
+                        })
+                    })
+                })
+        });
+        if !cohort_valid || current.is_none() || snapshot.columns.get(&window).copied() != current {
+            debug!(target: "spool::lua", "rejecting stale column width edit");
+            return;
+        }
+    }
+    if matches!(op, LayoutOp::SetFrame { .. })
+        && op.targets().any(|id| {
+            windows
+                .find(id)
+                .is_none_or(|(_, entity)| !windows.layout_is_writable(entity))
+        })
+    {
         return;
     }
-    // Widths and native tab entries can affect more than the named endpoint.
-    // Check those current members too, without invalidating unrelated ops.
     if matches!(
         op,
-        LayoutOp::SetWidth { .. }
-            | LayoutOp::Swap(..)
-            | LayoutOp::Stack { .. }
-            | LayoutOp::Unstack(_)
+        LayoutOp::Swap(..) | LayoutOp::Stack { .. } | LayoutOp::Unstack(_)
     ) {
         for target in op.targets() {
-            let Some((_, entity)) = windows.find(target) else {
+            let Some((_, entity)) = windows.find_any(target) else {
                 return;
             };
-            let Some((strip, _)) = workspaces.iter().find(|(strip, _)| strip.contains(entity))
-            else {
-                continue;
+            let Some(strip) = workspaces.iter().find(|strip| strip.contains(entity)) else {
+                return;
             };
-            if !windows.layout_column_is_writable(strip, entity) {
-                debug!(target: "spool::lua", "skipping {op:?}: an affected column is not writable");
+            if snapshot.structures.get(&target) != Some(&(strip.id(), strip.structure_revision())) {
                 return;
             }
-            let members = if matches!(op, LayoutOp::SetWidth { .. }) {
-                strip
-                    .column_containing(entity)
-                    .map(|column| column.window_iter().collect())
-                    .unwrap_or_default()
-            } else {
-                strip.tab_group(entity).unwrap_or_else(|| vec![entity])
+            let Some(column) = strip.column_containing(entity) else {
+                return;
             };
-            if members.into_iter().any(|member| {
-                windows
-                    .get(member)
-                    .is_none_or(|window| !matches_window(&snapshot, window.id(), &windows))
+            if column.window_iter().any(|member| {
+                windows.layout_transition_pending(member)
+                    || windows
+                        .get_any(member)
+                        .is_none_or(|window| !matches_window(&snapshot, window.id(), &windows))
             }) {
-                debug!(target: "spool::lua", "skipping {op:?}: an affected layout member has been replaced");
                 return;
             }
         }
@@ -110,18 +210,7 @@ fn apply_layout_op(
         );
         return;
     }
-    let viewport = if let LayoutOp::SetWidth { window, .. } = op {
-        windows.find(window).and_then(|(_, entity)| {
-            workspaces
-                .iter()
-                .find(|(strip, _)| strip.contains(entity))
-                .and_then(|(_, child)| displays.get(child.parent()).ok())
-                .map(|(display, dock)| display.actual_display_bounds(dock, &config))
-        })
-    } else {
-        None
-    };
-    apply(op, &windows, &mut workspaces, viewport, &mut commands);
+    apply(op, &windows, &mut workspaces, &topology, &mut commands);
 }
 
 /// Applies one op, or explains why it could not be.
@@ -129,13 +218,24 @@ fn apply_layout_op(
 fn apply(
     op: LayoutOp,
     windows: &Windows,
-    workspaces: &mut Query<(&mut LayoutStrip, &ChildOf), Without<Window>>,
-    viewport: Option<IRect>,
+    workspaces: &mut Query<&mut LayoutStrip, Without<Window>>,
+    topology: &super::topology::NativeTopology,
     commands: &mut Commands,
 ) {
     // Resolve up front so every arm below can assume the window still exists.
     let entity = if let Some(window_id) = op.target() {
-        let Some((_, entity)) = windows.find(window_id) else {
+        let resolved = if matches!(
+            op,
+            LayoutOp::SetWidth { .. }
+                | LayoutOp::Swap(..)
+                | LayoutOp::Stack { .. }
+                | LayoutOp::Unstack(_)
+        ) {
+            windows.find_any(window_id)
+        } else {
+            windows.find(window_id)
+        };
+        let Some((_, entity)) = resolved else {
             debug!(
                 target: "spool::lua",
                 "skipping {op:?}: window {window_id} is gone since the handler ran"
@@ -150,40 +250,25 @@ fn apply(
     match op {
         LayoutOp::Swap(_, other) => {
             let entity = entity.expect("Swap names a window");
-            let Some((_, other_entity)) = windows.find(other) else {
+            let Some((_, other_entity)) = windows.find_any(other) else {
                 debug!(target: "spool::lua", "skipping {op:?}: window {other} is gone");
                 return;
             };
             if is_floating(entity, windows) || is_floating(other_entity, windows) {
                 return;
             }
-            let Some((mut strip, _)) = workspaces
+            let Some(mut strip) = workspaces
                 .iter_mut()
-                .find(|(strip, _)| strip.contains(entity) && strip.contains(other_entity))
+                .find(|strip| strip.contains(entity) && strip.contains(other_entity))
             else {
                 debug!(target: "spool::lua", "skipping {op:?}: the two windows share no strip");
                 return;
             };
-            let widths = (|| {
-                let left = strip.get(strip.index_of(entity).ok()?).ok()?;
-                let right = strip.get(strip.index_of(other_entity).ok()?).ok()?;
-                let left_width = left.width(&|member| windows.requested_frame(member))?;
-                let right_width = right.width(&|member| windows.requested_frame(member))?;
-                let left_members = strip.tab_group(entity).unwrap_or_else(|| vec![entity]);
-                let right_members = strip
-                    .tab_group(other_entity)
-                    .unwrap_or_else(|| vec![other_entity]);
-                let mut sizes = resized_members(windows, left_members, right_width)?;
-                sizes.extend(resized_members(windows, right_members, left_width)?);
-                Some(sizes)
-            })();
-            let Some(widths) = widths else {
-                return;
-            };
             match strip.swap_items(entity, other_entity) {
                 Ok(true) => {
-                    apply_member_sizes(widths, commands);
-                    commands.reshuffle_around(entity);
+                    if topology.visible_display_for_space(strip.id()).is_some() {
+                        commands.reshuffle_around(entity);
+                    }
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -203,40 +288,21 @@ fn apply(
 
         LayoutOp::SetWidth { ratio, .. } => {
             let entity = entity.expect("SetWidth names a window");
-            let Some(viewport) = viewport.filter(|frame| frame.width() > 0 && frame.height() > 0)
-            else {
-                return;
-            };
-            let width = (ratio * f64::from(viewport.width())).round();
-            if !(1.0..=f64::from(i32::MAX)).contains(&width) || is_floating(entity, windows) {
-                debug!(target: "spool::lua", "skipping {op:?}: no representable tiled width");
+            if is_floating(entity, windows) {
                 return;
             }
-            let Some((strip, _)) = workspaces.iter().find(|(strip, _)| strip.contains(entity))
-            else {
+            let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) else {
                 return;
             };
-            let width = crate::util::round_px(width);
-            if !strip.accepts_column_width(entity, width, |member| windows.requested_frame(member))
-            {
-                debug!(target: "spool::lua", "skipping {op:?}: the strip offsets overflow");
+            let Some(id) = strip.column_id(entity) else {
                 return;
+            };
+            let mut proposed = strip.clone();
+            match proposed.set_width_intent(id, WidthIntent::ViewportRatio(ratio)) {
+                Ok(_) if proposed.width_budget_is_valid() => *strip = proposed,
+                Ok(_) => debug!(target: "spool::lua", "column width offsets overflow"),
+                Err(error) => debug!(target: "spool::lua", %error, "invalid column width intent"),
             }
-            let Some(column) = strip
-                .index_of(entity)
-                .ok()
-                .and_then(|index| strip.get(index).ok())
-                .filter(|column| !matches!(column, Column::Fullscren(_)))
-            else {
-                return;
-            };
-            let sizes = resized_members(windows, column.window_iter(), width);
-            let Some(sizes) = sizes else {
-                debug!(target: "spool::lua", "skipping {op:?}: a column member has no representable frame");
-                return;
-            };
-            apply_member_sizes(sizes, commands);
-            commands.reshuffle_around(entity);
         }
 
         LayoutOp::SetFrame { frame, .. } => {
@@ -244,10 +310,8 @@ fn apply(
             // The layout engine owns a tiled window's geometry and will move
             // it back, so warn if the target isn't floated.
             if !is_floating(entity, windows) {
-                debug!(
-                    target: "spool::lua",
-                    "{op:?} targets a tiled window; float it first or the layout will move it back"
-                );
+                debug!(target: "spool::lua", "rejecting frame edit for tiled window");
+                return;
             }
             let origin = Origin::new(frame.x, frame.y);
             let size = Size::new(frame.width.max(1), frame.height.max(1));
@@ -261,7 +325,7 @@ fn apply(
 
         LayoutOp::Stack { onto, .. } => {
             let entity = entity.expect("Stack names a window");
-            let Some((_, onto_entity)) = windows.find(onto) else {
+            let Some((_, onto_entity)) = windows.find_any(onto) else {
                 debug!(target: "spool::lua", "skipping {op:?}: window {onto} is gone");
                 return;
             };
@@ -269,15 +333,19 @@ fn apply(
                 debug!(target: "spool::lua", "skipping {op:?}: a floating window has no stack slot");
                 return;
             }
-            let Some((mut strip, _)) = workspaces
+            let Some(mut strip) = workspaces
                 .iter_mut()
-                .find(|(strip, _)| strip.contains(entity) && strip.contains(onto_entity))
+                .find(|strip| strip.contains(entity) && strip.contains(onto_entity))
             else {
                 debug!(target: "spool::lua", "skipping {op:?}: the two windows share no strip");
                 return;
             };
             match strip.stack_onto(entity, onto_entity) {
-                Ok(true) => commands.reshuffle_around(entity),
+                Ok(true) => {
+                    if topology.visible_display_for_space(strip.id()).is_some() {
+                        commands.reshuffle_around(entity);
+                    }
+                }
                 Ok(false) => {}
                 Err(error) => {
                     debug!(target: "spool::lua", %error, "skipping {op:?}: the layout refused the stack");
@@ -290,23 +358,20 @@ fn apply(
             if is_floating(entity, windows) {
                 return;
             }
-            let Some((mut strip, _)) = workspaces
-                .iter_mut()
-                .find(|(strip, _)| strip.contains(entity))
-            else {
+            let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) else {
                 return;
             };
             let mut proposed = strip.clone();
             match proposed.unstack(entity) {
                 Ok(true) => {
-                    if !proposed.accepts_column_widths(|_, column| {
-                        column.width(&|member| windows.requested_frame(member))
-                    }) {
+                    if !proposed.width_budget_is_valid() {
                         debug!(target: "spool::lua", "skipping {op:?}: unstacked column offsets overflow");
                         return;
                     }
                     *strip = proposed;
-                    commands.reshuffle_around(entity);
+                    if topology.visible_display_for_space(strip.id()).is_some() {
+                        commands.reshuffle_around(entity);
+                    }
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -321,30 +386,6 @@ fn is_floating(entity: Entity, windows: &Windows) -> bool {
     windows
         .get_tracked(entity)
         .is_some_and(|(_, _, state)| state.is_floating())
-}
-
-fn resized_members(
-    windows: &Windows,
-    members: impl IntoIterator<Item = Entity>,
-    width: i32,
-) -> Option<Vec<(Entity, Size)>> {
-    members
-        .into_iter()
-        .map(|member| {
-            let frame = windows.requested_frame(member)?;
-            let size = frame.size().with_x(width);
-            checked_window_frame(frame.min, size).map(|_| (member, size))
-        })
-        .collect()
-}
-
-fn apply_member_sizes(sizes: Vec<(Entity, Size)>, commands: &mut Commands) {
-    for (member, size) in sizes {
-        commands.resize_entity(member, size);
-        if let Ok(mut entity_commands) = commands.get_entity(member) {
-            entity_commands.try_remove::<FullWidthMarker>();
-        }
-    }
 }
 
 /// Shares the normal retile observer's native membership and capability checks.

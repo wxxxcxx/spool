@@ -199,12 +199,6 @@ pub trait AXUIAttributes {
             .map(|value| value.to_string())
     }
 
-    fn identifier(&self) -> Result<String> {
-        let axname = CFString::from_str("AXIdentifier");
-        self.get_attribute::<CFString>(&axname)
-            .map(|value| value.to_string())
-    }
-
     fn minimized(&self) -> Result<bool> {
         let axname = CFString::from_static_str(kAXMinimizedAttribute);
         self.get_attribute::<CFBoolean>(&axname)

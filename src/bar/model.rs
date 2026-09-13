@@ -184,7 +184,7 @@ mod tests {
                     active: true,
                     columns: Arc::new(vec![ColumnSet {
                         kind: ColumnKind::Stack,
-                        width_ratio: 0.5,
+                        width_ratio: Some(0.5),
                         selected: 1,
                         items: Arc::new(vec![
                             StackItemSet::Single(window(10, false)),

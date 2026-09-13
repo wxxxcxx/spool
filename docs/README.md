@@ -19,6 +19,10 @@
 - [Domain glossary](CONTEXT.md)
 - [Architecture decisions](adr/)
 - [Declarative, state-driven window management](adr/0006-declarative-state-driven-window-management.md)
+- [Declarative state model and migration map](wayfinding/declarative-state/map.md)
+- [Declarative state implementation specification index](wayfinding/declarative-state/spec.md)
+- [Declarative column-width implementation and verification](wayfinding/declarative-state/implementation.md)
+- [Explicit intent ownership and bounded realization](adr/0007-explicit-intent-ownership-and-realization.md)
 - [Resource CLI and native inspection design (in progress)](NATIVE_INSPECTION.md)
 - [Resource CLI implementation plan](CLI_IMPLEMENTATION_PLAN.md)
 

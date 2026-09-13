@@ -210,6 +210,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.init_resource::<topology::NativeTopology>();
     app.init_resource::<layout_snapshot::LayoutSession>();
     app.init_resource::<defaults::DefaultRetries>();
+    app.init_resource::<state::StatePersistence>();
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
@@ -283,7 +284,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             reconcile::confirm_unavailable_windows,
             systems::refresh_window_notifications,
-            restore::tick_restore_grace,
             state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
             state::cleanup_on_exit,
             script_state::periodic_script_state_save.run_if(on_timer(Duration::from_mins(5))),
@@ -327,6 +327,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .chain(),
         ),
     );
+    app.add_systems(PostUpdate, state::capture_state_changes);
     app.add_systems(Last, exit_restore::restore_launch_windows);
 }
 
@@ -356,8 +357,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         .add_observer(triggers::spawn_window_trigger)
         .add_observer(triggers::send_message_trigger)
         .add_observer(triggers::window_removal_trigger)
-        .add_observer(triggers::cleanup_timeout_trigger)
-        .add_observer(restore::restore_window_state);
+        .add_observer(triggers::cleanup_timeout_trigger);
 }
 
 /// Projection of the tracked window most recently confirmed focused by macOS.
@@ -464,9 +464,6 @@ pub struct Bounds(pub Size);
 /// optimistic layout state or `WindowOS`'s write-through cache.
 #[derive(Component, Clone, Copy, Debug, Deref, DerefMut, PartialEq, Eq)]
 pub struct ObservedWindowFrame(pub bevy::math::IRect);
-
-#[derive(Component, Clone, Debug, Deref, DerefMut)]
-pub struct WidthRatio(pub f64);
 
 /// Marks a window entity that is currently on a native macOS fullscreen space.
 /// The window has been removed from its tiled position in the strip.
@@ -681,9 +678,6 @@ pub struct ReadDisplayProperties(pub Entity);
 pub struct SendMessageTrigger(pub Event);
 
 #[derive(BevyEvent)]
-pub struct RestoreWindowState;
-
-#[derive(BevyEvent)]
 pub struct RaiseWindow {
     pub entity: Entity,
     pub with_strip: bool,
@@ -866,7 +860,10 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
 
     let state_file_path = StateFilePath::default();
     if let Some(previous_state) = SpoolState::load_from_file(state_file_path.as_path()) {
-        app.insert_resource(previous_state);
+        app.insert_resource(state::StatePersistence::starting_after(
+            previous_state.revision,
+        ));
+        app.insert_resource(restore::RestoreCandidates::from(previous_state));
     }
     app.insert_resource(state_file_path);
 

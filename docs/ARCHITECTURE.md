@@ -23,6 +23,12 @@ until state admission and effects are separated. macOS still owns observed
 lifecycle, topology, membership, visibility, and physical geometry; accepted
 intent is distinct from confirmed native completion.
 
+[ADR 0007](adr/0007-explicit-intent-ownership-and-realization.md) and the
+[declarative state map](wayfinding/declarative-state/map.md) define the migration.
+The column-width slice now stores original intent independently and accepts
+background-Space width edits. Other arrangement, focus, and membership migrations
+remain separate stages. See the [implementation record](wayfinding/declarative-state/implementation.md).
+
 ### Independent Native Window Identity
 
 New discovery produces ordinary layout windows, not application tab groups.
@@ -54,7 +60,7 @@ Bevy is typically used for games, so Spool implements a custom bridge to interac
 1.  **Platform Layer:** `src/platform/` uses `objc2` and AppKit to interface with macOS. It runs a native event loop or hooks into OS notifications.
 2.  **Event Channel:** macOS events (mouse moves, window creations, space changes) are sent via a thread-safe `mpsc` channel.
 3.  **Pump System:** The `pump_events` system (in `src/ecs/systems.rs`) reads from this channel during the `PreUpdate` phase and writes Bevy `Message`s or triggers `Observer`s.
-4.  **Observers:** Bevy Observers (primarily in `src/ecs/triggers.rs`, with focused domains such as session restore in `src/ecs/restore.rs`) react to these events to update the ECS World (e.g., spawning new `Window` entities or updating `FocusedMarker`).
+4.  **Observers:** Bevy Observers (primarily in `src/ecs/triggers.rs`, with focused domain modules) react to these events to update the ECS World (e.g., spawning new `Window` entities or updating `FocusedMarker`).
 
 ### Declarative Frame Pipeline (ECS -> macOS -> ECS)
 1.  **Render:** `layout::position_layout_windows` derives `DesiredWindowFrame` from Layout State. This is the final target and does not advance gradually.
@@ -65,18 +71,15 @@ Bevy is typically used for games, so Spool implements a custom bridge to interac
 
 The flow is intentionally one-way. An ordinary macOS readback never mutates tiled Layout State. User- or application-driven geometry is first collected as a `Geometry Gesture`; only the settled final frame becomes a single Layout State action. Floating windows are the exception because no tiling neighbours depend on their geometry.
 
-`Balance` and `Equalize` prepare all affected sizes from `Windows::requested_frame`,
-including earlier resize/reposition markers, before queuing any changes. Missing
-members or unrepresentable proposed endpoints reject the batch. `Balance` also
-checks the complete proposed strip width, retaining native fullscreen columns
-in that budget without resizing them. Restore markers are removed only after
-the plan has passed validation.
-
-Ordinary resize and maximize also read pending Layout State, not an intermediate
-observed animation frame. Column-width changes validate all affected members
-before replacing requests or clearing restoration state. Maximize validates its
-proposed unstack and restore frame before changing membership; native tab groups
-resize together and can restore after focus switches between members.
+Column width commands and script operations share `LayoutStrip` intent edits.
+`ColumnId` survives reordering; `WidthIntent` distinguishes inherited configuration,
+absolute slot points, and viewport ratios. Commands resolve ordinals at admission,
+without activating a Space. Geometry is derived only when the owning viewport and
+trusted constraints permit it; native writes independently check current eligibility.
+`Balance` copies the reference column's original width variant. Maximize stores that
+variant for restoration and validates any unstack before publishing changes.
+`Equalize` still edits pending stack heights; that later migration is not part of the
+column-width slice.
 `Windows::moving_frame` overlays pending requests on the desired projection and
 rejects unrepresentable frames. Resize centering uses wide intermediate arithmetic;
 viewport clamping preserves representable origins and positive-size endpoints.
@@ -95,8 +98,8 @@ Layout projection pairs eligible members with their representative sizes before
 packing heights. Missing or invalid geometry is omitted from the projection, not
 removed from `LayoutStrip`. A native tab item uses its first eligible member and
 emits only eligible siblings; stored membership/order remains intact for recovery.
-Column offsets and projected window widths use the same eligible master, so a
-wider follower cannot create a transient gap before the next column.
+Column offsets and member frames use the same solved slot width. Member frames
+provide eligibility and height, never authoritative column width.
 
 Global frame projection keeps intermediate offsets in wide integers, applies
 the existing padding/sliver rules, and narrows only a representable final frame.
@@ -122,7 +125,7 @@ fails; setting only an application object's timeout does not cover its windows.
 
 Discovery validates the application entity, PID, process serial number, and
 liveness before publication. Exit cancels pending probes. Startup retains
-`Initializing` until the queue and its last spawn batch settle, so restore grace
+`Initializing` until the queue and its last spawn batch settle, so initialization
 starts afterwards; the event pump keeps its short timeout during this work.
 Neither AX handles nor discovered windows enter a background task pool.
 
@@ -178,7 +181,7 @@ objects stay on their owning threads.
 | `src/ecs/systems.rs` | Bevy systems for lifecycle management, event pumping, and state syncing. |
 | `src/ecs/params.rs` | High-level Bevy `SystemParam` abstractions for querying the World. |
 | `src/ecs/triggers.rs` | Reactive event handlers (Observers) for OS and internal events. |
-| `src/ecs/restore.rs` | Startup session restore planning and application, including window matching, layout rebuilding, and restore grace-period handling. |
+| `src/ecs/restore.rs` | Isolated saved candidates and pure atomic import with explicitly trusted bindings and a frozen initial baseline; no automatic matching. |
 | `src/ecs/native_space.rs` | Native Space topology, visibility, capability-gated commands, and post-operation reconciliation. |
 | `src/ecs/workspace.rs` | Native Space/display lifecycle event handling. |
 | `src/ecs/scroll.rs` | Input handling for trackpad swipe gestures, inertia, and snapping. |
@@ -311,7 +314,7 @@ The predicted tree does not make deferred operations synchronous. A Space move
 or view does not guarantee that later layout operations wait for native
 confirmation, and backend focus may reject a target on another display.
 
-Local IPC uses protocol version 5. Dispatch actions carry their snake-case serde
+Local IPC uses protocol version 6. Dispatch actions carry their snake-case serde
 names and payloads as a JSON string inside the postcard envelope, including
 nested operations; enum declaration order no longer determines action meaning.
 Renaming an action or payload field remains a wire contract change. Other
@@ -486,7 +489,7 @@ the shared visible-Space predicate also gates follow completion.
 - **`DesiredWindowFrame`:** The final geometry rendered from Layout State.
 - **`PresentedWindowFrame`:** The current animation/effect output and sole normal commit input.
 - **`ObservedWindowFrame`:** The latest geometry successfully read back from macOS.
-- **`WidthRatio`:** A window's relative width in the tiling strip.
+- **`ColumnState` / `WidthIntent`:** Stable column identity and original width, with separate intent and structure revisions.
 - **`FocusedMarker`:** Identifies the currently focused window.
 - **`ActiveWorkspaceMarker`**: Identifies the currently active workspace.
 - **`VisibleNativeSpaceMarker`**: Marks the native Space currently visible on each display.
@@ -500,8 +503,9 @@ the shared visible-Space predicate also gates follow completion.
 - **`WindowManager`:** A wrapper for the global window management state and OS bridge.
 - **`WindowDiscovery`:** A main-thread-only queue for incremental inactive-Space discovery.
 - **`Config`:** The current user configuration.
-- **`SpoolState`**: The v3 durable snapshot of displays and one layout per native Space, used for recovery after restarts.
-- **`SessionRestore`**: A short-lived startup resource that keeps loaded state and restore timing active until the startup grace period expires.
+- **`SpoolState`**: The v6 snapshot of original column-width and stack-height intent, stack item identity, and candidate member hints.
+- **`StatePersistence`**: Accepted/saved revisions, dirty state, and monotonic atomic publication.
+- **`RestoreCandidates`**: Isolated input; loading it does not alter layout or issue effects.
 - **`MissionControlActive`:** A flag indicating if macOS Mission Control is visible (disabling tiling).
 - **`FocusFollowsMouse`:** Tracks which window should gain focus based on mouse position.
 
@@ -522,41 +526,26 @@ the shared visible-Space predicate also gates follow completion.
 - **Confirmed surfaces:** Borders, hit-testing heuristics, tab detection, and public frame queries use observed geometry when it exists.
 - **Gesture coalescing:** Intermediate external move/resize notifications update observation only. Tiled Layout State changes once after the gesture quiet period, so neighbouring windows reflow once.
 - **Pure Layout:** Layout math (in `layout.rs`) should remain as pure as possible, operating on coordinates and ratios rather than directly calling OS APIs.
-- **Bounded Restore:** Saved session state is only consulted during startup restore. After `SessionRestore` expires, normal config and window-rule placement owns newly discovered windows.
+- **Isolated import:** Saved candidates do not match windows automatically. The pure import seam requires trusted mappings and a frozen baseline; later edits invalidate it.
 - **Reactive Power Saving:** Systems should use Bevy's reactive scheduling to avoid CPU usage when no windows are moving or events are occurring.
 
-## 6. Session Restore
+## 6. Intent persistence
 
-`src/ecs/state.rs` extracts and persists the restart snapshot. The state file is
-written atomically to `spool/state.json` in the XDG state directory
-(`~/.local/state/spool/state.json` on a default macOS setup) and is loaded
-during Bevy app setup.
+`src/ecs/state.rs` captures retained original intent independently of native inventory
+availability. Each column persists its kind and width intent, and each independently
+arranged stack item persists its identity, raw positive height weight, and one member
+slot per retained member. A member slot records a cached binding hint or an explicit
+absence, so an identity that was not resolvable at capture shortens nothing. In-memory
+capture publishes accepted and dirty revisions; periodic and exit saves sync a temporary
+file, rename it atomically, and sync its directory. An old snapshot cannot replace a
+newer accepted snapshot, and failure retains dirty state.
 
-
-Periodic and exit saves require a complete current native display/Space catalog
-before extracting the snapshot. A retained ECS projection is useful during an
-observation failure but is not evidence that a new durable snapshot is trustworthy;
-incomplete observations preserve the previous file until observation recovers.
-
-`src/ecs/restore.rs` owns startup restore. It keeps the loaded `SpoolState`
-alive in `SessionRestore` for the configured grace period so applications have
-time to reopen their windows. As windows arrive, `restore_window_state` builds a
-restore plan from the saved state and the currently tracked ECS windows.
-
-Window matching prefers stable identity (`window_id`, `pid`, and `bundle_id`)
-and uses the conservative fallback identity only when it can do so
-unambiguously. The fallback includes `bundle_id`, window title when available,
-window identifier, role, and subrole. Saved windows that are missing at startup
-are ignored by default, and the restored layout is compacted around the matched
-windows.
-
-Restore rebuilds one `LayoutStrip` per native Space and its display
-association. When the current macOS Space
-to display mapping conflicts with saved display data, the current mapping is
-preferred; otherwise restore falls back to the saved display, then the active
-display, then any available display. Matched startup windows skip static
-`[windows]` placement so the saved session wins, while unmatched windows and
-post-grace windows follow normal config behavior.
+The v6 file lives at `spool/state.json` in the XDG state directory. Older formats are
+ignored, not migrated. Loading creates `RestoreCandidates` only. No AX ID, title, PID or
+saved Space number proves cross-daemon continuity, and an unresolved member slot never
+authorizes a binding. The pure import seam validates supplied trusted bindings against a
+once-frozen initial layout and refuses later edits or structural changes. No automatic
+recovery or manual binding UI is supplied by this slice.
 
 ## 7. Data Flow Diagram
 
@@ -573,8 +562,8 @@ graph TD
     O -->|Border / query / drift comparison| Q[Consumers]
     O -. settled external geometry .-> E
     H[CommandReader] -->|Unix Socket| C
-    S[SpoolState file] -->|Startup load| R(session restore)
-    R -->|Rebuild saved strips| E
+    S[SpoolState file] -->|Startup load| R(isolated candidates)
+    R -. Explicit trusted pure import seam only .-> E
     E -->|Periodic / exit save| S
 ```
 
@@ -582,6 +571,6 @@ graph TD
 
 1.  **Pure Unit Tests:** Located in `src/tests.rs` and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.
 2.  **ECS Integration Tests:** Use Bevy's `App` or `World` to drive systems in isolation. macOS APIs are typically mocked via the `WindowApi` and `WindowManagerApi` traits.
-3.  **Session Restore Tests:** `src/tests/session_restore.rs` covers restore planning, missing-window compaction, startup grace behavior, config precedence, native Space restoration, and multi-display fallback.
+3.  **Session Restore Tests:** `src/tests/session_restore.rs` covers candidate isolation, trusted atomic import, frozen baselines, and rejection of stale edits or structural changes.
 4.  **FFI Verification:** Manual or semi-automated tests on macOS to ensure the Accessibility API calls behave as expected with native windows.
 5.  **Agent Support:** The `AGENTS.md` file provides project-specific guidance for AI agents to ensure contributions follow these architectural patterns.

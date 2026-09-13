@@ -3,7 +3,7 @@
 use bevy::prelude::*;
 
 use super::display_navigation::{DisplayTarget, select_display};
-use super::{DisplayTransferBlockedWindows, MoveFocus, checked_ratio_width, checked_window_frame};
+use super::{MoveFocus, checked_window_frame};
 use crate::config::Config;
 use crate::ecs::focus::FocusCoordinator;
 use crate::ecs::layout::{LayoutStrip, centered_origin_in_viewport};
@@ -13,6 +13,17 @@ use crate::ecs::topology::NativeTopology;
 use crate::ecs::workspace::PendingSpaceDestruction;
 use crate::ecs::{DockPosition, NativeFullscreenMarker};
 use crate::manager::{Display, Size, WindowManager};
+
+type DisplayTransferBlockedWindows<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    Or<(
+        With<crate::ecs::native_space::NativeMoveOwner>,
+        With<crate::ecs::workspace::WindowSpaceReassignmentPending>,
+        With<crate::ecs::WindowDefaultsPending>,
+    )>,
+>;
 
 type TransferStrips<'w, 's> = Query<
     'w,
@@ -92,7 +103,7 @@ pub(super) fn execute(
             .ok_or_else(|| crate::errors::Error::rejected("invalid_display_frame"))?;
         Ok((entity, viewport))
     };
-    let (source_display, source_viewport) = context(source_display_id)?;
+    let (source_display, _source_viewport) = context(source_display_id)?;
     let (target_display, target_viewport) = context(target_display_id)?;
     let layout = |id, display| -> crate::errors::Result<_> {
         let mut candidates = strips.iter().filter(|(strip, _)| strip.id() == id);
@@ -115,10 +126,12 @@ pub(super) fn execute(
         .requested_frame(entity)
         .ok_or_else(|| crate::errors::Error::rejected("geometry_unavailable"))?;
     let size = if state.is_tiled() {
-        let ratio = f64::from(frame.width()) / f64::from(source_viewport.width());
+        let index = source_strip.index_of(entity)?;
         Size::new(
-            checked_ratio_width(ratio, target_viewport.width())
-                .ok_or_else(|| crate::errors::Error::rejected("invalid_geometry"))?,
+            source_strip
+                .width_for_viewport(index, Some(target_viewport.width()))
+                .map_err(|_| crate::errors::Error::rejected("width_projection_blocked"))?
+                .slot,
             target_viewport.height(),
         )
     } else {
@@ -153,19 +166,10 @@ pub(super) fn execute(
     let mut source = source_strip.clone();
     let mut destination = destination_strip.clone();
     if state.is_tiled() {
-        for member in &members {
-            source.remove(*member);
-        }
-        destination.append_tab_group(&members);
-        if !destination.accepts_column_widths(|_, column| {
-            column.width(&|member| {
-                if members.contains(&member) {
-                    Some(target)
-                } else {
-                    windows.requested_frame(member)
-                }
-            })
-        }) {
+        let selected = members.iter().copied().collect();
+        let mut transferred = source.take_windows_preserving_layout(&selected);
+        destination.append_strip(&mut transferred);
+        if !destination.width_budget_is_valid() {
             return Err(crate::errors::Error::rejected("invalid_layout_geometry"));
         }
     }

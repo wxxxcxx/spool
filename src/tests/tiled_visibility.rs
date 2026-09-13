@@ -156,7 +156,6 @@ fn tile_visibility_excludes_parked_tiles_from_navigation_and_state() {
         .world()
         .run_system_once(|windows: Windows, active: ActiveDisplay| {
             assert_eq!(windows.navigable_strip(active.active_strip()).len(), 0);
-            assert_eq!(windows.tiled_iter().count(), 0);
             for (window, entity) in windows.iter() {
                 assert!(!windows.get_tracked(entity).unwrap().2.is_visible());
                 assert!(windows.find_tiled(window.id()).is_none());

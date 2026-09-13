@@ -1,715 +1,344 @@
+//! Isolated intent candidates and a pure import seam. There is deliberately no
+//! native identity matcher, startup observer, timer, or automatic restore writer.
+
+#![allow(
+    dead_code,
+    reason = "the first intent slice exposes only a trusted-mapping pure import seam; no runtime automatic binding provider exists"
+)]
+
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
-use bevy::ecs::component::Component;
-use bevy::ecs::entity::Entity;
-use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::observer::On;
-use bevy::ecs::query::With;
 use bevy::ecs::resource::Resource;
-use bevy::ecs::system::{Commands, Query, Res, ResMut, SystemParam};
-use bevy::time::{Time, Timer, TimerMode, Virtual};
-use tracing::{Level, info, instrument, warn};
 
-use crate::config::MissingWindowBehavior;
-use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::{WindowCtx, Windows};
-use crate::ecs::state::{SavedColumn, SavedSpace, SavedStackItem, SavedWindow, SpoolState};
-use crate::ecs::topology::WindowMemberships;
-use crate::ecs::workspace::PendingSpaceDestruction;
-use crate::ecs::{Floating, RefreshWindowSizes, RestoreWindowState};
-use crate::manager::{Application, Display, WindowManager};
-use crate::platform::{Pid, WinID, WindowIncarnation, WorkspaceId};
+use crate::ecs::layout::{ColumnId, LayoutStrip, StackItemId};
+use crate::ecs::state::SpoolState;
+use crate::errors::{Error, Result};
+use bevy::ecs::entity::Entity;
 
-#[derive(Component)]
-pub(super) struct RestoredWindowPlacement {
-    pub(super) incarnation: WindowIncarnation,
-}
-
+/// Reading a file only creates this resource. Its numeric binding hints never
+/// become macOS topology or authorize an effect.
 #[derive(Debug, Resource)]
-pub(crate) struct SessionRestore {
+pub struct RestoreCandidates {
     state: SpoolState,
-    timer: Timer,
+    import_window_open: bool,
+    initial_layouts: Option<HashMap<crate::platform::WorkspaceId, InitialLayout>>,
 }
 
-impl SessionRestore {
-    fn new(state: SpoolState, grace: Duration) -> Self {
+#[derive(Debug)]
+struct InitialLayout {
+    structure_revision: u64,
+    columns: HashMap<ColumnId, u64>,
+    items: HashMap<StackItemId, u64>,
+}
+
+impl From<SpoolState> for RestoreCandidates {
+    fn from(state: SpoolState) -> Self {
         Self {
             state,
-            timer: Timer::new(grace, TimerMode::Once),
+            import_window_open: true,
+            initial_layouts: None,
         }
     }
 }
 
-#[derive(Resource)]
-pub(super) struct RestoreRetry {
-    timer: Timer,
-    pending_defaults: HashMap<Entity, WindowIncarnation>,
-}
-
-impl RestoreRetry {
-    pub(super) fn preserves_defaults(
-        &self,
-        entity: Entity,
-        incarnation: WindowIncarnation,
-    ) -> bool {
-        self.pending_defaults.get(&entity) == Some(&incarnation)
+impl RestoreCandidates {
+    pub fn state(&self) -> &SpoolState {
+        &self.state
     }
-}
 
-fn defer_restore(ctx: &mut WindowCtx, apps: &Query<&Application>, state: &SpoolState) {
-    // Saved Spaces retain candidate eligibility during incomplete observation;
-    // only the complete live membership scan below can authorize placement.
-    let saved_spaces = state.spaces.iter().map(|space| space.space_id).collect();
-    let planner = RestorePlanner::for_present_spaces(state, &saved_spaces);
-    let pending_defaults = current_window_identities(&ctx.windows, apps, &planner)
-        .into_iter()
-        .filter(|window| planner.has_saved_candidate(window))
-        .filter_map(|identity| {
-            ctx.windows
-                .get(identity.entity)
-                .map(|window| (identity.entity, window.incarnation()))
-        })
-        .collect();
-
-    ctx.commands.queue(|world: &mut bevy::prelude::World| {
-        world
-            .resource_mut::<super::topology::NativeTopology>()
-            .request_refresh();
-    });
-    ctx.commands.insert_resource(RestoreRetry {
-        timer: Timer::new(Duration::from_millis(250), TimerMode::Once),
-        pending_defaults,
-    });
-}
-
-pub(super) fn tick_restore_grace(
-    time: Res<Time<Virtual>>,
-    mut session: Option<ResMut<SessionRestore>>,
-    mut retry: Option<ResMut<RestoreRetry>>,
-    mut commands: Commands,
-) {
-    let Some(session) = session.as_mut() else {
-        return;
-    };
-
-    session.timer.tick(time.delta());
-    if session.timer.is_finished() {
-        info!("Session restore grace period ended");
-        commands.remove_resource::<SessionRestore>();
-        commands.remove_resource::<SpoolState>();
-        commands.remove_resource::<RestoreRetry>();
-    } else if let Some(retry) = retry.as_mut() {
-        retry.timer.tick(time.delta());
-        if retry.timer.is_finished() {
-            commands.remove_resource::<RestoreRetry>();
-            commands.trigger(RestoreWindowState);
+    /// Called once by a trusted startup owner after initial discovery and before
+    /// current-session edits are admitted. Binding discovery may finish later,
+    /// but it cannot replace this baseline with a newer layout snapshot.
+    /// Reading candidates alone does not freeze or enable an import protocol.
+    pub fn freeze_initial_layouts<'a>(
+        &mut self,
+        layouts: impl IntoIterator<Item = &'a LayoutStrip>,
+    ) -> Result<()> {
+        if !self.import_window_open || self.initial_layouts.is_some() {
+            return Err(Error::InvalidInput(
+                "initial import baseline is already frozen or expired".into(),
+            ));
         }
+        let mut initial = HashMap::new();
+        for layout in layouts {
+            if initial
+                .insert(
+                    layout.id(),
+                    InitialLayout {
+                        structure_revision: layout.structure_revision(),
+                        items: layout
+                            .column_states()
+                            .flat_map(|column| &column.height_items)
+                            .map(|item| (item.id, item.intent_revision))
+                            .collect(),
+                        columns: layout
+                            .column_states()
+                            .map(|column| (column.id, column.intent_revision))
+                            .collect(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(Error::InvalidInput("duplicate initial import Space".into()));
+            }
+        }
+        self.initial_layouts = Some(initial);
+        Ok(())
+    }
+
+    /// A caller owning a future startup protocol must close its frozen candidate
+    /// set when the startup window ends. No automatic binding provider exists.
+    pub fn close_import_window(&mut self) {
+        self.import_window_open = false;
     }
 }
 
+/// The caller must prove the mapping; this module never infers it from IDs,
+/// titles, positions, PID, or process-local native hashes. The private revision
+/// gates are frozen before the eventual commit.
 #[derive(Clone, Debug)]
-pub(crate) struct CurrentWindowIdentity {
-    pub entity: Entity,
-    pub window_id: WinID,
-    pub pid: Pid,
-    pub bundle_id: String,
-    pub title: String,
-    pub identifier: String,
-    pub role: String,
-    pub subrole: String,
+pub struct TrustedColumnBinding {
+    candidate_space: usize,
+    candidate_column: usize,
+    target_space: crate::platform::WorkspaceId,
+    target_column: ColumnId,
+    structure_revision: u64,
+    intent_revision: u64,
+    heights: Vec<(usize, Entity, StackItemId)>,
 }
 
-impl CurrentWindowIdentity {
-    fn hard_key(&self) -> WindowHardMatchKey {
-        WindowHardMatchKey::new(self.window_id, self.pid, self.bundle_id.clone())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct WindowHardMatchKey {
-    window_id: WinID,
-    pid: Pid,
-    bundle_id: String,
-}
-
-impl WindowHardMatchKey {
-    fn new(window_id: WinID, pid: Pid, bundle_id: String) -> Self {
-        Self {
-            window_id,
-            pid,
-            bundle_id,
+impl TrustedColumnBinding {
+    pub fn new(
+        candidate_space: usize,
+        candidate_column: usize,
+        candidates: &RestoreCandidates,
+        target: &LayoutStrip,
+        column: ColumnId,
+    ) -> Result<Self> {
+        if !candidates.import_window_open {
+            return Err(Error::InvalidInput(
+                "intent import window has expired".into(),
+            ));
         }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PlannedColumn {
-    Single(Entity),
-    Stack(Vec<PlannedStackItem>),
-    Tabs(Vec<Entity>),
-    Fullscreen(Entity),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PlannedStackItem {
-    Single(Entity),
-    Tabs(Vec<Entity>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PlannedStrip {
-    pub workspace_id: WorkspaceId,
-    pub columns: Vec<PlannedColumn>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RestorePlan {
-    pub strips: Vec<PlannedStrip>,
-    pub consumed_entities: HashSet<Entity>,
-    pub ignored_missing_windows: usize,
-    pub skipped_ambiguous_matches: usize,
-}
-
-pub(crate) struct RestorePlanner<'a> {
-    state: &'a SpoolState,
-    present_spaces: &'a HashSet<WorkspaceId>,
-    saved_hard_keys: HashSet<WindowHardMatchKey>,
-}
-
-impl<'a> RestorePlanner<'a> {
-    pub(crate) fn for_present_spaces(
-        state: &'a SpoolState,
-        present_spaces: &'a HashSet<WorkspaceId>,
-    ) -> Self {
-        Self {
-            state,
-            present_spaces,
-            saved_hard_keys: saved_hard_match_keys_for_spaces(state, present_spaces),
+        let baseline = candidates
+            .initial_layouts
+            .as_ref()
+            .and_then(|layouts| layouts.get(&target.id()))
+            .ok_or_else(|| {
+                Error::InvalidInput("target has no frozen startup import baseline".into())
+            })?;
+        let initial_revision = baseline.columns.get(&column).ok_or_else(|| {
+            Error::InvalidInput("column was created after the startup import baseline".into())
+        })?;
+        if baseline.structure_revision != target.structure_revision() {
+            return Err(Error::InvalidInput(
+                "layout changed after the startup import baseline".into(),
+            ));
         }
+        let state = target
+            .column_states()
+            .find(|state| state.id == column)
+            .ok_or_else(|| Error::InvalidInput("import target column no longer exists".into()))?;
+        // Imports are lower priority than any explicit current-session edit,
+        // including an edit made before a delayed identity mapping arrives.
+        if state.intent_revision != *initial_revision || state.intent_revision != 0 {
+            return Err(Error::InvalidInput(
+                "import cannot replace a current-session width edit".into(),
+            ));
+        }
+        Ok(Self {
+            candidate_space,
+            candidate_column,
+            target_space: target.id(),
+            target_column: column,
+            structure_revision: baseline.structure_revision,
+            intent_revision: *initial_revision,
+            heights: Vec::new(),
+        })
     }
 
-    fn saved_spaces(&self) -> impl Iterator<Item = &'a SavedSpace> {
-        self.state
+    /// The caller proves each saved slot-to-live-slot correspondence explicitly.
+    /// Column shape or a matching ordinal alone never authorizes a height import.
+    pub fn with_heights(
+        mut self,
+        candidates: &RestoreCandidates,
+        target: &LayoutStrip,
+        mapping: &[(usize, Entity)],
+    ) -> Result<Self> {
+        if !self.heights.is_empty() {
+            return Err(Error::InvalidInput(
+                "height import mapping is already bound".into(),
+            ));
+        }
+        let source = candidates
+            .state
             .spaces
-            .iter()
-            .filter(|space| self.present_spaces.contains(&space.space_id))
-    }
-
-    fn saved_windows(&self) -> impl Iterator<Item = &'a SavedWindow> {
-        self.saved_spaces()
-            .flat_map(|space| &space.columns)
-            .flat_map(saved_windows_in_column)
-    }
-
-    fn has_saved_fallback_windows(&self) -> bool {
-        self.saved_windows().any(|window| !window.title.is_empty())
-    }
-
-    fn has_saved_candidate(&self, current: &CurrentWindowIdentity) -> bool {
-        self.current_window_has_saved_hard_match(current)
-            || self
-                .saved_windows()
-                .any(|saved| saved.fallback_match(current))
-    }
-
-    fn has_unresolved_membership(
-        &self,
-        current: &[CurrentWindowIdentity],
-        memberships: &WindowMemberships,
-    ) -> bool {
-        current.iter().any(|window| {
-            memberships.unique_space(window.window_id).is_none() && self.has_saved_candidate(window)
-        })
-    }
-
-    pub(crate) fn plan(
-        &self,
-        current: &[CurrentWindowIdentity],
-        memberships: &WindowMemberships,
-    ) -> RestorePlan {
-        let mut plan = RestorePlan::default();
-
-        for space in self.saved_spaces() {
-            let eligible = current
-                .iter()
-                .filter(|window| memberships.unique_space(window.window_id) == Some(space.space_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            let surviving_strips = self.plan_space(space, &eligible, &mut plan);
-            plan.strips.extend(surviving_strips);
-        }
-
-        plan
-    }
-
-    fn plan_space(
-        &self,
-        space: &SavedSpace,
-        current: &[CurrentWindowIdentity],
-        plan: &mut RestorePlan,
-    ) -> Vec<PlannedStrip> {
-        let columns = space
-            .columns
-            .iter()
-            .filter_map(|column| self.plan_column(column, current, plan))
-            .collect::<Vec<_>>();
-        if columns.is_empty() {
-            Vec::new()
-        } else {
-            vec![PlannedStrip {
-                workspace_id: space.space_id,
-                columns,
-            }]
-        }
-    }
-
-    fn plan_column(
-        &self,
-        column: &SavedColumn,
-        current: &[CurrentWindowIdentity],
-        plan: &mut RestorePlan,
-    ) -> Option<PlannedColumn> {
-        match column {
-            SavedColumn::Single(saved) => self
-                .match_window(saved, current, plan)
-                .map(PlannedColumn::Single),
-            SavedColumn::Fullscreen(saved) => self
-                .match_window(saved, current, plan)
-                .map(PlannedColumn::Fullscreen),
-            SavedColumn::Tabs(tabs) => compact_entities(
-                tabs.iter()
-                    .filter_map(|saved| self.match_window(saved, current, plan))
-                    .collect(),
-            ),
-            SavedColumn::Stack(items) => compact_stack_items(
-                items
-                    .iter()
-                    .filter_map(|item| self.plan_stack_item(item, current, plan))
-                    .collect(),
-            ),
-        }
-    }
-
-    fn plan_stack_item(
-        &self,
-        item: &SavedStackItem,
-        current: &[CurrentWindowIdentity],
-        plan: &mut RestorePlan,
-    ) -> Option<PlannedStackItem> {
-        match item {
-            SavedStackItem::Single(saved) => self
-                .match_window(saved, current, plan)
-                .map(PlannedStackItem::Single),
-            SavedStackItem::Tabs(tabs) => compact_stack_tabs(
-                tabs.iter()
-                    .filter_map(|saved| self.match_window(saved, current, plan))
-                    .collect(),
-            ),
-        }
-    }
-
-    fn match_window(
-        &self,
-        saved: &SavedWindow,
-        current: &[CurrentWindowIdentity],
-        plan: &mut RestorePlan,
-    ) -> Option<Entity> {
-        if let Some(window) = current.iter().find(|window| {
-            !plan.consumed_entities.contains(&window.entity)
-                && saved.hard_match(window.window_id, window.pid, &window.bundle_id)
-        }) {
-            plan.consumed_entities.insert(window.entity);
-            return Some(window.entity);
-        }
-
-        let fallback_matches = current
-            .iter()
-            .filter(|window| {
-                !plan.consumed_entities.contains(&window.entity)
-                    && saved.fallback_match(window)
-                    && !self.current_window_has_saved_hard_match(window)
-            })
-            .collect::<Vec<_>>();
-
-        match fallback_matches.as_slice() {
-            [window] => {
-                plan.consumed_entities.insert(window.entity);
-                Some(window.entity)
+            .get(self.candidate_space)
+            .and_then(|space| space.columns.get(self.candidate_column))
+            .ok_or_else(|| Error::InvalidInput("height import candidate absent".into()))?;
+        let current = target
+            .column_states()
+            .find(|column| column.id == self.target_column)
+            .ok_or_else(|| Error::InvalidInput("height import column absent".into()))?;
+        let live_column = target
+            .columns()
+            .zip(target.column_states())
+            .find(|(_, state)| state.id == self.target_column)
+            .map(|(column, _)| column)
+            .ok_or_else(|| Error::InvalidInput("height import arrangement absent".into()))?;
+        let live_kind = match live_column {
+            crate::ecs::layout::Column::Single(_) => {
+                spool_shared_types::windowset::ColumnKind::Single
             }
-            [] => {
-                plan.ignored_missing_windows += 1;
-                None
+            crate::ecs::layout::Column::Stack(_) => {
+                spool_shared_types::windowset::ColumnKind::Stack
             }
-            _ => {
-                plan.skipped_ambiguous_matches += 1;
-                None
+            crate::ecs::layout::Column::Tabs(_) => spool_shared_types::windowset::ColumnKind::Tabs,
+            crate::ecs::layout::Column::Fullscren(_) => {
+                spool_shared_types::windowset::ColumnKind::Fullscreen
             }
-        }
-    }
-
-    fn current_window_has_saved_hard_match(&self, current: &CurrentWindowIdentity) -> bool {
-        self.saved_hard_keys.contains(&current.hard_key())
-    }
-}
-
-fn saved_windows_in_column(column: &SavedColumn) -> Box<dyn Iterator<Item = &SavedWindow> + '_> {
-    match column {
-        SavedColumn::Single(saved) | SavedColumn::Fullscreen(saved) => {
-            Box::new(std::iter::once(saved))
-        }
-        SavedColumn::Tabs(tabs) => Box::new(tabs.iter()),
-        SavedColumn::Stack(items) => Box::new(items.iter().flat_map(saved_windows_in_stack_item)),
-    }
-}
-
-fn saved_windows_in_stack_item(
-    item: &SavedStackItem,
-) -> Box<dyn Iterator<Item = &SavedWindow> + '_> {
-    match item {
-        SavedStackItem::Single(saved) => Box::new(std::iter::once(saved)),
-        SavedStackItem::Tabs(tabs) => Box::new(tabs.iter()),
-    }
-}
-
-impl SavedWindow {
-    fn hard_key(&self) -> WindowHardMatchKey {
-        WindowHardMatchKey::new(self.window_id, self.pid, self.bundle_id.clone())
-    }
-
-    fn fallback_match(&self, current: &CurrentWindowIdentity) -> bool {
-        !self.title.is_empty()
-            && self.bundle_id == current.bundle_id
-            && self.title == current.title
-            && self.identifier == current.identifier
-            && self.role == current.role
-            && self.subrole == current.subrole
-    }
-}
-
-fn saved_hard_match_keys_for_spaces(
-    state: &SpoolState,
-    present_spaces: &HashSet<WorkspaceId>,
-) -> HashSet<WindowHardMatchKey> {
-    state
-        .spaces
-        .iter()
-        .filter(|space| present_spaces.contains(&space.space_id))
-        .flat_map(|space| &space.columns)
-        .flat_map(saved_windows_in_column)
-        .map(SavedWindow::hard_key)
-        .collect()
-}
-
-pub(crate) fn eligible_restore_space_ids(
-    present_spaces: impl IntoIterator<Item = WorkspaceId>,
-    pending_space_ids: impl IntoIterator<Item = WorkspaceId>,
-) -> HashSet<WorkspaceId> {
-    let pending = pending_space_ids.into_iter().collect::<HashSet<_>>();
-    present_spaces
-        .into_iter()
-        .filter(|workspace_id| !pending.contains(workspace_id))
-        .collect()
-}
-
-#[derive(SystemParam)]
-pub(super) struct RestoreWindowStateCtx<'w, 's> {
-    workspaces: Query<
-        'w,
-        's,
-        (Entity, &'static mut LayoutStrip, Option<&'static ChildOf>),
-        With<super::native_space::NativeSpace>,
-    >,
-    displays: Query<'w, 's, &'static Display>,
-    apps: Query<'w, 's, &'static Application>,
-    pending_spaces: Query<'w, 's, &'static PendingSpaceDestruction>,
-    session: Option<Res<'w, SessionRestore>>,
-    restoration: Option<Res<'w, SpoolState>>,
-    window_manager: Res<'w, WindowManager>,
-    topology: Res<'w, super::topology::NativeTopology>,
-    window: WindowCtx<'w, 's>,
-}
-
-#[allow(clippy::too_many_lines)]
-#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-pub(super) fn restore_window_state(_: On<RestoreWindowState>, restore: RestoreWindowStateCtx) {
-    let RestoreWindowStateCtx {
-        mut workspaces,
-        displays,
-        apps,
-        pending_spaces,
-        session,
-        restoration,
-        window_manager,
-        topology,
-        window: mut ctx,
-    } = restore;
-    let restoration = if let Some(session) = session.as_deref() {
-        &session.state
-    } else {
-        let Some(restoration) = restoration.as_deref() else {
-            return;
         };
-        if !ctx.config.restore_enabled() {
-            info!("Session restore disabled by configuration");
-            ctx.commands.remove_resource::<SpoolState>();
-            return;
+        if source.kind != live_kind {
+            return Err(Error::InvalidInput(
+                "height import arrangement differs".into(),
+            ));
         }
-        match ctx.config.restore_missing_windows() {
-            MissingWindowBehavior::Ignore => {}
+        if mapping.len() != source.items.len() || mapping.len() != current.height_items.len() {
+            return Err(Error::InvalidInput(
+                "height import requires a complete slot mapping".into(),
+            ));
         }
-        ctx.commands.insert_resource(SessionRestore::new(
-            restoration.clone(),
-            ctx.config.restore_startup_grace(),
-        ));
-        restoration
-    };
-
-    let Ok(memberships) = topology
-        .observe_memberships(&window_manager)
-        .inspect_err(|error| {
-            warn!(%error, "Session restore deferred: native membership unavailable");
-        })
-    else {
-        defer_restore(&mut ctx, &apps, restoration);
-        return;
-    };
-    let topology = topology.known_displays().collect::<Vec<_>>();
-    let mut live_space_displays = HashMap::new();
-    for (display, spaces) in &topology {
-        for workspace_id in *spaces {
-            live_space_displays.insert(*workspace_id, display.id());
-        }
-    }
-    let present_spaces = eligible_restore_space_ids(
-        topology
-            .iter()
-            .flat_map(|(_, spaces)| spaces.iter().copied()),
-        pending_spaces.iter().map(|pending| pending.workspace_id),
-    );
-    let planner = RestorePlanner::for_present_spaces(restoration, &present_spaces);
-    let current = current_window_identities(&ctx.windows, &apps, &planner);
-    if planner.has_unresolved_membership(&current, &memberships) {
-        defer_restore(&mut ctx, &apps, restoration);
-        return;
-    }
-    let plan = planner.plan(&current, &memberships);
-    ctx.commands.remove_resource::<RestoreRetry>();
-
-    if plan.consumed_entities.is_empty() {
-        info!(
-            "Session restore matched 0 windows; missing={}, ambiguous={}",
-            plan.ignored_missing_windows, plan.skipped_ambiguous_matches
-        );
-        return;
-    }
-
-    let targets = plan
-        .strips
-        .iter()
-        .filter_map(|planned| {
-            workspaces.iter().find_map(|(entity, strip, child)| {
-                let display = child.and_then(|child| displays.get(child.parent()).ok())?;
-                (strip.id() == planned.workspace_id
-                    && !pending_spaces.contains(entity)
-                    && live_space_displays.get(&planned.workspace_id) == Some(&display.id()))
-                .then_some((planned.workspace_id, entity))
-            })
-        })
-        .collect::<HashMap<_, _>>();
-    if targets.len() != plan.strips.len() {
-        defer_restore(&mut ctx, &apps, restoration);
-        return;
-    }
-    for planned in &plan.strips {
-        if matches!(planned.columns.as_slice(), [PlannedColumn::Fullscreen(_)])
-            && workspaces
-                .get(targets[&planned.workspace_id])
-                .is_ok_and(|(_, strip, _)| {
-                    strip
-                        .all_windows()
+        let mut sources = HashSet::new();
+        let mut targets = HashSet::new();
+        for &(index, entity) in mapping {
+            let item = target
+                .height_state(entity)
+                .filter(|item| {
+                    current
+                        .height_items
                         .iter()
-                        .any(|entity| !plan.consumed_entities.contains(entity))
+                        .any(|candidate| candidate.id == item.id)
                 })
-        {
-            warn!("Skipping fullscreen restore that would discard unmatched live members");
-            return;
+                .ok_or_else(|| Error::InvalidInput("height import target absent".into()))?;
+            if source.items.get(index).is_none()
+                || !sources.insert(index)
+                || !targets.insert(item.id)
+                || item.intent_revision != 0
+                || candidates
+                    .initial_layouts
+                    .as_ref()
+                    .and_then(|layouts| layouts.get(&target.id()))
+                    .and_then(|initial| initial.items.get(&item.id))
+                    != Some(&0)
+            {
+                return Err(Error::InvalidInput(
+                    "stale or duplicate height import mapping".into(),
+                ));
+            }
+            self.heights.push((index, entity, item.id));
         }
+        Ok(self)
     }
-    for (_, mut strip, _) in &mut workspaces {
-        for entity in &plan.consumed_entities {
-            strip.remove(*entity);
-        }
-    }
+}
 
-    for entity in &plan.consumed_entities {
-        if let Some(window) = ctx.windows.get(*entity)
-            && let Ok(mut entity_commands) = ctx.commands.get_entity(*entity)
-        {
-            entity_commands.try_insert(RestoredWindowPlacement {
-                incarnation: window.incarnation(),
+/// Validates every binding and applies one strip transaction. No group creation,
+/// Space movement, focus change, or native calls occur. Mock bindings exercise
+/// this seam; they do not establish cross-daemon identity continuity.
+pub fn import_intents(
+    candidates: &RestoreCandidates,
+    target: &mut LayoutStrip,
+    bindings: &[TrustedColumnBinding],
+) -> Result<usize> {
+    if !candidates.import_window_open
+        || candidates.initial_layouts.is_none()
+        || !candidates.state.valid()
+    {
+        return Err(Error::InvalidInput(
+            "intent import candidates are invalid or expired".into(),
+        ));
+    }
+    let mut target_ids = HashSet::new();
+    let mut source_ids = HashSet::new();
+    let mut edits = Vec::with_capacity(bindings.len());
+    let mut height_edits = Vec::new();
+    for binding in bindings {
+        let baseline_matches = candidates
+            .initial_layouts
+            .as_ref()
+            .and_then(|layouts| layouts.get(&binding.target_space))
+            .is_some_and(|baseline| {
+                baseline.structure_revision == binding.structure_revision
+                    && baseline.columns.get(&binding.target_column)
+                        == Some(&binding.intent_revision)
             });
-            entity_commands.try_remove::<Floating>();
+        if !baseline_matches
+            || binding.target_space != target.id()
+            || binding.structure_revision != target.structure_revision()
+            || !target_ids.insert(binding.target_column)
+            || !source_ids.insert((binding.candidate_space, binding.candidate_column))
+        {
+            return Err(Error::InvalidInput(
+                "stale or duplicate intent import mapping".into(),
+            ));
         }
-    }
-
-    let mut restored_strips = 0;
-    for planned in &plan.strips {
-        let mut strip = layout_strip_from_plan(planned);
-        let entity = targets[&planned.workspace_id];
-        let Ok((_, mut existing, _)) = workspaces.get_mut(entity) else {
-            continue;
-        };
-        if !strip.is_fullscreen() {
-            strip.append_strip(&mut existing);
+        let current = target
+            .column_states()
+            .find(|state| state.id == binding.target_column)
+            .ok_or_else(|| Error::InvalidInput("import target column no longer exists".into()))?;
+        if current.intent_revision != binding.intent_revision || current.intent_revision != 0 {
+            return Err(Error::InvalidInput(
+                "intent import would overwrite a newer width edit".into(),
+            ));
         }
-        *existing = strip;
-        ctx.commands
-            .entity(entity)
-            .insert(RefreshWindowSizes::default());
-        restored_strips += 1;
-    }
-
-    info!(
-        "Session restore applied: matched={}, strips={}, missing={}, ambiguous={}",
-        plan.consumed_entities.len(),
-        restored_strips,
-        plan.ignored_missing_windows,
-        plan.skipped_ambiguous_matches
-    );
-}
-
-fn layout_strip_from_plan(planned: &PlannedStrip) -> LayoutStrip {
-    if let [PlannedColumn::Fullscreen(entity)] = planned.columns.as_slice() {
-        return LayoutStrip::fullscreen(planned.workspace_id, *entity);
-    }
-
-    let mut strip = LayoutStrip::new(planned.workspace_id);
-    apply_planned_columns(&mut strip, &planned.columns);
-    strip
-}
-
-fn current_window_identities(
-    windows: &Windows,
-    apps: &Query<&Application>,
-    planner: &RestorePlanner,
-) -> Vec<CurrentWindowIdentity> {
-    let mut current = windows
-        .tiled_iter()
-        .filter_map(|(window, entity, child)| {
-            let app = apps.get(child.parent()).ok()?;
-            Some(CurrentWindowIdentity {
-                entity,
-                window_id: window.id(),
-                pid: window.pid().ok()?,
-                bundle_id: app.bundle_id().unwrap_or_default().clone(),
-                title: String::new(),
-                identifier: String::new(),
-                role: String::new(),
-                subrole: String::new(),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    if planner.has_saved_fallback_windows() {
-        hydrate_fallback_identities(&mut current, windows, &planner.saved_hard_keys);
-    }
-
-    current
-}
-
-fn hydrate_fallback_identities(
-    current: &mut [CurrentWindowIdentity],
-    windows: &Windows,
-    saved_hard_keys: &HashSet<WindowHardMatchKey>,
-) {
-    for identity in current {
-        if saved_hard_keys.contains(&identity.hard_key()) {
-            continue;
+        let source = candidates
+            .state
+            .spaces
+            .get(binding.candidate_space)
+            .and_then(|space| space.columns.get(binding.candidate_column))
+            .ok_or_else(|| Error::InvalidInput("intent import candidate is absent".into()))?;
+        // Even a width-only import cannot resurrect pre-edit column state after
+        // the user has edited one of this column's height preferences.
+        let baseline = candidates
+            .initial_layouts
+            .as_ref()
+            .and_then(|layouts| layouts.get(&target.id()))
+            .ok_or_else(|| Error::InvalidInput("height import baseline absent".into()))?;
+        if current
+            .height_items
+            .iter()
+            .any(|item| item.intent_revision != 0 || baseline.items.get(&item.id) != Some(&0))
+        {
+            return Err(Error::InvalidInput(
+                "intent import would overwrite a newer height edit".into(),
+            ));
         }
-        let Some(window) = windows.get(identity.entity) else {
-            continue;
-        };
-        identity.title = window.title().unwrap_or_default();
-        if identity.title.is_empty() {
-            continue;
-        }
-        identity.identifier = window.identifier().unwrap_or_default();
-        identity.role = window.role().unwrap_or_default();
-        identity.subrole = window.subrole().unwrap_or_default();
-    }
-}
-
-fn apply_planned_columns(strip: &mut LayoutStrip, columns: &[PlannedColumn]) {
-    for column in columns {
-        match column {
-            PlannedColumn::Single(entity) | PlannedColumn::Fullscreen(entity) => {
-                strip.append(*entity);
+        for &(index, entity, id) in &binding.heights {
+            if target
+                .height_state(entity)
+                .is_none_or(|item| item.id != id || item.intent_revision != 0)
+            {
+                return Err(Error::InvalidInput("height import target changed".into()));
             }
-            PlannedColumn::Tabs(entities) => {
-                append_tabs(strip, entities);
-            }
-            PlannedColumn::Stack(items) => {
-                append_stack(strip, items);
-            }
+            let item = source
+                .items
+                .get(index)
+                .ok_or_else(|| Error::InvalidInput("height import candidate absent".into()))?;
+            height_edits.push((entity, item.weight));
         }
+        edits.push((binding.target_column, source.width));
     }
-}
-
-fn append_tabs(strip: &mut LayoutStrip, entities: &[Entity]) -> Option<Entity> {
-    let leader = *entities.first()?;
-    strip.append(leader);
-    for follower in &entities[1..] {
-        _ = strip.convert_to_tabs(leader, *follower);
+    // Stage only the one domain object, so a future domain validation failure
+    // cannot leave an earlier binding partially applied.
+    let mut staged = target.clone();
+    let mut changed = 0;
+    for (column, width) in edits {
+        changed += usize::from(staged.set_width_intent(column, width)?);
     }
-    Some(leader)
-}
-
-fn append_stack(strip: &mut LayoutStrip, items: &[PlannedStackItem]) {
-    let mut first = true;
-    for item in items {
-        let Some(leader) = append_stack_item(strip, item) else {
-            continue;
-        };
-        if first {
-            first = false;
-        } else {
-            _ = strip.stack(leader);
-        }
+    for (entity, weight) in height_edits {
+        changed += usize::from(staged.set_height_weight(entity, weight)?);
     }
-}
-
-fn append_stack_item(strip: &mut LayoutStrip, item: &PlannedStackItem) -> Option<Entity> {
-    match item {
-        PlannedStackItem::Single(entity) => {
-            strip.append(*entity);
-            Some(*entity)
-        }
-        PlannedStackItem::Tabs(entities) => append_tabs(strip, entities),
+    if changed > 0 {
+        *target = staged;
     }
-}
-
-fn compact_entities(entities: Vec<Entity>) -> Option<PlannedColumn> {
-    match entities.as_slice() {
-        [] => None,
-        [entity] => Some(PlannedColumn::Single(*entity)),
-        _ => Some(PlannedColumn::Tabs(entities)),
-    }
-}
-
-fn compact_stack_tabs(entities: Vec<Entity>) -> Option<PlannedStackItem> {
-    match entities.as_slice() {
-        [] => None,
-        [entity] => Some(PlannedStackItem::Single(*entity)),
-        _ => Some(PlannedStackItem::Tabs(entities)),
-    }
-}
-
-fn compact_stack_items(items: Vec<PlannedStackItem>) -> Option<PlannedColumn> {
-    match items.as_slice() {
-        [] => None,
-        [PlannedStackItem::Single(entity)] => Some(PlannedColumn::Single(*entity)),
-        [PlannedStackItem::Tabs(entities)] => Some(PlannedColumn::Tabs(entities.clone())),
-        _ => Some(PlannedColumn::Stack(items)),
-    }
+    Ok(changed)
 }

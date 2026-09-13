@@ -199,6 +199,23 @@ commands are documented in
 See [QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md) for the
 resource `list`/`inspect` responses and `spool session watch` event stream.
 
+### Column width intent
+
+Column ordinals start at 1. Width edits on a retained background Space are accepted
+without focusing a window or switching Spaces:
+
+```sh
+spool space layout width 800 --space 77 --column 1
+spool space layout width 75% --space 77 --column 1
+spool space layout width inherit --space 77 --column 1
+```
+
+A number is a logical column-slot width in points; a percentage uses that Space's
+usable viewport. `inherit` follows the applicable width rule or the first configured
+width preset. An unknown viewport delays projection, while keeping the accepted
+intent. Native eligibility is checked separately; becoming visible applies the latest
+accepted width. A successful command acknowledges the state edit, not native completion.
+
 ### Displays
 
 `window move-to-display next --follow`, `window move-to-display next --stay` and `mouse next-display` cycle
@@ -280,73 +297,28 @@ spool.setup { windows = {
 } }
 ```
 
-### Session Restore
+### Layout Intent Persistence
 
-Spool saves its tracked window layout and can restore it the next time it
-starts. Restore is a startup-only phase: Spool loads the saved session, applies
-it after initial window discovery, keeps matching open for a short grace period,
-then stops consulting the saved state until the next Spool process start.
+Spool saves accepted original layout intent and minimal candidate binding hints to
+`$XDG_STATE_HOME/spool/state.json` (usually `~/.local/state/spool/state.json`). It
+preserves whether a width inherits current configuration, uses absolute logical points,
+or uses a viewport ratio, together with each stack item's raw positive height weight and
+one member slot per retained member. A member slot whose identity could not be cached is
+stored as an explicit unresolved slot rather than dropped, so a saved item always keeps
+its member count. Effective heights, constraints, native observations, animations, and
+retry state are not persisted.
 
-The saved session includes:
+A successful command accepts intent; it does not guarantee a completed native
+adjustment or a durable save. Saving uses a versioned atomic replacement, and a
+failed save leaves the latest intent dirty for a later attempt. Valid intent
+can be saved even when its Space is invisible or native observation is unavailable.
 
-- native workspace ids
-- Space ID, order hint, kind, and one layout strip per Space
-- layout structure: singles, stacks, tabs, and fullscreen strips
-- display/screen association
-- window identity for matching across restarts
-
-Matched eligible startup windows use the saved tiled layout before initial
-`index`, `floating`, `width`, and `grid` preferences. Saved state cannot bypass
-admission or known movement/resize limitations. Unmatched startup windows,
-and all windows created after the restore
-grace period ends, keep normal `windows` behavior.
-
-| Option | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `enabled` | Boolean | `true` | Enables session restore on startup. |
-| `startup_grace_ms` | Integer (ms) | `2000` | How long Spool keeps restore matching active after startup. This gives apps a chance to create windows shortly after Spool starts. |
-| `missing_windows` | String | `"ignore"` | Behavior when a saved window is not present during restore. Currently only `"ignore"` is supported, which drops the missing window and compacts the restored layout. |
-
-**Example:**
-```lua
-spool.setup { restore = {
-  enabled = true,
-  startup_grace_ms = 2000,
-  missing_windows = "ignore",
-} }
-```
-
-Restore matches windows first by stable startup identity:
-
-- window id
-- process id
-- bundle id
-
-If an application has restarted and those ids changed, Spool can use a
-conservative fallback match:
-
-- bundle id
-- non-empty window title
-- window identifier
-- accessibility role
-- accessibility subrole
-
-Fallback matching is only used when it is unambiguous. If multiple current
-windows could match the same saved window, Spool skips that saved window rather
-than moving the wrong one.
-
-If a saved app or window is missing, the default `"ignore"` policy simply drops
-it from the restored layout. Empty stacks, tab groups, columns, and virtual rows
-are removed. If the previously selected virtual row is removed because all of
-its windows are missing, Spool selects the nearest remaining restored row for
-that native workspace. If no restored row remains, the normal startup workspace
-selection is kept.
-
-For screens, Spool prefers the current macOS workspace-to-display mapping when
-the workspace is already present on a display. Otherwise it restores to the
-saved display id when that screen is still connected, then falls back to the
-current active display, then the first available display by id. Spool does not
-create placeholder displays or off-screen state for disconnected monitors.
+Startup reads the new file format into isolated candidates only. It initializes
+windows from current native observations and current rules; it does not match
+old IDs or titles, reconstruct old groups, or reapply saved widths. Automatic
+cross-daemon restoration and a user-facing manual import command are not part
+of this implementation. Previous formats are ignored without migration. There
+is no `restore` configuration section or restore-enabled switch.
 
 ---
 

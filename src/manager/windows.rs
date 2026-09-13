@@ -178,7 +178,6 @@ pub trait WindowApi: Send + Sync {
     /// Drops the cached title so the next [`Self::title`] reads it afresh.
     /// Called when the app reports the title changed.
     fn invalidate_title(&self);
-    fn identifier(&self) -> Result<String>;
     fn child_role(&self) -> Result<bool>;
     fn role(&self) -> Result<String>;
     fn subrole(&self) -> Result<String>;
@@ -846,10 +845,6 @@ impl WindowApi for WindowOS {
 
     fn retained_title(&self) -> Option<String> {
         self.title.force_read().clone()
-    }
-
-    fn identifier(&self) -> Result<String> {
-        self.ax_element.identifier()
     }
 
     /// Returns true if the window has a child role.
