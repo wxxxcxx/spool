@@ -483,14 +483,24 @@ superset.
 
 Status: steps 1, 2a, 2b, 2c and the capability half of step 6 have landed
 (`47d239c`, `5399477`, `4d8f98a`, `5aa9579`, `b16da18`, `680fe51`), plus one
-soundness defect the diagnosis surfaced (`63e32d9`). The plan is revised from
-its first draft each time the investigation contradicts it; the revisions are
-recorded rather than silently applied. Two of the original steps were rejected
-outright once the evidence was in — step 5 and step 7 — and those rejections
-are part of the result, not gaps in it. The interface is 21 methods, down from
-22; the target shape sketched under [Proposed interface](#proposed-interface)
-was not reached, and the reasons are on the record rather than left as an
-unexplained shortfall.
+soundness defect the diagnosis surfaced (`63e32d9`). A follow-on pass then
+inventoried every method's failure semantics (`e850f39`), wrote the five
+contracts the inventory showed were missing (`bff9df5`), made the two
+remaining defects actionable rather than merely flagged (`47b178f`), and
+separated the native Space focus decision from its effect so it could be tested
+at all (`a8e93da`). The plan is revised from its first draft each time the
+investigation contradicts it; the revisions are recorded rather than silently
+applied. Two of the original steps were rejected outright once the evidence was
+in — step 5 and step 7 — and those rejections are part of the result, not gaps
+in it. The interface is 21 methods, down from 22; the target shape sketched
+under [Proposed interface](#proposed-interface) was not reached, and the reasons
+are on the record rather than left as an unexplained shortfall.
+
+**Two defects are open and blocked on evidence, not on effort.** They are the
+three-valued Space kind (see the inventory above) and the unchecked
+current-Space read. Both need one observation each from a live session, listed
+with the inventory. Everything else in this review is either landed or rejected
+with its reasoning.
 
 1. **Fix the adapter divergence.** Landed. Both adapters answer an empty Space
    with `Ok(vec![])`, the contract is stated on both membership methods, and
