@@ -123,6 +123,9 @@ struct MockStateInner {
     withdrawn_surfaces: HashMap<WinID, MockWindowData>,
     native_space_control: bool,
     native_space_intents: Vec<crate::manager::NativeSpaceIntent>,
+    /// Every submitted Space intent, including ones the platform refuses. A
+    /// capability that is unavailable must be refused before this is reached.
+    native_space_intent_attempts: usize,
     associated_windows: HashMap<WinID, Vec<WinID>>,
     focus_requests: Vec<WinID>,
     fail_focus_requests: bool,
@@ -198,6 +201,7 @@ impl MockState {
                 withdrawn_surfaces: HashMap::new(),
                 native_space_control: false,
                 native_space_intents: Vec::new(),
+                native_space_intent_attempts: 0,
                 associated_windows: HashMap::new(),
                 focus_requests: Vec::new(),
                 fail_focus_requests: false,
@@ -254,6 +258,12 @@ impl MockState {
 
     pub(crate) fn native_space_intents(&self) -> Vec<crate::manager::NativeSpaceIntent> {
         self.inner.force_read().native_space_intents.clone()
+    }
+
+    /// How many Space intents reached the platform, whether or not it carried
+    /// them out and whether or not the capability was available.
+    pub(crate) fn native_space_intent_attempts(&self) -> usize {
+        self.inner.force_read().native_space_intent_attempts
     }
 
     pub(crate) fn set_associated_windows(&self, window: WinID, associated: Vec<WinID>) {
@@ -1587,6 +1597,7 @@ impl MockState {
         wm.expect_perform_native_space_intent()
             .returning(move |intent| {
                 let mut state = s.inner.force_write();
+                state.native_space_intent_attempts += 1;
                 if !state.native_space_control {
                     return Err(Error::Generic("Space capability unavailable".to_string()));
                 }

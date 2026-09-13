@@ -29,7 +29,7 @@ use crate::ecs::{
     WindowFrameCommitSuspended, WindowFrameMotion, WindowVisibility,
 };
 use crate::events::Event;
-use crate::manager::{Display, NativeSpaceIntent, Origin, WindowManager};
+use crate::manager::{Display, NativeSpaceCapabilities, NativeSpaceIntent, Origin, WindowManager};
 use crate::platform::{WinID, WindowIncarnation, WorkspaceId};
 pub use spool_shared_types::state::SpaceKind;
 
@@ -211,6 +211,70 @@ impl PendingMoveLayout {
     }
 }
 
+/// Which platform capability an intent needs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpaceOperation {
+    MoveWindows,
+    Focus,
+    Create,
+    Delete,
+}
+
+impl SpaceOperation {
+    fn of(intent: &NativeSpaceIntent) -> Self {
+        match intent {
+            NativeSpaceIntent::MoveWindows { .. } => Self::MoveWindows,
+            NativeSpaceIntent::Focus { .. } => Self::Focus,
+            NativeSpaceIntent::Create { .. } => Self::Create,
+            NativeSpaceIntent::Delete { .. } => Self::Delete,
+        }
+    }
+}
+
+/// The Space-control capabilities that are actually available.
+///
+/// Configuration decides whether Space control is used at all; the platform
+/// decides what it can carry out. A capability is effective only when both
+/// agree. This is the same answer the inspection report publishes, so a gate
+/// and the report can no longer disagree about what is possible.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SpaceControl {
+    capabilities: NativeSpaceCapabilities,
+}
+
+impl SpaceControl {
+    pub(crate) fn effective(config: &Config, manager: &WindowManager) -> Self {
+        let native = manager.native_space_capabilities();
+        let permitted = config.space_control_enabled();
+        Self {
+            capabilities: NativeSpaceCapabilities {
+                move_windows: permitted && native.move_windows,
+                focus: permitted && native.focus,
+                create: permitted && native.create,
+                delete: permitted && native.delete,
+            },
+        }
+    }
+
+    /// Whether this operation can be carried out at all.
+    ///
+    /// A refusal here is a capability answer, not a failed attempt: the intent
+    /// is never submitted, so the platform cannot return a misleading
+    /// execution error for an operation it does not implement.
+    pub(crate) fn allows(self, operation: SpaceOperation) -> bool {
+        match operation {
+            SpaceOperation::MoveWindows => self.capabilities.move_windows,
+            SpaceOperation::Focus => self.capabilities.focus,
+            SpaceOperation::Create => self.capabilities.create,
+            SpaceOperation::Delete => self.capabilities.delete,
+        }
+    }
+
+    pub(crate) fn capabilities(self) -> NativeSpaceCapabilities {
+        self.capabilities
+    }
+}
+
 #[derive(Debug)]
 struct PendingFollow {
     member: MoveWindowIdentity,
@@ -228,7 +292,7 @@ impl PendingFollow {
         config: &Config,
         submitted: Duration,
     ) -> Option<Self> {
-        if !config.space_control_enabled() {
+        if !SpaceControl::effective(config, manager).allows(SpaceOperation::Focus) {
             return None;
         }
         let intent = NativeSpaceIntent::Focus {
@@ -612,7 +676,8 @@ pub(crate) fn execute_native_space_command(
             _ => None,
         };
         if let Some(intent) = intent {
-            if config.space_control_enabled() {
+            let control = SpaceControl::effective(&config, &window_manager);
+            if control.allows(SpaceOperation::of(&intent)) {
                 match window_manager.perform_native_space_intent(&intent) {
                     Ok(()) => {
                         if matches!(intent, NativeSpaceIntent::Focus { .. }) {
@@ -620,20 +685,20 @@ pub(crate) fn execute_native_space_command(
                         }
                     }
                     Err(error) => {
-                        warn!(?action, %error, "Space capability unavailable");
+                        warn!(?action, %error, "Space operation failed");
                         return Err(crate::errors::Error::rejected("native_operation_rejected"));
                     }
                 }
             } else {
-                warn!(?action, "Space control is disabled");
+                warn!(?action, "Space capability is unavailable");
                 return Err(crate::errors::Error::rejected("capability_unavailable"));
             }
             return Ok(());
         }
         return Err(crate::errors::Error::rejected("unsupported_operation"));
     };
-    if !config.space_control_enabled() {
-        warn!("Space control is disabled; enable experimental_space_control");
+    if !SpaceControl::effective(&config, &window_manager).allows(SpaceOperation::MoveWindows) {
+        warn!("Space control is disabled or unavailable; enable experimental_space_control");
         return Err(crate::errors::Error::rejected("capability_unavailable"));
     }
     let observations = window_manager.observe_displays().map_err(|error| {

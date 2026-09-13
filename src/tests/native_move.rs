@@ -176,6 +176,36 @@ fn native_space_move_rejects_when_no_display_can_confirm_the_target() {
     assert_space_move_refused(&mut harness, source, members);
 }
 
+/// Create and Delete are capabilities this platform does not implement, and the
+/// inspection report already publishes them as unavailable. A command must be
+/// refused on that answer rather than submitted and failed, so the platform is
+/// never asked to do something it has already said it cannot do.
+#[test]
+fn unavailable_space_capabilities_are_refused_without_reaching_the_platform() {
+    for action in [
+        Action::CreateSpace {
+            display_id: TEST_DISPLAY_ID,
+        },
+        Action::DeleteSpace { space_id: TARGET },
+    ] {
+        let (mut harness, _, _) = column_harness();
+        assert_eq!(
+            harness.mock_state.native_space_intent_attempts(),
+            0,
+            "the fixture submits nothing before the action under test"
+        );
+
+        dispatch_action(&mut harness, action);
+
+        assert_eq!(
+            harness.mock_state.native_space_intent_attempts(),
+            0,
+            "an unavailable capability must never be submitted to the platform"
+        );
+        assert!(harness.mock_state.native_space_intents().is_empty());
+    }
+}
+
 fn retained_width(harness: &mut TestHarness, entity: Entity) -> crate::ecs::layout::WidthIntent {
     let world = harness.world();
     world

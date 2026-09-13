@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 
 use crate::config::Config;
 use crate::ecs::layout::{Column, ColumnId, LayoutStrip, StackItem, WidthIntent};
-use crate::ecs::native_space::{NativeSpace, VisibleNativeSpaceMarker};
+use crate::ecs::native_space::{NativeSpace, SpaceControl, VisibleNativeSpaceMarker};
 use crate::ecs::params::Windows;
 use crate::ecs::topology::{SpaceMemberships, WindowMemberships};
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker};
@@ -802,13 +802,12 @@ impl QueryStateParams<'_, '_> {
             timestamp: now_timestamp(),
             active,
             capabilities: {
-                let capabilities = window_manager.native_space_capabilities();
-                let enabled = config.space_control_enabled();
+                let capabilities = SpaceControl::effective(config, window_manager).capabilities();
                 SpaceCapabilities {
-                    move_windows: enabled && capabilities.move_windows,
-                    focus: enabled && capabilities.focus,
-                    create: enabled && capabilities.create,
-                    delete: enabled && capabilities.delete,
+                    move_windows: capabilities.move_windows,
+                    focus: capabilities.focus,
+                    create: capabilities.create,
+                    delete: capabilities.delete,
                 }
             },
             displays: display_states,
