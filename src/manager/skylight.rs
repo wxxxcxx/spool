@@ -269,11 +269,12 @@ unsafe extern "C" {
     ///
     /// # Returns
     ///
-    /// A `NonNull<CFArray>` containing associated windows, or `NULL` if not found or an error occurs.
+    /// A raw pointer to a `CFArray` of associated windows, or `NULL` if not
+    /// found or an error occurs.
     ///
     /// # Original signature
     /// extern `CFArrayRef` SLSCopyAssociatedWindows(int cid, `uint32_t` wid);
-    pub fn SLSCopyAssociatedWindows(cid: ConnID, window_id: WinID) -> NonNull<CFArray<CFNumber>>;
+    pub fn SLSCopyAssociatedWindows(cid: ConnID, window_id: WinID) -> *mut CFArray<CFNumber>;
 
     /// Queries windows based on a provided `CFArray` of window IDs.
     ///

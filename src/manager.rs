@@ -632,11 +632,21 @@ impl WindowManagerApi for WindowManagerOS {
     }
 
     /// Returns child windows of the main window.
+    ///
+    /// The private API returns `NULL` both for a window with no associated
+    /// windows and on a failed read, and its own documentation does not
+    /// separate the two. `NULL` is therefore read as "no associated windows",
+    /// which is what both callers already do with the result; the point of the
+    /// guard is that the outcome is a defined empty list rather than an
+    /// invalid `NonNull` handed to `CFRetain`.
     #[instrument(level = Level::TRACE, skip(self), ret)]
     fn get_associated_windows(&self, window_id: WinID) -> Vec<WinID> {
         trace!("for window {window_id}");
-        let windows =
-            unsafe { CFRetained::retain(SLSCopyAssociatedWindows(self.main_cid, window_id)) };
+        let Some(ptr) = NonNull::new(unsafe { SLSCopyAssociatedWindows(self.main_cid, window_id) })
+        else {
+            return Vec::new();
+        };
+        let windows = unsafe { CFRetained::retain(ptr) };
         windows.into_iter().filter_map(|id| id.as_i32()).collect()
     }
 

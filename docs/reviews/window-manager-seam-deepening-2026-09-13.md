@@ -116,6 +116,24 @@ failed read is indistinguishable from "this window has no children".
 `windows_in_workspace` and `presentation_windows_in_workspace` overload
 `Err(NotFound)` to mean *empty Space*.
 
+> **Fixed for one of the two.** `get_associated_windows` had a worse problem
+> than a missing error channel: its `SkyLight` binding declared the return as
+> `NonNull<CFArray<CFNumber>>` while its own doc comment said the call returns
+> `NULL` "if not found or an error occurs", and the call site passed that
+> straight to `CFRetained::retain`, whose parameter is a `NonNull`. The sibling
+> binding for the same nullable "Copy rule" shape,
+> `SLSCopyManagedDisplaySpaces`, is declared `*mut` and guarded with
+> `NonNull::new`. The binding now matches that convention and the call site
+> guards the pointer. `NULL` is mapped to an empty list rather than an error,
+> because the API does not separate "no associated windows" from "failed" and
+> both callers already treat the result as a list that may be empty; what
+> changed is that the outcome is a defined empty list instead of an invalid
+> `NonNull` reaching `CFRetain`. `workspace_is_fullscreen` still returns a bare
+> `bool` and is left alone: giving it a failure channel means the fullscreen set
+> in `NativeTopology` needs a third "unknown" state, which changes which Space
+> operations are refused, and that is a design decision this review should not
+> make implicitly.
+
 ### The two adapters disagree about that error mode
 
 `space_window_list_for_connection` (`src/manager.rs:1046`) returns
