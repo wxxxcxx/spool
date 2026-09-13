@@ -342,6 +342,13 @@ pub trait WindowManagerApi: Send + Sync {
     /// # Returns
     ///
     /// `Ok(u64)` with the space ID if successful, otherwise `Err(Error)`.
+    ///
+    /// # Contract
+    ///
+    /// `0` is the platform's "no answer" sentinel rather than a Space id: a
+    /// probe against a live session saw it returned for a display UUID that
+    /// names no display. It is reported as an error, so a read that did not
+    /// happen cannot arrive as a Space that names nothing.
     fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId>;
     /// Returns `true` when `space_id` is a native macOS fullscreen Space.
     fn workspace_is_fullscreen(&self, space_id: WorkspaceId) -> bool;
@@ -756,9 +763,17 @@ impl WindowManagerApi for WindowManagerOS {
     ///
     /// `Ok(u64)` with the space ID if successful, otherwise `Err(Error)`.
     fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId> {
-        Display::uuid_from_id(display_id).map(|uuid| unsafe {
-            SLSManagedDisplayGetCurrentSpace(self.main_cid, &raw const *uuid)
-        })
+        let uuid = Display::uuid_from_id(display_id)?;
+        let space_id = unsafe { SLSManagedDisplayGetCurrentSpace(self.main_cid, &raw const *uuid) };
+        // The platform answers 0 when it cannot name a current Space, and 0
+        // names no Space. Returning it would make an unread display look like
+        // one showing a Space that does not exist.
+        if space_id == 0 {
+            return Err(Error::NotFound(format!(
+                "display {display_id} reports no current Space"
+            )));
+        }
+        Ok(space_id)
     }
 
     fn workspace_is_fullscreen(&self, space_id: WorkspaceId) -> bool {

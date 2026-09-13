@@ -485,4 +485,19 @@ mod tests {
             "an unreadable Space is unknown, not empty"
         );
     }
+
+    /// A display whose current Space could not be read is unknown, never
+    /// Space `0`. The platform answers `0` when it cannot name a Space, and no
+    /// Space has that id, so treating it as a value would make an unread
+    /// display look like one showing a Space that does not exist. This locks
+    /// the test double to the same answer production now gives.
+    #[test]
+    fn an_unresolved_current_space_is_unknown_not_space_zero() {
+        let mut state = MockState::new();
+        state.add_display(1, IRect::new(0, 0, 1000, 800), vec![]);
+        let manager = WindowManager(Box::new(state.create_window_manager()));
+        let mut topology = NativeTopology::default();
+        topology.sample(&manager, false);
+        assert_eq!(topology.visible_space(1), None);
+    }
 }
