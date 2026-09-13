@@ -276,6 +276,13 @@ pub trait WindowManagerApi: Send + Sync {
     /// # Returns
     ///
     /// A `Vec<WinID>` containing the IDs of associated child windows.
+    ///
+    /// # Contract
+    ///
+    /// There is no error channel. The platform call returns `NULL` both for a
+    /// window with no associated windows and on a failed read, and does not
+    /// separate the two, so both arrive as an empty list. A caller must not
+    /// read an empty result as proof that the window has no children.
     fn get_associated_windows(&self, window_id: WinID) -> Vec<WinID>;
     /// Retrieves every physical display together with its own Space read.
     ///
@@ -329,6 +336,14 @@ pub trait WindowManagerApi: Send + Sync {
     /// # Returns
     ///
     /// `Ok(Vec<Window>)` containing the found and added windows, otherwise `Err(Error)`.
+    ///
+    /// # Contract
+    ///
+    /// The `Err` covers the application's own `AX` window list only. The
+    /// supplementary `WindowServer` inventory is best effort: when it cannot be
+    /// read the call still succeeds with an empty second element, logged at
+    /// debug, so an unreadable inventory is indistinguishable from one with no
+    /// off-screen windows.
     fn find_existing_application_windows(
         &self,
         app: &mut Application,
@@ -386,10 +401,22 @@ pub trait WindowManagerApi: Send + Sync {
     /// or `None` if the position cannot be determined.
     fn cursor_position(&self) -> Option<CGPoint>;
 
+    /// Sets a brightness level per window: `0.0` normal, `1.0` bright,
+    /// `-1.0` dark.
+    ///
+    /// # Contract
+    ///
+    /// Best effort with no error channel. A request that the platform rejects,
+    /// or one whose length cannot be represented for the platform call, is
+    /// dropped with at most a debug log; callers cannot tell a dimmed window
+    /// from an ignored request.
     fn dim_windows(&self, windows: &[WinID], level: f32);
 
     /// Returns every `WindowServer` window in the current GUI session with
     /// its owning process, including off-screen and minimized windows.
+    ///
+    /// `None` means the `WindowServer` list was unavailable, which is not an
+    /// empty session.
     fn window_owners_in_session(&self) -> Option<HashMap<WinID, Pid>>;
 
     /// Current GUI session windows in `WindowServer` front-to-back order.
@@ -400,6 +427,13 @@ pub trait WindowManagerApi: Send + Sync {
     fn window_order_in_session(&self) -> Option<Vec<(WinID, Pid)>>;
 
     /// Refreshes the per-window `WindowServer` notification subscription.
+    ///
+    /// # Contract
+    ///
+    /// `Ok(())` also covers "not applicable here": on macOS versions before the
+    /// notification API exists this returns success without subscribing to
+    /// anything. A caller must not read `Ok` as confirmation that it is now
+    /// subscribed.
     fn request_window_notifications(&self, window_ids: &[WinID]) -> Result<()>;
 }
 
