@@ -167,7 +167,13 @@ unsafe extern "C" {
     ///
     /// # Returns
     ///
-    /// `0` = user/desktop, `4` = fullscreen, `2` = system (e.g. dashboard).
+    /// `0` = user/desktop, `2` = system (e.g. dashboard), `4` = fullscreen,
+    /// `3` = no Space has this id.
+    ///
+    /// The `3` sentinel is not in the header this binding was written from: it
+    /// was observed by calling the function with ids that name no Space (`0`,
+    /// `2`, `3`, `999`, `999999`, `u64::MAX`), all of which returned `3`. A
+    /// caller must read `3` as an absent Space, not as a default kind.
     ///
     /// # Original signature
     /// extern int SLSSpaceGetType(int cid, `uint64_t` `space_id`);
