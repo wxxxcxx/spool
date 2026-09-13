@@ -102,6 +102,80 @@ fn source_layout(harness: &mut TestHarness, source: Entity) -> String {
     format!("{:?}", harness.world().get::<LayoutStrip>(source).unwrap())
 }
 
+/// Asserts that a Space move neither reached the platform nor started a
+/// reassignment, and that the source layout is untouched.
+fn assert_space_move_refused(harness: &mut TestHarness, source: Entity, members: [Entity; 2]) {
+    assert!(
+        harness.mock_state.native_space_intents().is_empty(),
+        "a refused Space move must not reach the platform"
+    );
+    for member in members {
+        assert!(harness.world().get::<NativeMoveOwner>(member).is_none());
+        assert!(
+            harness
+                .world()
+                .get::<WindowSpaceReassignmentPending>(member)
+                .is_none()
+        );
+    }
+    assert!(
+        !harness
+            .world()
+            .get::<LayoutStrip>(source)
+            .unwrap()
+            .all_windows()
+            .is_empty(),
+        "a refused Space move must leave the source column in place"
+    );
+}
+
+/// The move precondition refuses a target Space that no native source listed.
+/// Without it the command would submit a native intent for a Space that exists
+/// on no observed display.
+#[test]
+fn native_space_move_rejects_a_target_outside_the_observed_topology() {
+    let (mut harness, source, members) = column_harness();
+    let before = source_layout(&mut harness, source);
+
+    dispatch_action(
+        &mut harness,
+        Action::MoveWindowToSpace {
+            window_id: 0,
+            // The fixture's only display lists TEST_WORKSPACE_ID and TARGET.
+            space_id: TARGET + 1,
+            move_focus: MoveFocus::Stay,
+        },
+    );
+
+    assert_eq!(source_layout(&mut harness, source), before);
+    assert_space_move_refused(&mut harness, source, members);
+}
+
+/// A display whose own Space list could not be read cannot confirm the target,
+/// and that failure is not evidence that the target Space does not exist. The
+/// move is refused rather than attempted either way.
+#[test]
+fn native_space_move_rejects_when_no_display_can_confirm_the_target() {
+    let (mut harness, source, members) = column_harness();
+    harness.mock_state.script_present_display_topology_queries(
+        TEST_DISPLAY_ID,
+        std::iter::repeat_n(Err(()), 1000),
+    );
+    let before = source_layout(&mut harness, source);
+
+    dispatch_action(
+        &mut harness,
+        Action::MoveWindowToSpace {
+            window_id: 0,
+            space_id: TARGET,
+            move_focus: MoveFocus::Stay,
+        },
+    );
+
+    assert_eq!(source_layout(&mut harness, source), before);
+    assert_space_move_refused(&mut harness, source, members);
+}
+
 fn retained_width(harness: &mut TestHarness, entity: Entity) -> crate::ecs::layout::WidthIntent {
     let world = harness.world();
     world
