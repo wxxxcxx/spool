@@ -522,6 +522,10 @@ impl FocusCoordinator {
             .and_then(|memory| memory.floating.last())
     }
 
+    pub(crate) fn space_selection(&self, workspace: WorkspaceId) -> Option<Entity> {
+        self.by_workspace.get(&workspace)?.selection
+    }
+
     pub(crate) fn navigation_entity(&self, workspace: WorkspaceId) -> Option<Entity> {
         let memory = self.by_workspace.get(&workspace)?;
         memory.selection.or_else(|| memory.any.last())
@@ -571,6 +575,9 @@ impl Plugin for FocusEventsPlugin {
                 reconcile_activation,
                 activation::verify_activation,
                 project_confirmed_focus,
+                reconcile_space_selections
+                    .before(super::systems::update_overlays)
+                    .before(crate::bar::update_bar),
                 autocenter_window_on_focus.after(super::systems::animate_resize_entities),
                 mouse_follows_focus.after(super::systems::animate_resize_entities),
                 stacking::reconcile_tiled_stacking.after(super::systems::commit_window_frame),
@@ -610,6 +617,68 @@ fn maintain_focus_singleton(_trigger: On<Add, FocusedMarker>, mut config: Global
         config.set_skip_reshuffle(false);
     }
     config.set_ffm_flag(None);
+}
+
+type SelectionWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Window,
+        Option<&'static super::WindowVisibility>,
+        Option<&'static super::reconcile::WindowUnavailable>,
+        Has<super::Floating>,
+    ),
+>;
+
+/// Lifecycle edits only the local selection; no activation or history writes.
+fn reconcile_space_selections(
+    mut focus: ResMut<FocusCoordinator>,
+    windows: SelectionWindows,
+    strips: Query<&LayoutStrip>,
+    manager: Res<WindowManager>,
+) {
+    let mut updates = Vec::new();
+    for (&space, memory) in &focus.by_workspace {
+        if memory.selection.is_some_and(|entity| {
+            windows
+                .get(entity)
+                .is_ok_and(|(_, _, visibility, _, _)| visibility.is_none())
+        }) {
+            // A suspended AX endpoint is not proof the retained choice vanished.
+            continue;
+        }
+        let strip = strips.iter().find(|strip| strip.id() == space);
+        let mut native = None;
+        let next = memory.any.newest_matching(|entity| {
+            let Ok((_, window, visibility, unavailable, floating)) = windows.get(entity) else {
+                return false;
+            };
+            if visibility.is_some() || unavailable.is_some() {
+                return false;
+            }
+            if strip.is_some_and(|strip| strip.contains(entity)) {
+                return true;
+            }
+            if !floating {
+                return false;
+            }
+            native
+                .get_or_insert_with(|| manager.windows_in_workspace(space).ok())
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&window.id()))
+        });
+        if next != memory.selection {
+            updates.push((space, next));
+        }
+    }
+    if !updates.is_empty() {
+        for (space, next) in updates {
+            if let Some(memory) = focus.by_workspace.get_mut(&space) {
+                memory.selection = next;
+            }
+        }
+    }
 }
 
 pub(crate) fn project_confirmed_focus(

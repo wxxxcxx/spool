@@ -201,6 +201,14 @@ objects stay on their owning threads.
 
 ### Bar presentation
 
+Bar icons and Space decorations share `FocusCoordinator::space_selection` as
+their local selection source. A focus-domain lifecycle system reconciles closed
+or hidden/minimized selections against that Space's confirmed history before
+either presentation runs. It does not issue activation requests or add history
+entries. AX unavailability alone retains the selection. Global `FocusedMarker`
+continues to represent confirmed native focus, independently of local highlights.
+See the [Space focus presentation specification](wayfinding/declarative-state/issues/22-space-focus-presentation.md).
+
 The Bar is not an `NSStatusItem`: macOS reserves no horizontal space for it, so
 it takes the menu bar's own rect instead — full display width, the menu bar's
 height, flush with the screen top, with no inset — and deliberately covers the

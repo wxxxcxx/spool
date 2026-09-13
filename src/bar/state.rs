@@ -39,13 +39,8 @@ pub(crate) struct BarStateParams<'w, 's> {
     windows: BarWindows<'w, 's>,
     apps: Query<'w, 's, (Entity, &'static Application)>,
     window_manager: Res<'w, WindowManager>,
-    /// A focus request the command path has already made, if any.
-    ///
-    /// The Bar draws this request instead of waiting for accessibility to
-    /// confirm it, so the indicator moves on the click rather than a frame and
-    /// an AX round trip later. Confirmed focus remains authoritative for
-    /// everything that acts on a window; this is presentation only.
-    requested_focus: Option<Res<'w, FocusCoordinator>>,
+    /// Per-Space selection is presentation state, independent of native focus.
+    focus: Option<Res<'w, FocusCoordinator>>,
 }
 
 impl BarStateParams<'_, '_> {
@@ -122,15 +117,10 @@ impl BarStateParams<'_, '_> {
                 |ids| ids.contains(&window_id),
             )
         };
-        // A pending request is what the user just clicked, so it is drawn as
-        // the focused member now rather than a frame and an accessibility round
-        // trip later. Scoped to the Space that holds it: another display's Bar
-        // keeps drawing the confirmed focus.
-        let requested = self.requested_focus_entity().filter(|entity| {
-            self.windows
-                .get(*entity)
-                .is_ok_and(|(window, ..)| strip.contains(*entity) || in_space(*entity, window.id()))
-        });
+        let selected = self
+            .focus
+            .as_ref()
+            .and_then(|focus| focus.space_selection(space.id));
         space.columns = strip
             .columns()
             .filter_map(|column| {
@@ -142,7 +132,7 @@ impl BarStateParams<'_, '_> {
                             .is_ok_and(|(_, _, _, floating, _, _, _)| !floating)
                     })
                     .filter_map(|entity| {
-                        self.window_record(entity, space.visible, &known, requested)
+                        self.window_record(entity, space.visible, &known, selected)
                     })
                     .collect::<Vec<_>>();
                 if windows.is_empty() {
@@ -182,19 +172,8 @@ impl BarStateParams<'_, '_> {
                     .get(*entity)
                     .is_ok_and(|(window, ..)| in_space(*entity, window.id()))
             })
-            .filter_map(|entity| self.window_record(entity, space.visible, &known, requested))
+            .filter_map(|entity| self.window_record(entity, space.visible, &known, selected))
             .collect();
-    }
-
-    /// The window a focus request has already named, if any.
-    ///
-    /// Pending activation is distinct from confirmed focus. Unknown evidence
-    /// retains the request; confirmation, yield or invalidation ends its
-    /// pending presentation without deleting the diagnostic outcome.
-    fn requested_focus_entity(&self) -> Option<Entity> {
-        self.requested_focus
-            .as_ref()
-            .and_then(|focus| focus.snapshot().requested_entity())
     }
 
     fn window_record(
@@ -202,10 +181,9 @@ impl BarStateParams<'_, '_> {
         entity: Entity,
         space_visible: bool,
         known: &HashMap<i32, BarWindow>,
-        requested: Option<Entity>,
+        selected: Option<Entity>,
     ) -> Option<BarWindow> {
-        let (window, _, parent, _, confirmed, unavailable, hidden) =
-            self.windows.get(entity).ok()?;
+        let (window, _, parent, _, _, unavailable, hidden) = self.windows.get(entity).ok()?;
         if unavailable.is_some()
             && self
                 .windows
@@ -221,13 +199,6 @@ impl BarStateParams<'_, '_> {
         if !hidden && unavailable.is_some_and(WindowUnavailable::excludes_from_layout_projection) {
             return None;
         }
-        // A pending request outranks the confirmed focus for drawing, but never
-        // the gates below: it cannot make an unavailable or hidden window (or
-        // one outside the visible Space) draw as focused.
-        let focused = match requested {
-            Some(requested) => requested == entity,
-            None => confirmed,
-        };
         let (_, app) = self.apps.get(parent.parent()).ok()?;
         Some(BarWindow {
             id: window.id(),
@@ -239,7 +210,7 @@ impl BarStateParams<'_, '_> {
                 .get(&window.id())
                 .map(|window| window.title.clone())
                 .unwrap_or_default(),
-            focused: space_visible && focused && unavailable.is_none(),
+            focused: selected == Some(entity),
             visible: space_visible && !hidden && unavailable.is_none(),
         })
     }
@@ -276,6 +247,70 @@ mod tests {
             .flat_map(|display| display.spaces.iter())
             .flat_map(BarSpace::windows)
             .any(|window| window.id == id && window.focused)
+    }
+
+    #[test]
+    fn background_space_preference_is_visible_without_activation() {
+        for floating in [false, true] {
+            let mut harness = TestHarness::new()
+                .with_display(
+                    crate::tests::TEST_DISPLAY_ID,
+                    bevy::math::IRect::new(0, 0, 1024, 768),
+                    vec![TEST_WORKSPACE_ID, 77],
+                )
+                .with_windows(1)
+                .with_workspace_window(1, 77, |window| window.default_floating = floating);
+            harness.pump_frames(15);
+            harness.mock_state.take_focus_requests();
+            harness
+                .world()
+                .run_system_once_with(crate::ecs::focus::set_space_preference, (77, 1))
+                .unwrap()
+                .unwrap();
+            let state = harness.world().run_system_once(snapshot).unwrap();
+            assert!(draws_focused(&state, 0));
+            assert!(draws_focused(&state, 1));
+            assert!(harness.mock_state.take_focus_requests().is_empty());
+            assert!(harness.mock_state.native_space_intents().is_empty());
+            harness.mock_state.os_withdraw_window(1);
+            harness.world().write_message(Event::SpaceChanged);
+            harness.pump_frames(3);
+            assert!(draws_focused(
+                &harness.world().run_system_once(snapshot).unwrap(),
+                1
+            ));
+        }
+    }
+
+    #[test]
+    fn local_selection_falls_back_after_close_or_minimize_and_clears_without_candidates() {
+        for close in [false, true] {
+            let mut harness = TestHarness::new().with_windows(2);
+            harness.pump_frames(15);
+            harness.world().write_message(Event::action_requested(
+                crate::commands::Action::FocusWindow { window_id: 1 },
+            ));
+            harness.pump_frames(30);
+            assert!(draws_focused(
+                &harness.world().run_system_once(snapshot).unwrap(),
+                1
+            ));
+            for (id, expected) in [(1, Some(0)), (0, None)] {
+                if close {
+                    harness.mock_state.os_close_window(id);
+                } else {
+                    harness.mock_state.os_minimize_window(id, true);
+                }
+                harness.pump_frames(3);
+                let state = harness.world().run_system_once(snapshot).unwrap();
+                let selected = original_space(&state)
+                    .windows()
+                    .filter(|window| window.focused)
+                    .map(|window| window.id)
+                    .collect::<Vec<_>>();
+                assert_eq!(selected, expected.into_iter().collect::<Vec<_>>());
+            }
+        }
     }
 
     /// The whole point of drawing a request: the window the user clicked is the
@@ -454,7 +489,7 @@ mod tests {
         assert!(
             original_space(&state)
                 .windows()
-                .all(|window| !window.focused && !window.visible)
+                .all(|window| !window.visible)
         );
         assert!(
             harness
@@ -619,7 +654,7 @@ mod tests {
         let window = space.windows().next().expect("fullscreen application icon");
         assert_eq!(window.bundle_id, "test");
         assert_eq!(window.app_name, "TestApp");
-        assert!(!window.focused);
+        assert!(window.focused);
     }
 
     #[test]

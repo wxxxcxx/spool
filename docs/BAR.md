@@ -6,6 +6,15 @@ world that owns window layout. It is part of the `spool` process; there is no
 
 ## Presentation
 
+Each Space shows its own retained focus selection, including background Spaces.
+Selected icons use the same highlight in every Space; the Space's active marker
+separately identifies global activity. A collapsed Space places its selected icon
+at the front of the icon deck without reordering its expanded layout. Closing or
+minimizing the selection falls back to the most recently used available window
+in that Space; an empty history leaves no selection. Temporary AX unavailability
+does not erase the retained choice. These indications do not request native
+focus or assert that several windows receive keyboard input simultaneously.
+
 The Bar *is* the menu bar band on each display: exactly as wide and as tall as
 the menu bar, flush with the screen top, with no inset and no rounding. It draws
 its content on a menu-material blur backdrop, so it looks like the menu bar it

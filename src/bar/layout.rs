@@ -709,7 +709,6 @@ impl BarLayout {
                 ItemKind::Window {
                     space_id,
                     focused: true,
-                    collapsed: false,
                     ..
                 } => Some(PlacedItem {
                     rect: item.rect,
@@ -915,8 +914,10 @@ fn collapsed_deck(space: &BarSpace) -> Vec<CollapsedIcon> {
     // full-size horizontal lane, regardless of their original layout role.
     space
         .windows()
-        .map(|window| collapsed_window_kind(space, window))
+        .filter(|window| window.focused)
+        .chain(space.windows().filter(|window| !window.focused))
         .take(4)
+        .map(|window| collapsed_window_kind(space, window))
         .enumerate()
         .map(|(index, kind)| CollapsedIcon {
             kind,
@@ -1024,7 +1025,7 @@ fn collapsed_window_kind(space: &BarSpace, window: &BarWindow) -> ItemKind {
         space_id: space.id,
         column_window_id: None,
         floating: false,
-        focused: false,
+        focused: window.focused,
         bundle_id: window.bundle_id.clone(),
         title: window.title.clone(),
         collapsed: true,
@@ -1078,6 +1079,48 @@ pub(super) mod tests {
             focused,
             visible: true,
         }
+    }
+
+    #[test]
+    fn collapsed_space_promotes_selected_icon_beyond_the_deck_limit() {
+        let mut display = display();
+        let space = &mut display.spaces[0];
+        space.visible = false;
+        space.focused = false;
+        space.floating.clear();
+        space.columns = (1..=6)
+            .map(|id| BarColumn {
+                kind: ColumnKind::Single,
+                selected: 0,
+                windows: vec![window(id, id == 6)],
+            })
+            .collect();
+        let space_id = space.id;
+        let layout = collapsed_layout(&display, 1200.0);
+        let icons = layout
+            .items
+            .iter()
+            .filter_map(|item| match item.kind {
+                ItemKind::Window {
+                    window_id,
+                    space_id: owner,
+                    focused,
+                    ..
+                } if owner == space_id => Some((window_id, focused)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(icons, vec![(3, false), (2, false), (1, false), (6, true)]);
+        assert!(layout.items.iter().any(
+            |item| matches!(item.kind, ItemKind::Focus { space_id: owner } if owner == space_id)
+        ));
+        assert_eq!(
+            display.spaces[0]
+                .windows()
+                .map(|window| window.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
     }
 
     pub(in crate::bar) fn display() -> BarDisplay {

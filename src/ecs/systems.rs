@@ -1304,36 +1304,45 @@ fn resolve_overlay_target(
 fn resolve_space_overlay_target(
     inputs: &OverlayInputs,
     strip: &LayoutStrip,
-    active: bool,
-    visible: bool,
 ) -> crate::errors::Result<Option<(NSRect, Entity)>> {
-    // A Space visible on an unfocused display remains fully dimmed. Hidden
-    // Spaces retain their last navigation target so WindowServer already has
-    // complete contents when it begins a Space transition.
-    if visible && !active {
+    let Some(entity) = inputs.focus.space_selection(strip.id()) else {
         return Ok(None);
-    }
-
-    let snapshot = inputs.focus.snapshot();
-    let candidates = if active {
-        [
-            snapshot.requested_entity(),
-            snapshot.confirmed_entity(),
-            inputs.focus.navigation_entity(strip.id()),
-        ]
-    } else {
-        [inputs.focus.navigation_entity(strip.id()), None, None]
     };
+    resolve_overlay_target(inputs, strip, entity)
+}
 
-    let mut visited = HashSet::new();
-    for entity in candidates.into_iter().flatten() {
-        if visited.insert(entity)
-            && let Some(target) = resolve_overlay_target(inputs, strip, entity)?
-        {
-            return Ok(Some(target));
-        }
+#[cfg(test)]
+mod space_selection_tests {
+    use super::*;
+    use crate::tests::{TEST_WORKSPACE_ID, TestHarness, find_window_entity};
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn visible_inactive_target(
+        inputs: OverlayInputs,
+        strips: Query<&LayoutStrip>,
+    ) -> Option<Entity> {
+        let strip = strips
+            .iter()
+            .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+            .unwrap();
+        resolve_space_overlay_target(&inputs, strip)
+            .unwrap()
+            .map(|(_, entity)| entity)
     }
-    Ok(None)
+
+    #[test]
+    fn visible_inactive_space_keeps_its_selected_border_target() {
+        let mut harness = TestHarness::new().with_windows(1);
+        harness.pump_frames(15);
+        let entity = find_window_entity(0, harness.world());
+        assert_eq!(
+            harness
+                .world()
+                .run_system_once(visible_inactive_target)
+                .unwrap(),
+            Some(entity)
+        );
+    }
 }
 
 fn overlay_border_params(
@@ -1430,7 +1439,7 @@ pub(super) fn update_overlays(
 
     let mut target_space_ids = HashSet::new();
     let mut targets = Vec::new();
-    for (_, strip, native_space, child, active, visible) in &spaces {
+    for (_, strip, native_space, child, _, _) in &spaces {
         if !native_space_has_overlay(native_space.kind) {
             continue;
         }
@@ -1439,7 +1448,7 @@ pub(super) fn update_overlays(
         };
         target_space_ids.insert(strip.id());
 
-        let focused = match resolve_space_overlay_target(&inputs, strip, active, visible) {
+        let focused = match resolve_space_overlay_target(&inputs, strip) {
             Ok(focused) => focused,
             Err(error) => {
                 // Space membership is a transient private-API read. Keep all

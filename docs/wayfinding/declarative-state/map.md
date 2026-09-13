@@ -3,7 +3,7 @@
 Label: wayfinder:map
 Status: resolved
 
-后续讨论：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已确认，待进入实现的整体确认）。
+后续切片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
 
 ## Destination
 
