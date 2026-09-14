@@ -1,6 +1,6 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -28,14 +28,14 @@ use tracing::warn;
 
 use crate::events::EventSender;
 
-use super::drag::{BarDrag, DropTarget};
-use super::layout::{BarLayout, BarMetrics, BarSurface, ItemKind, PlacedItem, Rect};
+use super::layout::{ItemKind, Rect};
 use super::model::{BarDisplay, BarSnapshot};
-use super::motion::{self, BarMotion, VisualItem};
+use super::motion::VisualItem;
 use super::preferences::BarPreferences;
+use super::runtime::{
+    Bar, BarInput, BarOutcome, BarPoll, BarScreenGeometry, BarSurface, DragPreview, RenderFrame,
+};
 use super::toolbar;
-
-const DRAG_RELEASE_GRACE: Duration = Duration::from_millis(250);
 
 /// One breath, in seconds. Slow enough to read as breathing rather than as a
 /// blink, which is what makes a hovered control feel alive.
@@ -59,269 +59,21 @@ const PULSE_SCALE: &str = "transform.scale";
 const BUTTON_PULSE: (f64, f64) = (0.07, 0.17);
 
 #[derive(Debug)]
-#[allow(clippy::struct_excessive_bools)] // Independent capability/style flags.
-struct ViewState {
-    display: BarDisplay,
-    layout: BarLayout,
-    motion: BarMotion,
-    surface: BarSurface,
-    space_scroll: HashMap<u64, f64>,
-    can_focus_spaces: bool,
-    can_move_windows: bool,
-    pressed: Option<BarDrag>,
-    release_observed_at: Option<Instant>,
-    floating_order: HashMap<u64, Vec<i32>>,
-    icons: HashMap<String, Retained<NSImage>>,
-    preferences: BarPreferences,
-    /// Runtime-only collapse state: every Bar starts expanded and nothing
-    /// persists this.
-    collapsed: bool,
-    /// Whether the pointer is on the Bar at all: its band while expanded, its
-    /// handle either way. This is what makes the panel interactive, so the menu
-    /// bar underneath keeps everything the Bar is not drawing.
-    hovered: bool,
-    /// Whether the pointer is on the handle, which is the one control that
-    /// breathes.
-    handle_hovered: bool,
-    /// Which toolbar button the pointer is over, if any.
-    hover_button: Option<Action>,
-    /// Set when the panel's own rect must be recomputed: collapse and hover
-    /// change the panel, not just its content.
-    chrome_dirty: bool,
-    /// Eased motion of the Bar between expanded and collapsed.
-    chrome: EasedProgress,
-    /// How far the handle has grown under the pointer. 0 is its resting size.
-    handle_grow: EasedProgress,
-}
-
-impl ViewState {
-    fn drag_release_expired(&mut self, mouse_down: bool, now: Instant) -> bool {
-        if mouse_down || !self.pressed.as_ref().is_some_and(|drag| drag.active) {
-            self.release_observed_at = None;
-            return false;
-        }
-        // Global button state can lead the queued mouseUp. This is only a
-        // missing-event watchdog; normal releases must finish via mouseUp.
-        let released = self.release_observed_at.get_or_insert(now);
-        now.saturating_duration_since(*released) >= DRAG_RELEASE_GRACE
-    }
-
-    /// The whole menu-bar band, in viewport coordinates.
-    fn panel_rect(&self) -> Rect {
-        Rect {
-            x: 0.0,
-            y: 0.0,
-            width: self.surface.width,
-            height: self.layout.height,
-        }
-    }
-
-    /// The band at the current progress: what is left of the Bar's own rect on
-    /// screen. It slides up out of the panel as the Bar collapses.
-    fn band_rect(&self) -> Rect {
-        super::placement::band_rect(
-            (self.surface.width, self.layout.height),
-            self.chrome.progress(),
-        )
-    }
-
-    /// The Bar Handle at the current progress, in viewport coordinates,
-    /// including however far it has grown under the pointer.
-    ///
-    /// The one description the drawn shape and the hit target both come from, so
-    /// they cannot drift apart. The grown rect contains the resting one and
-    /// keeps its glued top edge, so a pointer that is inside the small shape is
-    /// still inside the large one: growth can never drop the pointer out of
-    /// hover and flip the handle back and forth every frame.
-    fn handle_rect(&self) -> Rect {
-        let handle = self.preferences.handle_metrics();
-        let resting = super::placement::handle_rect(
-            (self.surface.width, self.layout.height),
-            self.surface.notch,
-            self.chrome.progress(),
-            handle,
-        );
-        let grown =
-            super::placement::grown_handle_rect(resting, handle, self.surface.notch.is_some());
-        let growth = self.handle_grow.progress();
-        Rect {
-            x: motion::lerp(resting.x, grown.x, growth),
-            y: motion::lerp(resting.y, grown.y, growth),
-            width: motion::lerp(resting.width, grown.width, growth),
-            height: motion::lerp(resting.height, grown.height, growth),
-        }
-    }
-
-    /// The Bar's own outline: the band, plus the handle that outlives it.
-    fn chrome_path(&self) -> Retained<NSBezierPath> {
-        chrome_path(
-            self.band_rect(),
-            self.handle_rect(),
-            self.preferences.corner_radius.clamp(0.0, 20.0),
-            self.preferences.handle_metrics().radius,
-        )
-    }
-
-    /// Whether a point grabs the handle, which toggles the Bar both ways.
-    fn handle_at(&self, point: (f64, f64)) -> bool {
-        contains(self.handle_rect(), NSPoint::new(point.0, point.1))
-    }
-
-    fn set_collapsed(&mut self, collapsed: bool) {
-        if self.collapsed == collapsed {
-            return;
-        }
-        self.collapsed = collapsed;
-        self.chrome.set_target(!collapsed, Instant::now());
-        self.chrome_dirty = true;
-    }
-
-    fn take_chrome_dirty(&mut self) -> bool {
-        std::mem::take(&mut self.chrome_dirty)
-    }
-
-    fn press_at(&mut self, point: NSPoint) -> Option<Action> {
-        self.pressed = None;
-        self.release_observed_at = None;
-        if self.handle_at((point.x, point.y)) {
-            // The handle is always visible — it hangs below the band while
-            // expanded — so one click toggles, with no reveal first.
-            self.set_collapsed(!self.collapsed);
-            return None;
-        }
-        if self.collapsed {
-            // The rest of the band belongs to the menu bar underneath while the
-            // Bar is collapsed, so nothing else here is live.
-            return None;
-        }
-        let hit_layout = self.motion.presented.interaction_layout(&self.layout);
-        if let Some(item) = window_at(&hit_layout, point)
-            && let ItemKind::Window { space_id, .. } = item.kind
-            && self.space_shows_windows(space_id)
-        {
-            // A drag can start in any Space that draws its windows; what a
-            // release means is settled in `release_drag`, once it is known
-            // whether the pointer moved.
-            self.pressed = BarDrag::begin(&item, &self.motion.presented, (point.x, point.y));
-            return None;
-        }
-        space_at(&hit_layout, point)
-            .filter(|_| self.can_focus_spaces)
-            .map(|space_id| Action::FocusSpace { space_id })
-    }
-
-    fn relayout(&mut self) {
-        let metrics = display_metrics(&self.display, &self.preferences);
-        let preview = self
-            .pressed
-            .as_ref()
-            .map(|drag| drag.preview_display(&self.display));
-        self.layout = BarLayout::resolve_surface(
-            preview.as_ref().unwrap_or(&self.display),
-            self.surface,
-            &mut self.space_scroll,
-            metrics,
-        );
-        self.motion.retarget(&self.layout, Instant::now());
-    }
-
-    fn drag_to(&mut self, point: NSPoint, inside_view: bool) {
-        self.release_observed_at = None;
-        let hit_layout = self.motion.presented.interaction_layout(&self.layout);
-        if let Some(drag) = &mut self.pressed {
-            drag.move_pointer((point.x, point.y));
-            drag.update_target(
-                &self.display,
-                &hit_layout,
-                &self.motion.presented,
-                self.can_move_windows && inside_view,
-            );
-        }
-        self.relayout();
-    }
-
-    fn release_drag(&mut self, point: NSPoint, inside_view: bool) -> Option<Action> {
-        self.drag_to(point, inside_view);
-        let pressed = self.pressed.take()?;
-        let allowed = pressed.is_valid(&self.display)
-            && (!pressed.active || self.can_move_windows && pressed.target_valid(&self.display));
-        let action = if allowed {
-            if pressed.active
-                && let Some(DropTarget::Floating { anchor, before }) = pressed.target
-            {
-                self.reorder_floating(pressed.space_id, pressed.window_id, anchor, before);
-            }
-            pressed.action(self.space_is_visible(pressed.space_id))
-        } else {
-            None
-        };
-        self.relayout();
-        action
-    }
-
-    fn sync_floating_order(&mut self) {
-        for space in &mut self.display.spaces {
-            let observed = space
-                .floating
-                .iter()
-                .map(|window| window.id)
-                .collect::<Vec<_>>();
-            let order = self.floating_order.entry(space.id).or_default();
-            order.retain(|window_id| observed.contains(window_id));
-            for window_id in observed {
-                if !order.contains(&window_id) {
-                    order.push(window_id);
-                }
-            }
-            space.floating.sort_by_key(|window| {
-                order
-                    .iter()
-                    .position(|window_id| *window_id == window.id)
-                    .unwrap_or(usize::MAX)
-            });
-        }
-    }
-
-    fn reorder_floating(&mut self, space_id: u64, window_id: i32, anchor: i32, before: bool) {
-        let Some(order) = self.floating_order.get_mut(&space_id) else {
-            return;
-        };
-        let Some(source) = order.iter().position(|candidate| *candidate == window_id) else {
-            return;
-        };
-        order.remove(source);
-        let Some(anchor) = order.iter().position(|candidate| *candidate == anchor) else {
-            return;
-        };
-        order.insert(if before { anchor } else { anchor + 1 }, window_id);
-        self.sync_floating_order();
-        self.relayout();
-    }
-
-    fn space_is_visible(&self, space_id: u64) -> bool {
-        self.display
-            .spaces
-            .iter()
-            .any(|space| space.id == space_id && space.visible)
-    }
-
-    /// Whether a Space draws its windows, and so whether they are worth aiming
-    /// at. A collapsed Space draws a deck instead: clicking it means "take me
-    /// there", not "this icon".
-    fn space_shows_windows(&self, space_id: u64) -> bool {
-        !self.preferences.collapse_inactive_spaces || self.space_is_visible(space_id)
-    }
-}
-
-#[derive(Debug)]
 struct BarViewIvars {
-    events: EventSender,
-    state: RefCell<ViewState>,
+    display_id: u32,
+    /// The last frame [`Bar`] published. The view draws from it and never
+    /// computes state of its own.
+    render: RefCell<Option<RenderFrame>>,
+    /// Interactions the selectors translated; drained by `Bar::animate`.
+    inputs: RefCell<Vec<BarInput>>,
     ghost: RefCell<Option<DragGhost>>,
     toolbar_buttons: RefCell<Vec<(Action, Retained<NSButton>)>>,
     /// One hover highlight per toolbar button, sitting under the button's own
     /// view so the symbol draws on top of it.
     highlights: RefCell<Vec<Retained<CALayer>>>,
+    /// Bundle identity to application icon, resolved lazily and shared by every
+    /// drawn window.
+    icons: RefCell<HashMap<String, Retained<NSImage>>>,
 }
 
 define_class!(
@@ -335,14 +87,12 @@ define_class!(
     impl BarView {
         #[unsafe(method(openMissionControl:))]
         fn open_mission_control(&self, _sender: Option<&AnyObject>) {
-            self.cancel_drag();
-            self.dispatch(Action::MissionControl);
+            self.enqueue(Action::MissionControl);
         }
 
         #[unsafe(method(showDesktop:))]
         fn show_desktop(&self, _sender: Option<&AnyObject>) {
-            self.cancel_drag();
-            self.dispatch(Action::ShowDesktop);
+            self.enqueue(Action::ShowDesktop);
         }
 
         #[unsafe(method(drawRect:))]
@@ -358,139 +108,157 @@ define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
-            let action = self.ivars().state.borrow_mut().press_at(point);
-            if let Some(action) = action {
-                self.dispatch(action);
-            }
+            self.push(BarInput::Press {
+                display_id: self.ivars().display_id,
+                point: (point.x, point.y),
+            });
         }
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
-            let mut state = self.ivars().state.borrow_mut();
-            // Dropping "inside" means inside the band the content lives in, not
-            // inside the taller panel that also holds the handle.
-            let inside = contains(state.panel_rect(), point);
-            state.drag_to(point, inside);
-            drop(state);
-            self.sync_drag_preview();
-            self.setNeedsDisplay(true);
+            self.push(BarInput::Drag {
+                display_id: self.ivars().display_id,
+                point: (point.x, point.y),
+            });
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
-            let mut state = self.ivars().state.borrow_mut();
-            let inside = contains(state.panel_rect(), point);
-            let action = state.release_drag(point, inside);
-            drop(state);
-            self.sync_drag_preview();
-            self.setNeedsDisplay(true);
-            if let Some(action) = action {
-                self.dispatch(action);
-            }
+            self.push(BarInput::Release {
+                display_id: self.ivars().display_id,
+                point: (point.x, point.y),
+            });
         }
 
         #[unsafe(method(cancelOperation:))]
         fn cancel_operation(&self, _sender: Option<&AnyObject>) {
-            self.cancel_drag();
+            self.push(BarInput::Cancel {
+                display_id: self.ivars().display_id,
+            });
         }
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
-            let mut state = self.ivars().state.borrow_mut();
-            // Scrolling belongs to the Space under the pointer: a slot narrower
-            // than its content scrolls inside itself, and every other Space
-            // keeps its place.
-            let hit_layout = state.motion.presented.interaction_layout(&state.layout);
-            let Some(space_id) = space_at(&hit_layout, point) else {
-                return;
-            };
-            let max_scroll = state.layout.max_space_scroll(space_id);
-            if max_scroll <= 0.0 {
-                return;
-            }
             let delta = if event.scrollingDeltaX().abs() > event.scrollingDeltaY().abs() {
                 event.scrollingDeltaX()
             } else {
                 event.scrollingDeltaY()
             };
-            let offset = state.space_scroll.entry(space_id).or_insert(0.0);
-            *offset = (*offset + delta).clamp(0.0, max_scroll);
-            state.relayout();
-            drop(state);
-            self.setNeedsDisplay(true);
+            // Scrolling belongs to the Space under the pointer: a slot narrower
+            // than its content scrolls inside itself, and every other Space
+            // keeps its place.
+            self.push(BarInput::Scroll {
+                display_id: self.ivars().display_id,
+                point: (point.x, point.y),
+                delta,
+            });
         }
     }
 );
 
 impl BarView {
-    fn install_toolbar(&self) {
-        // The panel window is taller than the band — it also holds the handle —
-        // so the buttons are sized by the band, which is what the menu bar is.
-        let band = self.ivars().state.borrow().layout.height;
-        let mut buttons = self.ivars().toolbar_buttons.borrow_mut();
-        for control in toolbar::buttons(band) {
-            let tooltip = NSString::from_str(control.tooltip);
-            let Some(symbol) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                &NSString::from_str(control.symbol),
-                Some(&tooltip),
-            ) else {
-                warn!(symbol = control.symbol, "Bar toolbar symbol unavailable");
-                continue;
-            };
-            // Menu-bar metrics: configure the symbol's own point size and
-            // weight instead of stretching one image into the whole button,
-            // which is what made the old buttons look coarse.
-            let point_size = (control.rect.width * 0.62).clamp(11.0, 16.0);
-            let configuration = NSImageSymbolConfiguration::configurationWithPointSize_weight(
-                point_size,
-                // NSFontWeightMedium; the constant needs a feature we do not enable.
-                0.23,
-            );
-            let image = symbol
-                .imageWithSymbolConfiguration(&configuration)
-                .unwrap_or(symbol);
-            let action = match control.action {
-                Action::MissionControl => sel!(openMissionControl:),
-                Action::ShowDesktop => sel!(showDesktop:),
-                _ => unreachable!("only system overview actions have toolbar buttons"),
-            };
-            // Both selectors are defined on this view; NSButton owns click tracking.
-            let button = unsafe {
-                NSButton::buttonWithImage_target_action(
-                    &image,
-                    Some(self),
-                    Some(action),
-                    self.mtm(),
-                )
-            };
-            button.setButtonType(NSButtonType::MomentaryPushIn);
-            button.setBezelStyle(NSBezelStyle::AccessoryBarAction);
-            button.setShowsBorderOnlyWhileMouseInside(true);
-            button.setImageScaling(NSImageScaling::ScaleProportionallyDown);
-            button.setContentTintColor(Some(&color(1.0, 1.0, 1.0, 0.92)));
-            // The hover highlight is drawn by the Bar itself, so the button
-            // contributes no bezel of its own.
-            button.setBordered(false);
-            button.setRefusesFirstResponder(true);
-            button.setToolTip(Some(&tooltip));
-            button.setFrame(ns_rect(control.rect));
-            self.addSubview(&button);
-            buttons.push((control.action, button));
-        }
+    /// Creates the toolbar button for one control, or reports that `AppKit`
+    /// could not resolve its symbol.
+    fn make_button(&self, control: &toolbar::ToolbarButton) -> Option<Retained<NSButton>> {
+        let tooltip = NSString::from_str(control.tooltip);
+        let Some(symbol) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str(control.symbol),
+            Some(&tooltip),
+        ) else {
+            warn!(symbol = control.symbol, "Bar toolbar symbol unavailable");
+            return None;
+        };
+        // Menu-bar metrics: configure the symbol's own point size and
+        // weight instead of stretching one image into the whole button,
+        // which is what made the old buttons look coarse.
+        let point_size = (control.rect.width * 0.62).clamp(11.0, 16.0);
+        let configuration = NSImageSymbolConfiguration::configurationWithPointSize_weight(
+            point_size,
+            // NSFontWeightMedium; the constant needs a feature we do not enable.
+            0.23,
+        );
+        let image = symbol
+            .imageWithSymbolConfiguration(&configuration)
+            .unwrap_or(symbol);
+        let action = match control.action {
+            Action::MissionControl => sel!(openMissionControl:),
+            Action::ShowDesktop => sel!(showDesktop:),
+            _ => unreachable!("only system overview actions have toolbar buttons"),
+        };
+        // Both selectors are defined on this view; NSButton owns click tracking.
+        let button = unsafe {
+            NSButton::buttonWithImage_target_action(&image, Some(self), Some(action), self.mtm())
+        };
+        button.setButtonType(NSButtonType::MomentaryPushIn);
+        button.setBezelStyle(NSBezelStyle::AccessoryBarAction);
+        button.setShowsBorderOnlyWhileMouseInside(true);
+        button.setImageScaling(NSImageScaling::ScaleProportionallyDown);
+        button.setContentTintColor(Some(&color(1.0, 1.0, 1.0, 0.92)));
+        // The hover highlight is drawn by the Bar itself, so the button
+        // contributes no bezel of its own.
+        button.setBordered(false);
+        button.setRefusesFirstResponder(true);
+        button.setToolTip(Some(&tooltip));
+        button.setFrame(ns_rect(control.rect));
+        Some(button)
     }
 
-    /// Places the per-button hover highlights and breathes the one under the
-    /// pointer. They are sublayers, so the button's own view still draws its
-    /// symbol on top.
-    fn sync_highlights(&self, controls: &[toolbar::ToolbarButton], origin: f64, slide: f64) {
-        let hover_button = self.ivars().state.borrow().hover_button.clone();
+    fn sync_toolbar(
+        &self,
+        preferences: &BarPreferences,
+        origin: f64,
+        slide: f64,
+        controls: &[toolbar::ToolbarButton],
+        hidden: bool,
+    ) {
+        let mut buttons = self.ivars().toolbar_buttons.borrow_mut();
+        for control in controls {
+            if buttons.iter().any(|(action, _)| *action == control.action) {
+                continue;
+            }
+            let Some(button) = self.make_button(control) else {
+                continue;
+            };
+            self.addSubview(&button);
+            buttons.push((control.action.clone(), button));
+        }
+        let tint = foreground_color(preferences, 1.0);
+        for (action, button) in buttons.iter() {
+            match controls.iter().find(|control| control.action == *action) {
+                // Buttons are subviews, so a Bar that has slid away would leave
+                // them floating over the desktop; a collapsed Bar has none.
+                None => button.setHidden(true),
+                Some(control) => {
+                    button.setHidden(hidden);
+                    // The buttons lead the Bar's group, so they ride out with it.
+                    let mut rect = control.rect;
+                    rect.x += origin;
+                    rect.y += slide;
+                    button.setFrame(ns_rect(rect));
+                    button.setContentTintColor(Some(&tint));
+                }
+            }
+        }
+        self.sync_highlights(&buttons, controls, origin, slide);
+    }
+
+    /// Places the per-button hover highlights under their buttons. The pulse
+    /// itself is [`Self::set_button_highlight`]'s, so positioning here cannot
+    /// restart a running breath.
+    fn sync_highlights(
+        &self,
+        buttons: &[(Action, Retained<NSButton>)],
+        controls: &[toolbar::ToolbarButton],
+        origin: f64,
+        slide: f64,
+    ) {
         let view_height = self.bounds().size.height;
         let parent = self.layer();
         let mut highlights = self.ivars().highlights.borrow_mut();
-        while highlights.len() < controls.len() {
+        while highlights.len() < buttons.len() {
             let layer = CALayer::new();
             layer.setBackgroundColor(Some(&NSColor::whiteColor().CGColor()));
             layer.setCornerRadius(6.0);
@@ -501,9 +269,12 @@ impl BarView {
             highlights.push(layer);
         }
         for (index, layer) in highlights.iter().enumerate() {
-            let Some(control) = controls.get(index) else {
-                // A configuration change can take a button away; its highlight
-                // must not be left behind.
+            let Some((action, _)) = buttons.get(index) else {
+                settle(layer);
+                continue;
+            };
+            let Some(control) = controls.iter().find(|control| control.action == *action) else {
+                // A disabled button keeps no highlight.
                 settle(layer);
                 continue;
             };
@@ -515,7 +286,16 @@ impl BarView {
             if let Some(parent) = &parent {
                 layer.setFrame(sublayer_rect(parent, view_height, rect));
             }
-            if hover_button.as_ref() == Some(&control.action) {
+        }
+    }
+
+    /// Breathes the button under the pointer and settles the rest. Idempotent,
+    /// so a running breath survives the per-frame sync.
+    fn set_button_highlight(&self, action: Option<Action>) {
+        let buttons = self.ivars().toolbar_buttons.borrow();
+        let highlights = self.ivars().highlights.borrow();
+        for ((button_action, _), layer) in buttons.iter().zip(highlights.iter()) {
+            if action.as_ref() == Some(button_action) {
                 breathe(
                     layer,
                     PULSE_OPACITY,
@@ -531,157 +311,57 @@ impl BarView {
         }
     }
 
-    fn layout_toolbar(&self) {
-        let (preferences, origin, band, slide, gone) = {
-            let state = self.ivars().state.borrow();
-            (
-                state.preferences.clone(),
-                state.motion.presented.toolbar_origin,
-                state.layout.height,
-                state.band_rect().y,
-                state.chrome.progress() <= 0.01,
-            )
-        };
-        let controls = toolbar::configured_buttons(
-            band,
-            preferences.show_mission_control,
-            preferences.show_desktop,
-        );
-        let tint = foreground_color(&preferences, 1.0);
-        for (action, button) in self.ivars().toolbar_buttons.borrow().iter() {
-            let control = controls.iter().find(|control| *action == control.action);
-            // Buttons are subviews, so a Bar that has slid away would leave
-            // them floating over the desktop; a collapsed Bar has none.
-            button.setHidden(control.is_none() || gone);
-            if let Some(control) = control {
-                // The buttons lead the Bar's group, so they ride out with it.
-                let mut rect = control.rect;
-                rect.x += origin;
-                rect.y += slide;
-                button.setFrame(ns_rect(rect));
-                button.setContentTintColor(Some(&tint));
-            }
-        }
-        self.sync_highlights(&controls, origin, slide);
+    fn push(&self, input: BarInput) {
+        self.ivars().inputs.borrow_mut().push(input);
     }
 
-    fn cancel_drag(&self) {
-        let mut state = self.ivars().state.borrow_mut();
-        state.pressed = None;
-        state.relayout();
-        drop(state);
-        self.sync_drag_preview();
-        self.setNeedsDisplay(true);
-    }
-
-    fn new(
-        mtm: MainThreadMarker,
-        events: EventSender,
-        display: BarDisplay,
-        surface: BarSurface,
-        capabilities: BarCapabilities,
-        preferences: BarPreferences,
-    ) -> Retained<Self> {
-        let metrics = display_metrics(&display, &preferences);
-        let layout = BarLayout::resolve_surface(&display, surface, &mut HashMap::new(), metrics);
-        // The view is the panel window: the menu-bar band, plus the overhang the
-        // handle hangs into — including the room it grows into under the
-        // pointer, or a hover would clip its rounded bottom off.
-        let frame = ns_rect(Rect {
-            width: layout.width,
-            height: layout.height + super::placement::window_overhang(preferences.handle_metrics()),
-            ..Rect::default()
+    fn enqueue(&self, action: Action) {
+        self.push(BarInput::Activate {
+            display_id: self.ivars().display_id,
+            action,
         });
+    }
+
+    fn take_inputs(&self) -> Vec<BarInput> {
+        std::mem::take(&mut *self.ivars().inputs.borrow_mut())
+    }
+
+    fn set_render(&self, frame: RenderFrame) {
+        *self.ivars().render.borrow_mut() = Some(frame);
+    }
+
+    fn new(mtm: MainThreadMarker, display_id: u32, size: NSSize) -> Retained<Self> {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), size);
         let this = Self::alloc(mtm).set_ivars(BarViewIvars {
-            events,
+            display_id,
+            render: RefCell::new(None),
+            inputs: RefCell::new(Vec::new()),
             ghost: RefCell::new(None),
             toolbar_buttons: RefCell::new(Vec::new()),
             highlights: RefCell::new(Vec::new()),
-            state: RefCell::new(ViewState {
-                display,
-                motion: BarMotion::new(&layout, Instant::now()),
-                layout,
-                surface,
-                space_scroll: HashMap::new(),
-                can_focus_spaces: capabilities.focus_spaces,
-                can_move_windows: capabilities.move_windows,
-                pressed: None,
-                release_observed_at: None,
-                floating_order: HashMap::new(),
-                icons: HashMap::new(),
-                preferences,
-                collapsed: false,
-                hovered: false,
-                handle_hovered: false,
-                hover_button: None,
-                chrome_dirty: false,
-                chrome: EasedProgress::new(true, Instant::now()),
-                handle_grow: EasedProgress::new(false, Instant::now()),
-            }),
+            icons: RefCell::new(HashMap::new()),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.setWantsLayer(true);
-        this.install_toolbar();
         this
-    }
-
-    fn update(
-        &self,
-        display: BarDisplay,
-        surface: BarSurface,
-        capabilities: BarCapabilities,
-        preferences: BarPreferences,
-    ) {
-        let mut state = self.ivars().state.borrow_mut();
-        state.display = display;
-        state.can_focus_spaces = capabilities.focus_spaces;
-        state.can_move_windows = capabilities.move_windows;
-        state.surface = surface;
-        state.preferences = preferences;
-        if state
-            .pressed
-            .as_ref()
-            .is_some_and(|drag| !drag.is_valid(&state.display))
-        {
-            state.pressed = None;
-        }
-        if !capabilities.move_windows
-            && let Some(drag) = &mut state.pressed
-        {
-            drag.target = None;
-        }
-        let target_missing = state
-            .pressed
-            .as_ref()
-            .is_some_and(|drag| !drag.target_valid(&state.display));
-        if target_missing && let Some(drag) = &mut state.pressed {
-            drag.target = None;
-        }
-        state.sync_floating_order();
-        state.relayout();
-        drop(state);
-        self.sync_drag_preview();
-        self.setNeedsDisplay(true);
-    }
-
-    fn dispatch(&self, action: Action) {
-        if let Err(error) = self.ivars().events.dispatch(action) {
-            warn!(%error, "unable to dispatch Bar action");
-        }
     }
 
     fn draw_bar(&self) {
         let bounds = self.bounds();
-        let (preferences, band, path, progress, split) = {
-            let state = self.ivars().state.borrow();
-            (
-                state.preferences.clone(),
-                state.band_rect(),
-                state.chrome_path(),
-                state.chrome.progress(),
-                state.motion.presented.split.clone(),
-            )
+        let render = self.ivars().render.borrow();
+        let Some(frame) = render.as_ref() else {
+            clear(bounds);
+            return;
         };
+        let preferences = &frame.preferences;
+        let band = frame.band;
+        let path = chrome_path(
+            frame.band,
+            frame.handle,
+            preferences.corner_radius.clamp(0.0, 20.0),
+            preferences.handle_metrics().radius,
+        );
+        let progress = frame.chrome_progress;
         clear(bounds);
 
         // One shape: the band slides up out of the screen and the handle stays
@@ -712,16 +392,6 @@ impl BarView {
         }
 
         if progress > 0.01 {
-            let (frame, drag) = {
-                let state = self.ivars().state.borrow();
-                (
-                    state.motion.presented.clone(),
-                    state
-                        .pressed
-                        .clone()
-                        .filter(|drag| drag.active && state.can_move_windows),
-                )
-            };
             // The content rides the band out of the screen: it is clipped to
             // the band's own rect at the same progress, and to nothing else.
             // There is no fade — the screen's top edge is what takes it away.
@@ -731,10 +401,10 @@ impl BarView {
             let band_at_rest = ns_rect(Rect { y: 0.0, ..band });
             NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(band_at_rest, radius, radius)
                 .addClip();
-            if let Some(split) = &split {
+            if let Some(split) = &frame.presentation.split {
                 clip_notch(band_at_rest, split.gap);
             }
-            self.draw_strip(&frame, drag.as_ref(), &preferences);
+            self.draw_strip(frame);
             NSGraphicsContext::restoreGraphicsState_class();
         }
 
@@ -746,31 +416,28 @@ impl BarView {
 
     /// The Bar's content, drawn in the band's own coordinates and clipped to it
     /// by the caller, which also translates it with the slide.
-    fn draw_strip(
-        &self,
-        frame: &super::motion::Presentation,
-        drag: Option<&BarDrag>,
-        preferences: &BarPreferences,
-    ) {
+    fn draw_strip(&self, frame: &RenderFrame) {
+        let presentation = &frame.presentation;
+        let drag = frame.drag.as_ref();
         NSGraphicsContext::saveGraphicsState_class();
         // Scrolling and dragging belong only to the Space viewport, never the fixed buttons.
         NSBezierPath::bezierPathWithRect(ns_rect(Rect {
-            x: frame.content_left,
-            width: (frame.width - frame.content_left).max(0.0),
-            height: frame.height,
+            x: presentation.content_left,
+            width: (presentation.width - presentation.content_left).max(0.0),
+            height: presentation.height,
             ..Rect::default()
         }))
         .addClip();
-        for visual in frame
+        for visual in presentation
             .items
             .iter()
             .filter(|visual| matches!(visual.item.kind, ItemKind::Space { .. }))
         {
-            self.draw_space(visual, frame.viewport(visual.space_id()));
+            Self::draw_space(frame, visual, presentation.viewport(visual.space_id()));
         }
         // Keep the moving fill below icons and its indicator above opaque decks.
         for pass in 0..3 {
-            for visual in &frame.items {
+            for visual in &presentation.items {
                 if drag.is_some_and(|drag| drag.hides(visual)) {
                     continue;
                 }
@@ -779,7 +446,7 @@ impl BarView {
                 {
                     continue;
                 }
-                let viewport = frame.viewport(visual.space_id());
+                let viewport = presentation.viewport(visual.space_id());
                 if viewport.width <= 0.0 || viewport.height <= 0.0 {
                     continue;
                 }
@@ -791,20 +458,22 @@ impl BarView {
                 )
                 .addClip();
                 match visual.item.kind {
-                    ItemKind::Window { .. } => self.draw_window(visual),
-                    ItemKind::Label { ordinal, .. } => draw_label(ordinal, visual, preferences),
-                    ItemKind::Placeholder { .. } => Self::draw_placeholder(visual),
-                    ItemKind::Focus { .. } if pass == 0 => self.draw_focus(visual),
-                    ItemKind::Focus { .. } => self.draw_focus_indicator(visual),
+                    ItemKind::Window { .. } => self.draw_window(frame, visual),
+                    ItemKind::Label { ordinal, .. } => {
+                        draw_label(ordinal, visual, &frame.preferences);
+                    }
+                    ItemKind::Placeholder { .. } => Self::draw_placeholder(frame, visual),
+                    ItemKind::Focus { .. } if pass == 0 => Self::draw_focus(frame, visual),
+                    ItemKind::Focus { .. } => Self::draw_focus_indicator(frame, visual),
                     _ => {}
                 }
                 NSGraphicsContext::restoreGraphicsState_class();
             }
         }
         if let Some(drag) = drag
-            && let Some(gap) = drag.gap_rect(frame)
+            && let Some(gap) = drag.gap_rect(presentation)
         {
-            let gap = gap.intersection(frame.viewport(drag.target_space()));
+            let gap = gap.intersection(presentation.viewport(drag.target_space()));
             if gap.width > 0.0 {
                 rounded_fill(ns_rect(gap.inset(0.5)), 4.0, color(0.2, 0.65, 1.0, 0.12));
                 rounded_stroke(
@@ -818,13 +487,13 @@ impl BarView {
         NSGraphicsContext::restoreGraphicsState_class();
     }
 
-    fn draw_space(&self, visual: &VisualItem, viewport: Rect) {
+    fn draw_space(frame: &RenderFrame, visual: &VisualItem, viewport: Rect) {
         let ItemKind::Space { .. } = visual.item.kind else {
             return;
         };
         NSGraphicsContext::saveGraphicsState_class();
         NSBezierPath::bezierPathWithRect(ns_rect(viewport)).addClip();
-        let preferences = self.ivars().state.borrow().preferences.clone();
+        let preferences = &frame.preferences;
         let active =
             BarPreferences::rgba(&preferences.active_workspace_color, [0.04, 0.52, 1.0, 0.2]);
         let rect = ns_rect(visual.item.space_background_rect());
@@ -839,65 +508,45 @@ impl BarView {
         NSGraphicsContext::restoreGraphicsState_class();
     }
 
-    fn draw_window(&self, visual: &VisualItem) {
+    fn draw_window(&self, _frame: &RenderFrame, visual: &VisualItem) {
         let ItemKind::Window { bundle_id, .. } = &visual.item.kind else {
             return;
         };
         draw_window_visual(visual, self.icon(bundle_id).as_deref());
     }
 
-    fn sync_drag_preview(&self) {
-        let drag = {
-            let state = self.ivars().state.borrow();
-            state
-                .pressed
-                .clone()
-                .filter(|drag| drag.active && state.can_move_windows)
-        };
-        let Some(drag) = drag else {
-            self.ivars().ghost.borrow_mut().take();
-            return;
-        };
+    fn show_drag_preview(&self, preview: &DragPreview) {
         let mut ghost = self.ivars().ghost.borrow_mut();
         if ghost.is_none() {
-            let Some(screen) = self.window().and_then(|window| window.screen()) else {
-                return;
-            };
-            *ghost = Some(DragGhost::new(self.mtm(), screen.frame()));
+            *ghost = Some(DragGhost::new(self.mtm()));
         }
-        let Some(ghost) = ghost.as_ref() else {
+        let Some(ghost) = ghost.as_mut() else {
             return;
         };
-        let pointer = NSEvent::mouseLocation();
-        let screen = ghost.screen;
-        let (rect, items) = drag.ghost_geometry(
-            (pointer.x, pointer.y),
-            Rect {
-                x: screen.origin.x,
-                y: screen.origin.y,
-                width: screen.size.width,
-                height: screen.size.height,
-            },
-        );
-        *ghost.view.ivars().borrow_mut() = items
-            .into_iter()
+        *ghost.view.ivars().borrow_mut() = preview
+            .items
+            .iter()
             .map(|visual| {
                 let icon = match &visual.item.kind {
                     ItemKind::Window { bundle_id, .. } => self.icon(bundle_id),
                     _ => None,
                 };
-                (visual, icon)
+                (visual.clone(), icon)
             })
             .collect();
         ghost
             .view
-            .setFrameSize(NSSize::new(rect.width, rect.height));
-        ghost.window.setFrame_display(ns_rect(rect), false);
+            .setFrameSize(NSSize::new(preview.rect.width, preview.rect.height));
+        ghost.window.setFrame_display(ns_rect(preview.rect), false);
         ghost.view.setNeedsDisplay(true);
         ghost.window.orderFrontRegardless();
     }
 
-    fn draw_placeholder(visual: &VisualItem) {
+    fn hide_drag_preview(&self) {
+        self.ivars().ghost.borrow_mut().take();
+    }
+
+    fn draw_placeholder(_frame: &RenderFrame, visual: &VisualItem) {
         let rect = ns_rect(visual.item.rect.inset(2.0));
         rounded_stroke(rect, 4.0, 1.0, color(1.0, 1.0, 1.0, 0.22 * visual.opacity));
         draw_symbol(
@@ -907,8 +556,8 @@ impl BarView {
         );
     }
 
-    fn draw_focus(&self, visual: &VisualItem) {
-        let preferences = self.ivars().state.borrow().preferences.clone();
+    fn draw_focus(frame: &RenderFrame, visual: &VisualItem) {
+        let preferences = &frame.preferences;
         let mut selection =
             BarPreferences::rgba(&preferences.selection_color, [0.04, 0.52, 1.0, 1.0]);
         selection[3] *= visual.opacity;
@@ -918,8 +567,8 @@ impl BarView {
         rounded_fill(rect, 5.0, rgba(fill));
     }
 
-    fn draw_focus_indicator(&self, visual: &VisualItem) {
-        let preferences = self.ivars().state.borrow().preferences.clone();
+    fn draw_focus_indicator(frame: &RenderFrame, visual: &VisualItem) {
+        let preferences = &frame.preferences;
         let mut selection =
             BarPreferences::rgba(&preferences.selection_color, [0.04, 0.52, 1.0, 1.0]);
         selection[3] *= visual.opacity;
@@ -947,15 +596,15 @@ impl BarView {
         if bundle_id.is_empty() {
             return None;
         }
-        let mut state = self.ivars().state.borrow_mut();
-        if let Some(icon) = state.icons.get(bundle_id) {
+        let mut icons = self.ivars().icons.borrow_mut();
+        if let Some(icon) = icons.get(bundle_id) {
             return Some(icon.clone());
         }
         let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(
             &NSString::from_str(bundle_id),
         );
         let icon = apps.firstObject()?.icon()?;
-        state.icons.insert(bundle_id.to_owned(), icon.clone());
+        icons.insert(bundle_id.to_owned(), icon.clone());
         Some(icon)
     }
 }
@@ -988,11 +637,10 @@ define_class!(
 struct DragGhost {
     window: Retained<NSPanel>,
     view: Retained<DragPreviewView>,
-    screen: NSRect,
 }
 
 impl DragGhost {
-    fn new(mtm: MainThreadMarker, screen: NSRect) -> Self {
+    fn new(mtm: MainThreadMarker) -> Self {
         let view = DragPreviewView::alloc(mtm).set_ivars(RefCell::new(Vec::new()));
         let view: Retained<DragPreviewView> = unsafe {
             msg_send![super(view), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(32.0, 32.0))]
@@ -1002,95 +650,13 @@ impl DragGhost {
         unsafe { window.setReleasedWhenClosed(false) };
         window.setIgnoresMouseEvents(true);
         window.setLevel(NSMainMenuWindowLevel + 2);
-        Self {
-            window,
-            view,
-            screen,
-        }
+        Self { window, view }
     }
 }
 
 impl Drop for DragGhost {
     fn drop(&mut self) {
         self.window.close();
-    }
-}
-
-/// Which interactions this Bar's capabilities allow.
-#[derive(Clone, Copy, Debug)]
-struct BarCapabilities {
-    focus_spaces: bool,
-    move_windows: bool,
-}
-
-/// An eased 0-to-1 progress, over the same 240ms ease-out the Bar's content
-/// motion follows.
-///
-/// The collapse uses it to slide the chrome, and the handle uses it to grow
-/// under the pointer. The panel window never moves: it always covers the
-/// menu-bar band plus the handle's overhang, and the collapse is what the chrome
-/// slides against. Moving and resizing a blurred window every frame is what made
-/// the old transition stutter.
-#[derive(Debug)]
-struct EasedProgress {
-    /// 1 at the far end, 0 at the near one.
-    progress: f64,
-    from: f64,
-    to: f64,
-    started: Instant,
-    active: bool,
-}
-
-impl EasedProgress {
-    fn new(high: bool, now: Instant) -> Self {
-        let progress = if high { 1.0 } else { 0.0 };
-        Self {
-            progress,
-            from: progress,
-            to: progress,
-            started: now,
-            active: false,
-        }
-    }
-
-    fn progress(&self) -> f64 {
-        self.progress
-    }
-
-    fn is_active(&self) -> bool {
-        self.active
-    }
-
-    /// Starts moving toward the end `high` describes: expanded for the collapse,
-    /// grown for the handle.
-    ///
-    /// An interrupted transition restarts from the frame on screen rather than
-    /// from the other endpoint, so reversing mid-flight never jumps.
-    fn set_target(&mut self, high: bool, now: Instant) {
-        let target = if high { 1.0 } else { 0.0 };
-        if (self.to - target).abs() < f64::EPSILON {
-            return;
-        }
-        self.from = self.progress;
-        self.to = target;
-        self.started = now;
-        self.active = true;
-    }
-
-    /// Advances the transition and returns whether the frame on screen has
-    /// changed.
-    fn advance(&mut self, now: Instant) -> bool {
-        if !self.active {
-            return false;
-        }
-        let elapsed = now.saturating_duration_since(self.started).as_secs_f64() / motion::DURATION;
-        if elapsed >= 1.0 {
-            self.progress = self.to;
-            self.active = false;
-            return true;
-        }
-        self.progress = motion::lerp(self.from, self.to, motion::ease_out(elapsed));
-        true
     }
 }
 
@@ -1213,12 +779,13 @@ struct PanelRecord {
     /// The panel window: the menu-bar band plus the handle's overhang, and only
     /// ever that.
     frame: Rect,
+    shadow: bool,
 }
 
 impl PanelRecord {
-    /// Presents the current state: the window keeps its rect and the chrome
-    /// inside it slides.
-    fn present(&self) {
+    /// Presents one frame: the window keeps its rect and the chrome inside it
+    /// slides.
+    fn present(&self, frame: &RenderFrame) {
         let rect = ns_rect(self.frame);
         if self.window.frame() != rect {
             self.window.setFrame_display(rect, false);
@@ -1227,10 +794,14 @@ impl PanelRecord {
         // eye should read is the Bar leaving, not the Bar dissolving. The mask
         // keeps the panel's size for the panel's whole life, so only its path
         // changes as the chrome slides.
-        let path = self.view.ivars().state.borrow().chrome_path();
+        let path = chrome_path(
+            frame.band,
+            frame.handle,
+            frame.preferences.corner_radius.clamp(0.0, 20.0),
+            frame.preferences.handle_metrics().radius,
+        );
         let cg_path = path.CGPath();
         self.mask.setPath(Some(&cg_path));
-        self.view.layout_toolbar();
         self.view.setNeedsDisplay(true);
     }
 
@@ -1244,246 +815,208 @@ impl PanelRecord {
     }
 }
 
-pub struct BarManager {
+/// The production adapter: it owns every native handle and turns the port's
+/// idempotent effects into `AppKit` calls.
+struct AppKitSurface {
     mtm: MainThreadMarker,
-    events: EventSender,
     panels: HashMap<u32, PanelRecord>,
-    preferences: BarPreferences,
+}
+
+impl AppKitSurface {
+    fn new(mtm: MainThreadMarker) -> Self {
+        Self {
+            mtm,
+            panels: HashMap::new(),
+        }
+    }
+}
+
+impl BarSurface for AppKitSurface {
+    fn screen_geometry(
+        &self,
+        display: &BarDisplay,
+        preferences: &BarPreferences,
+    ) -> Option<BarScreenGeometry> {
+        let screen = screens_by_id(self.mtm).remove(&display.id)?;
+        Some(BarScreenGeometry {
+            frame: view_rect(screen.frame()),
+            visible_frame: view_rect(screen.visibleFrame()),
+            safe_area_top: screen.safeAreaInsets().top,
+            menu_bar_thickness: NSStatusBar::systemStatusBar().thickness(),
+            notch_left: view_rect(screen.auxiliaryTopLeftArea()),
+            notch_right: view_rect(screen.auxiliaryTopRightArea()),
+            label_width: measured_label_width(display, preferences),
+        })
+    }
+
+    fn poll(&mut self) -> BarPoll {
+        let mut inputs = Vec::new();
+        for record in self.panels.values() {
+            inputs.append(&mut record.view.take_inputs());
+        }
+        let pointer = NSEvent::mouseLocation();
+        BarPoll {
+            pointer: (pointer.x, pointer.y),
+            mouse_button_down: NSEvent::pressedMouseButtons() & 1 != 0,
+            inputs,
+        }
+    }
+
+    fn pointer_is_on_chrome(&self) -> bool {
+        self.panels
+            .values()
+            .any(|record| !record.window.ignoresMouseEvents())
+    }
+
+    fn ensure_panel(&mut self, display_id: u32, preferences: &BarPreferences, frame: Rect) {
+        if let Some(record) = self.panels.get_mut(&display_id) {
+            record.frame = frame;
+            record.window.setFrame_display(ns_rect(frame), false);
+            if record.shadow != preferences.show_shadow {
+                record.window.setHasShadow(preferences.show_shadow);
+                record.shadow = preferences.show_shadow;
+            }
+            record.window.orderFrontRegardless();
+            return;
+        }
+        let view = BarView::new(self.mtm, display_id, NSSize::new(frame.width, frame.height));
+        let (window, mask) = make_bar_panel(self.mtm, &view);
+        window.setHasShadow(preferences.show_shadow);
+        window.orderFrontRegardless();
+        self.panels.insert(
+            display_id,
+            PanelRecord {
+                window,
+                view,
+                mask,
+                frame,
+                shadow: preferences.show_shadow,
+            },
+        );
+    }
+
+    fn remove_panel(&mut self, display_id: u32) {
+        if let Some(record) = self.panels.remove(&display_id) {
+            record.window.close();
+        }
+    }
+
+    fn present(&mut self, display_id: u32, frame: &RenderFrame) {
+        if let Some(record) = self.panels.get(&display_id) {
+            record.view.set_render(frame.clone());
+            record.present(frame);
+        }
+    }
+
+    fn set_interactive(&mut self, display_id: u32, interactive: bool) {
+        if let Some(record) = self.panels.get(&display_id) {
+            record.set_interactive(interactive);
+        }
+    }
+
+    fn sync_toolbar(
+        &mut self,
+        display_id: u32,
+        preferences: &BarPreferences,
+        origin: f64,
+        slide: f64,
+        buttons: &[toolbar::ToolbarButton],
+        hidden: bool,
+    ) {
+        if let Some(record) = self.panels.get(&display_id) {
+            record
+                .view
+                .sync_toolbar(preferences, origin, slide, buttons, hidden);
+        }
+    }
+
+    fn set_button_highlight(&mut self, display_id: u32, action: Option<Action>) {
+        if let Some(record) = self.panels.get(&display_id) {
+            record.view.set_button_highlight(action);
+        }
+    }
+
+    fn show_drag_preview(&mut self, display_id: u32, preview: &DragPreview) {
+        if let Some(record) = self.panels.get(&display_id) {
+            record.view.show_drag_preview(preview);
+        }
+    }
+
+    fn hide_drag_preview(&mut self, display_id: u32) {
+        if let Some(record) = self.panels.get(&display_id) {
+            record.view.hide_drag_preview();
+        }
+    }
+}
+
+impl Drop for AppKitSurface {
+    fn drop(&mut self) {
+        for record in self.panels.values() {
+            record.window.close();
+        }
+    }
+}
+
+/// The `NonSend` resource the ECS talks to. It holds the Bar's decisions and
+/// the main-thread surface that realises them, and routes returned actions back
+/// to the bus.
+pub struct BarManager {
+    bar: Bar,
+    surface: Box<dyn BarSurface>,
+    events: EventSender,
 }
 
 impl BarManager {
     pub fn new(mtm: MainThreadMarker, events: EventSender) -> Self {
         Self {
-            mtm,
+            bar: Bar::default(),
+            surface: Box::new(AppKitSurface::new(mtm)),
             events,
-            panels: HashMap::new(),
-            preferences: BarPreferences::default(),
         }
     }
 
     pub fn update(&mut self, snapshot: BarSnapshot, preferences: BarPreferences) {
-        self.preferences = preferences;
-        let screens = screens_by_id(self.mtm);
-        let mut retained = HashSet::new();
-        for display in snapshot.displays {
-            let display_id = display.id;
-            let Some(screen) = screens.get(&display.id) else {
-                continue;
-            };
-            retained.insert(display.id);
-            let capabilities = BarCapabilities {
-                focus_spaces: snapshot.can_focus_spaces,
-                move_windows: snapshot.can_move_windows,
-            };
-            let (frame, surface, preferences) = screen_placement(screen, &self.preferences);
-            let (window, view) = if let Some(record) = self.panels.get(&display.id) {
-                (record.window.clone(), record.view.clone())
-            } else {
-                let view = BarView::new(
-                    self.mtm,
-                    self.events.clone(),
-                    display.clone(),
-                    surface,
-                    capabilities,
-                    preferences.clone(),
-                );
-                let (window, mask) = make_bar_panel(self.mtm, &view);
-                self.panels.insert(
-                    display.id,
-                    PanelRecord {
-                        window: window.clone(),
-                        view: view.clone(),
-                        mask,
-                        frame,
-                    },
-                );
-                (window, view)
-            };
-            view.update(display, surface, capabilities, preferences.clone());
-            window.setHasShadow(preferences.show_shadow);
-            if let Some(record) = self.panels.get_mut(&display_id) {
-                record.frame = frame;
-                record.present();
-            }
-            window.orderFrontRegardless();
-        }
-
-        self.panels.retain(|display_id, record| {
-            if retained.contains(display_id) {
-                true
-            } else {
-                record.window.close();
-                false
-            }
-        });
+        let outcome = self
+            .bar
+            .update(snapshot, preferences, self.surface.as_mut());
+        self.dispatch(outcome);
     }
 
     /// Collapses or expands the Bar on the display the user is working on.
     ///
     /// Runtime-only: nothing persists this and every Bar starts expanded.
     pub fn toggle_collapse(&mut self) {
-        let Some(display_id) = self.active_display() else {
-            return;
-        };
-        let Some(record) = self.panels.get_mut(&display_id) else {
-            return;
-        };
-        {
-            let mut state = record.view.ivars().state.borrow_mut();
-            let collapsed = !state.collapsed;
-            state.set_collapsed(collapsed);
-        }
-        record.present();
-    }
-
-    /// The display the active Space lives on, or the only Bar there is.
-    fn active_display(&self) -> Option<u32> {
-        self.panels
-            .iter()
-            .find(|(_, record)| record.view.ivars().state.borrow().display.active)
-            .map(|(display_id, _)| *display_id)
-            .or_else(|| self.panels.keys().copied().min())
-    }
-
-    /// Reveals the end handles under the pointer.
-    ///
-    /// Pointer position comes from the system rather than from tracking areas:
-    /// the panel is a small strip above the menu bar and can be hovered
-    /// without ever becoming the key window.
-    fn update_hover(record: &PanelRecord, now: Instant) {
-        let location = NSEvent::mouseLocation();
-        let frame = record.window.frame();
-        // The view is flipped and shares the panel's origin, so this is already
-        // the viewport space the chrome is laid out in.
-        let local = (
-            location.x - frame.origin.x,
-            frame.origin.y + frame.size.height - location.y,
-        );
-        let mut state = record.view.ivars().state.borrow_mut();
-        // The handle is grabbable wherever it is drawn — hanging below the band
-        // while expanded, flush with the screen top once collapsed — and the
-        // band itself only counts while the Bar is actually there.
-        let handle = state.handle_rect();
-        let band = state.panel_rect();
-        let point = NSPoint::new(local.0, local.1);
-        let handle_hovered = contains(handle, point);
-        let band_hovered = !state.collapsed && contains(band, point);
-        let hovered = handle_hovered || band_hovered;
-        // The toolbar buttons only exist for the expanded Bar.
-        let hover_button = if band_hovered {
-            let controls = toolbar::configured_buttons(
-                state.layout.height,
-                state.preferences.show_mission_control,
-                state.preferences.show_desktop,
-            );
-            let slide = state.band_rect().y;
-            controls
-                .iter()
-                .find(|control| {
-                    let rect = Rect {
-                        x: control.rect.x + state.motion.presented.toolbar_origin,
-                        y: control.rect.y + slide,
-                        ..control.rect
-                    };
-                    local.0 >= rect.x
-                        && local.0 <= rect.x + rect.width
-                        && local.1 >= rect.y
-                        && local.1 <= rect.y + rect.height
-                })
-                .map(|control| control.action.clone())
-        } else {
-            None
-        };
-        if hovered != state.hovered
-            || handle_hovered != state.handle_hovered
-            || hover_button != state.hover_button
-        {
-            state.hovered = hovered;
-            state.handle_hovered = handle_hovered;
-            state.hover_button = hover_button;
-            state.chrome_dirty = true;
-        }
-        // The handle answers the pointer by growing a little, and the growth
-        // eases like every other transition the Bar has. A no-op once it has
-        // settled on either end.
-        state.handle_grow.set_target(handle_hovered, now);
+        let outcome = self
+            .bar
+            .toggle_collapse(Instant::now(), self.surface.as_mut());
+        self.dispatch(outcome);
     }
 
     pub fn is_animating(&self) -> bool {
-        self.panels.values().any(|record| {
-            let state = record.view.ivars().state.borrow();
-            state.motion.is_active()
-                || state.chrome.is_active()
-                || state.handle_grow.is_active()
-                || state.pressed.as_ref().is_some_and(|drag| drag.active)
-        })
+        self.bar.is_animating()
     }
 
     /// Whether the pointer is on some Bar panel's own chrome.
     ///
-    /// [`PanelRecord::set_interactive`] gives a panel mouse events exactly
-    /// while the pointer is on the Bar's band or handle — the same test
-    /// `AppKit` applies before it hands the click to the Bar rather than to the
-    /// window underneath. The global event tap sees the click either way, so
-    /// this is how the focus path tells a Bar click from a desktop click.
+    /// [`BarSurface::set_interactive`] gives a panel mouse events exactly while
+    /// the pointer is on the Bar's band or handle — the same test `AppKit`
+    /// applies before it hands the click to the Bar rather than to the window
+    /// underneath. The global event tap sees the click either way, so this is
+    /// how the focus path tells a Bar click from a desktop click.
     pub fn pointer_is_on_chrome(&self) -> bool {
-        self.panels
-            .values()
-            .any(|record| !record.window.ignoresMouseEvents())
+        self.surface.pointer_is_on_chrome()
     }
 
     pub fn animate(&mut self) {
-        let now = Instant::now();
-        for record in self.panels.values() {
-            Self::update_hover(record, now);
-            let dragging = record
-                .view
-                .ivars()
-                .state
-                .borrow()
-                .pressed
-                .as_ref()
-                .is_some_and(|drag| drag.active);
-            if dragging {
-                let release_expired = record
-                    .view
-                    .ivars()
-                    .state
-                    .borrow_mut()
-                    .drag_release_expired(NSEvent::pressedMouseButtons() & 1 != 0, now);
-                if release_expired {
-                    record.view.cancel_drag();
-                } else {
-                    record.view.sync_drag_preview();
-                }
-            }
-            let (changed, chrome_dirty, chrome_moving, handle_growing) = {
-                let mut state = record.view.ivars().state.borrow_mut();
-                (
-                    state.motion.advance(now),
-                    state.take_chrome_dirty(),
-                    state.chrome.advance(now),
-                    state.handle_grow.advance(now),
-                )
-            };
-            if changed || chrome_dirty || chrome_moving || handle_growing {
-                record.present();
-            }
-            // The window is a little taller than the band, so the strip beside
-            // the handle must stay the desktop's and the band must stay the menu
-            // bar's while the Bar is collapsed. Interactivity therefore follows
-            // the pointer: it is ours only where the pointer is on the Bar's own
-            // chrome, and everywhere else the panel lets clicks through.
-            let interactive = record.view.ivars().state.borrow().hovered;
-            record.set_interactive(interactive);
-        }
+        let outcome = self.bar.animate(Instant::now(), self.surface.as_mut());
+        self.dispatch(outcome);
     }
-}
 
-impl Drop for BarManager {
-    fn drop(&mut self) {
-        for record in self.panels.values() {
-            record.window.close();
+    fn dispatch(&self, outcome: BarOutcome) {
+        for action in outcome.actions {
+            if let Err(error) = self.events.dispatch(action) {
+                warn!(%error, "unable to dispatch Bar action");
+            }
         }
     }
 }
@@ -1502,32 +1035,6 @@ fn clip_notch(bounds: NSRect, gap: Rect) {
         ..Rect::default()
     }));
     path.addClip();
-}
-
-fn screen_placement(
-    screen: &NSScreen,
-    preferences: &BarPreferences,
-) -> (Rect, BarSurface, BarPreferences) {
-    let frame = view_rect(screen.frame());
-    let menu_height = super::placement::menu_height(
-        frame,
-        view_rect(screen.visibleFrame()),
-        screen.safeAreaInsets().top,
-        NSStatusBar::systemStatusBar().thickness(),
-    );
-    let preferences = preferences.for_menu_height(menu_height);
-    let panel = super::placement::panel_rect(frame, menu_height);
-    let gap = super::placement::notch_gap(
-        view_rect(screen.auxiliaryTopLeftArea()),
-        view_rect(screen.auxiliaryTopRightArea()),
-        menu_height,
-    );
-    let bias = preferences.notch_side;
-    (
-        super::placement::window_rect(panel, preferences.handle_metrics()),
-        super::placement::surface(panel, gap, bias),
-        preferences,
-    )
 }
 
 /// A menu-material backdrop the content draws on top of, so the Bar blurs what
@@ -1665,49 +1172,11 @@ fn screens_by_id(mtm: MainThreadMarker) -> HashMap<u32, Retained<NSScreen>> {
         .collect()
 }
 
-fn window_at(layout: &BarLayout, point: NSPoint) -> Option<PlacedItem> {
-    layout
-        .items
-        .iter()
-        .rev()
-        .find(|item| {
-            matches!(item.kind, ItemKind::Window { .. })
-                && contains(item.rect, point)
-                && inside_space_slot(layout, item, point)
-        })
-        .cloned()
-}
-
-/// Icons scrolled out of their Space are clipped on screen, so a point in a
-/// neighbouring slot must not hit them through their raw geometry.
-fn inside_space_slot(layout: &BarLayout, item: &PlacedItem, point: NSPoint) -> bool {
-    let space_id = item.kind.space_id();
-    layout
-        .items
-        .iter()
-        .find_map(|candidate| match candidate.kind {
-            ItemKind::Space { space_id: id, .. } if id == space_id => Some(candidate.rect),
-            _ => None,
-        })
-        .is_none_or(|slot| contains(slot, point))
-}
-
-fn space_at(layout: &BarLayout, point: NSPoint) -> Option<u64> {
-    layout.items.iter().find_map(|item| match item.kind {
-        ItemKind::Space { space_id, .. } if contains(item.rect, point) => Some(space_id),
-        _ => None,
-    })
-}
-
 /// Moves the drawing origin, in viewport coordinates.
 fn translate(dx: f64, dy: f64) {
     if let Some(context) = objc2_app_kit::NSGraphicsContext::currentContext() {
         objc2_core_graphics::CGContext::translate_ctm(Some(&context.CGContext()), dx, dy);
     }
-}
-
-fn contains(rect: Rect, point: NSPoint) -> bool {
-    rect.contains(point.x, point.y)
 }
 
 fn draw_window_visual(visual: &VisualItem, icon: Option<&NSImage>) {
@@ -1865,23 +1334,25 @@ fn draw_label(ordinal: u32, visual: &VisualItem, preferences: &BarPreferences) {
     );
 }
 
-fn display_metrics(display: &BarDisplay, preferences: &BarPreferences) -> BarMetrics {
-    let mut metrics = preferences.metrics();
-    if preferences.show_workspace_labels {
-        for space in &display.spaces {
+/// The widest label `AppKit` actually draws on this display, clamped the way
+/// the layout expects. Without labels nothing is measured, so a display's layout
+/// cannot change when labels are off.
+fn measured_label_width(display: &BarDisplay, preferences: &BarPreferences) -> f64 {
+    if !preferences.show_workspace_labels {
+        return 0.0;
+    }
+    display
+        .spaces
+        .iter()
+        .map(|space| {
             let text = attributed_text(
                 &BarPreferences::workspace_label(space.ordinal),
                 preferences.label_font_size.clamp(8.0, 20.0),
                 NSColor::whiteColor(),
             );
-            let measured = (text.size().width + 12.0).clamp(24.0, 120.0);
-            metrics.label_width = metrics
-                .label_width
-                .max(measured)
-                .max(preferences.workspace_label_width(space.ordinal));
-        }
-    }
-    metrics
+            (text.size().width + 12.0).clamp(24.0, 120.0)
+        })
+        .fold(0.0, f64::max)
 }
 
 fn draw_image(image: &NSImage, rect: NSRect, opacity: f64) {
@@ -1910,39 +1381,9 @@ fn draw_symbol(name: &str, rect: NSRect, opacity: f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::layout::BarAlign;
-    use super::super::preferences::NotchSide;
+    use super::super::motion::{self, EasedProgress};
     use super::*;
-
-    #[test]
-    fn space_blank_padding_is_clickable_throughout_animation() {
-        let display = crate::bar::layout::tests::display();
-        let now = Instant::now();
-        let initial = BarLayout::resolve(&display, 1200.0);
-        let mut motion = BarMotion::new(&initial, now);
-        let mut expanded = display.clone();
-        expanded.spaces[2].visible = true;
-        let target = BarLayout::resolve(&expanded, 1200.0);
-        motion.retarget(&target, now);
-        for millis in [0, 30, 120, 240] {
-            motion.advance(now + std::time::Duration::from_millis(millis));
-            let frame = &motion.presented;
-            let hits = frame.interaction_layout(&target);
-            for space in &display.spaces {
-                let rect = frame.space_rect(space.id).unwrap();
-                for y in [1.0, frame.height - 1.0] {
-                    let point = NSPoint::new(rect.x + rect.width / 2.0, y);
-                    assert!(window_at(&hits, point).is_none());
-                    assert_eq!(
-                        space_at(&hits, point),
-                        Some(space.id),
-                        "Space {} blank padding at y={y} must be clickable",
-                        space.id
-                    );
-                }
-            }
-        }
-    }
+    use std::time::Duration;
 
     #[test]
     fn space_background_defaults_are_visible_and_distinct() {
@@ -1959,505 +1400,6 @@ mod tests {
                 .into_iter()
                 .zip(inactive)
                 .any(|(a, b)| (a - b).abs() > 0.05)
-        );
-    }
-
-    #[test]
-    fn space_background_leaves_menu_bar_gaps_without_shrinking_click_regions() {
-        let display = crate::bar::layout::tests::display();
-        for height in [22.0, 24.0, 37.0] {
-            let prefs = BarPreferences::default().for_menu_height(height);
-            let layout = BarLayout::resolve_with_metrics(
-                &display,
-                1200.0,
-                &mut HashMap::new(),
-                prefs.metrics(),
-                BarAlign::Center,
-            );
-            let motion = BarMotion::new(&layout, Instant::now());
-            let hits = motion.presented.interaction_layout(&layout);
-            for item in &layout.items {
-                let ItemKind::Space { space_id, .. } = item.kind else {
-                    continue;
-                };
-                let background = item.space_background_rect();
-                assert!((background.y - 3.0).abs() < f64::EPSILON);
-                assert!((height - background.y - background.height - 3.0).abs() < f64::EPSILON);
-                for y in [1.0, height - 1.0] {
-                    let point = NSPoint::new(item.rect.x + item.rect.width / 2.0, y);
-                    assert!(!background.contains(point.x, point.y));
-                    assert_eq!(space_at(&hits, point), Some(space_id));
-                }
-            }
-            assert!(
-                BarPreferences::rgba(&prefs.background_color, [1.0; 4])[3].abs() < f64::EPSILON
-            );
-        }
-    }
-
-    #[test]
-    fn blank_space_clicks_dispatch_focus_without_changing_window_clicks() {
-        let (mut state, _) = drag_state();
-        for space_id in [10, 11, 12] {
-            let rect = state.motion.presented.space_rect(space_id).unwrap();
-            for y in [1.0, state.layout.height - 1.0] {
-                let point = NSPoint::new(rect.x + rect.width / 2.0, y);
-                assert_eq!(state.press_at(point), Some(Action::FocusSpace { space_id }));
-                assert!(state.pressed.is_none());
-                state.can_focus_spaces = false;
-                assert!(state.press_at(point).is_none());
-                state.can_focus_spaces = true;
-            }
-        }
-        let icon = state
-            .layout
-            .items
-            .iter()
-            .find(|item| matches!(item.kind, ItemKind::Window { window_id: 1, .. }))
-            .unwrap()
-            .rect;
-        let point = NSPoint::new(icon.x + 2.0, icon.y + 2.0);
-        assert!(state.press_at(point).is_none());
-        assert_eq!(state.pressed.as_ref().unwrap().window_id, 1);
-        assert_eq!(
-            state.release_drag(point, true),
-            Some(Action::FocusWindow { window_id: 1 })
-        );
-    }
-
-    fn drag_state() -> (ViewState, NSPoint) {
-        let display = crate::bar::layout::tests::display();
-        // No AppKit font calls: this exercises the real event-state path offscreen.
-        let preferences = BarPreferences {
-            show_workspace_labels: false,
-            ..BarPreferences::default()
-        };
-        let layout = BarLayout::resolve_with_metrics(
-            &display,
-            1200.0,
-            &mut HashMap::new(),
-            preferences.metrics(),
-            BarAlign::Center,
-        );
-        let motion = BarMotion::new(&layout, Instant::now());
-        let item = layout
-            .items
-            .iter()
-            .find(|item| matches!(item.kind, ItemKind::Window { window_id: 1, .. }))
-            .unwrap();
-        let pressed = BarDrag::begin(
-            item,
-            &motion.presented,
-            (item.rect.x + 2.0, item.rect.y + 2.0),
-        );
-        let target = layout
-            .items
-            .iter()
-            .find(|item| {
-                matches!(
-                    item.kind,
-                    ItemKind::ColumnDrop {
-                        anchor_window_id: 3,
-                        placement: spool_shared_types::commands::Placement::After,
-                        ..
-                    }
-                )
-            })
-            .unwrap();
-        let point = NSPoint::new(target.rect.x + target.rect.width / 2.0, target.rect.y + 8.0);
-        (
-            ViewState {
-                display,
-                layout,
-                motion,
-                surface: BarSurface {
-                    width: 1200.0,
-                    notch: None,
-                    bias: NotchSide::Balanced,
-                },
-                space_scroll: HashMap::new(),
-                can_focus_spaces: true,
-                can_move_windows: true,
-                pressed,
-                release_observed_at: None,
-                floating_order: HashMap::new(),
-                icons: HashMap::new(),
-                preferences,
-                collapsed: false,
-                hovered: false,
-                handle_hovered: false,
-                hover_button: None,
-                chrome_dirty: false,
-                chrome: EasedProgress::new(true, Instant::now()),
-                handle_grow: EasedProgress::new(false, Instant::now()),
-            },
-            point,
-        )
-    }
-
-    #[test]
-    fn mouse_drag_path_animates_preview_and_only_returns_command_on_release() {
-        let (mut state, point) = drag_state();
-        let original = state.display.clone();
-        let original_layout = state.layout.clone();
-        state.drag_to(point, true);
-        assert_ne!(state.layout, original_layout);
-        assert!(state.motion.is_active());
-        assert_eq!(state.display, original);
-        state
-            .motion
-            .advance(Instant::now() + std::time::Duration::from_secs(1));
-        assert!(
-            state
-                .pressed
-                .as_ref()
-                .unwrap()
-                .gap_rect(&state.motion.presented)
-                .is_some()
-        );
-        assert!(matches!(
-            state.release_drag(point, true),
-            Some(Action::ReorderColumn {
-                window_id: 1,
-                anchor_window_id: 3,
-                ..
-            })
-        ));
-        assert!(state.pressed.is_none());
-        assert_eq!(state.display, original);
-        assert_eq!(state.layout, original_layout);
-    }
-
-    #[test]
-    fn drag_survives_button_release_before_the_native_mouse_up_arrives() {
-        for cross_space in [false, true] {
-            let (mut state, reorder_point) = drag_state();
-            let source = state
-                .layout
-                .items
-                .iter()
-                .find(|item| matches!(item.kind, ItemKind::Window { window_id: 1, .. }))
-                .unwrap()
-                .rect;
-            state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0));
-            let point = if cross_space {
-                let target = state.motion.presented.space_rect(10).unwrap();
-                NSPoint::new(target.x + target.width / 2.0, target.y + 2.0)
-            } else {
-                reorder_point
-            };
-            state.drag_to(point, true);
-            assert!(state.pressed.as_ref().unwrap().target.is_some());
-            let now = Instant::now();
-            for millis in [0, 16, 100, 249] {
-                assert!(
-                    !state.drag_release_expired(false, now + Duration::from_millis(millis)),
-                    "global button state must not cancel a native mouseUp that has not arrived yet"
-                );
-            }
-            let expected = if cross_space {
-                Action::MoveColumnToSpace {
-                    window_id: 1,
-                    space_id: 10,
-                    move_focus: spool_shared_types::commands::MoveFocus::Follow,
-                }
-            } else {
-                Action::ReorderColumn {
-                    window_id: 1,
-                    anchor_window_id: 3,
-                    placement: spool_shared_types::commands::Placement::After,
-                }
-            };
-            assert_eq!(state.release_drag(point, true), Some(expected));
-            assert!(
-                state.release_drag(point, true).is_none(),
-                "release dispatches only once"
-            );
-        }
-    }
-
-    #[test]
-    fn missing_mouse_up_expires_but_native_pointer_events_reset_the_watchdog() {
-        let (mut state, point) = drag_state();
-        state.drag_to(point, true);
-        let now = Instant::now();
-        assert!(!state.drag_release_expired(false, now));
-        assert!(!state.drag_release_expired(false, now + Duration::from_millis(249)));
-        assert!(state.drag_release_expired(false, now + DRAG_RELEASE_GRACE));
-
-        assert!(!state.drag_release_expired(true, now + Duration::from_millis(300)));
-        assert!(!state.drag_release_expired(false, now + Duration::from_millis(600)));
-        state.drag_to(point, true);
-        assert!(!state.drag_release_expired(false, now + Duration::from_millis(900)));
-
-        let source = state
-            .motion
-            .presented
-            .items
-            .iter()
-            .find(|item| matches!(item.item.kind, ItemKind::Window { window_id: 1, .. }))
-            .unwrap()
-            .item
-            .rect;
-        state.press_at(NSPoint::new(source.x + 2.0, source.y + 2.0));
-        state.drag_to(point, true);
-        assert!(!state.drag_release_expired(false, now + Duration::from_secs(2)));
-    }
-
-    #[test]
-    fn toolbar_has_no_space_or_window_hit_targets_during_scroll_animation() {
-        let display = crate::bar::layout::tests::display();
-        let now = Instant::now();
-        let initial = BarLayout::resolve(&display, 150.0);
-        let target = BarLayout::resolve(&display, 150.0);
-        let mut motion = BarMotion::new(&initial, now);
-        motion.retarget(&target, now);
-        for millis in [0, 30, 120, 240] {
-            motion.advance(now + std::time::Duration::from_millis(millis));
-            let frame = &motion.presented;
-            let hits = frame.interaction_layout(&target);
-            for button in toolbar::buttons(frame.height) {
-                let point = NSPoint::new(
-                    button.rect.x + button.rect.width / 2.0,
-                    button.rect.y + button.rect.height / 2.0,
-                );
-                assert!(window_at(&hits, point).is_none());
-                assert!(space_at(&hits, point).is_none());
-            }
-            for hit in hits.items.iter().filter(|item| item.rect.width > 0.0) {
-                assert!(hit.rect.x >= frame.content_left);
-            }
-        }
-    }
-
-    #[test]
-    fn notch_clips_each_space_and_has_no_hits_during_scroll_or_rebalance() {
-        let mut display = crate::bar::layout::tests::display();
-        let surface = BarSurface {
-            width: 520.0,
-            notch: Some(Rect {
-                x: 180.0,
-                y: 0.0,
-                width: 140.0,
-                height: 34.0,
-            }),
-            bias: NotchSide::Balanced,
-        };
-        let now = Instant::now();
-        let initial = BarLayout::resolve_surface(
-            &display,
-            surface,
-            &mut HashMap::new(),
-            BarMetrics::default(),
-        );
-        let mut motion = BarMotion::new(&initial, now);
-        // A Space on each side of the notch scrolls inside its own slot; the
-        // notch itself stays dead either way.
-        let left = initial
-            .spans
-            .iter()
-            .find(|span| span.rect.x < 180.0)
-            .map(|span| span.space_id);
-        let right = initial
-            .spans
-            .iter()
-            .rev()
-            .find(|span| span.rect.x > 320.0)
-            .map(|span| span.space_id);
-        for scrolled in [left, right, None] {
-            let mut scroll = HashMap::new();
-            if let Some(space_id) = scrolled {
-                scroll.insert(space_id, f64::MAX);
-            }
-            let target =
-                BarLayout::resolve_surface(&display, surface, &mut scroll, BarMetrics::default());
-            motion.retarget(&target, now);
-            for millis in [0, 30, 120, 240] {
-                motion.advance(now + std::time::Duration::from_millis(millis));
-                let frame = &motion.presented;
-                let hits = frame.interaction_layout(&target);
-                for x in [181.0, 250.0, 319.0] {
-                    assert!(!frame.over_space_strip((x, 17.0)));
-                    assert!(window_at(&hits, NSPoint::new(x, 17.0)).is_none());
-                    assert!(space_at(&hits, NSPoint::new(x, 17.0)).is_none());
-                }
-                for visual in &frame.items {
-                    let viewport = frame.viewport(visual.space_id());
-                    let lane = frame.split.as_ref().unwrap().viewport(
-                        visual.space_id(),
-                        frame.width,
-                        frame.height,
-                        frame.content_left,
-                    );
-                    if viewport.width > 0.0 {
-                        assert_eq!(viewport, viewport.intersection(lane));
-                    }
-                }
-            }
-        }
-        display.spaces.remove(0);
-        let target = BarLayout::resolve_surface(
-            &display,
-            surface,
-            &mut HashMap::new(),
-            BarMetrics::default(),
-        );
-        motion.retarget(&target, now);
-        assert!(
-            !motion.is_active(),
-            "membership changes must not animate across the notch"
-        );
-        assert_eq!(motion.presented.split, target.split);
-    }
-
-    #[test]
-    fn releasing_over_notch_cancels_an_existing_drop_preview() {
-        let (mut state, _) = drag_state();
-        state.surface = BarSurface {
-            width: 1000.0,
-            notch: Some(Rect {
-                x: 440.0,
-                y: 0.0,
-                width: 120.0,
-                height: state.layout.height,
-            }),
-            bias: NotchSide::Balanced,
-        };
-        state.relayout();
-        let target = state
-            .layout
-            .items
-            .iter()
-            .find(|item| {
-                matches!(
-                    item.kind,
-                    ItemKind::ColumnDrop {
-                        anchor_window_id: 3,
-                        placement: spool_shared_types::commands::Placement::After,
-                        ..
-                    }
-                )
-            })
-            .unwrap()
-            .rect;
-        // Activate the gesture before aiming at the drop slot: the slot can sit
-        // inside the 4pt drag threshold of the grab point, and `active` is
-        // sticky once set, so moving away first is enough.
-        state.drag_to(NSPoint::new(900.0, target.y + 2.0), true);
-        state.drag_to(
-            NSPoint::new(target.x + target.width / 2.0, target.y + 2.0),
-            true,
-        );
-        assert!(state.pressed.as_ref().unwrap().target.is_some());
-    }
-
-    #[test]
-    fn releasing_a_window_over_either_toolbar_button_cancels_the_drag() {
-        for button in toolbar::buttons(34.0) {
-            let (mut state, target) = drag_state();
-            let original = state.display.clone();
-            state.drag_to(target, true);
-            assert!(state.pressed.as_ref().unwrap().target.is_some());
-            let point = NSPoint::new(
-                button.rect.x + button.rect.width / 2.0,
-                button.rect.y + button.rect.height / 2.0,
-            );
-            assert!(state.release_drag(point, true).is_none());
-            assert!(state.pressed.is_none());
-            assert_eq!(state.display, original);
-        }
-    }
-
-    #[test]
-    fn release_clears_preview_on_outside_drop_capability_loss_or_stale_source() {
-        for scenario in 0..3 {
-            let (mut state, point) = drag_state();
-            state.drag_to(point, true);
-            match scenario {
-                1 => state.can_move_windows = false,
-                2 => {
-                    state.display.spaces[1].columns.remove(0);
-                }
-                _ => {}
-            }
-            assert!(state.release_drag(point, scenario != 0).is_none());
-            assert!(state.pressed.is_none());
-            let mut scroll = state.space_scroll.clone();
-            assert_eq!(
-                state.layout,
-                BarLayout::resolve_with_metrics(
-                    &state.display,
-                    1200.0,
-                    &mut scroll,
-                    state.preferences.metrics(),
-                    BarAlign::Center,
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn scrolled_icons_are_not_hittable_outside_their_space() {
-        let mut display = crate::bar::layout::tests::display();
-        let template = display.spaces[1].floating[0].clone();
-        for id in 20..40 {
-            let mut window = template.clone();
-            window.id = id;
-            display.spaces[1].floating.push(window);
-        }
-        let mut scroll = HashMap::new();
-        scroll.insert(11, 60.0);
-        let layout = BarLayout::resolve_with_metrics(
-            &display,
-            700.0,
-            &mut scroll,
-            BarMetrics::default(),
-            BarAlign::Center,
-        );
-        let slot = layout
-            .spans
-            .iter()
-            .find(|span| span.space_id == 11)
-            .expect("focused slot")
-            .rect;
-        let escaped = layout
-            .items
-            .iter()
-            .find(|item| {
-                matches!(item.kind, ItemKind::Window { space_id: 11, .. }) && item.rect.x < slot.x
-            })
-            .expect("an icon is scrolled out of its slot");
-        let outside = NSPoint::new(
-            escaped.rect.x + 1.0,
-            escaped.rect.y + escaped.rect.height / 2.0,
-        );
-        assert!(outside.x < slot.x, "the probe point is left of the slot");
-        let hit = window_at(&layout, outside);
-        assert_ne!(
-            hit.as_ref().map(|item| item.kind.space_id()),
-            Some(11),
-            "a clipped icon must not be hit through its raw rect"
-        );
-
-        let visible = layout
-            .items
-            .iter()
-            .find(|item| {
-                matches!(item.kind, ItemKind::Window { space_id: 11, .. })
-                    && item.rect.x >= slot.x
-                    && item.rect.x + item.rect.width <= slot.x + slot.width
-            })
-            .expect("an icon remains inside the slot");
-        assert!(
-            window_at(
-                &layout,
-                NSPoint::new(
-                    visible.rect.x + 1.0,
-                    visible.rect.y + visible.rect.height / 2.0
-                )
-            )
-            .is_some(),
-            "icons inside the slot stay hittable"
         );
     }
 
@@ -2510,231 +1452,6 @@ mod tests {
             assert!((0.0..=1.0).contains(&value), "bounded at {step}: {value}");
             previous = value;
         }
-    }
-
-    #[test]
-    fn collapsing_slides_the_band_out_and_leaves_the_handle_behind() {
-        let (mut state, _) = drag_state();
-        let band = state.panel_rect();
-        assert_eq!(state.band_rect(), band, "expanded, the band is the band");
-        let expanded_handle = state.handle_rect();
-        assert!(
-            (expanded_handle.y - band.height).abs() < f64::EPSILON,
-            "the handle is glued to the band's bottom edge, below it"
-        );
-        assert!(
-            expanded_handle.y + expanded_handle.height
-                <= band.height
-                    + super::super::placement::window_overhang(state.preferences.handle_metrics(),)
-                    + f64::EPSILON,
-            "the panel window has room for it"
-        );
-
-        state.set_collapsed(true);
-        state
-            .chrome
-            .advance(Instant::now() + Duration::from_secs(1));
-        let collapsed_band = state.band_rect();
-        assert!(
-            (collapsed_band.y + collapsed_band.height).abs() < f64::EPSILON,
-            "the band has left through the screen's top edge"
-        );
-        let collapsed_handle = state.handle_rect();
-        assert!(
-            collapsed_handle.y.abs() < f64::EPSILON,
-            "the handle comes to rest flush with the screen top"
-        );
-        assert!((collapsed_handle.width - expanded_handle.width).abs() < f64::EPSILON);
-        assert!((collapsed_handle.height - expanded_handle.height).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn the_drawn_shape_and_the_hit_target_are_one_geometry() {
-        let (state, _) = drag_state();
-        let handle = state.handle_rect();
-        assert!(state.handle_at((
-            handle.x + handle.width / 2.0,
-            handle.y + handle.height / 2.0
-        )));
-        assert!(!state.handle_at((handle.x - 1.0, handle.y + 1.0)));
-        assert!(!state.handle_at((
-            handle.x + handle.width / 2.0,
-            handle.y + handle.height + 1.0
-        )));
-    }
-
-    #[test]
-    fn the_handle_toggles_collapse_and_the_rest_of_the_band_does_not() {
-        let (mut state, _) = drag_state();
-        let band = state.panel_rect();
-        assert!(!state.collapsed, "every Bar starts expanded");
-        // The band is not a collapse target: its clicks belong to Spaces and
-        // windows, exactly as they did before.
-        state.press_at(NSPoint::new(2.0, 2.0));
-        assert!(!state.collapsed, "the band does not collapse the Bar");
-
-        // The handle does, in one click, with no reveal first.
-        let handle = state.handle_rect();
-        assert!(
-            state
-                .press_at(NSPoint::new(handle.x + handle.width / 2.0, handle.y + 1.0))
-                .is_none()
-        );
-        assert!(state.collapsed, "the handle collapses the Bar");
-        assert!(state.take_chrome_dirty(), "the panel must be rewritten");
-
-        // Collapsed, only the handle is live: the rest of the band stays the
-        // menu bar's.
-        state
-            .chrome
-            .advance(Instant::now() + Duration::from_secs(1));
-        let collapsed = state.handle_rect();
-        assert!(collapsed.y.abs() < f64::EPSILON);
-        assert!(
-            state
-                .press_at(NSPoint::new(band.width - 4.0, 2.0))
-                .is_none()
-        );
-        assert!(state.collapsed, "the far end of the band is the menu bar's");
-        assert!(
-            state
-                .press_at(NSPoint::new(collapsed.x + 2.0, collapsed.y + 2.0))
-                .is_none()
-        );
-        assert!(!state.collapsed, "the handle expands the Bar again");
-    }
-
-    #[test]
-    fn a_window_in_another_space_is_clicked_and_dragged_like_one_here() {
-        // Space 12 is not the one macOS is showing, and with
-        // `bar.collapse_inactive_spaces` off its windows are drawn, so they are
-        // aimed at rather than treated as one "take me there" target.
-        let (mut state, _) = drag_state();
-        let point_of = |state: &ViewState, window_id: i32| {
-            let visual = state
-                .motion
-                .presented
-                .items
-                .iter()
-                .find(|visual| {
-                    matches!(
-                        visual.item.kind,
-                        ItemKind::Window {
-                            window_id: id,
-                            space_id: 12,
-                            ..
-                        } if id == window_id
-                    )
-                })
-                .expect("a window drawn in the inactive Space");
-            NSPoint::new(
-                visual.item.rect.x + visual.item.rect.width / 2.0,
-                visual.item.rect.y + visual.item.rect.height / 2.0,
-            )
-        };
-        let point = point_of(&state, 7);
-
-        // Pressing starts a drag, so the release decides what it meant. Which
-        // member of a stacked column is on top is the layout's business: take
-        // the one the press actually grabbed.
-        assert!(state.press_at(point).is_none());
-        let pressed = state
-            .pressed
-            .clone()
-            .expect("a drag can start in any Space that draws its windows");
-        assert_eq!(pressed.space_id, 12);
-        let window_id = pressed.window_id;
-        assert_eq!(
-            state.release_drag(point, true),
-            Some(Action::FocusWindowInSpace {
-                window_id,
-                space_id: 12,
-            }),
-            "a click there has to say which Space to go to"
-        );
-
-        // With inactive Spaces collapsed the same card is the Space: a deck
-        // shows what is in a Space, it is not a set of separate targets.
-        state.preferences.collapse_inactive_spaces = true;
-        state.relayout();
-        let point = point_of(&state, window_id);
-        assert_eq!(
-            state.press_at(point),
-            Some(Action::FocusSpace { space_id: 12 }),
-            "the press switches Spaces"
-        );
-        assert!(state.pressed.is_none(), "a deck card is not a drag handle");
-    }
-
-    #[test]
-    fn no_space_sits_under_the_notch_collar_even_when_it_grows() {
-        let (mut state, _) = drag_state();
-        let band = state.panel_rect();
-        state.surface.notch = Some(Rect {
-            x: 500.0,
-            y: 0.0,
-            width: 180.0,
-            height: band.height,
-        });
-        // Taller than the horizontal padding: a lane that only kept clear of the
-        // Notch itself would now show through the collar's ears.
-        state.preferences.handle_height = 12.0;
-        state.relayout();
-        assert!(!state.layout.spans.is_empty(), "there are Spaces to place");
-
-        for grown in [false, true] {
-            state.handle_grow = EasedProgress::new(grown, Instant::now());
-            let collar = state.handle_rect();
-            assert!(
-                collar.width >= 180.0 + state.preferences.handle_height * 2.0 - f64::EPSILON,
-                "the collar reaches past the notch: {collar:?}"
-            );
-            for span in &state.layout.spans {
-                let left_of_it = span.rect.x + span.rect.width <= collar.x + f64::EPSILON;
-                let right_of_it = span.rect.x >= collar.x + collar.width - f64::EPSILON;
-                assert!(
-                    left_of_it || right_of_it,
-                    "grown={grown}: Space {} ({:?}) sits under the collar {collar:?}",
-                    span.space_id,
-                    span.rect
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_collapsed_collar_is_one_target_across_the_notch() {
-        let (mut state, _) = drag_state();
-        let band = state.panel_rect();
-        state.surface.notch = Some(Rect {
-            x: 500.0,
-            y: 0.0,
-            width: 180.0,
-            height: band.height,
-        });
-        let handle = state.preferences.handle_metrics();
-        state.set_collapsed(true);
-        let collar = state.handle_rect();
-        assert!(
-            (collar.width - (180.0 + handle.height * 2.0)).abs() < f64::EPSILON,
-            "the collar clears the notch"
-        );
-        assert!(
-            (collar.height - (band.height + handle.height)).abs() < f64::EPSILON,
-            "and reaches below the band, where its chin shows"
-        );
-        // The middle of the collar sits behind the camera housing, so it is
-        // invisible — but it is still one target, because the ears and the chin
-        // belong to the same control.
-        assert!(
-            state
-                .press_at(NSPoint::new(
-                    collar.x + collar.width / 2.0,
-                    band.height + 2.0
-                ))
-                .is_none()
-        );
-        assert!(!state.collapsed, "the collar expands the Bar");
     }
 
     #[test]
@@ -2849,64 +1566,6 @@ mod tests {
                     < f64::EPSILON
             );
             assert!(text.size.height <= region.size.height);
-        }
-    }
-
-    #[test]
-    fn overlapping_stack_hit_testing_follows_focused_paint_layer() {
-        let mut display = crate::bar::layout::tests::display();
-        let now = Instant::now();
-        let initial = BarLayout::resolve(&display, 1200.0);
-        let mut motion = BarMotion::new(&initial, now);
-        for (step, focused) in [Some(2), None, Some(1)].into_iter().enumerate() {
-            for window in &mut display.spaces[1].columns[0].windows {
-                window.focused = focused == Some(window.id);
-            }
-            let target = BarLayout::resolve(&display, 1200.0);
-            let start = now + std::time::Duration::from_millis(u64::try_from(step).unwrap() * 100);
-            motion.retarget(&target, start);
-            motion.advance(start + std::time::Duration::from_millis(50));
-            let hits = motion.presented.interaction_layout(&target);
-            let front = hits
-                .items
-                .iter()
-                .rev()
-                .find(|item| {
-                    matches!(
-                        item.kind,
-                        ItemKind::Window {
-                            space_id: 11,
-                            column_window_id: Some(1),
-                            ..
-                        }
-                    )
-                })
-                .unwrap();
-            let point = NSPoint::new(
-                front.rect.x + front.rect.width / 2.0,
-                front.rect.y + front.rect.height / 2.0,
-            );
-            let hit = window_at(&hits, point).unwrap();
-            assert!(
-                matches!(hit.kind, ItemKind::Window { window_id, column_window_id: Some(1), .. } if window_id == focused.unwrap_or(1))
-            );
-            let exposed_top = window_at(
-                &hits,
-                NSPoint::new(front.rect.x + front.rect.width / 2.0, 7.0),
-            )
-            .unwrap();
-            assert!(matches!(
-                exposed_top.kind,
-                ItemKind::Window { window_id: 1, .. }
-            ));
-            assert_eq!(
-                display.spaces[1].columns[0]
-                    .windows
-                    .iter()
-                    .map(|window| window.id)
-                    .collect::<Vec<_>>(),
-                vec![1, 2]
-            );
         }
     }
 }

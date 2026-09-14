@@ -6,7 +6,7 @@
 //! band plus the handle's overhang below it — the one part of the Bar that stays
 //! on screen once the band has slid away.
 
-use super::layout::{BarSurface, Rect};
+use super::layout::{BarSurfaceGeometry, Rect};
 use super::preferences::NotchSide;
 
 /// The menu-bar band's height for one screen.
@@ -36,7 +36,7 @@ pub fn panel_rect(screen: Rect, menu_height: f64) -> Rect {
     }
 }
 
-impl BarSurface {
+impl BarSurfaceGeometry {
     /// The gap the Bar's content must keep clear: the Notch, plus how far the
     /// Bar Handle reaches past it on each side.
     ///
@@ -65,8 +65,8 @@ impl BarSurface {
 /// A display without a notch gets a single run of Spaces; one with a notch
 /// gets two lanes, one on each side of `gap`.
 #[must_use]
-pub fn surface(panel: Rect, gap: Option<Rect>, bias: NotchSide) -> BarSurface {
-    BarSurface {
+pub fn surface(panel: Rect, gap: Option<Rect>, bias: NotchSide) -> BarSurfaceGeometry {
+    BarSurfaceGeometry {
         width: panel.width,
         notch: gap.filter(|gap| gap.width > 0.0).map(|gap| Rect {
             x: gap.x - panel.x,
@@ -161,7 +161,7 @@ pub fn band_rect(panel: (f64, f64), progress: f64) -> Rect {
 }
 
 /// The collapsed Bar, in panel-local coordinates: the same space as
-/// [`BarSurface::notch`], with the origin at the panel's top-left corner and
+/// [`BarSurfaceGeometry::notch`], with the origin at the panel's top-left corner and
 /// `y` growing downwards, because a `BarView` is flipped.
 ///
 /// A display with a notch gets a collar hugging it — the notch plus the handle's

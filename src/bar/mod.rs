@@ -5,6 +5,7 @@ mod model;
 mod motion;
 mod placement;
 mod preferences;
+mod runtime;
 mod state;
 mod toolbar;
 

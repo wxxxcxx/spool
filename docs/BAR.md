@@ -430,6 +430,16 @@ interrupted transitions between collapsed and expanded stack geometry, unchanged
 single-window vertical geometry, exclusion of unresolved native surfaces until
 AX discovery, floating icon/focus agreement after identity recovery, inventory
 failures, and preservation of tracked identities on inactive Spaces.
-Live Space switching, drag gestures, multi-display behavior and
-the subjective animation/style review still require desktop acceptance; unit
-tests are not a substitute for that inspection.
+
+The Bar's coordination is covered behind the surface seam by `RecordingSurface`,
+an in-memory `BarSurface` that records every effect and replays queued
+`BarInput`. Those tests exercise per-display `Bar::update` coordination and
+panel ensure/remove, `toggle_collapse` targeting the active display only, the
+input-to-action mapping (press/release, scroll, cancel, toolbar activate) and
+per-display routing, and the toolbar, button-highlight and drag-preview effects.
+They never render. The visual and native half still requires desktop
+acceptance: what CoreGraphics draws (chrome, icons, blur), the `NSButton`
+toolbar and its tooltips, real mouse-event routing and the panel's click-through
+to the menu bar underneath, the `Stationary` window behaviour, multi-display
+arrangements, live Space switching, drag gestures and the subjective
+animation/style review. Unit tests are not a substitute for that inspection.

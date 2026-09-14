@@ -1,9 +1,15 @@
+use std::time::Duration;
+
 use spool_shared_types::commands::{Action, MoveFocus, Placement};
 use spool_shared_types::state::SpaceKind;
 
 use super::layout::{BarLayout, ItemKind, PlacedItem, Rect};
 use super::model::BarDisplay;
 use super::motion::{Presentation, VisualItem};
+
+/// How long global button state may lead a queued `mouseUp` before the drag is
+/// treated as released: a missing-event watchdog, not the normal release path.
+pub const DRAG_RELEASE_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DropTarget {

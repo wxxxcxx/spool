@@ -4,7 +4,7 @@ use spool_shared_types::commands::Placement;
 use spool_shared_types::state::SpaceKind;
 
 use super::model::{BarColumn, BarDisplay, BarSpace, BarWindow};
-use super::preferences::NotchSide;
+use super::preferences::{BarPreferences, NotchSide};
 use super::toolbar::TOOLBAR_WIDTH;
 
 /// Where a group of Bar items sits inside the width it was given.
@@ -133,7 +133,7 @@ impl SpaceSpan {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct BarSurface {
+pub struct BarSurfaceGeometry {
     pub width: f64,
     pub notch: Option<Rect>,
     /// How the Space group is distributed around the notch.
@@ -166,8 +166,8 @@ impl NotchSplit {
 mod notch_tests {
     use super::*;
 
-    pub(super) fn surface() -> BarSurface {
-        BarSurface {
+    pub(super) fn surface() -> BarSurfaceGeometry {
+        BarSurfaceGeometry {
             width: 600.0,
             notch: Some(Rect {
                 x: 220.0,
@@ -212,7 +212,7 @@ mod notch_tests {
         // push the gap off the panel.
         let wide = surface.keep_out(20.0).expect("a gap");
         assert!((wide.x - (notch.x - 20.0)).abs() < f64::EPSILON);
-        let edge = BarSurface {
+        let edge = BarSurfaceGeometry {
             notch: Some(Rect {
                 x: 2.0,
                 width: 10.0,
@@ -542,12 +542,12 @@ impl BarLayout {
 
     pub fn resolve_surface(
         display: &BarDisplay,
-        surface: BarSurface,
+        surface: BarSurfaceGeometry,
         space_scroll: &mut HashMap<u64, f64>,
         metrics: BarMetrics,
     ) -> Self {
         // The lanes keep clear of the handle's collar, not just the notch: see
-        // `BarSurface::keep_out`.
+        // `BarSurfaceGeometry::keep_out`.
         let Some(gap) = surface.keep_out(metrics.handle_height) else {
             return Self::resolve_with_metrics(
                 display,
@@ -733,6 +733,63 @@ impl BarLayout {
             spans,
         }
     }
+}
+
+/// The display's layout metrics: the adapter measures the labels and this folds
+/// that measurement into the base metrics alongside the pure per-Space extents.
+#[must_use]
+pub fn display_metrics(
+    display: &BarDisplay,
+    preferences: &BarPreferences,
+    measured_label_width: f64,
+) -> BarMetrics {
+    let mut metrics = preferences.metrics();
+    for space in &display.spaces {
+        metrics.label_width = metrics
+            .label_width
+            .max(measured_label_width)
+            .max(preferences.workspace_label_width(space.ordinal));
+    }
+    metrics
+}
+
+/// The topmost window under a point, clipped to the slot of the Space it draws
+/// in.
+#[must_use]
+pub fn window_at(layout: &BarLayout, point: (f64, f64)) -> Option<PlacedItem> {
+    layout
+        .items
+        .iter()
+        .rev()
+        .find(|item| {
+            matches!(item.kind, ItemKind::Window { .. })
+                && item.rect.contains(point.0, point.1)
+                && inside_space_slot(layout, item, point)
+        })
+        .cloned()
+}
+
+/// Icons scrolled out of their Space are clipped on screen, so a point in a
+/// neighbouring slot must not hit them through their raw geometry.
+#[must_use]
+pub fn inside_space_slot(layout: &BarLayout, item: &PlacedItem, point: (f64, f64)) -> bool {
+    let space_id = item.kind.space_id();
+    layout
+        .items
+        .iter()
+        .find_map(|candidate| match candidate.kind {
+            ItemKind::Space { space_id: id, .. } if id == space_id => Some(candidate.rect),
+            _ => None,
+        })
+        .is_none_or(|slot| slot.contains(point.0, point.1))
+}
+
+#[must_use]
+pub fn space_at(layout: &BarLayout, point: (f64, f64)) -> Option<u64> {
+    layout.items.iter().find_map(|item| match item.kind {
+        ItemKind::Space { space_id, .. } if item.rect.contains(point.0, point.1) => Some(space_id),
+        _ => None,
+    })
 }
 
 /// Hands every Space a slot wide enough to be seen.

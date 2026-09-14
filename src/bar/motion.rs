@@ -341,6 +341,77 @@ fn interpolate(from: &VisualItem, to: &VisualItem, t: f64) -> VisualItem {
     }
 }
 
+/// An eased 0-to-1 progress, over the same 240ms ease-out the Bar's content
+/// motion follows.
+///
+/// The collapse uses it to slide the chrome, and the handle uses it to grow
+/// under the pointer. The panel window never moves: it always covers the
+/// menu-bar band plus the handle's overhang, and the collapse is what the chrome
+/// slides against. Moving and resizing a blurred window every frame is what made
+/// the old transition stutter.
+#[derive(Debug)]
+pub struct EasedProgress {
+    /// 1 at the far end, 0 at the near one.
+    progress: f64,
+    from: f64,
+    to: f64,
+    started: Instant,
+    active: bool,
+}
+
+impl EasedProgress {
+    pub fn new(high: bool, now: Instant) -> Self {
+        let progress = if high { 1.0 } else { 0.0 };
+        Self {
+            progress,
+            from: progress,
+            to: progress,
+            started: now,
+            active: false,
+        }
+    }
+
+    pub fn progress(&self) -> f64 {
+        self.progress
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Starts moving toward the end `high` describes: expanded for the collapse,
+    /// grown for the handle.
+    ///
+    /// An interrupted transition restarts from the frame on screen rather than
+    /// from the other endpoint, so reversing mid-flight never jumps.
+    pub fn set_target(&mut self, high: bool, now: Instant) {
+        let target = if high { 1.0 } else { 0.0 };
+        if (self.to - target).abs() < f64::EPSILON {
+            return;
+        }
+        self.from = self.progress;
+        self.to = target;
+        self.started = now;
+        self.active = true;
+    }
+
+    /// Advances the transition and returns whether the frame on screen has
+    /// changed.
+    pub fn advance(&mut self, now: Instant) -> bool {
+        if !self.active {
+            return false;
+        }
+        let elapsed = now.saturating_duration_since(self.started).as_secs_f64() / DURATION;
+        if elapsed >= 1.0 {
+            self.progress = self.to;
+            self.active = false;
+            return true;
+        }
+        self.progress = lerp(self.from, self.to, ease_out(elapsed));
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::layout::BarAlign;

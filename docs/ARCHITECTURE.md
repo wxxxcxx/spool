@@ -196,7 +196,7 @@ objects stay on their owning threads.
 | `src/reader.rs` | The daemon adapter: turns authenticated local IPC requests into events. |
 | `crates/local_ipc` | The deep IPC module: singleton lock, Unix socket lifecycle, peer authentication, bounded framing, deadlines, replies, and subscriptions. |
 | `src/overlay.rs` | Logic for drawing active window borders and inactive window dimming. |
-| `src/bar/` | The native AppKit Bar: one panel per display occupying that display's menu-bar band plus the handle's overhang, drawn on a menu-material blur backdrop. `layout.rs` owns the Space strip and its per-Space slots, `placement.rs` the menu-bar rect, the notch and the handle's geometry, `appkit.rs` the panel, gestures and drawing. |
+| `src/bar/` | The native AppKit Bar: one panel per display occupying that display's menu-bar band plus the handle's overhang, drawn on a menu-material blur backdrop. `runtime.rs` owns the pure Bar decisions (per-display interaction state and the update/animate/collapse coordination) behind the `BarSurface` port; `appkit.rs` is the production `AppKitSurface` adapter for panels, gestures and drawing; `layout.rs` owns the Space strip and its per-Space slots, and `placement.rs` the menu-bar rect, the notch and the handle's geometry. |
 | `src/bar/preferences.rs` | Bar preferences parsed from `spool.setup{ bar = … }`; the band's height is resolved from the observed menu bar, never from configuration. |
 
 ### Bar presentation
@@ -233,6 +233,23 @@ manager that wakes its whole ECS at refresh rate to animate a highlight spends
 ~45% of a core doing it. Nothing about collapse is persisted and every Bar starts
 expanded, so the collapsed state can never be restored into a session that did
 not ask for it.
+
+That coordination lives behind a seam. `Bar` in `src/bar/runtime.rs` owns each
+display's interaction state and the update/animate/collapse decisions, and
+depends only on plain data — a `BarSnapshot`, the adapter's resolved screen
+geometry and measured metrics, and `BarPreferences` — plus the `BarSurface`
+port. It never queries the environment mid-decision, and icon images never cross
+the seam: `present` resolves bundle identities inside the adapter and consumes
+the pure `Presentation`. Effects leave through the port's idempotent methods
+(ensure/remove panel, present, set interactivity, sync toolbar, set button
+highlight, show/hide drag preview); pointer and `AppKit` interactions arrive as
+plain `BarInput`, and actions leave as a returned `BarOutcome` rather than an
+injected `EventSender`. `appkit.rs` provides the production `AppKitSurface`
+adapter, and `RecordingSurface` in `runtime.rs`'s tests is the in-memory test
+adapter for the same seam, so the coordination runs with no window server. The
+port is main-thread-only and deliberately does not require `Send + Sync`,
+matching the `NonSend` `BarManager` resource that holds `Bar` and
+`Box<dyn BarSurface>`.
 
 ## 4. Key Data Entities
 
