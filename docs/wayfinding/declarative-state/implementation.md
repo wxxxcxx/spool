@@ -110,3 +110,33 @@ Balance的继承语义经过三位专家一致确认：若参考列继承规则0
 ### 本片实际边界
 
 没有安装、daemon重启、推送或真实桌面操作。时序阈值是实现默认，不是原生稳定性证明。自身迟到效果的排除采用保守的会话内实例记录，无法排除的竞争会保持未确认；不能宣称已获得macOS输入来源或完全因果识别。目标Space归属的声明式事务与完整跨重启恢复仍未实现。
+
+## 归属切片（声明式目标 Space 归属）
+
+用户于 2026-09-15 裁决的模型不是"保留目标、条件允许时实现"，而是**不变量 + 修复**：归属是状态的一部分，必须始终指向一个当前存在的用户 Space；编辑要么当场可尝试、要么当场拒绝；外部事件触发修复，修复只改状态、不写原生。四小片按 [issue 23](issues/23-space-membership.md) 落地。
+
+### 已实施
+
+- **拒绝原因具体化**（`b91b9a5`）：归属路径不再混装 `native_precondition_failed`，拆为 `target_space_unavailable`（无此用户 Space）、`fullscreen_space`、`space_not_visible`（目的显示器当前未显示，属"现在不行"）、`capability_unavailable`、`native_move_pending`、`window_unavailable`、`layout_not_found`、`ineligible_layout_entry`、`snapshot_binding_stale`、`topology_unresolved`（读取失败不是缺席）。`Rejection::TargetSpaceUnavailable` 不再有生产者，已删除。
+- **最近一次尝试可查**（`b91b9a5`）：只读诊断 `SpaceMoveAttempt`（`in_flight` / `confirmed` / `timed_out` / `retired` / `refused(code)`），`window inspect --source spool` 的 window row 暴露为 `membership.attempt`。
+- **声明归属与修复**（`b1ff96a`）：`DeclaredSpace { target, observed, repairs }`（修复历史保留最近 4 次）与 `reconcile_declared_space`（调度在 `Last`：销毁处理 → 事务协调 → 声明协调）。触发器：目标 Space 被销毁/合并（`target_space_destroyed`）、变原生全屏（`target_space_fullscreen`）、外部移动/合并（`membership_changed`）、未确认尝试（`attempt_unconfirmed`）、成员实例退休（`member_retired`）；显示器断开而目标仍存在、以及读取不可读时**不修**（未知不是缺席）。实例退休时声明随实体消失，替换实例不继承历史。
+- **被接纳的编辑写入声明**（`7d2f040`）：整列/关联成员的每一个都立即声明目标 Space；这是作者转移而非修复，不进修复历史。**在途尝试拥有实现权**：带 `NativeMoveOwner` 时只更新 `observed`、不修复，否则观测会把刚被接纳的声明按回去。
+- **未确认的尝试带原因修复**（`b6b8b2b`）：2 秒确认窗口过后事务释放所有权，声明协调据尝试记录把声明修复回观测并记 `attempt_unconfirmed`（`Retired` → `member_retired`）；不自动重试（测试断言原生意图计数不变）。超时因此不再只剩一条日志。
+- **跨显示器可见性门**（`ad33d31`）：结论**保留**并写明理由 —— `move-to-display` 的语义是"放到那块屏幕上我能看到的地方"（transfer 用目的显示器可用视口暂存 frame 并在确认后呈现于此），因此没有唯一可见 Space 的目的显示器答 `space_not_visible`，而不是替用户挑一个 Space；把窗口送到另一屏的隐藏 Space 走 `move-to-space <id>`，不受此门约束。
+
+### 本片验证
+
+最终代码树验证（本机，Apple M4，并行套件）：
+
+- `cargo test -p spool`：1164通过、0失败、2项原有忽略。`cargo test --workspace --locked`：主程序1164、shared-types 96、local-ipc 24，其余 6/4，全绿。
+- `cargo test -p spool --no-default-features`：1021通过、0失败。
+- `cargo fmt --all --check`、`cargo clippy -p spool --all-targets`（默认与 `--no-default-features -- -D warnings`）全部通过。
+- `docs/**/*.md` 相对链接检查 0 失效。
+- 行为改变处均有"先在旧代码上失败"的证据：拒绝原因（旧代码得到 `native_precondition_failed` / `TargetSpaceUnavailable`）、在途不被按回（移除跳过时声明被拉回源 Space：`left: Some(2) right: Some(3)`）、未确认原因（移除推导时得到 `membership_changed`）。新状态类型的测试在旧代码上无法编译（`cannot find type DeclaredSpace`），这是新状态的固有形态。
+
+### 本片实际边界
+
+- 没有安装、daemon 重启或真实桌面操作：mock 通过只证明模型与调用协议，真实 macOS Space 动画、约束、回声与原生 tab 边界仍需另行授权的现场验收。
+- 跨重启恢复归属仍未实现：声明归属是会话内状态，新格式保存与候选隔离没有覆盖它（Out of scope，见 [地图](map.md)）。
+- 声明归属只覆盖已跟踪窗口；未解决的原生表面（无 AX 身份）不进入该状态。
+- `SpaceMoveAttempt` 与 `DeclaredSpace` 都不驱动行为：前者是只读诊断，后者由修复与**被接纳的编辑**写、被效果层读取的目标；没有任何路径用它们反向覆盖观测。

@@ -98,6 +98,23 @@ Blocked by: none
 - 窗口实例退休 → 该窗口的声明归属删除，不继承到新实例。
 - 已上线的尺寸/排列/高度行为不变（回归）。
 
+### 验收矩阵复核（2026-09-15）
+
+| 验收项 | 状态 |
+| --- | --- |
+| 后台（不可见）目标 Space 的归属编辑：被接纳、零原生写入、诊断显示目标 + blocked 原因 | **本次不覆盖**：编辑在目标不存在/不可尝试时当场拒绝（模型裁决 X）。目标不可见但**已知**的 `move-to-space <id>` 本来就不受可见性门约束；其"接纳后零写入"的验证属于本片的 `InFlight` 断言。 |
+| 编辑目标不存在 / 不是用户 Space / 已全屏 → 当场拒绝、码具体、状态不变 | ✅ `space_move_refusals_name_their_own_cause`、`a_refused_move_leaves_the_declaration_alone` |
+| 能力关闭 → 当场拒绝 `capability_unavailable`、状态不变、不进入等待 | ✅ 同上（能力关闭一节） |
+| 一次尝试未确认 → 2 秒后声明归属修复回观测并记录"尝试未确认" | ✅ `an_in_flight_attempt_is_not_repaired_back_by_the_observation`（含不重试断言） |
+| 外部把窗口拖到别的 Space → 声明归属修复为观测值，零原生写入 | ✅ `an_external_move_repairs_the_declared_space` |
+| 观测读失败 → 声明归属保留、标未知、零原生写入 | ✅ `an_unreadable_inventory_does_not_repair_a_declaration` |
+| 窗口实例退休 → 该窗口的声明归属删除，不继承到新实例 | ✅ `a_replaced_instance_does_not_inherit_a_declaration` |
+| 用户场景：space3 被手动关闭 → 修复为观测到的 space1、原因可查、零原生写入、无悬空目标；space3 重建不搬迁 | ✅ `a_destroyed_target_repairs_the_declared_space_to_where_the_window_is` |
+| 呈现/导航/命中检测在确认前仍按已确认归属 | ✅ 未改动相关路径（呈现读 `ObservedWindowFrame` 与 strip 归属），全量回归绿 |
+| 已上线的尺寸/排列/高度行为不变 | ✅ 全量回归绿（workspace 1164） |
+| 保存 → 重启 → 候选隔离读取：归属意图不被自动应用 | **明确推迟**：声明归属不进新格式保存（Out of scope，跨重启恢复另属地图）。 |
+| 目标 Space 归属的声明式事务（本片核心） | ✅ 本片本体 |
+
 ### 与 ADR 0006 的关系
 
 ADR 0006 的"不可见 Space 也应接受 desired-layout 编辑"在本票被**明确界定**：该承诺适用于**尺寸与排列**（已实现，且满足保留判据）；**归属**这一维不适用 —— 归属编辑要求目标有效且当场可尝试，外部事件走修复。界定已记入 [ADR 0006](../../../adr/0006-declarative-state-driven-window-management.md)，以免以后从 ADR 再推出"挂着等"的实现。

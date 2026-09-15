@@ -261,3 +261,21 @@ A stack item that currently contributes to layout projection because at least on
 A retained member position within a stack item whose window identity could not be cached when intent was saved. It preserves the item's member count and order for a later validated binding; it is not an identity, and it never authorizes one.
 
 _Avoid_: Anonymous window, missing window, placeholder identity
+
+## Declared Space
+
+The Space a tracked window's state says it belongs to. It must name a Space that exists and is a user Space, or be unknown while no valid target is known; it never holds a target that cannot be validated. An accepted membership edit declares it, and an external fact that invalidates a target which was valid repairs it.
+
+_Avoid_: Target Space, desired Space, pending Space
+
+## Space Repair
+
+A recorded change of a Declared Space onto a target that is valid again, together with the fact that required it: the Space was destroyed or merged away, it became native fullscreen, the window was moved somewhere else, an attempt was not confirmed, or a member's identity retired. A repair changes state only; it performs no native write.
+
+_Avoid_: Fallback, correction, fixup
+
+## Membership Attempt
+
+The most recent try at realizing a window's Declared Space, and how it ended: submitted and awaiting the membership audit, confirmed, timed out, retired with its member, or refused with the caller's reason. It is diagnostic only — no layout, effect, or admission decision reads it.
+
+_Avoid_: Move request, pending move
