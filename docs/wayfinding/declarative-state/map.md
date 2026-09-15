@@ -3,7 +3,7 @@
 Label: wayfinder:map
 Status: resolved
 
-已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（用户已裁决：不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）。下一片（已裁决、待实施）：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（用户已确认按票中倾向执行；实现从帧权威的横切切换开始）。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
+已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）；已实施：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（帧权威切换、保存与候选隔离，均已验证并推送）；待裁决：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（七个问题待裁决，裁决前不实施）。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
 
 ## Destination
 
@@ -50,6 +50,8 @@ Status: resolved
 
 - [焦点偏好、激活请求与实际焦点的完整迁移切片](issues/21-focus-activation.md) — 已核对独立版本、单次尝试、让权证据与入口替换；焦点代码已实施，目标Space归属事务仍为后续切片。
 - [目标 Space 归属的不变量与修复](issues/23-space-membership.md) — 用户裁决：归属必须始终指向存在的用户 Space；编辑当场拒绝或当场尝试（2 秒、不重试）；外部事件触发状态修复且不写原生；保留与否按「用户无法便宜重试且卡住常见持久」判据。已实施、验证并推送（6 笔）。
+- [浮动窗口的完整迁移切片](issues/24-floating-windows.md) — 用户已裁决六项；已实施：帧权威切换（意图 + 约束派生 + 修复，不写原生）、保存与候选隔离；9+1 条测试，验证并推送。
+- [跨重启恢复的入口票](issues/25-cross-restart-recovery.md) — 恢复地图的入口：身份连续性证据、恢复域与顺序、候选 vs 自动绑定、停机冲突、版本策略、呈现影响。待裁决。
 
 ## Not yet specified
 
@@ -60,4 +62,5 @@ Status: resolved
 - 完整跨重启恢复所有焦点/归属/执行进度及通用停机冲突解决；本轮仅规定首切片所需的新格式保存和导入。
 - 旧版本格式/接口兼容与旧快照迁移。
 - 跨daemon身份连续性研究、自动绑定和真实重启恢复另立恢复地图；本轮不创建相关研究票或假称已验证。
+  → 入口票：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（`Status: open`，裁决前不实施、不声称已验证）。
 - 规划轮不执行代码实现；后续授权的首片实现见实施记录。提交推送、安装部署、服务重启和真实桌面动作仍未执行。
