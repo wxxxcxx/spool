@@ -1,6 +1,6 @@
 # Explicit intent ownership and bounded realization
 
-Status: Accepted design, 2026-09-13; all map decisions resolved through authorized expert consensus or explicit user decisions. Column-width, arrangement and stack-height slices implemented. Focus activation slice implemented with conservative bounded evidence; see the [focus slice](../wayfinding/declarative-state/issues/21-focus-activation.md).
+Status: Accepted design, 2026-09-13; all map decisions resolved through authorized expert consensus or explicit user decisions. Column-width, arrangement and stack-height slices implemented. Focus activation slice implemented with conservative bounded evidence; see the [focus slice](../wayfinding/declarative-state/issues/21-focus-activation.md). Space membership implemented as an invariant with repair ([issue 23](../wayfinding/declarative-state/issues/23-space-membership.md)), and floating frames implemented as retained intent with a derived target ([issue 24](../wayfinding/declarative-state/issues/24-floating-windows.md)).
 
 ## Context
 

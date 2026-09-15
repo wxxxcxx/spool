@@ -76,7 +76,7 @@ Bevy is typically used for games, so Spool implements a custom bridge to interac
 4. **Observe:** synchronous AX readback and external notifications update `ObservedWindowFrame`. Borders and public queries use this confirmed projection.
 5. **Reconcile:** `reconcile::reconcile_windows` periodically compares desired and observed frames, retries boundedly, and also repairs missed lifecycle notifications from complete AX and WindowServer inventories.
 
-The flow is intentionally one-way. An ordinary macOS readback never mutates tiled Layout State. User- or application-driven geometry is first collected as a `Geometry Gesture`; only the settled final frame becomes a single Layout State action. Floating windows are the exception because no tiling neighbours depend on their geometry.
+The flow is intentionally one-way. An ordinary macOS readback never mutates tiled Layout State. User- or application-driven geometry is first collected as a `Geometry Gesture`; only the settled final frame becomes a single Layout State action. A floating window is the exception in policy rather than in retention: it has no tiling neighbours to disturb, so a settled observation is adopted immediately, and what it is adopted *into* is the window's retained frame intent (see below) rather than the frame itself.
 
 Column width commands and script operations share `LayoutStrip` intent edits.
 `ColumnId` survives reordering; `WidthIntent` distinguishes inherited configuration,
@@ -521,6 +521,32 @@ Rejected mutations are not queued for later replay with stale source geometry.
 Normal admission resumes only when both transaction ownership and the geometry
 barrier have cleared. Timeout alone does not bypass an unresolved membership
 barrier; native confirmation or the ordinary membership audit releases it.
+
+### Retained Space membership and floating frames
+
+Two per-window facts are authored state rather than observations.
+
+`DeclaredSpace` is the Space a tracked window is declared to belong to. It must
+name a Space that exists and is a user Space, or be unknown while no valid target
+is known; it never holds a target that cannot be validated. An accepted membership
+edit declares it — for every member the edit moves — and a fact that invalidates a
+target which was valid repairs it: the Space was destroyed or merged away, it
+became native fullscreen, the window ended up somewhere else, an attempt was not
+confirmed in its two-second window, or a member's identity retired. Each repair is
+recorded with its reason, and a repair changes state only. While an attempt is in
+flight the attempt owns realization, so a lagging observation cannot pull a just
+accepted declaration back. `SpaceMoveAttempt` records the last attempt and its
+outcome for diagnosis only; no layout, effect, or admission decision reads it.
+
+`FloatingGeometry` is a floating window's authored frame — position and size, one
+per window rather than per Space. `derive_floating_frames` projects the frame the
+pipeline presents from it, clamping it into the display that holds it and
+relocating it, keeping the offset it had, when that display is gone; an inventory
+that cannot be read leaves the intent alone with `unresolved` set, because unknown
+is not absence. Edit commands, the external gesture observer, and the
+reconciliation that adopts an observed frame all state this intent rather than
+writing the frame, and the intent survives a tiled spell. Its frame is saved as an
+isolated candidate with the rest of the layout intent.
 
 ### Named Window Focus
 
