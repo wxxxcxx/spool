@@ -1673,12 +1673,27 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                             .is_ok_and(|(display, _)| display.id() == request.display_id)
                 })
         });
+        // An unresolved native control target is a retention problem, not a
+        // per-frame condition: name it when the commit is withheld so a
+        // permanently rejected window is diagnosable instead of silently
+        // parked. Inactive native tabs resolve to their visible owner instead
+        // and stay silent here.
+        let control_target_current = match window.represented_window_id() {
+            Ok(id) => id == window.id(),
+            Err(error) => {
+                warn!(
+                    window_id = window.id(),
+                    ?entity,
+                    %error,
+                    "geometry commit withheld: native control target unresolved"
+                );
+                false
+            }
+        };
         if unavailable
             || (reassigning && transfer.is_none())
             || (default_frame.is_none() && defaults_pending)
-            || !window
-                .represented_window_id()
-                .is_ok_and(|id| id == window.id())
+            || !control_target_current
         {
             sync.finish_frame_attempt(entity, desired.0, false);
             commands

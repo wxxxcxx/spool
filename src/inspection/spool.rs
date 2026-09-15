@@ -9,7 +9,7 @@ use crate::ecs::workspace::WindowSpaceReassignmentPending;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, DesiredWindowFrame, DockPosition, Floating,
     FocusedMarker, ObservedWindowFrame, PresentedWindowFrame, PreviousTiledStrip,
-    WindowFrameMotion, WindowVisibility,
+    WindowFrameCommitSuspended, WindowFrameMotion, WindowVisibility,
 };
 use crate::manager::{Application, Display, Window};
 use bevy::{ecs::system::SystemParam, prelude::*};
@@ -44,6 +44,7 @@ type GeometryRows<'w, 's> = Query<
         Has<WindowFrameMotion>,
         Has<NativeMoveOwner>,
         Has<WindowSpaceReassignmentPending>,
+        Has<WindowFrameCommitSuspended>,
     ),
     With<Window>,
 >;
@@ -164,7 +165,7 @@ impl Projection<'_, '_> {
                 "identity":{"id":window.id(),"pid":recorded(app.map(|app| app.pid())),"title":recorded(window.retained_title()),"bundle_id":recorded(app.and_then(|app| app.bundle_id())),"app_name":recorded(app.map(|app| app.name()))},
                 "geometry":{"realization": self.sync.frame_progress(entity).map(|progress| json!({"attempts":progress.attempts,"active":progress.active,"blocked":progress.blocked,"confirmed":progress.confirmed,"checks_pending":progress.checks_pending})),"desired":recorded(geometry.and_then(|row| row.0).map(|frame_| frame(frame_.0))),"presented":recorded(geometry.and_then(|row| row.1).map(|frame_| frame(frame_.0))),"observed":recorded(observed.map(frame))},
                 "layout":{"space_id":recorded(space_id),"column":column,"display_id":recorded(display_id),"previous_column":previous.map(|previous| previous.index+1)},
-                "state":{"available":!unavailable,"floating":floating,"focused":focused,"visible":hidden.is_none()&&!parked,"minimized":matches!(hidden,Some(WindowVisibility::Minimized)),"on_screen":recorded(on_screen),"motion":geometry.is_some_and(|row|row.3),"migration":geometry.is_some_and(|row|row.4||row.5),"blockers":{"unavailable":unavailable,"native_move":geometry.is_some_and(|row|row.4),"space_reassignment":geometry.is_some_and(|row|row.5),"parked":parked}}
+                "state":{"available":!unavailable,"floating":floating,"focused":focused,"visible":hidden.is_none()&&!parked,"minimized":matches!(hidden,Some(WindowVisibility::Minimized)),"on_screen":recorded(on_screen),"motion":geometry.is_some_and(|row|row.3),"migration":geometry.is_some_and(|row|row.4||row.5),"blockers":{"unavailable":unavailable,"native_move":geometry.is_some_and(|row|row.4),"space_reassignment":geometry.is_some_and(|row|row.5),"parked":parked,"commit_suspended":geometry.is_some_and(|row|row.6)}}
             })
         }).collect()
     }

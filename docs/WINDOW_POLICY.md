@@ -72,6 +72,28 @@ settable 不保证任意尺寸可达。明确返回 attribute unsupported 也归
 
 浮动 `grid` 需要完整几何操作：能力未知时等待，明确受限时不执行 grid，保留当前 frame。固定窗口也不执行浮动切换时的装饰性缩放。
 
+## 控制目标身份（2026-09-15）
+
+几何提交按窗口的「原生控制目标」判定，与窗口准入是两个问题。`WindowApi::represented_window_id` 读取窗口自身子元素中的唯一直接 `AXTabGroup`，再解析其 `AXWindow` 归属：
+
+| 枚举结果 | 提交行为 |
+| --- | --- |
+| 唯一 `AXTabGroup`，归属指向另一个窗口 | 拒绝写入，保留「不猜测未知控制目标」保护 |
+| 子元素表可读，其中没有 tab group | 该窗口自己就是控制目标，正常提交 |
+| **子元素表读不出来** | 同样按「没有直接 anchor」处理，记住结论并只 WARN 一次 |
+| 可读但存在多个直接 `AXTabGroup` | 歧义，仍然拒绝而不是猜测 |
+
+读取失败不是「另一个窗口拥有该元素」的证据。旧行为把两者等同，于是 AX 子元素表读不出来的窗口其几何写入被永久挂起；现在只有「读成功且归属确实指向别的窗口」才继续拒绝。结论与成功结果一样只结算一次，因此既不会每帧重试失败读取，也不会反复刷日志。
+
+现场证据（2026-09-15，Telegram 12.8 / `ru.keepcoder.Telegram`，窗口元素）：
+
+- 该元素在 `AXUIElementCopyAttributeNames` 中声明支持 `AXChildren` 与 `AXChildrenInNavigationOrder`，但两者每次都返回 `kAXErrorFailure`（`-25200`），耗时 1–2 ms。不是超时：超时对应 `kAXErrorCannotComplete`（`-25204`），本机同一会话中其他进程会返回它。也不是客户端差异：Spool CLI、独立 C 探针与 System Events 结论一致（System Events 看到该窗口 0 个 UI element）。同一元素上 `AXRole`/`AXTitle`/`AXPosition`/`AXSize`/`AXFrame` 均 0.1 ms 成功，真正不支持的属性正确返回 `kAXErrorAttributeUnsupported`（`-25205`）。
+- 修复前的表现：`desired` 正确、`presented` 停在动画中途、`observed` 停在旧位置，`attempts=0`、无 `WindowFrameMotion`；显式 `window reconcile` 与新的列宽意图都不能推动该窗口，同一 Space 的其他窗口全部正常移动。这与「缓存只在窗口诞生时读到一次成功结果」一致：诞生瞬间读成功的新窗口此后一直可写，而已经完整运行后才被接管（典型情形是 daemon 重启）的窗口永远读不到成功结果。
+
+可观测性：提交因控制目标未解析而被扣留时，`commit_window_frames` 输出一次 WARN（窗口 ID、entity、真实 AX 错误）；`window inspect --source spool` 的 `state.blockers.commit_suspended` 表示该窗口当前处于提交挂起。`geometry.realization` 的 attempts/active/blocked/confirmed 是目标轮次状态，不替代这两者。
+
+此决定不放宽写入资格：身份、可用性、Space 可见性、全屏与 Space 迁移保护不变，原生写入失败仍走既有有界重试与挂起。验收状态：本次现场中该窗口修复后可随重排、reveal 与列序变化一起移动；daemon 重启后重新接管一个已完整运行的同类窗口是否同样可写，需要下一次重启后现场确认。
+
 ## 用户规则
 
 `windows` 保持命名表。四个可选匹配条件是 AND：`title` 正则、`bundle_id`、`role`、`subrole` 精确匹配。省略条件表示不限制该属性，不再要求 `title=".*"`。真实空标题可以匹配 `^$`；暂时读取失败不能冒充空标题。其他条件已经确定不匹配时，不必等待无关元数据。

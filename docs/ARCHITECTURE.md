@@ -40,7 +40,11 @@ handle, preserving its layout slot and padding. Spawn-time bootstrap requires
 a unique publication transition, matching physical geometry, same user Space
 and live WindowServer ownership. Unpublished, nonpresented objects on a confirmed
 visible user Space are not new layout windows; offscreen visibility alone never
-excludes one. Ordinary geometry commits reject stale or unknown control targets.
+excludes one. Ordinary geometry commits reject stale or mismatched control
+targets. An unreadable child enumeration is not evidence of another window's
+ownership: it resolves once to "no retained anchor", so a window whose
+accessibility implementation never answers `AXChildren` keeps committing
+against the element Spool already tracks instead of being parked permanently.
 Legacy tab operations described below remain for compatibility, but automatic
 tab detection no longer creates these layouts. Live evidence and remaining
 acceptance are in `research/native-tab-platform-observation-2026-09-11.md`.
@@ -48,6 +52,7 @@ acceptance are in `research/native-tab-platform-observation-2026-09-11.md`.
 Spool manages macOS windows as a **sliding strip** (inspired by Niri and PaperWM). The core design philosophy is **Data-Driven/ECS**: instead of managing windows as complex objects with internal state, we represent the "World" as a collection of simple data components (Windows, Displays, Workspaces) that are processed by systems.
 
 The primary problem Spool solves is providing a predictable, stable, and ergonomic tiling experience on macOS. By using Bevy's ECS, we gain:
+
 - **Declarative Logic:** layout state is rendered into a desired window frame; effects and OS observations are separate projections.
 - **Change-Driven Work:** Efficient change detection and budgeted event/discovery processing.
 - **Modularity:** Functionality is divided into decoupled plugins and systems.
@@ -57,17 +62,19 @@ The primary problem Spool solves is providing a predictable, stable, and ergonom
 Bevy is typically used for games, so Spool implements a custom bridge to interact with the macOS Window Server.
 
 ### Event Ingestion (macOS -> ECS)
-1.  **Platform Layer:** `src/platform/` uses `objc2` and AppKit to interface with macOS. It runs a native event loop or hooks into OS notifications.
-2.  **Event Channel:** macOS events (mouse moves, window creations, space changes) are sent via a thread-safe `mpsc` channel.
-3.  **Pump System:** The `pump_events` system (in `src/ecs/systems.rs`) reads from this channel during the `PreUpdate` phase and writes Bevy `Message`s or triggers `Observer`s.
-4.  **Observers:** Bevy Observers (primarily in `src/ecs/triggers.rs`, with focused domain modules) react to these events to update the ECS World (e.g., spawning new `Window` entities or updating `FocusedMarker`).
+
+1. **Platform Layer:** `src/platform/` uses `objc2` and AppKit to interface with macOS. It runs a native event loop or hooks into OS notifications.
+2. **Event Channel:** macOS events (mouse moves, window creations, space changes) are sent via a thread-safe `mpsc` channel.
+3. **Pump System:** The `pump_events` system (in `src/ecs/systems.rs`) reads from this channel during the `PreUpdate` phase and writes Bevy `Message`s or triggers `Observer`s.
+4. **Observers:** Bevy Observers (primarily in `src/ecs/triggers.rs`, with focused domain modules) react to these events to update the ECS World (e.g., spawning new `Window` entities or updating `FocusedMarker`).
 
 ### Declarative Frame Pipeline (ECS -> macOS -> ECS)
-1.  **Render:** `layout::position_layout_windows` derives `DesiredWindowFrame` from Layout State. This is the final target and does not advance gradually.
-2.  **Present:** `window_frame::animate_presented_window_frames` derives `PresentedWindowFrame` from the desired frame. Gestures and cross-Space jumps may explicitly snap this projection.
-3.  **Commit:** `systems::commit_window_frame` is the normal-operation geometry writer. It sends only the presented frame through the `Window` abstraction.
-4.  **Observe:** synchronous AX readback and external notifications update `ObservedWindowFrame`. Borders and public queries use this confirmed projection.
-5.  **Reconcile:** `reconcile::reconcile_windows` periodically compares desired and observed frames, retries boundedly, and also repairs missed lifecycle notifications from complete AX and WindowServer inventories.
+
+1. **Render:** `layout::position_layout_windows` derives `DesiredWindowFrame` from Layout State. This is the final target and does not advance gradually.
+2. **Present:** `window_frame::animate_presented_window_frames` derives `PresentedWindowFrame` from the desired frame. Gestures and cross-Space jumps may explicitly snap this projection.
+3. **Commit:** `systems::commit_window_frame` is the normal-operation geometry writer. It sends only the presented frame through the `Window` abstraction.
+4. **Observe:** synchronous AX readback and external notifications update `ObservedWindowFrame`. Borders and public queries use this confirmed projection.
+5. **Reconcile:** `reconcile::reconcile_windows` periodically compares desired and observed frames, retries boundedly, and also repairs missed lifecycle notifications from complete AX and WindowServer inventories.
 
 The flow is intentionally one-way. An ordinary macOS readback never mutates tiled Layout State. User- or application-driven geometry is first collected as a `Geometry Gesture`; only the settled final frame becomes a single Layout State action. Floating windows are the exception because no tiling neighbours depend on their geometry.
 
@@ -534,6 +541,7 @@ Rejected ordinary focus does not cancel an otherwise valid pending follow, and
 the shared visible-Space predicate also gates follow completion.
 
 ### Components
+
 - **`Window`:** A wrapper around a macOS window handle (AXUIElement).
 - **`Display`:** Represents a physical monitor and its bounds.
 - **`LayoutStrip`:** One per native Space; manages its ordered list of `Column`s.
@@ -554,6 +562,7 @@ the shared visible-Space predicate also gates follow completion.
 - **`WindowFrameMotion`**: Marks a presented frame that has not converged to its desired frame.
 
 ### Resources
+
 - **`WindowManager`:** A wrapper for the global window management state and OS bridge.
 - **`WindowDiscovery`:** A main-thread-only queue for incremental inactive-Space discovery.
 - **`Config`:** The current user configuration.
@@ -623,11 +632,11 @@ graph TD
 
 ## 8. Testing Strategy
 
-1.  **Pure Unit Tests:** Located in `src/tests.rs` and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.
-2.  **ECS Integration Tests:** Use Bevy's `App` or `World` to drive systems in isolation. macOS APIs are typically mocked via the `WindowApi` and `WindowManagerApi` traits.
-3.  **Session Restore Tests:** `src/tests/session_restore.rs` covers candidate isolation, trusted atomic import, frozen baselines, and rejection of stale edits or structural changes.
-4.  **FFI Verification:** Manual or semi-automated tests on macOS to ensure the Accessibility API calls behave as expected with native windows.
-5.  **Agent Support:** The `AGENTS.md` file provides project-specific guidance for AI agents to ensure contributions follow these architectural patterns.
+1. **Pure Unit Tests:** Located in `src/tests.rs` and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.
+2. **ECS Integration Tests:** Use Bevy's `App` or `World` to drive systems in isolation. macOS APIs are typically mocked via the `WindowApi` and `WindowManagerApi` traits.
+3. **Session Restore Tests:** `src/tests/session_restore.rs` covers candidate isolation, trusted atomic import, frozen baselines, and rejection of stale edits or structural changes.
+4. **FFI Verification:** Manual or semi-automated tests on macOS to ensure the Accessibility API calls behave as expected with native windows.
+5. **Agent Support:** The `AGENTS.md` file provides project-specific guidance for AI agents to ensure contributions follow these architectural patterns.
 
 ## Declarative focus activation
 

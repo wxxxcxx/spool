@@ -760,6 +760,21 @@ impl WindowOS {
             .to_result(function_name!())?;
         Ok(())
     }
+
+    /// This window's direct children, each paired with its accessibility role.
+    ///
+    /// One read: [`WindowApi::represented_window_id`] picks the retained anchor
+    /// out of these handles, so the child list is never enumerated twice.
+    fn children_with_roles(&self) -> Result<Vec<(String, CFRetained<AXUIWrapper>)>> {
+        let children = self
+            .ax_element
+            .get_attribute::<CFArray<AXUIWrapper>>(&CFString::from_static_str("AXChildren"))?;
+        children
+            .to_vec()
+            .into_iter()
+            .map(|child| child.role().map(|role| (role, child)))
+            .collect()
+    }
 }
 
 impl WindowApi for WindowOS {
@@ -781,19 +796,24 @@ impl WindowApi for WindowOS {
 
     fn represented_window_id(&self) -> Result<WinID> {
         if self.presentation_anchor.get().is_none() {
-            let children = self
-                .ax_element
-                .get_attribute::<CFArray<AXUIWrapper>>(&CFString::from_static_str("AXChildren"))?;
-            let mut anchors = Vec::new();
-            for child in children.to_vec() {
-                if child.role()? == "AXTabGroup" {
-                    anchors.push(child);
-                }
+            let children = self.children_with_roles();
+            if let Err(error) = children.as_ref() {
+                // Failing to enumerate this window's children is not evidence
+                // that another window owns this element. Some applications
+                // advertise `AXChildren` and then always fail the read
+                // (Telegram 12.8 answers `kAXErrorFailure` in about a
+                // millisecond), and treating that as an unknown control target
+                // suspends every geometry commit for the window indefinitely.
+                // Resolve to "no retained anchor" once, which also stops paying
+                // the failing synchronous read on every commit attempt.
+                warn!(
+                    window_id = self.id,
+                    %error,
+                    "window child list unreadable; treating the element as its own control target"
+                );
             }
-            if anchors.len() > 1 {
-                return Err(Error::InvalidWindow);
-            }
-            let _ = self.presentation_anchor.set(anchors.pop());
+            let anchor = direct_presentation_anchor(children)?;
+            let _ = self.presentation_anchor.set(anchor);
         }
         let Some(Some(anchor)) = self.presentation_anchor.get() else {
             return Ok(self.id);
@@ -1119,6 +1139,33 @@ impl WindowApi for WindowOS {
     }
 }
 
+/// Resolves a window's retained native chrome anchor from its enumerated direct
+/// children.
+///
+/// `children` is the enumeration outcome, each child paired with its
+/// accessibility role: `Err` means the list could not be read at all. An
+/// unreadable list resolves to "no direct anchor" rather than an unknown control
+/// target. A failing read is not evidence that another window owns the element,
+/// and rejecting the window on it parked every geometry commit for as long as
+/// the application kept failing the read (Telegram 12.8 advertises
+/// `AXChildren` and always answers `kAXErrorFailure`). A window that enumerates
+/// more than one direct `AXTabGroup` stays an ambiguity the caller rejects
+/// instead of guessing.
+fn direct_presentation_anchor<T>(children: Result<Vec<(String, T)>>) -> Result<Option<T>> {
+    let Ok(children) = children else {
+        return Ok(None);
+    };
+    let mut anchors = children
+        .into_iter()
+        .filter(|(role, _)| role == "AXTabGroup")
+        .map(|(_, child)| child);
+    match (anchors.next(), anchors.next()) {
+        (None, _) => Ok(None),
+        (Some(anchor), None) => Ok(Some(anchor)),
+        (Some(_), Some(_)) => Err(Error::InvalidWindow),
+    }
+}
+
 fn known_window_title(result: Result<String>) -> Result<String> {
     match result {
         Err(error)
@@ -1139,6 +1186,43 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn an_unreadable_child_list_keeps_the_window_as_its_own_control_target() {
+        // Telegram 12.8 advertises AXChildren and always fails the read. That is
+        // not evidence that another window owns the element, so it must resolve
+        // to "no anchor" instead of an unknown control target: rejecting it
+        // suspends every geometry commit for the window indefinitely.
+        assert_eq!(
+            direct_presentation_anchor::<u8>(Err(Error::macos(
+                "AXChildren",
+                accessibility_sys::kAXErrorFailure
+            )))
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            direct_presentation_anchor(Ok(vec![("AXWindow".to_string(), 7u8)])).unwrap(),
+            None
+        );
+        // Exactly one direct tab group keeps that chrome as the anchor.
+        assert_eq!(
+            direct_presentation_anchor(Ok(vec![
+                ("AXWindow".to_string(), 7u8),
+                ("AXTabGroup".to_string(), 8u8),
+            ]))
+            .unwrap(),
+            Some(8)
+        );
+        // Two tab groups stay ambiguous: the caller must reject, not guess.
+        assert!(
+            direct_presentation_anchor(Ok(vec![
+                ("AXTabGroup".to_string(), 8u8),
+                ("AXTabGroup".to_string(), 9u8),
+            ]))
+            .is_err()
+        );
+    }
 
     #[test]
     fn window_policy_fallback_evidence_obeys_rules_and_skips_standard_windows() {

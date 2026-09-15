@@ -30,6 +30,8 @@ An application-owned outer frame represented by one ordinary layout entity.
 Native tab count, order, selection and internal layout belong to the application.
 The backend may retain native chrome to resolve a changing AX control target;
 reconciliation replaces that target on the same entity without adding a column.
+A child enumeration the application cannot answer resolves to the window itself,
+never to an unknown control target that would park its geometry.
 A one-to-one publication withdrawal may bootstrap continuity only with matching
 physical geometry, live process ownership and same-Space presentation evidence.
 Geometry or onscreen visibility alone is insufficient.
