@@ -122,6 +122,7 @@ Balance的继承语义经过三位专家一致确认：若参考列继承规则0
 - **声明归属与修复**（`b1ff96a`）：`DeclaredSpace { target, observed, repairs }`（修复历史保留最近 4 次）与 `reconcile_declared_space`（调度在 `Last`：销毁处理 → 事务协调 → 声明协调）。触发器：目标 Space 被销毁/合并（`target_space_destroyed`）、变原生全屏（`target_space_fullscreen`）、外部移动/合并（`membership_changed`）、未确认尝试（`attempt_unconfirmed`）、成员实例退休（`member_retired`）；显示器断开而目标仍存在、以及读取不可读时**不修**（未知不是缺席）。实例退休时声明随实体消失，替换实例不继承历史。
 - **被接纳的编辑写入声明**（`7d2f040`）：整列/关联成员的每一个都立即声明目标 Space；这是作者转移而非修复，不进修复历史。**在途尝试拥有实现权**：带 `NativeMoveOwner` 时只更新 `observed`、不修复，否则观测会把刚被接纳的声明按回去。
 - **未确认的尝试带原因修复**（`b6b8b2b`）：2 秒确认窗口过后事务释放所有权，声明协调据尝试记录把声明修复回观测并记 `attempt_unconfirmed`（`Retired` → `member_retired`）；不自动重试（测试断言原生意图计数不变）。超时因此不再只剩一条日志。
+- **浮动窗口的观测**（本次）：票要求"每个 tracked 窗口一个声明（浮动窗口也有）"，而首版用布局归属近似观测，浮动窗口因此一直停在未知。现在：有实时 strip 成员关系的窗口仍用布局（那已是观测被协调后的视图）；**没有** strip 成员的窗口先读原生成员关系（浮动窗口在哪由 macOS 说），读不到时才退回 `PreviousTiledStrip` 记忆 —— 顺序与票的兜底顺序一致（观测 → 上次所在 → 未知），因为记忆是"上次平铺所在"，可能与现状不同。该扫描覆盖全部 Space，所以**每轮只取一次、只在有窗口需要时取、且每个拓扑 generation 至多一次**（`refresh_topology` 的 1 秒心跳或事件失效才会推进 generation）；读取失败等下一代观测，不逐帧重试。测试：`a_floating_window_declares_the_space_membership_reports`（观测与记忆不一致时观测胜出；移除原生优先时该断言失败）、`an_unreadable_membership_scan_does_not_invalidate_a_floating_declaration`。
 - **跨显示器可见性门**（`ad33d31`）：结论**保留**并写明理由 —— `move-to-display` 的语义是"放到那块屏幕上我能看到的地方"（transfer 用目的显示器可用视口暂存 frame 并在确认后呈现于此），因此没有唯一可见 Space 的目的显示器答 `space_not_visible`，而不是替用户挑一个 Space；把窗口送到另一屏的隐藏 Space 走 `move-to-space <id>`，不受此门约束。
 
 ### 本片验证

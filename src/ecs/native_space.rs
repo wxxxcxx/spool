@@ -18,7 +18,7 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::layout_snapshot::{LayoutSession, matches_window};
 use crate::ecs::params::Windows;
-use crate::ecs::topology::{NativeTopology, SpaceClaim};
+use crate::ecs::topology::{NativeTopology, SpaceClaim, WindowMemberships};
 use crate::ecs::window_frame::{DisplayTransferFrame, DisplayTransferReadback};
 use crate::ecs::workspace::{
     PendingSpaceDestruction, WindowSpaceReassignmentPending, freeze_window_for_space_reassignment,
@@ -176,6 +176,7 @@ pub(crate) struct DeclaredSpaceCtx<'w, 's> {
     spaces: Query<'w, 's, (&'static LayoutStrip, Has<PendingSpaceDestruction>)>,
     previous: Query<'w, 's, &'static PreviousTiledStrip>,
     topology: Res<'w, NativeTopology>,
+    manager: Res<'w, WindowManager>,
     declared: Query<'w, 's, &'static mut DeclaredSpace>,
     attempts: Query<'w, 's, &'static SpaceMoveAttempt>,
     moving: Query<'w, 's, (), With<NativeMoveOwner>>,
@@ -196,11 +197,13 @@ pub(crate) fn reconcile_declared_space(
         spaces,
         previous,
         topology,
+        manager,
         mut declared,
         attempts,
         moving,
         mut commands,
     }: DeclaredSpaceCtx,
+    mut scanned: Local<u64>,
 ) {
     let known: Vec<(WorkspaceId, bool)> = spaces
         .iter()
@@ -212,8 +215,15 @@ pub(crate) fn reconcile_declared_space(
             .any(|(id, destroying)| *id == space && !destroying)
             && !topology.is_fullscreen(space)
     };
-    let owner = |entity: Entity| {
-        spaces
+    // A window with no layout membership — a floating window, or one whose layout
+    // is unresolved — takes its observation from native membership instead. The
+    // scan covers every Space, so it is taken once for the whole pass, only when
+    // some window needs it, and at most once per topology generation: a failed
+    // read waits for the next observation rather than being retried per frame.
+    let scan_allowed = topology.generation() != *scanned;
+    let mut memberships: Option<WindowMemberships> = None;
+    let mut owner = |entity: Entity| {
+        let layout = spaces
             .iter()
             .find_map(|(strip, _)| strip.contains(entity).then_some(strip.id()))
             .or_else(|| {
@@ -221,7 +231,30 @@ pub(crate) fn reconcile_declared_space(
                     .get(entity)
                     .ok()
                     .map(|previous| previous.workspace_id)
-            })
+            });
+        if layout.is_some() {
+            return layout;
+        }
+        // No live strip holds it, so it is a floating window or one whose layout
+        // is unresolved. The observation comes first — a floating window is
+        // wherever macOS says — and the remembered strip is the fallback for a
+        // window the scan cannot see, not a competing authority.
+        let native = if scan_allowed {
+            if memberships.is_none() {
+                memberships = topology.observe_memberships(&manager).ok();
+            }
+            windows
+                .get_any(entity)
+                .and_then(|window| memberships.as_ref()?.unique_space(window.id()))
+        } else {
+            None
+        };
+        native.or_else(|| {
+            previous
+                .get(entity)
+                .ok()
+                .map(|previous| previous.workspace_id)
+        })
     };
 
     for (_, entity) in windows.iter_any().collect::<Vec<_>>() {
@@ -274,6 +307,9 @@ pub(crate) fn reconcile_declared_space(
                 });
             state.repair(replacement, reason);
         }
+    }
+    if scan_allowed {
+        *scanned = topology.generation();
     }
 }
 

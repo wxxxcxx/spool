@@ -313,6 +313,81 @@ fn an_in_flight_attempt_is_not_repaired_back_by_the_observation() {
     );
 }
 
+/// Makes one tracked window float and takes it out of every strip, so it has no
+/// layout membership to observe and the declaration must come from native
+/// membership instead.
+fn float_window(harness: &mut TestHarness, entity: Entity) {
+    let world = harness.world();
+    for (_, mut strip) in world.query::<(Entity, &mut LayoutStrip)>().iter_mut(world) {
+        strip.remove(entity);
+    }
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(crate::ecs::Floating);
+}
+
+/// A floating window has no strip to read its Space from, so its declaration
+/// comes from the native membership scan — one read per observation, taken only
+/// when some window needs it.
+#[test]
+fn a_floating_window_declares_the_space_membership_reports() {
+    let (mut harness, _, members) = column_harness();
+    float_window(&mut harness, members[1]);
+    // macOS reports it on a different Space than the strip it was tiled in, so
+    // the observation and the remembered strip disagree.
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = TARGET);
+    harness.pump_frames(70);
+
+    let declared = declared_space(&mut harness, members[1]);
+    assert_eq!(
+        declared.target,
+        Some(TARGET),
+        "the observation wins over the remembered strip"
+    );
+    assert_eq!(
+        declared.repairs.last().map(|repair| repair.reason),
+        Some("membership_changed"),
+        "the declaration had been the remembered strip and followed the window"
+    );
+
+    // macOS moves it back; the declaration follows the observation again.
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    harness.pump_frames(70);
+
+    let moved = declared_space(&mut harness, members[1]);
+    assert_eq!(moved.target, Some(TEST_WORKSPACE_ID));
+    assert_eq!(
+        moved.repairs.last().map(|repair| repair.reason),
+        Some("membership_changed")
+    );
+}
+
+/// The scan is an observation like any other: when it cannot be read, a
+/// declaration that still names a valid Space is left alone.
+#[test]
+fn an_unreadable_membership_scan_does_not_invalidate_a_floating_declaration() {
+    let (mut harness, _, members) = column_harness();
+    float_window(&mut harness, members[1]);
+    harness.pump_frames(70);
+    let before = declared_space(&mut harness, members[1]);
+    assert_eq!(before.target, Some(TEST_WORKSPACE_ID));
+
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = TARGET);
+    harness.mock_state.set_display_inventory_available(false);
+    harness.pump_frames(70);
+
+    let after = declared_space(&mut harness, members[1]);
+    assert_eq!(after.target, before.target);
+    assert_eq!(after.repairs, before.repairs);
+}
+
 /// A Space that became native fullscreen is not a user Space, so a declaration
 /// pointing at it stops being valid and is repaired with that reason.
 #[test]
