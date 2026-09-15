@@ -44,8 +44,13 @@ mod workspace;
 pub type OSStatus = i32;
 /// Type alias for `WinID`, a 32-bit integer representing a window identifier in `SkyLight`.
 pub type WinID = i32;
-/// Stable identity of one AX window object during its lifetime. Unlike
-/// [`WinID`], this changes when `WindowServer` reuses an integer ID.
+/// Stable identity of one AX window object during its lifetime.
+///
+/// Unlike [`WinID`], this is expected to change when `WindowServer` reuses an
+/// integer ID. That reuse is asserted here without a primary source and is **to
+/// be verified**: see `docs/wayfinding/declarative-state/issues/27-window-identity-verification.md`,
+/// which also questions what `CFHash` hashes and whether a stable application
+/// provided identifier exists.
 pub type WindowIncarnation = u64;
 /// Type alias for `ConnID`, a 64-bit integer representing a connection identifier in `SkyLight`.
 pub type ConnID = i64;

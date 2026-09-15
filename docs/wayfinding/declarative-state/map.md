@@ -3,7 +3,7 @@
 Label: wayfinder:map
 Status: resolved
 
-已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）；已实施：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（帧权威切换、保存与候选隔离，均已验证并推送）；已裁决、实施中：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（七项已裁决）；下一片待确认接口：[恢复第一个切片](issues/26-recovery-first-slice.md)。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
+已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）；已实施：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（帧权威切换、保存与候选隔离，均已验证并推送）；已裁决、实施中：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（七项已裁决）；下一片待确认接口：[恢复第一个切片](issues/26-recovery-first-slice.md)；待核实：[窗口唯一标识的核实](issues/27-window-identity-verification.md)。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
 
 ## Destination
 
