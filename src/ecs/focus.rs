@@ -26,6 +26,7 @@ use crate::ecs::{
 use crate::events::{Event, FocusObservation};
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, WinID, WindowIncarnation, WorkspaceId};
+use spool_shared_types::commands::FocusRole;
 
 pub(crate) mod activation;
 mod stacking;
@@ -63,6 +64,16 @@ struct TierMemory {
     any: FocusOrder,
     tiled: FocusOrder,
     floating: FocusOrder,
+}
+
+/// One Space's focus memory as the live entities it names. Entities never leave
+/// the process, so a saver resolves them to cached identity hints and an import
+/// resolves cached hints back to entities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FocusMemory {
+    pub space_id: WorkspaceId,
+    pub preference: Option<Entity>,
+    pub selection: Option<Entity>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -560,6 +571,37 @@ impl FocusCoordinator {
 
     pub(super) fn forget_workspace(&mut self, workspace: WorkspaceId) {
         self.by_workspace.remove(&workspace);
+    }
+
+    /// Every Space's recorded focus memory, for a saver to resolve into cached
+    /// identity hints. A Space with neither a preference nor a selection carries
+    /// no intent to save.
+    pub(crate) fn focus_memory(&self) -> impl Iterator<Item = FocusMemory> + '_ {
+        self.by_workspace.iter().filter_map(|(space, memory)| {
+            (memory.preference.is_some() || memory.selection.is_some()).then_some(FocusMemory {
+                space_id: *space,
+                preference: memory.preference,
+                selection: memory.selection,
+            })
+        })
+    }
+
+    /// Records the focus memory a trusted import names.
+    ///
+    /// This is the authored transition, like [`set_space_preference`]: it
+    /// creates no activation request, advances no observation, leaves confirmed
+    /// history alone, and writes nothing to the platform.
+    pub(crate) fn import_focus_memory(
+        &mut self,
+        workspace: WorkspaceId,
+        role: FocusRole,
+        entity: Entity,
+    ) {
+        let memory = self.by_workspace.entry(workspace).or_default();
+        match role {
+            FocusRole::Preference => memory.preference = Some(entity),
+            FocusRole::Selection => memory.selection = Some(entity),
+        }
     }
 }
 

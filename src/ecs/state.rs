@@ -63,6 +63,26 @@ pub struct SpoolState {
     /// that a startup owner may map, never a cross-session identity.
     #[serde(default)]
     pub membership: Vec<SavedMembership>,
+    /// Per-Space focus memory is session-scoped intent like the rest: the Space
+    /// id and every cached window identity are candidate hints only.
+    #[serde(default)]
+    pub focus: Vec<SavedFocus>,
+}
+
+/// One Space's saved focus memory, with cached identity hints only.
+///
+/// A role whose identity was not resolvable at capture is omitted rather than
+/// written as `null`: unlike a member slot, an absent focus hint carries no
+/// structure, and `null` would claim "no preference", which capture cannot
+/// support. No reader may infer identity from either hint.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SavedFocus {
+    pub space_id: WorkspaceId,
+    #[serde(default)]
+    pub preference: Option<SavedWindow>,
+    #[serde(default)]
+    pub selection: Option<SavedWindow>,
 }
 
 /// One tracked window's declared Space, with cached identity hints only.
@@ -151,6 +171,7 @@ impl SpoolState {
             &crate::ecs::floating_geometry::FloatingGeometry,
         )>,
         membership: &Query<(&Window, &ChildOf, &crate::ecs::native_space::DeclaredSpace)>,
+        focus: &crate::ecs::focus::FocusCoordinator,
     ) -> Self {
         Self::from_layouts(
             strips.iter(),
@@ -187,6 +208,7 @@ impl SpoolState {
                     space_id: declared.target?,
                 })
             }),
+            focus.focus_memory(),
         )
     }
 
@@ -197,6 +219,7 @@ impl SpoolState {
         mut window_hint: impl FnMut(Entity) -> Option<SavedWindow>,
         floating: impl IntoIterator<Item = SavedFloatingWindow>,
         membership: impl IntoIterator<Item = SavedMembership>,
+        focus: impl IntoIterator<Item = crate::ecs::focus::FocusMemory>,
     ) -> Self {
         let mut spaces = strips
             .into_iter()
@@ -247,12 +270,26 @@ impl SpoolState {
         floating.sort_by_key(|window| window.window_id);
         let mut membership = membership.into_iter().collect::<Vec<_>>();
         membership.sort_by_key(|entry| entry.window_id);
+        let mut focus = focus
+            .into_iter()
+            .filter_map(|memory| {
+                let preference = memory.preference.and_then(&mut window_hint);
+                let selection = memory.selection.and_then(&mut window_hint);
+                (preference.is_some() || selection.is_some()).then_some(SavedFocus {
+                    space_id: memory.space_id,
+                    preference,
+                    selection,
+                })
+            })
+            .collect::<Vec<_>>();
+        focus.sort_by_key(|entry| entry.space_id);
         Self {
             version: INTENT_STATE_VERSION,
             revision: 0,
             spaces,
             floating,
             membership,
+            focus,
         }
     }
 
@@ -260,7 +297,12 @@ impl SpoolState {
         let mut spaces = HashSet::new();
         let mut columns = HashSet::new();
         let mut items = HashSet::new();
+        let mut focus_spaces = HashSet::new();
         self.version == INTENT_STATE_VERSION
+            && self
+                .focus
+                .iter()
+                .all(|entry| focus_spaces.insert(entry.space_id))
             && self.spaces.iter().all(|space| {
                 spaces.insert(space.space_id)
                     && space.columns.iter().all(|column| {
@@ -892,45 +934,63 @@ fn now_timestamp() -> u64 {
         .as_secs()
 }
 
+/// The accepted-intent inputs every save path captures from, bundled so each
+/// path declares one parameter instead of six.
+#[derive(SystemParam)]
+pub struct IntentCapture<'w, 's> {
+    strips: Query<'w, 's, &'static LayoutStrip>,
+    windows: Windows<'w, 's>,
+    apps: Query<'w, 's, &'static Application>,
+    floating: Query<
+        'w,
+        's,
+        (
+            &'static Window,
+            &'static ChildOf,
+            &'static crate::ecs::floating_geometry::FloatingGeometry,
+        ),
+    >,
+    membership: Query<
+        'w,
+        's,
+        (
+            &'static Window,
+            &'static ChildOf,
+            &'static crate::ecs::native_space::DeclaredSpace,
+        ),
+    >,
+    focus: Res<'w, crate::ecs::focus::FocusCoordinator>,
+}
+
+impl IntentCapture<'_, '_> {
+    /// The accepted domain state, including Spaces that native inventory cannot
+    /// currently observe.
+    pub fn capture(&self) -> SpoolState {
+        SpoolState::extract(
+            &self.strips,
+            &self.windows,
+            &self.apps,
+            &self.floating,
+            &self.membership,
+            &self.focus,
+        )
+    }
+}
+
 /// Publishes accepted snapshot revisions independently of the save interval.
 /// No native calls or filesystem IO; equality ignores effective/presented values.
-pub fn capture_state_changes(
-    strips: Query<&LayoutStrip>,
-    windows: Windows,
-    apps: Query<&Application>,
-    floating: Query<(
-        &Window,
-        &ChildOf,
-        &crate::ecs::floating_geometry::FloatingGeometry,
-    )>,
-    membership: Query<(&Window, &ChildOf, &crate::ecs::native_space::DeclaredSpace)>,
-    mut persistence: ResMut<StatePersistence>,
-) {
-    if let Err(error) = persistence.capture(SpoolState::extract(
-        &strips,
-        &windows,
-        &apps,
-        &floating,
-        &membership,
-    )) {
+pub fn capture_state_changes(capture: IntentCapture, mut persistence: ResMut<StatePersistence>) {
+    if let Err(error) = persistence.capture(capture.capture()) {
         warn!(%error, "Unable to capture accepted layout intent");
     }
 }
 
 pub fn periodic_state_save(
-    strips: Query<&LayoutStrip>,
-    windows: Windows,
-    apps: Query<&Application>,
-    floating: Query<(
-        &Window,
-        &ChildOf,
-        &crate::ecs::floating_geometry::FloatingGeometry,
-    )>,
-    membership: Query<(&Window, &ChildOf, &crate::ecs::native_space::DeclaredSpace)>,
+    capture: IntentCapture,
     path: Res<StateFilePath>,
     mut persistence: ResMut<StatePersistence>,
 ) {
-    let state = SpoolState::extract(&strips, &windows, &apps, &floating, &membership);
+    let state = capture.capture();
     match persistence
         .capture(state)
         .and_then(|snapshot| persistence.commit(&snapshot, path.as_path()))
@@ -944,26 +1004,14 @@ pub fn periodic_state_save(
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Bevy injects independent system parameters"
-)]
 pub fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    strips: Query<&LayoutStrip>,
-    windows: Windows,
-    apps: Query<&Application>,
-    floating: Query<(
-        &Window,
-        &ChildOf,
-        &crate::ecs::floating_geometry::FloatingGeometry,
-    )>,
-    membership: Query<(&Window, &ChildOf, &crate::ecs::native_space::DeclaredSpace)>,
+    capture: IntentCapture,
     path: Res<StateFilePath>,
     mut persistence: ResMut<StatePersistence>,
 ) {
     if exit_events.read().next().is_some() {
-        let state = SpoolState::extract(&strips, &windows, &apps, &floating, &membership);
+        let state = capture.capture();
         if let Err(error) = persistence
             .capture(state)
             .and_then(|snapshot| persistence.commit(&snapshot, path.as_path()))

@@ -188,7 +188,7 @@ objects stay on their owning threads.
 | `src/ecs/systems.rs` | Bevy systems for lifecycle management, event pumping, and state syncing. |
 | `src/ecs/params.rs` | High-level Bevy `SystemParam` abstractions for querying the World. |
 | `src/ecs/triggers.rs` | Reactive event handlers (Observers) for OS and internal events. |
-| `src/ecs/restore.rs` | Isolated saved candidates and pure atomic import with explicitly trusted bindings and a frozen initial baseline; no automatic matching. |
+| `src/ecs/restore.rs` | Isolated saved candidates and pure atomic import of every recovered domain (column/height intent, floating frames, declared Spaces, per-Space focus memory) with explicitly trusted bindings and a frozen initial baseline; no automatic matching. |
 | `src/ecs/native_space.rs` | Native Space topology, visibility, capability-gated commands, and post-operation reconciliation. |
 | `src/ecs/workspace.rs` | Native Space/display lifecycle event handling. |
 | `src/ecs/scroll.rs` | Input handling for trackpad swipe gestures, inertia, and snapping. |
@@ -603,7 +603,7 @@ the shared visible-Space predicate also gates follow completion.
 - **`WindowManager`:** A wrapper for the global window management state and OS bridge.
 - **`WindowDiscovery`:** A main-thread-only queue for incremental inactive-Space discovery.
 - **`Config`:** The current user configuration.
-- **`SpoolState`**: The v6 snapshot of original column-width and stack-height intent, stack item identity, and candidate member hints.
+- **`SpoolState`**: The v6 snapshot of original column-width and stack-height intent, stack item identity, candidate member hints, floating frames, declared Spaces, and per-Space focus memory.
 - **`StatePersistence`**: Accepted/saved revisions, dirty state, and monotonic atomic publication.
 - **`RestoreCandidates`**: Isolated input; loading it does not alter layout or issue effects.
 - **`MissionControlActive`:** A flag indicating if macOS Mission Control is visible (disabling tiling).
@@ -635,7 +635,11 @@ the shared visible-Space predicate also gates follow completion.
 availability. Each column persists its kind and width intent, and each independently
 arranged stack item persists its identity, raw positive height weight, and one member
 slot per retained member. A member slot records a cached binding hint or an explicit
-absence, so an identity that was not resolvable at capture shortens nothing. In-memory
+absence, so an identity that was not resolvable at capture shortens nothing. A floating
+window's authored frame, each tracked window's declared Space, and each Space's focus
+preference and logical selection are captured with the same cached identity hints; a
+focus hint that could not be resolved is omitted instead of being written as a "no
+preference" claim. In-memory
 capture publishes accepted and dirty revisions; periodic and exit saves sync a temporary
 file, rename it atomically, and sync its directory. An old snapshot cannot replace a
 newer accepted snapshot, and failure retains dirty state.

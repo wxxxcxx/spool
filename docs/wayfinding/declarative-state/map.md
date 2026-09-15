@@ -3,7 +3,7 @@
 Label: wayfinder:map
 Status: resolved
 
-已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）；已实施：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（帧权威切换、保存与候选隔离，均已验证并推送）；已裁决、实施中：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（七项已裁决）；下一片待确认接口：[恢复第一个切片](issues/26-recovery-first-slice.md)；已实施：[恢复：Space 归属的候选与导入](issues/28-recovery-membership.md)；待核实：[窗口唯一标识的核实](issues/27-window-identity-verification.md)。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
+已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）；已实施：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（帧权威切换、保存与候选隔离，均已验证并推送）；已裁决、实施中：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（七项已裁决）；下一片待确认接口：[恢复第一个切片](issues/26-recovery-first-slice.md)；已实施：[恢复：Space 归属的候选与导入](issues/28-recovery-membership.md)；已实施：[恢复：每 Space 焦点记忆的候选与导入](issues/29-recovery-focus.md)；待核实：[窗口唯一标识的核实](issues/27-window-identity-verification.md)。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
 
 ## Destination
 
@@ -52,6 +52,7 @@ Status: resolved
 - [目标 Space 归属的不变量与修复](issues/23-space-membership.md) — 用户裁决：归属必须始终指向存在的用户 Space；编辑当场拒绝或当场尝试（2 秒、不重试）；外部事件触发状态修复且不写原生；保留与否按「用户无法便宜重试且卡住常见持久」判据。已实施、验证并推送（6 笔）。
 - [浮动窗口的完整迁移切片](issues/24-floating-windows.md) — 用户已裁决六项；已实施：帧权威切换（意图 + 约束派生 + 修复，不写原生）、保存与候选隔离；9+1 条测试，验证并推送。
 - [跨重启恢复的入口票](issues/25-cross-restart-recovery.md) — 恢复地图的入口：身份连续性证据、恢复域与顺序、候选 vs 自动绑定、停机冲突、版本策略、呈现影响。待裁决。
+- [恢复：每 Space 焦点记忆的候选与导入](issues/29-recovery-focus.md) — 第三个恢复域：保存每 Space 的偏好与逻辑选择，经同一入口按角色逐条证明后导入；无法解析的提示省略而非写成 null。已实施。
 
 ## Not yet specified
 

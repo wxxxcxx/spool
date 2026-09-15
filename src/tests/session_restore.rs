@@ -14,6 +14,7 @@ fn candidates(widths: &[WidthIntent]) -> RestoreCandidates {
         revision: 7,
         floating: Vec::new(),
         membership: Vec::new(),
+        focus: Vec::new(),
         spaces: vec![SavedSpace {
             // Intentionally different from the current Space. Matching is
             // supplied externally, not guessed from a coincident numeric ID.
@@ -339,8 +340,13 @@ fn height_import_requires_matching_arrangement_and_complete_trusted_slots() {
         "a saved single is not a proved stack mapping"
     );
 
-    let mut saved =
-        SpoolState::from_layouts([&target], |_| None, std::iter::empty(), std::iter::empty());
+    let mut saved = SpoolState::from_layouts(
+        [&target],
+        |_| None,
+        std::iter::empty(),
+        std::iter::empty(),
+        std::iter::empty(),
+    );
     saved.spaces[0].columns[0].items[0].weight = 2.0;
     let mut candidate = RestoreCandidates::from(saved);
     candidate.freeze_initial_layouts([&target]).unwrap();
@@ -384,6 +390,7 @@ fn floating_candidates(pid: i32, bundle_id: &str) -> RestoreCandidates {
             },
         }],
         membership: Vec::new(),
+        focus: Vec::new(),
         spaces: Vec::new(),
     }
     .into()
@@ -421,6 +428,7 @@ fn a_trusted_floating_binding_imports_the_candidate_frame() {
                 target_window_id: 0,
             }],
             membership: Vec::new(),
+            focus: Vec::new(),
         },
     );
     assert!(result.is_ok(), "{result:?}");
@@ -468,6 +476,7 @@ fn an_uncorroborated_floating_binding_is_refused() {
                 target_window_id: 0,
             }],
             membership: Vec::new(),
+            focus: Vec::new(),
         },
     );
     let error = result
@@ -510,6 +519,7 @@ fn a_late_import_is_refused() {
                 target_window_id: 0,
             }],
             membership: Vec::new(),
+            focus: Vec::new(),
         },
     );
     let error = result
@@ -540,6 +550,7 @@ fn an_import_without_a_frozen_baseline_is_refused() {
                 target_window_id: 0,
             }],
             membership: Vec::new(),
+            focus: Vec::new(),
         },
     );
     let error = result
@@ -562,6 +573,7 @@ fn membership_candidates(pid: i32, bundle_id: &str) -> RestoreCandidates {
             bundle_id: bundle_id.into(),
             space_id: TEST_WORKSPACE_ID,
         }],
+        focus: Vec::new(),
         spaces: Vec::new(),
     }
     .into()
@@ -611,6 +623,7 @@ fn a_trusted_membership_binding_declares_the_space() {
                 target_window_id: 0,
                 target_space: TEST_WORKSPACE_ID + 1,
             }],
+            focus: Vec::new(),
         },
     );
     assert!(result.is_ok(), "{result:?}");
@@ -656,6 +669,7 @@ fn an_uncorroborated_membership_binding_is_refused() {
                 target_window_id: 0,
                 target_space: TEST_WORKSPACE_ID + 1,
             }],
+            focus: Vec::new(),
         },
     );
     let error = result
@@ -694,6 +708,7 @@ fn a_membership_import_to_an_unknown_space_is_refused() {
                 target_window_id: 0,
                 target_space: TEST_WORKSPACE_ID + 100,
             }],
+            focus: Vec::new(),
         },
     );
     let error = result
@@ -736,6 +751,7 @@ fn one_bad_binding_refuses_the_whole_import() {
                 target_window_id: 0,
                 target_space: TEST_WORKSPACE_ID + 1,
             }],
+            focus: Vec::new(),
         },
     );
     assert!(result.expect("the system runs").is_err());
@@ -748,4 +764,303 @@ fn one_bad_binding_refuses_the_whole_import() {
         before,
         "a refused import applies nothing, including its valid group"
     );
+}
+
+// --- Per-Space focus memory candidates (issue 25's third domain) -------------
+
+/// A candidate document carrying exactly the focus memory given to it.
+fn focus_candidates_with(focus: Vec<crate::ecs::state::SavedFocus>) -> RestoreCandidates {
+    SpoolState {
+        version: INTENT_STATE_VERSION,
+        revision: 7,
+        floating: Vec::new(),
+        membership: Vec::new(),
+        focus,
+        spaces: Vec::new(),
+    }
+    .into()
+}
+
+fn saved_focus_hint(pid: i32, bundle_id: &str, window_id: i32) -> crate::ecs::state::SavedWindow {
+    crate::ecs::state::SavedWindow {
+        window_id,
+        pid,
+        bundle_id: bundle_id.into(),
+    }
+}
+
+/// One Space remembering a preference and a different logical selection.
+fn focus_candidates(pid: i32, bundle_id: &str) -> RestoreCandidates {
+    focus_candidates_with(vec![crate::ecs::state::SavedFocus {
+        space_id: TEST_WORKSPACE_ID,
+        preference: Some(saved_focus_hint(pid, bundle_id, 0)),
+        selection: Some(saved_focus_hint(pid, bundle_id, 1)),
+    }])
+}
+
+/// One import document naming exactly the bindings given to it.
+fn focus_bindings(
+    bindings: Vec<spool_shared_types::commands::RestoreFocusBinding>,
+) -> spool_shared_types::commands::RestoreBindings {
+    spool_shared_types::commands::RestoreBindings {
+        columns: Vec::new(),
+        floating: Vec::new(),
+        membership: Vec::new(),
+        focus: bindings,
+    }
+}
+
+fn focus_binding(
+    candidate_focus: usize,
+    role: spool_shared_types::commands::FocusRole,
+    target_window_id: i32,
+) -> spool_shared_types::commands::RestoreFocusBinding {
+    focus_binding_in(TEST_WORKSPACE_ID, candidate_focus, role, target_window_id)
+}
+
+fn focus_binding_in(
+    target_space: u64,
+    candidate_focus: usize,
+    role: spool_shared_types::commands::FocusRole,
+    target_window_id: i32,
+) -> spool_shared_types::commands::RestoreFocusBinding {
+    spool_shared_types::commands::RestoreFocusBinding {
+        candidate_focus,
+        target_space,
+        role,
+        target_window_id,
+    }
+}
+
+/// A corroborated binding restores both roles of the Space's focus memory as
+/// authored state: it creates no activation and advances no observation.
+#[test]
+fn a_trusted_focus_binding_restores_the_per_space_memory() {
+    use spool_shared_types::commands::FocusRole;
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(10);
+    harness
+        .world()
+        .insert_resource(focus_candidates(TEST_PROCESS_ID, "test"));
+    harness.pump_frames(2);
+
+    let preference = crate::tests::find_window_entity(0, harness.world());
+    let selection = crate::tests::find_window_entity(1, harness.world());
+    let before = harness
+        .world()
+        .resource::<crate::ecs::focus::FocusCoordinator>()
+        .snapshot();
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        focus_bindings(vec![
+            focus_binding(0, FocusRole::Preference, 0),
+            focus_binding(0, FocusRole::Selection, 1),
+        ]),
+    );
+    assert!(result.is_ok(), "{result:?}");
+
+    let focus = harness
+        .world()
+        .resource::<crate::ecs::focus::FocusCoordinator>();
+    assert_eq!(focus.preference_entity(TEST_WORKSPACE_ID), Some(preference));
+    assert_eq!(focus.navigation_entity(TEST_WORKSPACE_ID), Some(selection));
+    assert_eq!(
+        focus.snapshot(),
+        before,
+        "restoring memory is authored state, not an activation request or an observation"
+    );
+}
+
+/// A binding the candidate's cached identity does not corroborate is refused,
+/// and the Space keeps the memory it had.
+#[test]
+fn an_uncorroborated_focus_binding_is_refused() {
+    use spool_shared_types::commands::FocusRole;
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(10);
+    harness
+        .world()
+        .insert_resource(focus_candidates(TEST_PROCESS_ID + 5, "elsewhere"));
+    harness.pump_frames(2);
+
+    let target = crate::tests::find_window_entity(0, harness.world());
+    let before = harness
+        .world()
+        .resource::<crate::ecs::focus::FocusCoordinator>()
+        .preference_entity(TEST_WORKSPACE_ID);
+    assert_ne!(
+        before,
+        Some(target),
+        "the import is what would have changed the preference"
+    );
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        focus_bindings(vec![focus_binding(0, FocusRole::Preference, 0)]),
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("an uncorroborated binding is refused");
+    assert_eq!(error.admission_code(), "import_binding_rejected");
+    assert_eq!(
+        harness
+            .world()
+            .resource::<crate::ecs::focus::FocusCoordinator>()
+            .preference_entity(TEST_WORKSPACE_ID),
+        before,
+        "a refused import writes nothing"
+    );
+}
+
+/// A candidate that remembers no selection offers no mapping for one: the
+/// caller cannot prove a hint that does not exist.
+#[test]
+fn a_focus_binding_for_a_role_the_candidate_does_not_hold_is_refused() {
+    use spool_shared_types::commands::FocusRole;
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(10);
+    harness
+        .world()
+        .insert_resource(focus_candidates_with(vec![crate::ecs::state::SavedFocus {
+            space_id: TEST_WORKSPACE_ID,
+            preference: Some(saved_focus_hint(TEST_PROCESS_ID, "test", 0)),
+            selection: None,
+        }]));
+    harness.pump_frames(2);
+
+    let target = crate::tests::find_window_entity(1, harness.world());
+    let before = harness
+        .world()
+        .resource::<crate::ecs::focus::FocusCoordinator>()
+        .navigation_entity(TEST_WORKSPACE_ID);
+    assert_ne!(
+        before,
+        Some(target),
+        "the import is what would have changed the selection"
+    );
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        focus_bindings(vec![focus_binding(0, FocusRole::Selection, 1)]),
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("an absent hint is not a mapping");
+    assert_eq!(error.admission_code(), "import_binding_rejected");
+    assert_eq!(
+        harness
+            .world()
+            .resource::<crate::ecs::focus::FocusCoordinator>()
+            .navigation_entity(TEST_WORKSPACE_ID),
+        before,
+        "a refused import writes nothing"
+    );
+}
+
+/// Focus memory belongs to a user Space that exists, checked at the import
+/// rather than repaired afterwards.
+#[test]
+fn a_focus_import_to_an_unknown_space_is_refused() {
+    use spool_shared_types::commands::{FocusRole, RestoreFocusBinding};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(10);
+    harness
+        .world()
+        .insert_resource(focus_candidates(TEST_PROCESS_ID, "test"));
+    harness.pump_frames(2);
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        focus_bindings(vec![RestoreFocusBinding {
+            candidate_focus: 0,
+            target_space: TEST_WORKSPACE_ID + 100,
+            role: FocusRole::Preference,
+            target_window_id: 0,
+        }]),
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("an unknown Space is refused");
+    assert_eq!(error.admission_code(), "import_target_space_not_found");
+}
+
+/// One bad binding refuses the whole group: a validated sibling is not applied
+/// just because it was listed first.
+#[test]
+fn one_bad_focus_binding_refuses_the_whole_group() {
+    use spool_shared_types::commands::FocusRole;
+
+    let mut harness = two_space_harness();
+    // The first Space is corroborated; the second claims another application.
+    harness.world().insert_resource(focus_candidates_with(vec![
+        crate::ecs::state::SavedFocus {
+            space_id: TEST_WORKSPACE_ID,
+            preference: Some(saved_focus_hint(TEST_PROCESS_ID, "test", 0)),
+            selection: None,
+        },
+        crate::ecs::state::SavedFocus {
+            space_id: TEST_WORKSPACE_ID + 1,
+            preference: Some(saved_focus_hint(TEST_PROCESS_ID + 5, "elsewhere", 1)),
+            selection: None,
+        },
+    ]));
+    harness.pump_frames(2);
+
+    let target = crate::tests::find_window_entity(0, harness.world());
+    let before = harness
+        .world()
+        .resource::<crate::ecs::focus::FocusCoordinator>()
+        .preference_entity(TEST_WORKSPACE_ID);
+    assert_ne!(before, Some(target), "the import is what would change it");
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        focus_bindings(vec![
+            focus_binding_in(TEST_WORKSPACE_ID, 0, FocusRole::Preference, 0),
+            focus_binding_in(TEST_WORKSPACE_ID + 1, 1, FocusRole::Preference, 1),
+        ]),
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("the uncorroborated binding refuses the group");
+    assert_eq!(error.admission_code(), "import_binding_rejected");
+    assert_eq!(
+        harness
+            .world()
+            .resource::<crate::ecs::focus::FocusCoordinator>()
+            .preference_entity(TEST_WORKSPACE_ID),
+        before,
+        "a refused import applies nothing, including its valid binding"
+    );
+}
+
+/// One Space holds one preference and one selection, so a request cannot claim
+/// the same role twice for it.
+#[test]
+fn a_duplicate_focus_binding_is_refused() {
+    use spool_shared_types::commands::FocusRole;
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(10);
+    harness
+        .world()
+        .insert_resource(focus_candidates(TEST_PROCESS_ID, "test"));
+    harness.pump_frames(2);
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        focus_bindings(vec![
+            focus_binding(0, FocusRole::Preference, 0),
+            focus_binding(0, FocusRole::Preference, 0),
+        ]),
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("a duplicate role is refused");
+    assert_eq!(error.admission_code(), "import_failed");
 }

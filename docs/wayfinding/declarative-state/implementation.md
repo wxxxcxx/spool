@@ -173,7 +173,16 @@ Balance的继承语义经过三位专家一致确认：若参考列继承规则0
 按 [25 号票](issues/25-cross-restart-recovery.md) 的裁决，把"有缝但没人用"的候选/导入缝接上所有者与入口，并逐个域接入：
 
 - **入口与所有者**（[26 号票](issues/26-recovery-first-slice.md)）：`Action::RestoreIntents(RestoreBindings)`（JSON 自描述，信封不变；分类 `Running`，因为它是只改保留状态、且有自身启动窗口作新鲜度门的启动期操作）；启动所有者 `freeze_restore_baseline` + `close_restore_window`（30 秒，实现默认值）；`spool session restore --bindings <file|->`。
-- **已接入的域**：列宽/高度（既有 `import_intents`）、浮动帧（`import_floating_frames`，2026-09-15）、Space 归属（`import_declared_spaces` + `SavedMembership`，见 [28 号票](issues/28-recovery-membership.md)）。
-- **共同语义**：先校验全部绑定再应用（一条坏绑定拒绝整次导入）；导入只改保留状态、不写原生；绑定必须由候选缓存的 `window_id`/`pid`/`bundle_id` 佐证；目标 Space 必须存在且为用户 Space。
-- **未接入**：焦点域（每 Space 偏好/逻辑选择）、在途尝试（按裁决永不恢复）。
+- **已接入的域**：列宽/高度（既有 `import_intents`）、浮动帧（`import_floating_frames`，2026-09-15）、Space 归属（`import_declared_spaces` + `SavedMembership`，见 [28 号票](issues/28-recovery-membership.md)）、每 Space 焦点记忆（`import_space_focus` + `SavedFocus`，见 [29 号票](issues/29-recovery-focus.md)）。
+- **共同语义**：先校验全部绑定再应用（一条坏绑定拒绝整次导入）；导入只改保留状态、不写原生；绑定必须由候选缓存的 `window_id`/`pid`/`bundle_id` 佐证；目标 Space 必须存在且为用户 Space。分组顺序为 列 → 浮动 → 归属 → 焦点。
+- **未接入**：在途尝试（按裁决永不恢复）。
 - **边界**：全部恢复仍只在同一登录会话内有意义（编号是会话作用域）；跨登出/重启的连续性等待 [27 号票](issues/27-window-identity-verification.md) 的核实结论。
+
+### 焦点恢复（29 号票）
+
+- **保存**：`SpoolState` 新增 `focus: Vec<SavedFocus>`（`#[serde(default)]`，版本仍 v6）；每 Space 一条，`space_id` 唯一性进 `valid()`。`FocusCoordinator::focus_memory()` 只导出至少有一个角色的 Space；保存用与成员 hint 相同的闭包解析偏好/选择，解析不到的角色省略、两个角色都解析不到则整条不落盘（`null` 无法与"没有偏好"区分，不写这个断言）。三条保存路径与 `window inspect` 的抓取都包含它。
+- **导入**：`RestoreBindings.focus` + `FocusRole`（`preference`/`selection`）；`TrustedFocusBinding::new` 要求候选在该角色上确有提示，且缓存 `window_id`/`pid`/`bundle_id` 与现场窗口三者全等；`import_space_focus` 先查重（`(candidate, role)` 与 `(space, role)`）再写，写的是"作者转移"：不记修复、不产生激活请求、不动确认顺序。
+- **测试**：`src/tests/session_restore.rs` 6 条（可信偏好+选择恢复且 `FocusSnapshot` 逐字段不变、身份不符拒绝且记忆不变、角色无提示拒绝、目标 Space 不存在拒绝、组内坏绑定使整组不被应用、重复角色拒绝）；`src/tests/state.rs` 1 条保存往返（不可解析的提示被省略而不是写成 `null`）。
+- **行为证据**：去掉身份比对后，身份不符用例不再被拒绝（`expect_err` 在"an uncorroborated binding is refused: ()"处 panic），组内坏绑定用例同样失败；去掉"该角色必须有提示"后，无提示用例走到写入而不再拒绝；把"两个角色都解析不到则省略"改成无条件保留后，保存用例得到多出的 `SavedFocus { space_id: 3, preference: None, selection: None }`。
+- **验证**：`cargo test --workspace --locked` 主程序 1193 通过 / 2 原有忽略（上一片 1186），`--no-default-features` 1051 通过；`cargo fmt --all --check`、`cargo clippy -p spool --all-targets`（默认与 `--no-default-features --locked -- -D warnings`）、`git diff --check`、docs 相对链接检查均通过。
+- **边界**：导入不验证现场窗口当前是否属于目标 Space（同一次导入可能正是建立该归属；消费侧按资格过滤），前台编辑仍由 `set_space_preference` 把关；不恢复在途尝试、不自动绑定。

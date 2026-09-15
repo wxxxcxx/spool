@@ -565,6 +565,7 @@ fn intent_snapshot(width: crate::ecs::layout::WidthIntent) -> SpoolState {
         revision: 0,
         floating: Vec::new(),
         membership: Vec::new(),
+        focus: Vec::new(),
         spaces: vec![SavedSpace {
             space_id: TEST_WORKSPACE_ID,
             columns: vec![SavedColumn {
@@ -811,7 +812,13 @@ fn persistence_tracks_arrangement_and_raw_height_without_native_geometry() {
     strip.append(first);
     strip.append(second);
     let capture = |strip: &LayoutStrip| {
-        SpoolState::from_layouts([strip], |_| None, std::iter::empty(), std::iter::empty())
+        SpoolState::from_layouts(
+            [strip],
+            |_| None,
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+        )
     };
     let mut persistence = StatePersistence::default();
     persistence.capture(capture(&strip)).unwrap();
@@ -869,8 +876,13 @@ fn unresolved_members_are_persisted_as_explicit_slots() {
     strip.append(first);
     strip.append(second);
     strip.stack(second).unwrap();
-    let unresolved =
-        SpoolState::from_layouts([&strip], |_| None, std::iter::empty(), std::iter::empty());
+    let unresolved = SpoolState::from_layouts(
+        [&strip],
+        |_| None,
+        std::iter::empty(),
+        std::iter::empty(),
+        std::iter::empty(),
+    );
     assert!(unresolved.valid());
     let item = &unresolved.spaces[0].columns[0].items[0];
     assert_eq!(
@@ -899,6 +911,7 @@ fn unresolved_members_are_persisted_as_explicit_slots() {
                 bundle_id: "fixture".into(),
             })
         },
+        std::iter::empty(),
         std::iter::empty(),
         std::iter::empty(),
     );
@@ -942,6 +955,7 @@ fn saved_native_tabs_remain_one_height_slot_inside_a_stack() {
         },
         std::iter::empty(),
         std::iter::empty(),
+        std::iter::empty(),
     );
     assert!(saved.valid());
     let items = &saved.spaces[0].columns[0].items;
@@ -977,6 +991,7 @@ fn a_floating_frame_round_trips_and_an_older_file_still_loads() {
             },
         }],
         std::iter::empty(),
+        std::iter::empty(),
     );
     saved.revision = 3;
 
@@ -991,4 +1006,81 @@ fn a_floating_frame_round_trips_and_an_older_file_still_loads() {
     });
     let loaded: SpoolState = serde_json::from_value(older).expect("a file without the field loads");
     assert!(loaded.floating.is_empty());
+}
+
+/// Per-Space focus memory is saved as the same cached identity hints as the
+/// other candidates. Unlike a member slot, a hint that cannot be resolved is
+/// omitted rather than written as null: null would claim "no preference",
+/// which is an assertion the capture cannot support.
+#[test]
+fn focus_memory_is_saved_as_cached_identity_hints() {
+    use crate::ecs::focus::FocusMemory;
+    use crate::ecs::state::{INTENT_STATE_VERSION, SavedFocus, SavedWindow};
+    use bevy::ecs::entity::Entity as BevyEntity;
+
+    let mut world = bevy::prelude::World::new();
+    let preference = world.spawn_empty().id();
+    let selection = world.spawn_empty().id();
+    let unresolvable = world.spawn_empty().id();
+
+    let hints = |entity: BevyEntity| match entity {
+        candidate if candidate == preference => Some(SavedWindow {
+            window_id: 7,
+            pid: 11,
+            bundle_id: "fixture".into(),
+        }),
+        candidate if candidate == selection => Some(SavedWindow {
+            window_id: 8,
+            pid: 11,
+            bundle_id: "fixture".into(),
+        }),
+        _ => None,
+    };
+    let saved = SpoolState::from_layouts(
+        std::iter::empty(),
+        hints,
+        std::iter::empty(),
+        std::iter::empty(),
+        [
+            FocusMemory {
+                space_id: TEST_WORKSPACE_ID,
+                preference: Some(preference),
+                selection: Some(selection),
+            },
+            FocusMemory {
+                space_id: TEST_WORKSPACE_ID + 1,
+                preference: Some(unresolvable),
+                selection: None,
+            },
+        ],
+    );
+    assert_eq!(
+        saved.focus,
+        vec![SavedFocus {
+            space_id: TEST_WORKSPACE_ID,
+            preference: Some(SavedWindow {
+                window_id: 7,
+                pid: 11,
+                bundle_id: "fixture".into(),
+            }),
+            selection: Some(SavedWindow {
+                window_id: 8,
+                pid: 11,
+                bundle_id: "fixture".into(),
+            }),
+        }],
+        "an unresolvable hint is omitted, never written as a claim of no preference"
+    );
+    assert!(saved.valid());
+    let roundtrip: SpoolState =
+        serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+    assert_eq!(roundtrip, saved, "the memory survives the round trip");
+
+    let older = serde_json::json!({
+        "version": INTENT_STATE_VERSION,
+        "revision": 1,
+        "spaces": [],
+    });
+    let loaded: SpoolState = serde_json::from_value(older).expect("a file without the field loads");
+    assert!(loaded.focus.is_empty());
 }

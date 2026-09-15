@@ -307,7 +307,11 @@ one member slot per retained member. A member slot whose identity could not be c
 stored as an explicit unresolved slot rather than dropped, so a saved item always keeps
 its member count. A floating window's authored frame and each tracked window's declared
 Space are saved too, with the same cached identity hints; the fields are additions to the
-existing format, so a file written before they existed still loads. Effective frames, constraints, native observations, animations,
+existing format, so a file written before they existed still loads. Each Space's focus
+preference and logical navigation selection are saved the same way, one entry per Space;
+a hint whose identity could not be cached is omitted rather than written as `null`,
+because unlike a member slot it carries no structure and `null` would claim "no
+preference". Effective frames, constraints, native observations, animations,
 and retry state are not persisted.
 
 A successful command accepts intent; it does not guarantee a completed native

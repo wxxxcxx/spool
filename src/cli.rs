@@ -566,6 +566,7 @@ mod tests {
 
     #[test]
     fn session_restore_reads_its_bindings_document() {
+        use spool_shared_types::commands::FocusRole;
         use std::io::Write as _;
 
         let path = std::env::temp_dir().join(format!(
@@ -574,7 +575,7 @@ mod tests {
         ));
         let mut file = std::fs::File::create(&path).expect("create the bindings document");
         file.write_all(
-            br#"{"columns":[{"candidate_space":0,"candidate_column":1,"target_space":2,"target_column":3}],"floating":[{"candidate_window":0,"target_window_id":7}]}"#,
+            br#"{"columns":[{"candidate_space":0,"candidate_column":1,"target_space":2,"target_column":3}],"floating":[{"candidate_window":0,"target_window_id":7}],"focus":[{"candidate_focus":0,"target_space":2,"role":"preference","target_window_id":7},{"candidate_focus":0,"target_space":2,"role":"selection","target_window_id":8}]}"#,
         )
         .expect("write the bindings document");
         let bindings = read_restore_bindings(path.to_str().expect("path")).expect("parse");
@@ -582,6 +583,10 @@ mod tests {
         assert_eq!(bindings.columns[0].target_space, 2);
         assert_eq!(bindings.floating.len(), 1);
         assert_eq!(bindings.floating[0].target_window_id, 7);
+        assert_eq!(bindings.focus.len(), 2);
+        assert_eq!(bindings.focus[0].role, FocusRole::Preference);
+        assert_eq!(bindings.focus[1].role, FocusRole::Selection);
+        assert_eq!(bindings.focus[1].target_window_id, 8);
         let _ = std::fs::remove_file(&path);
 
         // An omitted group is empty rather than an error; an unreadable document

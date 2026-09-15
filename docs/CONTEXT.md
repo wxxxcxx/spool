@@ -116,7 +116,7 @@ A column's identity within one Spool run, independent of its current ordinal or 
 The original choice of a column's layout-slot width in logical points, as an absolute value, a proportion of its usable viewport, or an inherited configuration default. An ordinary new column without an explicit width rule adopts its admitted window's logical width once as an absolute value; later native observations and preset changes do not reseed it.
 
 **Restore Candidate**:
-A saved description of layout intent and possible object associations awaiting validated binding to the current run. Reading a candidate does not restore a window or establish current native topology. A candidate member with no recorded identity hint is an unresolved slot, not an absent association.
+A saved description of layout intent and possible object associations awaiting validated binding to the current run. Reading a candidate does not restore a window or establish current native topology. A candidate member with no recorded identity hint is an unresolved slot, not an absent association. Candidates cover column width and stack-height intent, floating frames, declared Spaces, and each Space's focus preference and logical selection; every one of them is bound to a live object only by a caller-proven mapping.
 
 **Navigable Layout**:
 A read-only projection of a Space's retained layout containing available, visible tiled identities, with stack and tab structure preserved. Directional, first/last/numeric, and next/previous tiled focus use this projection; retained unavailable identities are restoration data, not navigation targets. Projection never deletes or reorders the original layout.

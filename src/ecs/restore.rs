@@ -465,6 +465,101 @@ pub fn import_floating_frames(
     Ok(applied)
 }
 
+/// One per-Space focus memory candidate, already validated against the live
+/// window it claims.
+#[derive(Clone, Copy, Debug)]
+pub struct TrustedFocusBinding {
+    candidate_focus: usize,
+    role: spool_shared_types::commands::FocusRole,
+    target_space: crate::platform::WorkspaceId,
+    entity: Entity,
+}
+
+impl TrustedFocusBinding {
+    /// The caller must prove the mapping, and the candidate must hold a hint for
+    /// the role it claims: a role the candidate does not remember has nothing to
+    /// map. The cached native id, pid and bundle id must all agree with the live
+    /// window, because a native `WindowServer` id has no documented lifetime or
+    /// reuse behaviour and never authorizes a binding on its own.
+    pub fn new(
+        claimed: spool_shared_types::commands::RestoreFocusBinding,
+        candidates: &RestoreCandidates,
+        pid: Pid,
+        bundle_id: &str,
+        entity: Entity,
+    ) -> Result<Self> {
+        if !candidates.import_window_open || candidates.initial_layouts.is_none() {
+            return Err(Error::InvalidInput(
+                "intent import candidates are invalid or expired".into(),
+            ));
+        }
+        let saved = candidates
+            .state
+            .focus
+            .get(claimed.candidate_focus)
+            .ok_or_else(|| Error::InvalidInput("candidate focus memory does not exist".into()))?;
+        let hint = match claimed.role {
+            spool_shared_types::commands::FocusRole::Preference => &saved.preference,
+            spool_shared_types::commands::FocusRole::Selection => &saved.selection,
+        }
+        .as_ref()
+        .ok_or_else(|| {
+            Error::InvalidInput("candidate focus memory does not hold that role".into())
+        })?;
+        if hint.window_id != claimed.target_window_id
+            || hint.pid != pid
+            || hint.bundle_id != bundle_id
+        {
+            return Err(Error::InvalidInput(
+                "candidate focus memory's cached identity does not match the live window".into(),
+            ));
+        }
+        Ok(Self {
+            candidate_focus: claimed.candidate_focus,
+            role: claimed.role,
+            target_space: claimed.target_space,
+            entity,
+        })
+    }
+}
+
+/// Records the per-Space focus memory a trusted import names.
+///
+/// An import is authored state, exactly like a `space prefer-focus` edit: it
+/// creates no activation and writes nothing to the platform. Every binding is
+/// validated before any is applied, so one bad binding refuses the whole group.
+///
+/// The import does not verify that the named window currently belongs to the
+/// named Space. The same request may be what establishes that membership (the
+/// declaration group precedes this one), and consumers already filter a
+/// preference by eligibility where it is used, so a memory that names a window
+/// elsewhere is inert rather than a dangling effect. The caller's claim on the
+/// live window is corroborated by [`TrustedFocusBinding::new`] before this runs.
+pub fn import_space_focus(
+    candidates: &RestoreCandidates,
+    focus: &mut crate::ecs::focus::FocusCoordinator,
+    bindings: &[TrustedFocusBinding],
+) -> Result<usize> {
+    if !candidates.import_window_open || !candidates.state.valid() {
+        return Err(Error::InvalidInput(
+            "intent import candidates are invalid or expired".into(),
+        ));
+    }
+    let mut seen_candidates = HashSet::new();
+    let mut seen_targets = HashSet::new();
+    for binding in bindings {
+        if !seen_candidates.insert((binding.candidate_focus, binding.role))
+            || !seen_targets.insert((binding.target_space, binding.role))
+        {
+            return Err(Error::InvalidInput("duplicate focus import binding".into()));
+        }
+    }
+    for binding in bindings {
+        focus.import_focus_memory(binding.target_space, binding.role, binding.entity);
+    }
+    Ok(bindings.len())
+}
+
 /// A saved frame as a representable window frame.
 fn checked_frame_from(frame: spool_shared_types::state::Frame) -> Option<IRect> {
     let origin = IVec2::new(frame.x, frame.y);
@@ -542,6 +637,7 @@ pub(crate) struct RestoreIntentsCtx<'w, 's> {
     >,
     topology: Res<'w, crate::ecs::topology::NativeTopology>,
     apps: Query<'w, 's, &'static crate::manager::Application>,
+    focus: ResMut<'w, crate::ecs::focus::FocusCoordinator>,
     commands: Commands<'w, 's>,
 }
 
@@ -665,6 +761,45 @@ pub(crate) fn restore_intents(
         membership.push(trusted);
     }
 
+    let mut focus = Vec::new();
+    for binding in &bindings.focus {
+        // Focus memory belongs to a user Space that exists: checked here rather
+        // than written first and repaired later, like the membership group.
+        if !ctx
+            .strips
+            .iter()
+            .any(|strip| strip.id() == binding.target_space)
+        {
+            return Err(crate::errors::Error::rejected(
+                "import_target_space_not_found",
+            ));
+        }
+        if ctx.topology.is_fullscreen(binding.target_space) {
+            return Err(crate::errors::Error::rejected(
+                "import_target_space_not_user",
+            ));
+        }
+        let Some((entity, _, parent, _)) = ctx
+            .windows
+            .iter()
+            .find(|(_, window, _, _)| window.id() == binding.target_window_id)
+        else {
+            return Err(crate::errors::Error::rejected(
+                "import_target_window_not_tracked",
+            ));
+        };
+        let app = ctx.apps.get(parent.parent()).map_err(|error| {
+            crate::errors::Error::rejection_with_cause("import_target_window_unavailable", error)
+        })?;
+        let bundle_id = app.bundle_id().unwrap_or_default();
+        let trusted =
+            TrustedFocusBinding::new(*binding, &candidates, app.pid(), &bundle_id, entity)
+                .map_err(|error| {
+                    crate::errors::Error::rejection_with_cause("import_binding_rejected", error)
+                })?;
+        focus.push(trusted);
+    }
+
     let mut imported = 0;
     for (space, trusted) in columns {
         let Some(mut strip) = ctx.strips.iter_mut().find(|strip| strip.id() == space) else {
@@ -682,6 +817,8 @@ pub(crate) fn restore_intents(
         &membership,
     )
     .map_err(|error| crate::errors::Error::rejection_with_cause("import_failed", error))?;
+    imported += import_space_focus(&candidates, &mut ctx.focus, &focus)
+        .map_err(|error| crate::errors::Error::rejection_with_cause("import_failed", error))?;
 
     if imported > 0 {
         // The startup owner asked explicitly; its window closes with the request.

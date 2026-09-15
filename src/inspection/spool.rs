@@ -167,6 +167,7 @@ impl Projection<'_, '_> {
                     space_id: declared.target?,
                 })
             }),
+            self.focus.focus_memory(),
         );
         self.persistence.capture(snapshot).map(|_| ())
     }
