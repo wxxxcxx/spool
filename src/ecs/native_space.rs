@@ -177,6 +177,7 @@ pub(crate) struct DeclaredSpaceCtx<'w, 's> {
     previous: Query<'w, 's, &'static PreviousTiledStrip>,
     topology: Res<'w, NativeTopology>,
     declared: Query<'w, 's, &'static mut DeclaredSpace>,
+    moving: Query<'w, 's, (), With<NativeMoveOwner>>,
     commands: Commands<'w, 's>,
 }
 
@@ -195,6 +196,7 @@ pub(crate) fn reconcile_declared_space(
         previous,
         topology,
         mut declared,
+        moving,
         mut commands,
     }: DeclaredSpaceCtx,
 ) {
@@ -229,6 +231,12 @@ pub(crate) fn reconcile_declared_space(
             continue;
         };
         state.observed = observed;
+        if moving.contains(entity) {
+            // An accepted attempt owns realization: the declaration stays where
+            // the caller asked until the audit settles it, so the observation
+            // catching up (or not) never fights the edit.
+            continue;
+        }
         let Some(target) = state.target else {
             // No valid target is known yet; adopt one as soon as there is one.
             if let Some(observed) = observed.filter(|space| is_valid_target(*space)) {
@@ -250,6 +258,29 @@ pub(crate) fn reconcile_declared_space(
             state.repair(replacement, "membership_changed");
         }
     }
+}
+
+/// Declares the Space an accepted membership edit names.
+///
+/// This is the authored transition, not a repair: the declaration becomes the
+/// Space the caller asked for, and realizing it is the effect layer's work. A
+/// repair history entry would misreport it as something that was invalidated.
+pub(crate) fn declare_space_membership(
+    commands: &mut Commands,
+    entity: Entity,
+    space_id: WorkspaceId,
+) {
+    commands.queue(move |world: &mut bevy::prelude::World| {
+        let Ok(mut entity) = world.get_entity_mut(entity) else {
+            return;
+        };
+        match entity.get_mut::<DeclaredSpace>() {
+            Some(mut declared) => declared.target = Some(space_id),
+            None => {
+                entity.insert(DeclaredSpace::new(Some(space_id)));
+            }
+        }
+    });
 }
 
 /// Records the outcome of one attempt on the addressed window, if it is tracked.
@@ -594,6 +625,7 @@ impl NativeSpaceTransactions {
                 source.index_of(member.entity).unwrap_or_default(),
                 commands,
             );
+            declare_space_membership(commands, member.entity, plan.target_space_id);
             commands.entity(member.entity).insert((
                 NativeMoveOwner,
                 SpaceMoveAttempt {
@@ -1045,6 +1077,9 @@ pub(crate) fn execute_native_space_command(
         } else {
             transactions.cancel_follows_for(&window_ids);
         }
+        for member in &members {
+            declare_space_membership(&mut commands, member.entity, space_id);
+        }
         return Ok(());
     }
     let intent = NativeSpaceIntent::MoveWindows {
@@ -1076,6 +1111,7 @@ pub(crate) fn execute_native_space_command(
                     })
                     .unwrap_or_default();
                 freeze_window_for_space_reassignment(entity, index, &mut commands);
+                declare_space_membership(&mut commands, entity, space_id);
                 commands.entity(entity).insert((
                     NativeMoveOwner,
                     SpaceMoveAttempt {

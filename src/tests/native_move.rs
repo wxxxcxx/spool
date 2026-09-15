@@ -218,6 +218,94 @@ fn an_external_move_repairs_the_declared_space() {
     );
 }
 
+/// An accepted edit declares the Space it names, for every member it moves, and
+/// does so before the observation agrees: the declaration is the authored choice
+/// and realization is the effect layer's work.
+#[test]
+fn an_accepted_move_declares_its_target_for_every_member() {
+    use crate::ecs::native_space::SpaceMoveResult;
+    let (mut harness, _, members) = column_harness();
+    harness.pump_frames(5);
+    submit(&mut harness, MoveFocus::Stay);
+
+    assert_eq!(
+        move_attempt(&mut harness, members[0]),
+        SpaceMoveResult::InFlight
+    );
+    for member in members {
+        let declared = declared_space(&mut harness, member);
+        assert_eq!(declared.target, Some(TARGET));
+        assert!(
+            declared.repairs.is_empty(),
+            "an accepted edit is not a repair: {:?}",
+            declared.repairs
+        );
+    }
+}
+
+/// A refused edit changes nothing: the declaration keeps naming the Space it had,
+/// and the refusal is visible in the attempt record instead.
+#[test]
+fn a_refused_move_leaves_the_declaration_alone() {
+    use crate::ecs::native_space::SpaceMoveResult;
+    let (mut harness, _, members) = column_harness();
+    harness.pump_frames(5);
+    dispatch_action(
+        &mut harness,
+        Action::MoveWindowToSpace {
+            window_id: 0,
+            space_id: TARGET + 100,
+            move_focus: MoveFocus::Stay,
+        },
+    );
+
+    let declared = declared_space(&mut harness, members[0]);
+    assert_eq!(declared.target, Some(TEST_WORKSPACE_ID));
+    assert!(declared.repairs.is_empty());
+    assert_eq!(
+        move_attempt(&mut harness, members[0]),
+        SpaceMoveResult::Refused("target_space_unavailable".into())
+    );
+}
+
+/// While an accepted attempt is in flight the observation does not repair the
+/// declaration back: the attempt owns realization until the audit settles it.
+#[test]
+fn an_in_flight_attempt_is_not_repaired_back_by_the_observation() {
+    let (mut harness, _, members) = column_harness();
+    harness.pump_frames(5);
+    submit(&mut harness, MoveFocus::Stay);
+    // The platform has not moved anything yet.
+    for id in 0..2 {
+        harness
+            .mock_state
+            .update_window(id, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    }
+    harness.pump_frames(5);
+
+    let declared = declared_space(&mut harness, members[0]);
+    assert_eq!(
+        declared.target,
+        Some(TARGET),
+        "the declaration is the caller's choice while the attempt runs"
+    );
+    assert!(
+        declared.repairs.is_empty(),
+        "an in-flight attempt is not a repair: {:?}",
+        declared.repairs
+    );
+
+    // Past the confirmation window the transaction gives up, and the declaration
+    // returns to where the window actually is.
+    harness.pump_frames(45);
+    let settled = declared_space(&mut harness, members[0]);
+    assert_eq!(settled.target, Some(TEST_WORKSPACE_ID));
+    assert!(
+        !settled.repairs.is_empty(),
+        "an unconfirmed attempt is recorded as a repair"
+    );
+}
+
 /// A Space that became native fullscreen is not a user Space, so a declaration
 /// pointing at it stops being valid and is repaired with that reason.
 #[test]

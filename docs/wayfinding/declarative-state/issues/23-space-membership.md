@@ -124,6 +124,12 @@ ADR 0006 的"不可见 Space 也应接受 desired-layout 编辑"在本票被**�
 - 诊断：window row 的 `membership` 现在含 `declared` / `observed` / `repairs`（`membership` 已在默认选择内，叶子路径 `membership.declared|observed|repairs` 可单独选）。
 - 测试在改动前的代码上无法编译（`cannot find type DeclaredSpace`）——新状态类型的固有形态；行为断言由此建立。
 
+### task-2b：被接纳的编辑写入声明（已实施，2026-09-15）
+
+- 被接纳的归属编辑**立即声明**它命名的 Space（`declare_space_membership`），对整列/关联成员的每一个都写：三条受理路径（已完全对齐、已提交原生意图、跨显示器转移的 `submit_display_move`）。这是**作者的转移，不是修复**，所以不进 `repairs` 历史。
+- **在途尝试拥有实现权**：`reconcile_declared_space` 在窗口带 `NativeMoveOwner` 时只更新 `observed`、不做修复 —— 否则观测会立刻把刚被接纳的声明按回去，和被拒绝的编辑一样没用。事务放弃（2 秒）后所有权释放，声明才回到窗口实际所在处。
+- 测试：`an_accepted_move_declares_its_target_for_every_member`（含整列成员、且在确认前）、`a_refused_move_leaves_the_declaration_alone`、`an_in_flight_attempt_is_not_repaired_back_by_the_observation`（移除在途跳过时该测试失败：`left: Some(2) right: Some(3)`，即声明被观测按回源 Space）。
+
 ## Resolution
 
 用户于 2026-09-15 逐项裁决：不变量 + 修复、修复不写原生、兜底顺序（观测 → 上次所在 → 未知）、一次尝试（2 秒，不自动重试）、以及"保留只在用户无法便宜重试且卡住状态常见持久时才做"这条判据。见上文 Answer。
