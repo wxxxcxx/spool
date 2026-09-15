@@ -32,6 +32,7 @@ type WindowRows<'w, 's> = Query<
         Has<WindowUnavailable>,
         Has<ParkedTile>,
         Option<&'static PreviousTiledStrip>,
+        Option<&'static crate::ecs::native_space::SpaceMoveAttempt>,
     ),
 >;
 type GeometryRows<'w, 's> = Query<
@@ -139,7 +140,7 @@ impl Projection<'_, '_> {
     }
 
     fn window_rows(&self, budget: &Budget) -> Vec<Value> {
-        self.windows.iter().take_while(|_| budget.admit()).map(|(entity, window, parent, floating, focused, hidden, unavailable, parked, previous)| {
+        self.windows.iter().take_while(|_| budget.admit()).map(|(entity, window, parent, floating, focused, hidden, unavailable, parked, previous, attempt)| {
             let app = self.apps.get(parent.parent()).ok().map(|(_, app)| app);
             let geometry = self.geometry.get(entity).ok();
             let observed = geometry.and_then(|row| row.2).map(|frame| frame.0);
@@ -165,6 +166,7 @@ impl Projection<'_, '_> {
                 "identity":{"id":window.id(),"pid":recorded(app.map(|app| app.pid())),"title":recorded(window.retained_title()),"bundle_id":recorded(app.and_then(|app| app.bundle_id())),"app_name":recorded(app.map(|app| app.name()))},
                 "geometry":{"realization": self.sync.frame_progress(entity).map(|progress| json!({"attempts":progress.attempts,"active":progress.active,"blocked":progress.blocked,"confirmed":progress.confirmed,"checks_pending":progress.checks_pending})),"desired":recorded(geometry.and_then(|row| row.0).map(|frame_| frame(frame_.0))),"presented":recorded(geometry.and_then(|row| row.1).map(|frame_| frame(frame_.0))),"observed":recorded(observed.map(frame))},
                 "layout":{"space_id":recorded(space_id),"column":column,"display_id":recorded(display_id),"previous_column":previous.map(|previous| previous.index+1)},
+                "membership":{"attempt":recorded(attempt.map(|attempt| json!({"target_space_id":attempt.target_space_id,"result":attempt.result.name(),"code":attempt.result.code()})))},
                 "state":{"available":!unavailable,"floating":floating,"focused":focused,"visible":hidden.is_none()&&!parked,"minimized":matches!(hidden,Some(WindowVisibility::Minimized)),"on_screen":recorded(on_screen),"motion":geometry.is_some_and(|row|row.3),"migration":geometry.is_some_and(|row|row.4||row.5),"blockers":{"unavailable":unavailable,"native_move":geometry.is_some_and(|row|row.4),"space_reassignment":geometry.is_some_and(|row|row.5),"parked":parked,"commit_suspended":geometry.is_some_and(|row|row.6)}}
             })
         }).collect()
@@ -448,6 +450,39 @@ pub(crate) fn collect(In(request): In<ReadRequest>, mut state: Projection) -> Re
 mod tests {
     use bevy::ecs::system::RunSystemOnce;
     use spool_shared_types::inspection::{ReadRequest, Resource, Source};
+
+    #[test]
+    fn window_detail_reports_the_last_membership_attempt() {
+        let mut harness = crate::tests::TestHarness::new().with_windows(2);
+        harness.pump_frames(10);
+        let entity = crate::tests::find_window_entity(1, harness.world());
+        harness
+            .world()
+            .entity_mut(entity)
+            .insert(crate::ecs::native_space::SpaceMoveAttempt {
+                target_space_id: crate::tests::TEST_WORKSPACE_ID + 1,
+                result: crate::ecs::native_space::SpaceMoveResult::Refused(
+                    "capability_unavailable".into(),
+                ),
+            });
+
+        let mut request = ReadRequest::detail(Resource::Window, Source::Spool, Some(1));
+        request.show = vec!["membership".into()];
+        let report = harness
+            .world()
+            .run_system_once_with(super::collect, request)
+            .unwrap();
+
+        assert_eq!(report.data["membership"]["attempt"]["result"], "refused");
+        assert_eq!(
+            report.data["membership"]["attempt"]["code"],
+            "capability_unavailable"
+        );
+        assert_eq!(
+            report.data["membership"]["attempt"]["target_space_id"],
+            crate::tests::TEST_WORKSPACE_ID + 1
+        );
+    }
 
     #[test]
     fn geometry_detail_reads_retained_state_and_preserves_focus() {

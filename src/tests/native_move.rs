@@ -102,6 +102,137 @@ fn source_layout(harness: &mut TestHarness, source: Entity) -> String {
     format!("{:?}", harness.world().get::<LayoutStrip>(source).unwrap())
 }
 
+fn move_attempt(
+    harness: &mut TestHarness,
+    entity: Entity,
+) -> crate::ecs::native_space::SpaceMoveResult {
+    harness
+        .world()
+        .get::<crate::ecs::native_space::SpaceMoveAttempt>(entity)
+        .expect("a membership attempt record")
+        .result
+        .clone()
+}
+
+/// The last membership attempt is recorded, so `window inspect` can show what
+/// Spool tried for a window and how it ended instead of leaving that in the logs.
+#[test]
+fn the_last_membership_attempt_is_recorded() {
+    use crate::ecs::native_space::SpaceMoveResult;
+
+    // Refused before any native write: the caller's reason survives on the window.
+    let (mut harness, _, members) = column_harness();
+    dispatch_action(
+        &mut harness,
+        Action::MoveWindowToSpace {
+            window_id: 0,
+            space_id: TARGET + 100,
+            move_focus: MoveFocus::Stay,
+        },
+    );
+    assert_eq!(
+        move_attempt(&mut harness, members[0]),
+        SpaceMoveResult::Refused("target_space_unavailable".into())
+    );
+
+    // Submitted, awaiting the membership audit. This is the state between the
+    // native write and the audit's answer, so it is read before any frame runs.
+    let (mut harness, _, members) = column_harness();
+    submit(&mut harness, MoveFocus::Stay);
+    assert_eq!(
+        move_attempt(&mut harness, members[0]),
+        SpaceMoveResult::InFlight
+    );
+
+    // The audit observed the move and ends the attempt.
+    harness.pump_frames(5);
+    assert_eq!(
+        move_attempt(&mut harness, members[0]),
+        SpaceMoveResult::Confirmed
+    );
+
+    // A confirmation window that elapses without agreement says so.
+    let (mut harness, _, members) = column_harness();
+    submit(&mut harness, MoveFocus::Stay);
+    for id in 0..2 {
+        harness
+            .mock_state
+            .update_window(id, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    }
+    harness.pump_frames(45);
+    assert_eq!(
+        move_attempt(&mut harness, members[0]),
+        SpaceMoveResult::TimedOut
+    );
+}
+
+/// Each refusal names its own cause, so a caller can tell "never possible" (an
+/// unknown or fullscreen Space) from "not now" (capability off, a move already
+/// in flight, an unreadable inventory). All of them used to answer with
+/// `native_precondition_failed`.
+#[test]
+fn space_move_refusals_name_their_own_cause() {
+    use spool_shared_types::wire::{AdmissionStatus, CheckedAction, Response};
+
+    let code = |harness: &mut TestHarness, action: Action| {
+        let (reply, received) = async_channel::bounded(1);
+        harness
+            .world()
+            .write_message(Event::CheckedActionRequested {
+                request: CheckedAction {
+                    request_id: "space-move".into(),
+                    action,
+                },
+                respond_to: reply,
+            });
+        harness.world().run_schedule(PreUpdate);
+        let Response::Admission(receipt) = received.try_recv().expect("execution receipt") else {
+            panic!("admission response")
+        };
+        assert_eq!(receipt.status, AdmissionStatus::Rejected);
+        receipt.code.unwrap_or_default()
+    };
+    let move_to = |space: WorkspaceId| Action::MoveWindowToSpace {
+        window_id: 0,
+        space_id: space,
+        move_focus: MoveFocus::Stay,
+    };
+
+    let (mut harness, _, _) = column_harness();
+    assert_eq!(
+        code(&mut harness, move_to(TARGET + 100)),
+        "target_space_unavailable"
+    );
+
+    let (mut harness, _, _) = column_harness();
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, TARGET, true);
+    harness.pump_frames(2);
+    assert_eq!(code(&mut harness, move_to(TARGET)), "fullscreen_space");
+
+    // Capability off is a configuration answer, whatever the target is.
+    let mut harness = TestHarness::new().with_windows(2).with_display(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+        vec![TEST_WORKSPACE_ID, TARGET],
+    );
+    harness.pump_frames(10);
+    assert_eq!(
+        code(&mut harness, move_to(TARGET)),
+        "capability_unavailable"
+    );
+
+    let (mut harness, _, _) = column_harness();
+    submit(&mut harness, MoveFocus::Stay);
+    assert_eq!(code(&mut harness, move_to(TARGET)), "native_move_pending");
+
+    // An unreadable inventory is unknown, not evidence that the target is gone.
+    let (mut harness, _, _) = column_harness();
+    harness.mock_state.set_display_inventory_available(false);
+    assert_eq!(code(&mut harness, move_to(TARGET)), "topology_unresolved");
+}
+
 /// Asserts that a Space move neither reached the platform nor started a
 /// reassignment, and that the source layout is untouched.
 fn assert_space_move_refused(harness: &mut TestHarness, source: Entity, members: [Entity; 2]) {

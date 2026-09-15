@@ -53,6 +53,10 @@ fn unique_strip(In(space): In<u64>, strips: Strips) -> Result<(), Rejection> {
     strip_of(space, &strips).map(|_| ())
 }
 
+fn target_space(In(display_id): In<u32>, admission: Admission) -> Result<u64, Rejection> {
+    admission.target_space(display_id)
+}
+
 fn column_index(
     In((space, ordinal)): In<(u64, usize)>,
     strips: Strips,
@@ -238,6 +242,29 @@ fn no_focused_window_is_rejected() {
     harness.pump_frames(10);
     let result = harness.world().run_system_once(focus_target).unwrap();
     assert_eq!(result, Err(Rejection::NoFocusedWindow));
+}
+
+#[test]
+fn an_unreachable_target_is_not_a_fullscreen_one() {
+    let mut harness = harness();
+
+    // Nothing is visible on a display that is not there: that is "not now".
+    let result = harness
+        .world()
+        .run_system_once_with(target_space, 999)
+        .unwrap();
+    assert_eq!(result, Err(Rejection::SpaceNotVisible));
+
+    // A fullscreen Space is not a user Space at all, which is a different answer.
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, true);
+    harness.pump_frames(2);
+    let result = harness
+        .world()
+        .run_system_once_with(target_space, TEST_DISPLAY_ID)
+        .unwrap();
+    assert_eq!(result, Err(Rejection::FullscreenSpace));
 }
 
 #[test]

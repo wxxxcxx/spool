@@ -78,6 +78,74 @@ pub(crate) struct DetachedSpace {
 #[derive(Component)]
 pub(crate) struct NativeMoveOwner;
 
+/// The most recent attempt to realize a membership move for one window.
+///
+/// Diagnostic only: layout, effects and admission never read it. It exists so
+/// `window inspect` can answer "what did Spool last try for this window, and how
+/// did it end" without reconstructing that from barriers, logs and timing.
+#[derive(Component, Clone, Debug)]
+pub(crate) struct SpaceMoveAttempt {
+    pub(crate) target_space_id: WorkspaceId,
+    pub(crate) result: SpaceMoveResult,
+}
+
+/// How the most recent membership attempt ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SpaceMoveResult {
+    /// Submitted; the membership audit has not confirmed it yet.
+    InFlight,
+    /// The audit observed every member in the requested Space.
+    Confirmed,
+    /// The confirmation window elapsed without the observation agreeing.
+    TimedOut,
+    /// A member's identity retired before confirmation.
+    Retired,
+    /// Refused before any native write, with the reason the caller was given.
+    Refused(String),
+}
+
+impl SpaceMoveResult {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::InFlight => "in_flight",
+            Self::Confirmed => "confirmed",
+            Self::TimedOut => "timed_out",
+            Self::Retired => "retired",
+            Self::Refused(_) => "refused",
+        }
+    }
+
+    pub(crate) fn code(&self) -> Option<&str> {
+        match self {
+            Self::Refused(code) => Some(code),
+            _ => None,
+        }
+    }
+}
+
+/// Records the outcome of one attempt on the addressed window, if it is tracked.
+///
+/// A refusal happens before the transaction exists, so the record is the only
+/// place it survives; an attempt for a window Spool no longer tracks is dropped
+/// rather than turned into state.
+pub(crate) fn note_space_move_attempt(
+    world: &mut bevy::prelude::World,
+    window_id: WinID,
+    target_space_id: WorkspaceId,
+    result: SpaceMoveResult,
+) {
+    let entity = world
+        .query::<(Entity, &crate::manager::Window)>()
+        .iter(world)
+        .find_map(|(entity, window)| (window.id() == window_id).then_some(entity));
+    if let Some(entity) = entity {
+        world.entity_mut(entity).insert(SpaceMoveAttempt {
+            target_space_id,
+            result,
+        });
+    }
+}
+
 #[derive(Debug)]
 struct PendingMove {
     window_ids: Vec<i32>,
@@ -399,6 +467,10 @@ impl NativeSpaceTransactions {
             );
             commands.entity(member.entity).insert((
                 NativeMoveOwner,
+                SpaceMoveAttempt {
+                    target_space_id: plan.target_space_id,
+                    result: SpaceMoveResult::InFlight,
+                },
                 DisplayTransferFrame {
                     target: plan.target,
                     viewport: plan.viewport,
@@ -525,7 +597,7 @@ pub(crate) fn execute_native_space_command(
                     ?op,
                     "skipping deferred Space command with a stale snapshot identity"
                 );
-                return Err(crate::errors::Error::rejected("native_precondition_failed"));
+                return Err(crate::errors::Error::rejected("snapshot_binding_stale"));
             }
             let action = match *op {
                 LayoutOp::MoveToWorkspace {
@@ -638,24 +710,24 @@ pub(crate) fn execute_native_space_command(
         } => {
             let Some((_, entity)) = windows.find(*window_id) else {
                 warn!(window_id, "window is not tracked");
-                return Err(crate::errors::Error::rejected("native_precondition_failed"));
+                return Err(crate::errors::Error::rejected("window_not_found"));
             };
             let Some((_, _, state)) = windows.get_tracked(entity) else {
-                return Err(crate::errors::Error::rejected("native_precondition_failed"));
+                return Err(crate::errors::Error::rejected("window_unavailable"));
             };
             if state.is_floating() {
                 warn!(
                     window_id,
                     "a floating window does not belong to a tiled column"
                 );
-                return Err(crate::errors::Error::rejected("native_precondition_failed"));
+                return Err(crate::errors::Error::rejected("ineligible_layout_entry"));
             }
             let Some(column) = spaces
                 .iter()
                 .find_map(|strip| strip.column_containing(entity))
             else {
                 warn!(window_id, "window is not in a layout column");
-                return Err(crate::errors::Error::rejected("native_precondition_failed"));
+                return Err(crate::errors::Error::rejected("layout_not_found"));
             };
             Some((*window_id, *space_id, *move_focus, Some(column)))
         }
@@ -703,7 +775,8 @@ pub(crate) fn execute_native_space_command(
     }
     let observations = window_manager.observe_displays().map_err(|error| {
         warn!(space_id, %error, "unable to read the display inventory");
-        crate::errors::Error::rejected("native_precondition_failed")
+        // A failed read cannot establish that the target does not exist.
+        crate::errors::Error::rejected("topology_unresolved")
     })?;
     // A display whose Space list could not be read cannot confirm the target,
     // but its failure is not evidence that the target Space does not exist.
@@ -713,9 +786,16 @@ pub(crate) fn execute_native_space_command(
             .as_ref()
             .is_ok_and(|spaces| spaces.contains(&space_id))
     });
-    if !target_is_known || window_manager.workspace_is_fullscreen(space_id) {
-        warn!(space_id, "target is not a known user Space");
-        return Err(crate::errors::Error::rejected("native_precondition_failed"));
+    if !target_is_known {
+        warn!(space_id, "target is not a known Space");
+        return Err(crate::errors::Error::rejected("target_space_unavailable"));
+    }
+    if window_manager.workspace_is_fullscreen(space_id) {
+        warn!(
+            space_id,
+            "target is a native fullscreen Space, not a user Space"
+        );
+        return Err(crate::errors::Error::rejected("fullscreen_space"));
     }
     if windows.find(window_id).is_none() {
         warn!(window_id, "window is not tracked");
@@ -736,7 +816,7 @@ pub(crate) fn execute_native_space_command(
         .any(|member| windows.get_tracked(*member).is_none())
     {
         warn!(window_id, "column has unavailable members");
-        return Err(crate::errors::Error::rejected("native_precondition_failed"));
+        return Err(crate::errors::Error::rejected("window_unavailable"));
     }
     for member in members {
         let Some((window, _, _)) = windows.get_tracked(member) else {
@@ -754,7 +834,7 @@ pub(crate) fn execute_native_space_command(
             .is_some_and(|(_, entity)| !windows.is_available(entity))
     }) {
         warn!(window_id, "associated window is temporarily unavailable");
-        return Err(crate::errors::Error::rejected("native_precondition_failed"));
+        return Err(crate::errors::Error::rejected("window_unavailable"));
     }
     if snapshot.is_some_and(|snapshot| {
         window_ids
@@ -765,7 +845,7 @@ pub(crate) fn execute_native_space_command(
             window_id,
             "skipping script move with unbound or replaced associated windows"
         );
-        return Err(crate::errors::Error::rejected("native_precondition_failed"));
+        return Err(crate::errors::Error::rejected("snapshot_binding_stale"));
     }
     if transactions
         .moves
@@ -867,7 +947,13 @@ pub(crate) fn execute_native_space_command(
                     })
                     .unwrap_or_default();
                 freeze_window_for_space_reassignment(entity, index, &mut commands);
-                commands.entity(entity).insert(NativeMoveOwner);
+                commands.entity(entity).insert((
+                    NativeMoveOwner,
+                    SpaceMoveAttempt {
+                        target_space_id: space_id,
+                        result: SpaceMoveResult::InFlight,
+                    },
+                ));
             }
             let layout = column.map_or(PendingMoveLayout::AssociatedWindows, |column| {
                 PendingMoveLayout::capture_column(column, space_id, spaces.iter(), &members)
@@ -950,6 +1036,16 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
             .iter()
             .any(|member| !member.is_current(&windows))
         {
+            for member in &pending.members {
+                // A replaced member's entity may already be gone; the record is
+                // diagnostic, so it never justifies a command against it.
+                if let Ok(mut entity) = commands.get_entity(member.entity) {
+                    entity.try_insert(SpaceMoveAttempt {
+                        target_space_id: pending.target_space_id,
+                        result: SpaceMoveResult::Retired,
+                    });
+                }
+            }
             expired.extend(pending.members.iter().map(|member| member.entity));
             warn!(
                 space_id = pending.target_space_id,
@@ -1056,6 +1152,14 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
                     commands.entity(entity).remove::<PreviousTiledStrip>();
                 }
             }
+            for entity in &moved_entities {
+                if let Ok(mut entity) = commands.get_entity(*entity) {
+                    entity.try_insert(SpaceMoveAttempt {
+                        target_space_id: pending.target_space_id,
+                        result: SpaceMoveResult::Confirmed,
+                    });
+                }
+            }
             completed.extend_from_slice(&moved_entities);
             debug!(
                 space_id = pending.target_space_id,
@@ -1088,6 +1192,14 @@ pub(crate) fn reconcile_native_space_transactions(ctx: NativeSpaceReconciliation
             }
             false
         } else if timed_out {
+            for member in &pending.members {
+                if let Ok(mut entity) = commands.get_entity(member.entity) {
+                    entity.try_insert(SpaceMoveAttempt {
+                        target_space_id: pending.target_space_id,
+                        result: SpaceMoveResult::TimedOut,
+                    });
+                }
+            }
             expired.extend(pending.members.iter().map(|member| member.entity));
             warn!(
                 space_id = pending.target_space_id,

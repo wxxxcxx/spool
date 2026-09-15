@@ -283,10 +283,26 @@ fn execute_action(world: &mut World, action: Action) -> crate::errors::Result<()
         | Action::CreateSpace { .. }
         | Action::DeleteSpace { .. }
         | Action::MoveWindowToSpace { .. }
-        | Action::MoveColumnToSpace { .. }) => invoked(world.run_system_cached_with(
-            crate::ecs::native_space::execute_native_space_command,
-            crate::events::Event::action_requested(action),
-        ))?,
+        | Action::MoveColumnToSpace { .. }) => {
+            // A refused membership edit leaves no transaction behind, so the
+            // record is the only place its reason survives for diagnosis.
+            let attempt = membership_attempt(&action);
+            let outcome = invoked(world.run_system_cached_with(
+                crate::ecs::native_space::execute_native_space_command,
+                crate::events::Event::action_requested(action),
+            ))?;
+            if let (Some((window_id, space_id)), Err(error)) = (attempt, &outcome) {
+                crate::ecs::native_space::note_space_move_attempt(
+                    world,
+                    window_id,
+                    space_id,
+                    crate::ecs::native_space::SpaceMoveResult::Refused(
+                        error.admission_code().to_owned(),
+                    ),
+                );
+            }
+            outcome
+        }
         Action::TargetedWindow {
             window_id,
             operation: Operation::ToNextDisplay(move_focus),
@@ -333,6 +349,28 @@ fn execute_action(world: &mut World, action: Action) -> crate::errors::Result<()
         #[cfg(not(feature = "lua"))]
         Action::Layout(_) => Err(crate::errors::Error::rejected("unsupported_operation")),
         _ => Err(crate::errors::Error::rejected("unsupported_operation")),
+    }
+}
+
+/// The window and target Space a membership edit addresses, if any.
+///
+/// Focus and Space-lifecycle actions share their arm with the membership moves
+/// but do not move a window's membership, so they have nothing to record.
+fn membership_attempt(
+    action: &Action,
+) -> Option<(crate::platform::WinID, crate::platform::WorkspaceId)> {
+    match action {
+        Action::MoveWindowToSpace {
+            window_id,
+            space_id,
+            ..
+        }
+        | Action::MoveColumnToSpace {
+            window_id,
+            space_id,
+            ..
+        } => Some((*window_id, *space_id)),
+        _ => None,
     }
 }
 
@@ -474,7 +512,6 @@ pub(crate) enum Rejection {
     DisplayGeometryStale,
     InvalidDisplayFrame,
     LayoutOwnershipUnresolved,
-    TargetSpaceUnavailable,
 }
 
 impl Rejection {
@@ -498,7 +535,6 @@ impl Rejection {
             Self::DisplayGeometryStale => "display_geometry_stale",
             Self::InvalidDisplayFrame => "invalid_display_frame",
             Self::LayoutOwnershipUnresolved => "layout_ownership_unresolved",
-            Self::TargetSpaceUnavailable => "target_space_unavailable",
         }
     }
 }
@@ -713,12 +749,15 @@ impl Admission<'_, '_> {
 
     /// The Space a display currently shows, when it is uniquely visible and not
     /// native fullscreen.
+    ///
+    /// An unreachable target and an unusable one are different answers: a display
+    /// that is not showing a single Space is "not now" (`SpaceNotVisible`,
+    /// usually a transient topology fact), while a fullscreen Space is not a user
+    /// Space at all (`FullscreenSpace`).
     pub(crate) fn target_space(&self, display_id: u32) -> Result<WorkspaceId, Rejection> {
-        let space = self
-            .visible_space_on_display(display_id)
-            .map_err(|_| Rejection::TargetSpaceUnavailable)?;
+        let space = self.visible_space_on_display(display_id)?;
         if self.topology.is_fullscreen(space) {
-            return Err(Rejection::TargetSpaceUnavailable);
+            return Err(Rejection::FullscreenSpace);
         }
         Ok(space)
     }

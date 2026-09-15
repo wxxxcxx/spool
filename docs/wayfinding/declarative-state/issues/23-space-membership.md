@@ -66,12 +66,18 @@ Blocked by: none
 
 ### 编辑时的拒绝原因（需具体）
 
-- 目标 Space 不存在 / 不是用户 Space / 已原生全屏 → `target_space_unavailable`（或更精确的新码）
-- 目标显示器当前未显示该 Space（跨显示器转移）→ 明确说明"目标当前不可达"
-- 能力关闭（`experimental_space_control`）→ `capability_unavailable`，说明如何开启
-- 该窗口已有一次移动在途 → `native_move_pending`，说明"上一次尝试尚未结束"
+已实施（task-1，2026-09-15）：
 
-这些今天大多已存在，问题在于混装成 `native_precondition_failed`，调用方无法区分"永远不行"与"现在不行"。
+- 目标 Space 不存在 / 不是用户 Space → `target_space_unavailable`
+- 目标已原生全屏 → `fullscreen_space`
+- 目标显示器当前未显示该 Space（跨显示器转移）→ `space_not_visible`（“现在不行”，与上一行的“不是用户 Space”分开）
+- 能力关闭（`experimental_space_control`）→ `capability_unavailable`
+- 该窗口已有一次移动在途 → `native_move_pending`
+- 列/成员已不可用 → `window_unavailable`；列不存在 → `layout_not_found`；浮动窗口不属列 → `ineligible_layout_entry`
+- 脚本计划的快照绑定已失效 → `snapshot_binding_stale`（新增）
+- 显示器清单读取失败 → `topology_unresolved`（读取失败不是“不存在”）
+
+测试：`space_move_refusals_name_their_own_cause`（每种原因一个断言）、`an_unreachable_target_is_not_a_fullscreen_one`。两测在改动前的代码上均失败（分别得到 `native_precondition_failed` 与 `TargetSpaceUnavailable`）。
 
 ### 实施顺序与移除清单
 
@@ -79,7 +85,7 @@ Blocked by: none
 2. **拒绝原因层**：拆开编辑路径的拒绝原因；诊断显示"声明的归属 / 观测的归属 / 最近一次尝试与结果 / 修复历史与原因"。
 3. **效果层**：确认"一次尝试 → 2 秒 → 未确认即修复回观测"这条链，并让超时不再静默（今天只有一条 `warn!` 日志）。
 4. **评估跨显示器那道可见性门**：有真实技术理由则保留并明确报告；若是遗留限制则移除，让效果层在可尝试时提交。
-5. **移除清单**：`native_precondition_failed` 作为归属路径的混装原因；事务超时后靠"忘记"处理归属的隐含语义。
+5. **移除清单**：`native_precondition_failed` 作为归属路径的混装原因（已移除）；事务超时后靠“忘记”处理归属的隐含语义（待 task-3）。
 
 ### 验收矩阵（mock）
 
@@ -100,6 +106,15 @@ ADR 0006 的"不可见 Space 也应接受 desired-layout 编辑"在本票被**�
 
 - 不做：挂起/重试/排队的归属移动；跨重启恢复归属；Space 创建与删除的声明式化；浮动窗口独立几何的全面迁移。
 - mock 通过只证明模型与调用协议；真实 macOS Space 动画、约束、回声与原生 tab 边界仍需另行授权验收。
+
+## 实施进展
+
+### task-1：拒绝原因具体化 + 最近一次尝试可查（已实施，2026-09-15）
+
+- 归属路径的混装 `native_precondition_failed` 拆开（见上文“编辑时的拒绝原因”）；跨显示器转移不再把“看不见”与“全屏”合并成 `target_space_unavailable`（`Rejection::TargetSpaceUnavailable` 因此不再被任何共享配方构造，已删除）。
+- 新增**只读诊断记录** `SpaceMoveAttempt`（`InFlight` / `Confirmed` / `TimedOut` / `Retired` / `Refused(code)`）：编辑被拒时记下调用方拿到的原因；提交时记“在途”；审计确认/超时/实例退休时收尾。它**不被布局、效果或准入读取**，仅用于诊断（替换/退休的实体用 `try_insert`，不会因记录而对已 despawn 的实体发命令）。
+- `window inspect --source spool` 的 window row 新增 `membership.attempt`（`target_space_id` / `result` / `code`），并把 `membership` 加入默认选择与可选路径。
+- 测试：`the_last_membership_attempt_is_recorded`（五种结果各自的断言）、`window_detail_reports_the_last_membership_attempt`（诊断投影）。
 
 ## Resolution
 
