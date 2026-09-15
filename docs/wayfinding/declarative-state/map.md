@@ -3,7 +3,7 @@
 Label: wayfinder:map
 Status: resolved
 
-已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（用户已裁决：不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）。下一片（待裁决）：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（已核对当前浮动几何「观测即期望、无保留意图、不进投影与保存」；裁决前不实施）。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
+已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（用户已裁决：不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）。下一片（已裁决、待实施）：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（用户已确认按票中倾向执行；实现从帧权威的横切切换开始）。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
 
 ## Destination
 

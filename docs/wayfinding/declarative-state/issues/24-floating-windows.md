@@ -3,7 +3,7 @@
 Id: 24
 Type: task
 Label: wayfinder:task
-Status: open
+Status: resolved
 Assignee: none
 Parent: [Spool 声明式状态模型与迁移边界](../map.md)
 Blocked by: none
@@ -69,8 +69,8 @@ Blocked by: none
 
 ## Resolution
 
-待用户逐项裁决后填写；裁决前不实施。
+用户于 2026-09-15 确认按票中六项倾向执行（保留意图、位置+尺寸、每窗口一份、修复顺序且不写原生、命令写意图、进保存、位置为窗口属性）。裁决记录在此；实现未开始。
 
 ## Implementation follow-up
 
-未实施。
+未实施。第一步是**帧权威的横切切换**：浮动窗口的期望帧目前有多个写入者（编辑命令经 `RepositionMarker`/`ResizeMarker`、外部手势直接写 `DesiredWindowFrame`、而 `position_layout_windows` 跳过浮动窗口），迁移要求这些写入者与"意图 → 有效目标"派生在同一次改动内一起切换，否则会互相覆盖；按仓库对列宽片的先例（"所有输入和 writer 同次迁移"），它必须在一次连贯、验证过的改动里落地，而不是分次留下双重权威。第 4 步（保存与候选隔离）可单独成一次改动。
