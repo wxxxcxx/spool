@@ -1,4 +1,5 @@
 mod column_intent;
+mod command_admission;
 mod command_dispatch;
 mod cross_display_focus;
 mod display;

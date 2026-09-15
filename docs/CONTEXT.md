@@ -48,6 +48,9 @@ The decision to track an independent application window, ignore a non-window or 
 **Fallback Admission**:
 Conservative admission of a nonstandard AX window using independent parent, valid geometry, visible normal/floating-layer surface, and close/minimize-button evidence. Its initial floating preference is generic, not a Quick Look or application-name rule; the evidence is not a liveness requirement for an already tracked identity.
 
+**Command Admission**:
+The decision to accept a runtime action and carry it out against current Spool and native state, or to refuse it with a reason. It concerns whether a command is acted on, not whether a window is tracked: Window Admission decides whether an independent application window enters Spool, while Command Admission decides whether an instruction about already-represented state may change or act on it now. Acceptance is not proof that a native effect has completed.
+
 **Layout Capability**:
 The operations the current backend can perform on a window, distinguished as supported, unsupported, or unknown. Capability does not describe the window's purpose.
 

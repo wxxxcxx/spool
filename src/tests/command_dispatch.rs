@@ -608,3 +608,76 @@ fn command_batch_preserves_script_and_named_focus_order() {
         );
     }
 }
+
+#[test]
+fn dispatched_center_uses_the_active_display_and_wraps_the_mouse() {
+    use bevy::ecs::system::RunSystemOnce;
+    let mut harness = harness();
+    let expected = harness
+        .world()
+        .run_system_once(
+            |active: crate::ecs::params::ActiveDisplay, config: Res<crate::config::Config>| {
+                active.actual_bounds(&config).center()
+            },
+        )
+        .unwrap();
+    dispatch(&mut harness, [Action::Window(Operation::Center)]);
+    assert_eq!(harness.mock_state.cursor_position(), expected);
+}
+
+#[test]
+fn dispatched_toggle_floating_flips_the_focused_window() {
+    let mut harness = harness();
+    let entity = find_window_entity(0, harness.world());
+    dispatch(&mut harness, [Action::Window(Operation::ToggleFloating)]);
+    assert!(harness.world().get::<Floating>(entity).is_some());
+}
+
+#[test]
+fn dispatched_window_toggle_tiled_visibility_parks_and_restores() {
+    let mut harness = harness();
+    let entity = find_window_entity(1, harness.world());
+    dispatch(
+        &mut harness,
+        [Action::Window(Operation::ToggleTiledVisibility)],
+    );
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::tiled_visibility::ParkedTile>(entity)
+            .is_some()
+    );
+    dispatch(
+        &mut harness,
+        [Action::Window(Operation::ToggleTiledVisibility)],
+    );
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::tiled_visibility::ParkedTile>(entity)
+            .is_none()
+    );
+}
+
+#[test]
+fn dispatched_quit_reaches_the_manager_once() {
+    use crate::manager::{MockWindowManagerApi, WindowManager};
+    use std::sync::{Arc, Mutex};
+
+    let calls = Arc::new(Mutex::new(0));
+    let recorded = Arc::clone(&calls);
+    let mut manager = MockWindowManagerApi::new();
+    manager.expect_quit().times(1).returning(move || {
+        *recorded.lock().unwrap() += 1;
+        Ok(())
+    });
+    let mut app = App::new();
+    app.add_message::<Event>()
+        .init_resource::<crate::lifecycle::Lifecycle>()
+        .insert_resource(WindowManager(Box::new(manager)))
+        .add_systems(PreUpdate, crate::commands::dispatch_actions);
+    app.world_mut()
+        .write_message(Event::action_requested(Action::Quit));
+    app.update();
+    assert_eq!(*calls.lock().unwrap(), 1);
+}

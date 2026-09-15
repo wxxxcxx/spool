@@ -2,15 +2,12 @@
 
 use bevy::prelude::*;
 
+use super::admission::Admission;
 use super::{Action, Direction, Operation};
 use crate::config::Config;
-use crate::ecs::layout::{Column, LayoutStrip, clamp_origin_to_viewport};
+use crate::ecs::layout::clamp_origin_to_viewport;
 use crate::ecs::params::Windows;
-use crate::ecs::topology::NativeTopology;
-use crate::ecs::{
-    DockPosition, Floating, FullWidthMarker, RetilePending, RetileWindow, SpawnCommandsExt,
-};
-use crate::manager::{Display, WindowManager};
+use crate::ecs::{Floating, FullWidthMarker, RetilePending, RetileWindow, SpawnCommandsExt};
 
 type BlockedWindows<'w, 's> = Query<
     'w,
@@ -34,12 +31,9 @@ type BlockedWindows<'w, 's> = Query<
 pub(super) fn execute(
     In(action): In<Action>,
     windows: Windows,
-    strips: Query<(Entity, &LayoutStrip, &ChildOf)>,
-    displays: Query<(&Display, Option<&DockPosition>)>,
     pending_retiles: Query<(), With<RetilePending>>,
     blocked: BlockedWindows,
-    mut topology: ResMut<NativeTopology>,
-    manager: Res<WindowManager>,
+    mut admission: Admission,
     config: Res<Config>,
     mut commands: Commands,
 ) -> crate::errors::Result<()> {
@@ -52,48 +46,22 @@ pub(super) fn execute(
             "unsupported explicit operation",
         ));
     };
-    let (_, entity) = windows
-        .find(window_id)
-        .ok_or_else(|| crate::errors::Error::rejected("window_not_found"))?;
+    let entity = admission.writable_window(window_id)?;
+    if blocked.contains(entity) {
+        return Err(crate::errors::Error::rejected("window_unavailable"));
+    }
     let (_, _, state) = windows
         .get_tracked(entity)
         .ok_or_else(|| crate::errors::Error::rejected("window_unavailable"))?;
-    if blocked.contains(entity) || !state.is_visible() || !windows.layout_is_writable(entity) {
-        return Err(crate::errors::Error::rejected("window_unavailable"));
+    let space = admission.visible_space(window_id)?;
+    let view = admission.space_view(space)?;
+    let strip_entity = view.strip_entity;
+    let strip = view.strip;
+    let display = view.display;
+    let viewport = view.viewport;
+    if state.is_tiled() {
+        Admission::tiled_column(strip, entity)?;
     }
-    let space = topology
-        .observe_visible_window_space(&manager, window_id)
-        .ok_or_else(|| crate::errors::Error::rejected("space_not_visible"))?;
-    if topology.is_fullscreen(space) {
-        return Err(crate::errors::Error::rejected("fullscreen_space"));
-    }
-    let (strip_entity, strip, parent) = strips
-        .iter()
-        .find(|(_, s, _)| s.id() == space)
-        .ok_or_else(|| crate::errors::Error::rejected("layout_not_found"))?;
-    let (display, dock) = displays
-        .get(parent.parent())
-        .map_err(|error| crate::errors::Error::rejection_with_cause("display_not_found", error))?;
-    if topology.visible_display_for_space(space) != Some(display.id()) {
-        return Err(crate::errors::Error::rejected("topology_unresolved"));
-    }
-    let (native, _) = topology
-        .known_displays()
-        .find(|(native, _)| native.id() == display.id())
-        .ok_or_else(|| crate::errors::Error::rejected("topology_unresolved"))?;
-    if display.clone().update_geometry(native) {
-        return Err(crate::errors::Error::rejected("display_geometry_stale"));
-    }
-    if state.is_tiled()
-        && strip
-            .column_containing(entity)
-            .is_none_or(|column| matches!(column, Column::Fullscren(_)))
-    {
-        return Err(crate::errors::Error::rejected("ineligible_layout_entry"));
-    }
-    let viewport = display
-        .checked_actual_display_bounds(dock, &config)
-        .ok_or_else(|| crate::errors::Error::rejected("invalid_display_frame"))?;
     let frame = windows
         .requested_frame(entity)
         .ok_or_else(|| crate::errors::Error::rejected("geometry_unavailable"))?;
@@ -138,12 +106,7 @@ pub(super) fn execute(
             if state.is_floating() {
                 commands.reposition_entity(entity, origin);
             } else {
-                if strip
-                    .column_containing(entity)
-                    .is_none_or(|column| matches!(column, Column::Fullscren(_)))
-                {
-                    return Err(crate::errors::Error::rejected("ineligible_layout_entry"));
-                }
+                Admission::tiled_column(strip, entity)?;
                 let position = windows
                     .layout_position(entity)
                     .ok_or_else(|| crate::errors::Error::rejected("layout_position_unavailable"))?
@@ -161,8 +124,8 @@ pub(super) fn execute(
             Ok(())
         }
         Operation::Maximize => {
-            if state.is_tiled() && !windows.layout_column_is_writable(strip, entity) {
-                return Err(crate::errors::Error::rejected("column_unavailable"));
+            if state.is_tiled() {
+                admission.writable_column(strip, entity)?;
             }
             let marker = windows.full_width(entity).or_else(|| {
                 state

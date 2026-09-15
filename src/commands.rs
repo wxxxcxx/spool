@@ -2,14 +2,14 @@ use bevy::app::PreUpdate;
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::query::{Has, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, In, Query, Res, ResMut};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info};
 
-mod admission;
+pub(crate) mod admission;
 mod column_width;
 mod display_navigation;
 mod layout_edit;
@@ -27,9 +27,7 @@ use crate::ecs::layout::{
 };
 use crate::ecs::native_space::VisibleNativeSpaceMarker;
 use crate::ecs::params::{ActiveDisplay, Windows};
-use crate::ecs::topology::NativeTopology;
 use crate::ecs::window_frame::{checked_frame_size, checked_window_frame};
-use crate::ecs::workspace::PendingSpaceDestruction;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Floating, FocusedMarker, FullWidthMarker,
     NativeFullscreenMarker, RaiseWindow, RetilePending, RetileWindow, SendMessageTrigger,
@@ -84,7 +82,6 @@ pub fn register_commands(app: &mut bevy::app::App) {
 )]
 pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands: Commands) {
     use crate::ecs::native_space::apply_native_space_command;
-    use crate::platform::mission_control::SystemOverview;
 
     for event in messages.read() {
         if let Event::CheckedActionRequested {
@@ -117,91 +114,9 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
             continue;
         };
         match action {
-            Action::SpaceLayout { .. }
-            | Action::TargetedWindow { .. }
-            | Action::MoveFocusedWindowToSpace { .. } => {
-                let action = action.clone();
-                commands.queue(move |world: &mut bevy::prelude::World| {
-                    if let Err(reason) = admission::execute(world, action) {
-                        debug!(%reason, "command rejected");
-                    }
-                });
-            }
-            Action::Window(operation) => match operation {
-                Operation::Focus(_) | Operation::FocusStep(_) => {
-                    let operation = operation.clone();
-                    commands.queue(move |world: &mut bevy::prelude::World| {
-                        match world.run_system_cached_with(command_move_focus, operation) {
-                            Ok(Ok(())) => {}
-                            Ok(Err(reason)) => debug!(%reason, "command rejected"),
-                            Err(error) => error!(%error, "command execution failed"),
-                        }
-                    });
-                }
-                Operation::Move(_)
-                | Operation::ToggleStack
-                | Operation::Equalize
-                | Operation::Resize { .. }
-                | Operation::SetWidth(_)
-                | Operation::Maximize
-                | Operation::Balance => {
-                    let action = action.clone();
-                    commands.queue(move |world: &mut bevy::prelude::World| {
-                        if let Err(reason) = admission::execute(world, action) {
-                            debug!(%reason, "command rejected");
-                        }
-                    });
-                }
-                Operation::ToNextDisplay(move_focus) => {
-                    commands.run_system_cached_with(
-                        move_to_display,
-                        (*move_focus, DisplayTarget::Next),
-                    );
-                }
-                Operation::Center => commands.run_system_cached(command_center_window),
-                Operation::ToggleFloating => commands.run_system_cached(toggle_floating_window),
-                Operation::Snap => commands.run_system_cached(snap_window),
-                Operation::FocusFloating => commands.run_system_cached(command_focus_floating),
-                Operation::FocusTiled => commands.run_system_cached(command_focus_tiled),
-                Operation::FocusOtherLayer => commands.run_system_cached(command_focus_other_layer),
-                Operation::ToggleTiledVisibility => {
-                    commands.queue(|world: &mut bevy::prelude::World| {
-                        match world
-                            .run_system_cached_with(crate::ecs::tiled_visibility::toggle, None)
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(reason)) => debug!(%reason, "command rejected"),
-                            Err(error) => error!(%error, "command execution failed"),
-                        }
-                    });
-                }
-            },
-            Action::Mouse(MouseMove::ToNextDisplay) => {
-                commands.run_system_cached_with(focus_other_display, (None, DisplayTarget::Next));
-            }
-            Action::SetSpaceFocusPreference {
-                space_id,
-                window_id,
-            } => {
-                let action = Action::SetSpaceFocusPreference {
-                    space_id: *space_id,
-                    window_id: *window_id,
-                };
-                commands.queue(move |world: &mut bevy::prelude::World| {
-                    if let Err(reason) = admission::execute(world, action) {
-                        debug!(%reason, "focus preference rejected");
-                    }
-                });
-            }
-            Action::FocusWindow { .. }
-            | Action::FocusWindowInSpace { .. }
-            | Action::FocusSpace { .. }
-            | Action::MoveWindowToSpace { .. }
-            | Action::MoveColumnToSpace { .. }
-            | Action::CreateSpace { .. }
-            | Action::DeleteSpace { .. } => {
-                commands.run_system_cached_with(apply_native_space_command, event.clone());
-            }
+            // A script's returned plan is its own ordered batch boundary:
+            // `layout_ops` applies it op-by-op, and each inner operation takes
+            // its own admission path.
             #[cfg(feature = "lua")]
             Action::Layout(plan) => {
                 commands.run_system_cached_with(
@@ -211,26 +126,16 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
             }
             #[cfg(not(feature = "lua"))]
             Action::Layout(_) => {}
-            Action::ReorderColumn { .. } => {
-                commands.run_system_cached_with(command_reorder_column, action.clone());
-            }
-            Action::ReconcileWindows => commands.run_system_cached(reconcile_windows_handler),
-            Action::PrintState => commands.run_system_cached(print_internal_state_handler),
-            Action::Quit => commands.run_system_cached(command_quit_handler),
-            Action::Restart => commands.run_system_cached(command_restart_handler),
-            Action::MissionControl => {
-                commands.run_system_cached_with(
-                    command_system_overview,
-                    SystemOverview::MissionControl,
-                );
-            }
-            Action::ShowDesktop => {
-                commands
-                    .run_system_cached_with(command_system_overview, SystemOverview::ShowDesktop);
-            }
-            Action::ToggleBarCollapse => commands.run_system_cached(command_toggle_bar_collapse),
             // Lua execution is asynchronous; its returned plan enters this queue later.
             Action::Lua(_) => {}
+            action => {
+                let action = action.clone();
+                commands.queue(move |world: &mut bevy::prelude::World| {
+                    if let Err(reason) = admission::execute_dispatched(world, action) {
+                        debug!(%reason, "command rejected");
+                    }
+                });
+            }
         }
     }
 }
@@ -301,14 +206,7 @@ fn command_system_overview(
 /// Pending focus owns subsequent commands; an invalid target must not redirect
 /// a destructive action back to the previously confirmed window.
 fn command_entity(windows: &Windows, focus: &FocusCoordinator) -> Option<Entity> {
-    let entity = focus
-        .snapshot()
-        .requested_entity()
-        .or_else(|| windows.focused().map(|(_, entity)| entity))?;
-    windows
-        .get_tracked(entity)
-        .filter(|(_, _, state)| state.is_visible())
-        .map(|(_, entity, _)| entity)
+    admission::Admission::focused_target_in(windows, focus).ok()
 }
 
 fn active_command_entity(
@@ -317,20 +215,7 @@ fn active_command_entity(
     strip: &LayoutStrip,
     manager: &WindowManager,
 ) -> Option<Entity> {
-    let entity = command_entity(windows, focus)?;
-    if !windows.layout_is_writable(entity) {
-        return None;
-    }
-    let (window, _, state) = windows.get_tracked(entity)?;
-    let belongs = if state.is_tiled() {
-        strip.contains(entity)
-    } else {
-        manager
-            .windows_in_workspace(strip.id())
-            .ok()?
-            .contains(&window.id())
-    };
-    belongs.then_some(entity)
+    admission::Admission::active_space_target_in(windows, focus, strip, manager).ok()
 }
 
 fn writable_column_range(windows: &Windows, strip: &LayoutStrip, a: Entity, b: Entity) -> bool {
@@ -1104,21 +989,9 @@ fn move_to_display(
 
 #[derive(bevy::ecs::system::SystemParam)]
 struct MouseContext<'w, 's> {
+    admission: admission::Admission<'w, 's>,
     windows: Windows<'w, 's>,
-    layout_strips:
-        Query<'w, 's, (&'static LayoutStrip, &'static ChildOf), Without<PendingSpaceDestruction>>,
-    displays: Query<
-        'w,
-        's,
-        (
-            Entity,
-            &'static Display,
-            Option<&'static crate::ecs::DockPosition>,
-        ),
-    >,
-    topology: ResMut<'w, NativeTopology>,
     window_manager: Res<'w, WindowManager>,
-    config: Res<'w, Config>,
     commands: Commands<'w, 's>,
 }
 
@@ -1138,75 +1011,45 @@ fn checked_focus_other_display(
     context: MouseContext,
 ) -> crate::errors::Result<()> {
     let MouseContext {
+        mut admission,
         windows,
-        layout_strips,
-        displays,
-        mut topology,
         window_manager,
-        config,
         mut commands,
     } = context;
-    if !topology.refresh_for_command(&window_manager) {
-        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
-    }
-    if source.is_some_and(|id| topology.active_display() != Some(id)) {
-        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
+    let reject = || crate::errors::Error::rejected("mouse_target_unavailable");
+    admission.require_topology().map_err(|_| reject())?;
+    if source.is_some_and(|id| admission.active_display() != Some(id)) {
+        return Err(reject());
     }
     let Some(source_id) = source.or_else(|| {
         display_at(
             window_manager.cursor_position().map(origin_from)?,
-            topology.known_displays().map(|(display, _)| display),
+            admission.known_displays().map(|(display, _)| display),
         )
     }) else {
-        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
+        return Err(reject());
     };
     let Some(target_id) = select_display(
         source_id,
         target,
-        topology.known_displays().map(|(display, _)| display),
+        admission.known_displays().map(|(display, _)| display),
     ) else {
         return Ok(());
     };
     for id in [source_id, target_id] {
-        let mut matches = displays.iter().filter(|(_, display, _)| display.id() == id);
-        let Some((_, display, _)) = matches.next() else {
-            return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
-        };
-        if matches.next().is_some()
-            || !topology
-                .known_displays()
-                .any(|(native, _)| native.id() == id && !display.clone().update_geometry(native))
-            || topology
-                .visible_space(id)
-                .is_none_or(|space| topology.visible_display_for_space(space) != Some(id))
+        if admission.display_entity(id).is_err() || admission.visible_space_on_display(id).is_err()
         {
-            return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
+            return Err(reject());
         }
     }
-    let Some((display_entity, other, dock)) = displays
-        .iter()
-        .find(|(_, display, _)| display.id() == target_id)
-    else {
-        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
-    };
-    let Some(viewport) = other.checked_actual_display_bounds(dock, &config) else {
-        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
-    };
-    let Some(space_id) = topology.visible_space(target_id) else {
-        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
-    };
-    let mut matches = layout_strips
-        .iter()
-        .filter(|(strip, _)| strip.id() == space_id);
-    let Some((other_strip, child)) = matches.next() else {
-        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
-    };
-    if matches.next().is_some() || child.parent() != display_entity {
-        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
-    }
-    let Ok(memberships) = topology.observe_memberships(&window_manager) else {
-        return Err(crate::errors::Error::rejected("mouse_target_unavailable"));
-    };
+    let (display_entity, viewport) = admission.display_context(target_id).map_err(|_| reject())?;
+    let space_id = admission
+        .visible_space_on_display(target_id)
+        .map_err(|_| reject())?;
+    let other_strip = admission
+        .owned_strip_including_fullscreen(space_id, display_entity)
+        .map_err(|_| reject())?;
+    let memberships = admission.memberships().map_err(|_| reject())?;
     let candidate = other_strip
         .all_windows()
         .into_iter()
@@ -2530,6 +2373,7 @@ mod tests {
             });
         let mut app = App::new();
         app.add_message::<Event>()
+            .init_resource::<crate::lifecycle::Lifecycle>()
             .insert_resource(WindowManager(Box::new(manager)))
             .add_systems(PreUpdate, dispatch_actions);
         for action in [
@@ -2551,6 +2395,19 @@ mod tests {
                 SystemOverview::MissionControl,
             ]
         );
+    }
+
+    #[test]
+    fn checked_lifecycle_actions_start_stopping_without_running_the_effect() {
+        for action in [Action::Quit, Action::Restart] {
+            let mut world = World::new();
+            world.init_resource::<crate::lifecycle::Lifecycle>();
+            assert!(admission::execute(&mut world, action).is_ok());
+            assert_eq!(
+                world.resource::<crate::lifecycle::Lifecycle>().phase(),
+                crate::lifecycle::Phase::Stopping
+            );
+        }
     }
 
     fn setup_world_with_layout() -> (World, LayoutStrip, Vec<Entity>) {

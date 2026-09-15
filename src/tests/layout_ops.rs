@@ -1202,3 +1202,12 @@ fn arrangement_does_not_need_a_native_display_parent() {
         .unwrap();
     assert_eq!(columns(&mut harness), vec![vec![0], vec![2], vec![1]]);
 }
+
+#[test]
+fn layout_plan_keeps_inner_operations_on_the_admission_path() {
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(10);
+    harness.mock_state.take_focus_requests();
+    replay(&mut harness, vec![LayoutOp::Focus(999), LayoutOp::Focus(1)]);
+    assert_eq!(harness.mock_state.take_focus_requests(), vec![1]);
+}

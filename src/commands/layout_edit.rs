@@ -1,4 +1,5 @@
 //! Arrangement and stack-height intent, independent of native effect eligibility.
+use super::admission::Admission;
 use super::{Action, Operation, ResizeAxis, ResizeDirection};
 use crate::config::Config;
 use crate::ecs::focus::FocusCoordinator;
@@ -37,26 +38,22 @@ pub(super) fn execute(
             space_id,
             operation: SpaceLayoutOperation::Equalize { column },
         } => {
-            let mut matches = strips
-                .iter()
-                .filter(|(_, strip, _, active)| space_id.map_or(*active, |id| strip.id() == id));
-            let Some((_, strip, _, _)) = matches.next() else {
-                return reject("layout_not_found");
+            let strip = match Admission::space_scope_strip_in(
+                strips.iter().map(|(_, strip, _, active)| (active, strip)),
+                space_id,
+            ) {
+                Ok(strip) => strip,
+                Err(rejection) => return Some(Err(rejection.into())),
             };
-            if matches.next().is_some() {
-                return reject("ambiguous_layout");
-            }
             let entity = if let Some(ordinal) = column {
-                let Some(index) = ordinal.checked_sub(1) else {
-                    return reject("column_out_of_range");
+                let index = match Admission::column_index(strip, ordinal) {
+                    Ok(index) => index,
+                    Err(rejection) => return Some(Err(rejection.into())),
                 };
-                let Ok(column) = strip.get(index) else {
-                    return reject("column_out_of_range");
-                };
-                let Some(entity) = column.top() else {
-                    return reject("column_unavailable");
-                };
-                entity
+                match Admission::column_leader(strip, index) {
+                    Ok(entity) => entity,
+                    Err(rejection) => return Some(Err(rejection.into())),
+                }
             } else {
                 let Some(entity) = super::command_entity(&windows, &focus) else {
                     return reject("no_focused_window");
@@ -79,8 +76,9 @@ pub(super) fn execute(
                     ..
                 }),
         } => {
-            let Some((_, entity)) = windows.find_any(window_id) else {
-                return reject("window_not_found");
+            let entity = match Admission::window_any(&windows, window_id) {
+                Ok(entity) => entity,
+                Err(rejection) => return Some(Err(rejection.into())),
             };
             if windows
                 .get_tracked(entity)
@@ -88,11 +86,12 @@ pub(super) fn execute(
             {
                 return None;
             }
-            let Some((_, strip, _, _)) = strips
-                .iter()
-                .find(|(_, strip, _, _)| strip.contains(entity))
-            else {
-                return reject("layout_not_found");
+            let strip = match Admission::strip_containing_in(
+                strips.iter().map(|(_, strip, _, _)| strip),
+                entity,
+            ) {
+                Ok(strip) => strip,
+                Err(rejection) => return Some(Err(rejection.into())),
             };
             (strip.id(), entity, operation)
         }
@@ -104,8 +103,8 @@ pub(super) fn execute(
     let Ok(index) = strip.index_of(entity) else {
         return reject("layout_membership_unresolved");
     };
-    if matches!(strip.get(index), Ok(Column::Fullscren(_))) {
-        return reject("ineligible_layout_entry");
+    if let Err(rejection) = Admission::ineligible_column(&strip, index) {
+        return Some(Err(rejection.into()));
     }
     let visible = topology.visible_display_for_space(space).is_some();
     let mut affected = vec![index];
@@ -128,16 +127,8 @@ pub(super) fn execute(
         None
     };
     for index in affected {
-        let Ok(column) = strip.get(index) else {
-            return reject("column_unavailable");
-        };
-        if matches!(column, Column::Fullscren(_)) {
-            return reject("ineligible_layout_entry");
-        }
-        if column.window_iter().any(|member| {
-            windows.get_any(member).is_none() || windows.layout_transition_pending(member)
-        }) {
-            return reject("layout_transition_pending");
+        if let Err(rejection) = Admission::eligible_column_in(&windows, &strip, index) {
+            return Some(Err(rejection.into()));
         }
     }
     if let Operation::Move(direction) = &operation

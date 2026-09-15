@@ -190,7 +190,9 @@ objects stay on their owning threads.
 | `src/manager/` | OS-agnostic traits (`WindowApi`, `ProcessApi`) and their macOS implementations (`WindowOS`). |
 | `src/platform/` | Low-level macOS FFI, event loop integration, and workspace/input hooks. |
 | `src/config/` | Configuration parsing, validation, and hot-reloading logic. |
-| `src/commands.rs` | Implementation of CLI subcommands. |
+| `src/commands.rs` | The thin ordered action reader (`dispatch_actions`) plus the command helpers shared with the executors. |
+| `src/commands/admission.rs` | Command Admission: the single action reader, the shared target/layout recipes, and the typed rejection vocabulary. |
+| `src/commands/` | Domain executors for targeted windows, display transfer, layout edits, and column widths. |
 | `src/client.rs` | The CLI query, command, and subscription adapter over the typed IPC protocol. |
 | `src/client_script.rs` | Isolated, on-demand Lua client execution; injects the socket-backed `spool` module without entering the daemon runtime. |
 | `src/reader.rs` | The daemon adapter: turns authenticated local IPC requests into events. |
@@ -313,13 +315,25 @@ before issuing an intent; the existing move transaction then owns its captured
 entity/incarnation bindings. These are freshness checks, not client authentication
 or a frozen world revision.
 
-`commands::dispatch_actions` is the single reader for runtime actions, including
+`commands::dispatch_actions` is a thin reader: it turns checked IPC requests into
+admission receipts and forwards every bus action to `commands::admission`.
+`admission::execute` (the checked path) and `admission::execute_dispatched` (the
+fire-and-forget path) are the single readers for runtime actions, including
 directional window operations, named focus, Space commands, column reorder, and
-returned script plans. It runs after the event pump and before topology refresh.
-Each command flushes its deferred changes and observers before the next command
-is accepted. A plan's operations use the same nested execution path, so native
-focus and movement do not return to a separate message reader behind later
-actions. Snapshot identity is checked again at the native command handoff.
+effect-only actions. They share one ordered pipeline: the lifecycle and
+`session_not_writable` gate, the effect-only actions, default-target resolution,
+then the domain executor. The shared `Admission` recipes resolve target windows,
+unique strips and displays, native membership, and layout writability in one
+place, and the bounded typed `Rejection` maps to the existing snake-case IPC
+codes. The reader runs after the event pump and before topology refresh. Each
+command flushes its deferred changes and observers before the next command is
+accepted.
+
+`Action::Layout(plan)` is the one deliberate second boundary:
+`layout_ops::apply_layout_plan` replays the captured plan operation by operation,
+and each operation still takes its own admission path, so native focus and
+movement do not return to a separate message reader behind later actions.
+Snapshot identity is checked again at the native command handoff.
 
 Window mutations select the still-pending focus request before confirmed focus;
 this does not optimistically change `FocusedMarker` or public focus state. An

@@ -1,4 +1,5 @@
 //! State-only column edits. Native eligibility belongs to the effect committer.
+use super::admission::Admission;
 use super::{Action, Operation, ResizeAxis};
 use crate::config::Config;
 use crate::ecs::layout::{Column, LayoutStrip, WidthIntent};
@@ -7,16 +8,6 @@ use crate::ecs::{ActiveWorkspaceMarker, DockPosition};
 use crate::manager::Display;
 use bevy::prelude::*;
 use spool_shared_types::commands::{ColumnWidth, SpaceLayoutOperation};
-
-type PendingTransitions<'w, 's> = Query<
-    'w,
-    's,
-    (),
-    Or<(
-        With<crate::ecs::native_space::NativeMoveOwner>,
-        With<crate::ecs::workspace::WindowSpaceReassignmentPending>,
-    )>,
->;
 
 #[derive(bevy::ecs::system::SystemParam)]
 pub(super) struct WidthEditPresentation<'w, 's> {
@@ -56,7 +47,6 @@ pub(super) fn execute(
     )>,
     displays: Query<(&Display, Option<&DockPosition>)>,
     config: Res<Config>,
-    transitions: PendingTransitions,
     mut presentation: WidthEditPresentation,
 ) -> Option<crate::errors::Result<()>> {
     let reject = |reason| Some(Err(crate::errors::Error::rejected(reason)));
@@ -76,8 +66,9 @@ pub(super) fn execute(
                 }
                 | Operation::Maximize),
         } => {
-            let Some((_, entity)) = windows.find_any(window_id) else {
-                return reject("window_not_found");
+            let entity = match Admission::window_any(&windows, window_id) {
+                Ok(entity) => entity,
+                Err(rejection) => return Some(Err(rejection.into())),
             };
             if windows
                 .get_tracked(entity)
@@ -85,15 +76,17 @@ pub(super) fn execute(
             {
                 return None;
             }
-            let Some((strip, _, _)) = strips.iter().find(|(strip, _, _)| strip.contains(entity))
-            else {
-                return reject("layout_not_found");
+            let strip = match Admission::strip_containing_in(
+                strips.iter().map(|(strip, _, _)| strip),
+                entity,
+            ) {
+                Ok(strip) => strip,
+                Err(rejection) => return Some(Err(rejection.into())),
             };
-            if strip.column_containing(entity).is_some_and(|column| {
-                column
-                    .window_iter()
-                    .any(|member| transitions.contains(member))
-            }) {
+            if strip
+                .index_of(entity)
+                .is_ok_and(|index| Admission::column_transition_pending_in(&windows, strip, index))
+            {
                 return reject("layout_transition_pending");
             }
             let space = strip.id();
@@ -105,24 +98,28 @@ pub(super) fn execute(
         }
         _ => return None,
     };
-    let mut matches = strips
+    let strip_id = match Admission::space_scope_strip_in(
+        strips.iter().map(|(strip, _, active)| (active, strip)),
+        space,
+    ) {
+        Ok(strip) => strip.id(),
+        Err(rejection) => return Some(Err(rejection.into())),
+    };
+    let Some((mut strip, _, _)) = strips
         .iter_mut()
-        .filter(|(strip, _, active)| space.map_or(*active, |id| strip.id() == id));
-    let Some((mut strip, _, _)) = matches.next() else {
+        .find(|(strip, _, _)| strip.id() == strip_id)
+    else {
         return reject("layout_not_found");
     };
-    if matches.next().is_some() {
-        return reject("ambiguous_layout");
-    }
     let ordinal = match operation {
         SpaceLayoutOperation::SetWidth { column, .. } => Some(column),
         SpaceLayoutOperation::Balance { reference_column } => reference_column,
         _ => unreachable!(),
     };
     let index = match ordinal {
-        Some(ordinal) => match ordinal.checked_sub(1) {
-            Some(index) => index,
-            None => return reject("column_out_of_range"),
+        Some(ordinal) => match Admission::ordinal_index(ordinal) {
+            Ok(index) => index,
+            Err(rejection) => return Some(Err(rejection.into())),
         },
         None => match windows
             .focused()
@@ -133,22 +130,14 @@ pub(super) fn execute(
             None => return reject("no_focused_window"),
         },
     };
-    if strip.get(index).is_err()
-        || strip
-            .get(index)
-            .is_ok_and(|column| matches!(column, Column::Fullscren(_)))
-    {
-        return reject("ineligible_layout_entry");
+    if let Err(rejection) = Admission::ineligible_column(&strip, index) {
+        return Some(Err(rejection.into()));
     }
     if strip
         .columns()
         .enumerate()
         .filter(|(i, _)| matches!(operation, SpaceLayoutOperation::Balance { .. }) || *i == index)
-        .any(|(_, column)| {
-            column
-                .window_iter()
-                .any(|member| transitions.contains(member))
-        })
+        .any(|(i, _)| Admission::column_transition_pending_in(&windows, &strip, i))
     {
         return reject("layout_transition_pending");
     }
@@ -212,10 +201,8 @@ fn edit_window(
         .iter_mut()
         .find(|(strip, _, _)| strip.id() == space)?;
     let index = strip.index_of(entity).ok()?;
-    if matches!(strip.get(index), Ok(Column::Fullscren(_))) {
-        return Some(Err(crate::errors::Error::rejected(
-            "ineligible_layout_entry",
-        )));
+    if let Err(rejection) = Admission::ineligible_column(&strip, index) {
+        return Some(Err(rejection.into()));
     }
     let state = strip.column_state(index)?;
     let id = state.id;
