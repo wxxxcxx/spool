@@ -85,8 +85,8 @@ without activating a Space. Geometry is derived only when the owning viewport an
 trusted constraints permit it; native writes independently check current eligibility.
 `Balance` copies the reference column's original width variant. Maximize stores that
 variant for restoration and validates any unstack before publishing changes.
-`Equalize` still edits pending stack heights; that later migration is not part of the
-column-width slice.
+`Equalize` edits those same retained stack heights: the stack-height slice moved it
+to the state-edit path, so it is no longer a pending-height mechanism.
 `Windows::moving_frame` overlays pending requests on the desired projection and
 rejects unrepresentable frames. Resize centering uses wide intermediate arithmetic;
 viewport clamping preserves representable origins and positive-size endpoints.

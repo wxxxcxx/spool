@@ -596,7 +596,9 @@ its reasoning.
 3. **Cover the preconditions before moving them.** Landed as step 2b. The
    `native_precondition_failed` rejection for a Space move to an unknown target
    had no test; both branches now have one, mutation-checked by neutering the
-   precondition.
+   precondition. (Later, 2026-09-15: that refusal is `target_space_unavailable`
+   and its siblings are named too — the membership slice's first step; see
+   `wayfinding/declarative-state/issues/23-space-membership.md`.)
 4. **Let the observation epoch own the per-Space membership fallback.**
    Landed. `SpaceMemberships` answers a Space at a time from one scan, and
    reads a Space alone when the scan could not be taken. The Bar's inline
