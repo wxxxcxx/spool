@@ -137,6 +137,13 @@ ADR 0006 的"不可见 Space 也应接受 desired-layout 编辑"在本票被**�
 - 不自动重试：测试断言超时修复后原生意图计数不变（只提交过那一次）。
 - 测试：`an_in_flight_attempt_is_not_repaired_back_by_the_observation` 覆盖"在途不修 → 超时带原因修回观测 → 不重试"；移除原因推导时该断言失败（`left: Some("membership_changed")`）。
 
+### task-4：跨显示器可见性门 — 结论：保留（2026-09-15）
+
+- **语义理由**：`move-to-display <next>` 的含义是"把这个窗口放到那块屏幕上我能看到的地方"。`transfer::execute` 会用目的显示器的可用视口计算并暂存新 frame，并在确认后把窗口呈现在那里；若目的显示器没有唯一可见的 Space，任何选择都是用户没做过的选择，而窗口落到该显示器未显示的 Space 会让用户看不到它。
+- 因此答案分开：目的显示器当前没有唯一可见 Space → `space_not_visible`（现在不行）；目标 Space 不存在/不是用户 Space → `target_space_unavailable`；目标是原生全屏 Space → `fullscreen_space`（task-1 已拆）。
+- 把窗口送到另一块屏幕上的**隐藏** Space 走的是 `move-to-space <id>`，不受此门约束（只要求目标已知且能力允许）。
+- 测试：`a_display_transfer_needs_a_space_the_destination_display_shows`（目的显示器有 Space → 接纳；没有 → 拒绝 `space_not_visible`）。文档：ARCHITECTURE 的 Cross-Display Command Admission 段落写明该理由。
+
 ## Resolution
 
 用户于 2026-09-15 逐项裁决：不变量 + 修复、修复不写原生、兜底顺序（观测 → 上次所在 → 未知）、一次尝试（2 秒，不自动重试）、以及"保留只在用户无法便宜重试且卡住状态常见持久时才做"这条判据。见上文 Answer。

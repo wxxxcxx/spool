@@ -1161,3 +1161,52 @@ fn cross_display_rejects_invalid_or_overflowing_viewports_without_writes() {
         assert_rejected(&mut harness, entity, source);
     }
 }
+
+/// `move-to-display` means "put this window where I can see it on that display",
+/// so it answers "not now" (`space_not_visible`) when the destination display is
+/// showing no single Space, instead of picking one the user never chose. It is
+/// not the same answer as "that Space does not exist", and targeting a hidden
+/// Space on another display is what the space-id move is for.
+#[test]
+fn a_display_transfer_needs_a_space_the_destination_display_shows() {
+    use spool_shared_types::wire::{AdmissionStatus, CheckedAction, Response};
+
+    let transfer = |harness: &mut TestHarness| {
+        let (reply, received) = async_channel::bounded(1);
+        harness
+            .world()
+            .write_message(Event::CheckedActionRequested {
+                request: CheckedAction {
+                    request_id: "display-transfer".into(),
+                    action: Action::TargetedWindow {
+                        window_id: 0,
+                        operation: Operation::ToNextDisplay(MoveFocus::Follow),
+                    },
+                },
+                respond_to: reply,
+            });
+        harness.world().run_schedule(PreUpdate);
+        let Response::Admission(receipt) = received.try_recv().expect("execution receipt") else {
+            panic!("admission response")
+        };
+        (receipt.status, receipt.code)
+    };
+
+    // The destination shows a Space: the transfer is admitted.
+    let mut visible = harness();
+    let (status, code) = transfer(&mut visible);
+    assert_eq!(status, AdmissionStatus::Accepted, "{code:?}");
+
+    // The destination shows none: refuse with the reason that it is not now.
+    let mut hidden = harness();
+    hidden.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![],
+    );
+    hidden.pump_frames(5);
+    hidden.mock_state.take_focus_requests();
+    let (status, code) = transfer(&mut hidden);
+    assert_eq!(status, AdmissionStatus::Rejected);
+    assert_eq!(code.as_deref(), Some("space_not_visible"));
+}

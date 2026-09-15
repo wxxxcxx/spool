@@ -410,6 +410,14 @@ tab siblings, native moves already in flight, and an overflowing proposed strip
 reject the request without partially removing the source layout. Pending
 initialization geometry also blocks transfer admission.
 
+The destination is the Space the target display is currently showing, and that is
+deliberate rather than incidental: the command means "put this window where I can
+see it on that display", so a display showing no single Space answers
+`space_not_visible` — not now — instead of choosing a Space the user never picked,
+and a window moved to a Space that display is not showing would leave the user's
+view. Targeting a hidden Space on another display is the space-id move's job, and
+that path is not gated this way.
+
 The selected native tab group moves as one layout item. Tiled width ratios and
 destination heights are planned in the command and enter the shared frame
 pipeline together; there is no delayed callback carrying an old width ratio or
