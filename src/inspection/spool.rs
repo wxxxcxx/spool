@@ -457,15 +457,23 @@ mod tests {
         let mut harness = crate::tests::TestHarness::new().with_windows(2);
         harness.pump_frames(10);
         let entity = crate::tests::find_window_entity(1, harness.world());
-        harness
-            .world()
-            .entity_mut(entity)
-            .insert(crate::ecs::native_space::SpaceMoveAttempt {
+        harness.world().entity_mut(entity).insert((
+            crate::ecs::native_space::SpaceMoveAttempt {
                 target_space_id: crate::tests::TEST_WORKSPACE_ID + 1,
                 result: crate::ecs::native_space::SpaceMoveResult::Refused(
                     "capability_unavailable".into(),
                 ),
-            });
+            },
+            crate::ecs::native_space::DeclaredSpace {
+                target: Some(crate::tests::TEST_WORKSPACE_ID),
+                observed: Some(crate::tests::TEST_WORKSPACE_ID + 1),
+                repairs: vec![crate::ecs::native_space::SpaceRepair {
+                    from: Some(crate::tests::TEST_WORKSPACE_ID + 1),
+                    to: Some(crate::tests::TEST_WORKSPACE_ID),
+                    reason: "target_space_destroyed",
+                }],
+            },
+        ));
 
         let mut request = ReadRequest::detail(Resource::Window, Source::Spool, Some(1));
         request.show = vec!["membership".into()];
@@ -482,6 +490,18 @@ mod tests {
         assert_eq!(
             report.data["membership"]["attempt"]["target_space_id"],
             crate::tests::TEST_WORKSPACE_ID + 1
+        );
+        assert_eq!(
+            report.data["membership"]["declared"],
+            crate::tests::TEST_WORKSPACE_ID
+        );
+        assert_eq!(
+            report.data["membership"]["observed"],
+            crate::tests::TEST_WORKSPACE_ID + 1
+        );
+        assert_eq!(
+            report.data["membership"]["repairs"][0]["reason"],
+            "target_space_destroyed"
         );
     }
 
