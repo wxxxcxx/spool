@@ -5,7 +5,7 @@ Type: task
 Label: wayfinder:task
 Status: resolved
 Assignee: none
-Parent: [ADR 0009 — Command Admission](../../adr/0009-command-admission.md)
+Parent: [ADR 0009 — Command Admission](../../../adr/0009-command-admission.md)
 Blocked by: 05
 
 ## What to build
