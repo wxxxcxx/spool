@@ -42,6 +42,14 @@ independently moved. New native window discovery does not create these groups.
 **Window Visibility**:
 Whether a tracked window is visible, minimized, or hidden. Visibility is independent of whether the window is tiled or floating.
 
+**Action Intake**:
+The path by which a requested action reaches a running Spool instance: a checked control request that is owed a receipt, a fire-and-forget request, a keybinding, or a script. Intakes differ in acknowledgement, not in whether the action must be admitted.
+_Avoid_: Action source, Entry point
+
+**Action Admission**:
+The decision that a requested action is accepted, refused, or ends the session, together with the order in which its effect is realized. It is one decision per request and does not depend on how the request reached Spool; the intake determines only whether the requester is owed a receipt. Action Admission includes the session-reach classification: whether an action needs a writable session or only a running one.
+_Avoid_: Command validation, Window Admission
+
 **Window Admission**:
 The decision to track an independent application window, ignore a non-window or excluded surface, or defer while its identity evidence is incomplete. Fallback admission carries an initial floating preference, but does not determine layout capability or override explicit placement choices.
 

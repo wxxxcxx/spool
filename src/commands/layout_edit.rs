@@ -1,5 +1,5 @@
 //! Arrangement and stack-height intent, independent of native effect eligibility.
-use super::admission::Admission;
+use super::admission::{Admission, Rejection};
 use super::{Action, Operation, ResizeAxis, ResizeDirection};
 use crate::config::Config;
 use crate::ecs::focus::FocusCoordinator;
@@ -56,10 +56,10 @@ pub(super) fn execute(
                 }
             } else {
                 let Some(entity) = super::command_entity(&windows, &focus) else {
-                    return reject("no_focused_window");
+                    return Some(Err(Rejection::NoFocusedWindow.into()));
                 };
                 if !strip.contains(entity) {
-                    return reject("focused_window_outside_space");
+                    return Some(Err(Rejection::FocusedWindowOutsideSpace.into()));
                 }
                 entity
             };

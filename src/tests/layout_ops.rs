@@ -1211,3 +1211,40 @@ fn layout_plan_keeps_inner_operations_on_the_admission_path() {
     replay(&mut harness, vec![LayoutOp::Focus(999), LayoutOp::Focus(1)]);
     assert_eq!(harness.mock_state.take_focus_requests(), vec![1]);
 }
+
+/// A script's plan is a Layout State edit like any other, so it is admitted by
+/// the session's writability, not by which intake delivered it. The batch is
+/// refused as one action; the replay stays snapshot-bound and op-by-op.
+#[test]
+fn a_layout_plan_cannot_edit_an_unwritable_session() {
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(5);
+    let intent = |harness: &mut TestHarness| {
+        let world = harness.world();
+        world
+            .query::<&LayoutStrip>()
+            .single(world)
+            .unwrap()
+            .column_states()
+            .nth(1)
+            .unwrap()
+            .width
+    };
+    let before = intent(&mut harness);
+    harness
+        .world()
+        .resource_mut::<crate::ecs::MissionControlActive>()
+        .0 = true;
+    replay(
+        &mut harness,
+        vec![LayoutOp::SetWidth {
+            window: 1,
+            ratio: 0.75,
+        }],
+    );
+    assert_eq!(
+        intent(&mut harness),
+        before,
+        "a plan must not edit Layout State while the session is not writable"
+    );
+}

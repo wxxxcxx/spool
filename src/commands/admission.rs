@@ -34,6 +34,73 @@ enum LifecycleEffect {
     Immediate,
 }
 
+/// Which gates one action passes before its effect may run.
+///
+/// The compiler demands an answer for every `Action` variant, so a new action
+/// cannot be added without stating its reach. A hand-written list of the gated
+/// variants would instead let a new one bypass the session gate by omission,
+/// which is how the same action came to be admitted differently on different
+/// intakes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionReach {
+    /// The session must be writable as well: not initializing, not showing
+    /// Mission Control, not exiting.
+    Writable,
+    /// The lifecycle gate alone decides.
+    Running,
+}
+
+fn session_reach(action: &Action) -> SessionReach {
+    match action {
+        // Layout State edits. `Layout(plan)` is one admitted batch whose inner
+        // operations still take their own admission path during replay.
+        Action::Window(_)
+        | Action::TargetedWindow { .. }
+        | Action::SpaceLayout { .. }
+        | Action::Layout(_) => SessionReach::Writable,
+        // Everything else keeps the reach it has today. Several of these do
+        // edit state — a Space focus preference, a native Space command — and
+        // the native command system revalidates the session itself; promoting
+        // one to `Writable` is its own change, with its own tests.
+        Action::SetSpaceFocusPreference { .. }
+        | Action::Mouse(_)
+        | Action::FocusWindow { .. }
+        | Action::FocusWindowInSpace { .. }
+        | Action::FocusSpace { .. }
+        | Action::MoveWindowToSpace { .. }
+        | Action::MoveColumnToSpace { .. }
+        | Action::MoveFocusedWindowToSpace { .. }
+        | Action::CreateSpace { .. }
+        | Action::DeleteSpace { .. }
+        | Action::ToggleBarCollapse
+        | Action::ReorderColumn { .. }
+        | Action::PrintState
+        | Action::ReconcileWindows
+        | Action::MissionControl
+        | Action::ShowDesktop
+        | Action::Lua(_)
+        // Answered before this classification is consulted.
+        | Action::Quit
+        | Action::Restart => SessionReach::Running,
+    }
+}
+
+fn session_is_writable(world: &World) -> bool {
+    !world.contains_resource::<crate::ecs::Initializing>()
+        && !world
+            .get_resource::<crate::ecs::MissionControlActive>()
+            .is_some_and(|overview| overview.0)
+        && !world.contains_resource::<crate::ecs::exit_restore::ExitInProgress>()
+}
+
+/// One translation for every effect arm: a cached system that could not run at
+/// all is an execution failure, while whatever the system itself concluded
+/// passes through untouched.
+fn invoked<T, E: std::fmt::Display>(outcome: Result<T, E>) -> crate::errors::Result<T> {
+    outcome
+        .map_err(|error| crate::errors::Error::rejection_with_cause("execution_unavailable", error))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "exhaustive command/source branches share one admission or capture boundary"
@@ -48,16 +115,8 @@ fn execute_action(
         && matches!(action, Action::Quit | Action::Restart)
     {
         return match action {
-            Action::Quit => world
-                .run_system_cached(super::command_quit_handler)
-                .map_err(|error| {
-                    crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                }),
-            Action::Restart => world
-                .run_system_cached(super::command_restart_handler)
-                .map_err(|error| {
-                    crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                }),
+            Action::Quit => invoked(world.run_system_cached(super::command_quit_handler)),
+            Action::Restart => invoked(world.run_system_cached(super::command_restart_handler)),
             _ => unreachable!("lifecycle action"),
         };
     }
@@ -70,230 +129,130 @@ fn execute_action(
     }
     // Effect-only actions carry no state to validate; they run before the
     // arrangement recipes so a session that cannot answer a layout query still
-    // reaches its native effect.
+    // reaches its native effect. `session_reach` declares the same reach.
     match &action {
         Action::MissionControl => {
-            return world
-                .run_system_cached_with(
-                    super::command_system_overview,
-                    crate::platform::mission_control::SystemOverview::MissionControl,
-                )
-                .map_err(|error| {
-                    crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                });
+            return invoked(world.run_system_cached_with(
+                super::command_system_overview,
+                crate::platform::mission_control::SystemOverview::MissionControl,
+            ));
         }
         Action::ShowDesktop => {
-            return world
-                .run_system_cached_with(
-                    super::command_system_overview,
-                    crate::platform::mission_control::SystemOverview::ShowDesktop,
-                )
-                .map_err(|error| {
-                    crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                });
+            return invoked(world.run_system_cached_with(
+                super::command_system_overview,
+                crate::platform::mission_control::SystemOverview::ShowDesktop,
+            ));
         }
         Action::PrintState => {
-            return world
-                .run_system_cached(super::print_internal_state_handler)
-                .map_err(|error| {
-                    crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                });
+            return invoked(world.run_system_cached(super::print_internal_state_handler));
         }
         Action::ReconcileWindows => {
-            return world
-                .run_system_cached(super::reconcile_windows_handler)
-                .map_err(|error| {
-                    crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                });
+            return invoked(world.run_system_cached(super::reconcile_windows_handler));
         }
         Action::ToggleBarCollapse => {
-            return world
-                .run_system_cached(super::command_toggle_bar_collapse)
-                .map_err(|error| {
-                    crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                });
+            return invoked(world.run_system_cached(super::command_toggle_bar_collapse));
         }
         _ => {}
     }
-    let action = world
-        .run_system_cached_with(resolve_default, action)
-        .map_err(|error| {
-            crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-        })??;
-    if let Some(result) = world
-        .run_system_cached_with(super::column_width::execute, action.clone())
-        .map_err(|error| {
-            crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-        })?
+    let action = invoked(world.run_system_cached_with(resolve_default, action))??;
+    if let Some(result) =
+        invoked(world.run_system_cached_with(super::column_width::execute, action.clone()))?
     {
         return result;
     }
-    if let Some(result) = world
-        .run_system_cached_with(super::layout_edit::execute, action.clone())
-        .map_err(|error| {
-            crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-        })?
+    if let Some(result) =
+        invoked(world.run_system_cached_with(super::layout_edit::execute, action.clone()))?
     {
         return result;
     }
-    if matches!(
-        action,
-        Action::TargetedWindow { .. } | Action::Window(_) | Action::SpaceLayout { .. }
-    ) && (world.contains_resource::<crate::ecs::Initializing>()
-        || world
-            .get_resource::<crate::ecs::MissionControlActive>()
-            .is_some_and(|overview| overview.0)
-        || world.contains_resource::<crate::ecs::exit_restore::ExitInProgress>())
-    {
+    if session_reach(&action) == SessionReach::Writable && !session_is_writable(world) {
         return Err(crate::errors::Error::rejected("session_not_writable"));
     }
     if let Action::Window(
         operation @ (Operation::FocusFloating | Operation::FocusTiled | Operation::FocusOtherLayer),
     ) = &action
     {
-        world
-            .run_system_cached_with(validate_layer_target, operation.clone())
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            })??;
+        invoked(world.run_system_cached_with(validate_layer_target, operation.clone()))??;
     }
     match action {
-        Action::Window(operation @ (Operation::Focus(_) | Operation::FocusStep(_))) => world
-            .run_system_cached_with(super::command_move_focus, operation)
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            })?,
-        Action::Window(Operation::Center) => world
-            .run_system_cached(super::command_center_window)
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            }),
-        Action::Window(Operation::ToggleFloating) => world
-            .run_system_cached(super::toggle_floating_window)
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            }),
-        Action::Window(Operation::Snap) => {
-            world
-                .run_system_cached(super::snap_window)
-                .map_err(|error| {
-                    crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                })
+        Action::Window(operation @ (Operation::Focus(_) | Operation::FocusStep(_))) => {
+            invoked(world.run_system_cached_with(super::command_move_focus, operation))?
         }
-        Action::Window(Operation::ToNextDisplay(move_focus)) => world
-            .run_system_cached_with(super::move_to_display, (move_focus, DisplayTarget::Next))
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            }),
-        Action::Window(Operation::FocusFloating) => world
-            .run_system_cached(super::command_focus_floating)
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            }),
-        Action::Window(Operation::FocusTiled) => world
-            .run_system_cached(super::command_focus_tiled)
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            }),
-        Action::Window(Operation::FocusOtherLayer) => world
-            .run_system_cached(super::command_focus_other_layer)
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            }),
-        Action::Mouse(super::MouseMove::ToNextDisplay) => world
-            .run_system_cached_with(
-                super::checked_focus_other_display,
-                (None, DisplayTarget::Next),
-            )
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            })?,
+        Action::Window(Operation::FocusFloating) => {
+            invoked(world.run_system_cached(super::command_focus_floating))
+        }
+        Action::Window(Operation::FocusTiled) => {
+            invoked(world.run_system_cached(super::command_focus_tiled))
+        }
+        Action::Window(Operation::FocusOtherLayer) => {
+            invoked(world.run_system_cached(super::command_focus_other_layer))
+        }
+        Action::Mouse(super::MouseMove::ToNextDisplay) => invoked(world.run_system_cached_with(
+            super::checked_focus_other_display,
+            (None, DisplayTarget::Next),
+        ))?,
         Action::SetSpaceFocusPreference {
             space_id,
             window_id,
-        } => world
-            .run_system_cached_with(
-                crate::ecs::focus::set_space_preference,
-                (space_id, window_id),
-            )
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            })?,
+        } => invoked(world.run_system_cached_with(
+            crate::ecs::focus::set_space_preference,
+            (space_id, window_id),
+        ))?,
         action @ (Action::FocusWindow { .. }
         | Action::FocusWindowInSpace { .. }
         | Action::FocusSpace { .. }
         | Action::CreateSpace { .. }
         | Action::DeleteSpace { .. }
         | Action::MoveWindowToSpace { .. }
-        | Action::MoveColumnToSpace { .. }) => world
-            .run_system_cached_with(
-                crate::ecs::native_space::execute_native_space_command,
-                crate::events::Event::action_requested(action),
-            )
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            })?,
+        | Action::MoveColumnToSpace { .. }) => invoked(world.run_system_cached_with(
+            crate::ecs::native_space::execute_native_space_command,
+            crate::events::Event::action_requested(action),
+        ))?,
         Action::TargetedWindow {
             window_id,
             operation: Operation::ToNextDisplay(move_focus),
-        } => world
-            .run_system_cached_with(
-                super::transfer::execute,
-                (window_id, move_focus, DisplayTarget::Next),
-            )
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            })?,
+        } => invoked(world.run_system_cached_with(
+            super::transfer::execute,
+            (window_id, move_focus, DisplayTarget::Next),
+        ))?,
         Action::TargetedWindow {
             window_id,
             operation: Operation::Move(direction),
         } => {
-            let destination = world
-                .run_system_cached_with(move_destination, (window_id, direction.clone()))
-                .map_err(|error| {
-                    crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                })?;
+            let destination = invoked(
+                world.run_system_cached_with(move_destination, (window_id, direction.clone())),
+            )?;
             if let Some(destination) = destination {
-                world
-                    .run_system_cached_with(
-                        super::transfer::execute,
-                        (window_id, super::MoveFocus::Follow, destination),
-                    )
-                    .map_err(|error| {
-                        crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                    })?
+                invoked(world.run_system_cached_with(
+                    super::transfer::execute,
+                    (window_id, super::MoveFocus::Follow, destination),
+                ))?
             } else {
-                world
-                    .run_system_cached_with(
-                        super::targeted::execute,
-                        Action::TargetedWindow {
-                            window_id,
-                            operation: Operation::Move(direction),
-                        },
-                    )
-                    .map_err(|error| {
-                        crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-                    })?
+                invoked(world.run_system_cached_with(
+                    super::targeted::execute,
+                    Action::TargetedWindow {
+                        window_id,
+                        operation: Operation::Move(direction),
+                    },
+                ))?
             }
         }
-        action @ Action::TargetedWindow { .. } => world
-            .run_system_cached_with(super::targeted::execute, action)
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            })?,
+        action @ Action::TargetedWindow { .. } => {
+            invoked(world.run_system_cached_with(super::targeted::execute, action))?
+        }
         Action::SpaceLayout {
             space_id,
             operation: SpaceLayoutOperation::ToggleTiledVisibility,
-        } => world
-            .run_system_cached_with(crate::ecs::tiled_visibility::toggle, space_id)
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            })?,
-        action @ Action::ReorderColumn { .. } => world
-            .run_system_cached_with(super::command_reorder_column, action)
-            .map_err(|error| {
-                crate::errors::Error::rejection_with_cause("execution_unavailable", error)
-            }),
+        } => invoked(world.run_system_cached_with(crate::ecs::tiled_visibility::toggle, space_id))?,
+        action @ Action::ReorderColumn { .. } => {
+            invoked(world.run_system_cached_with(super::command_reorder_column, action))
+        }
+        #[cfg(feature = "lua")]
+        Action::Layout(plan) => {
+            invoked(world.run_system_cached_with(crate::ecs::layout_ops::apply_layout_plan, plan))
+        }
+        #[cfg(not(feature = "lua"))]
+        Action::Layout(_) => Err(crate::errors::Error::rejected("unsupported_operation")),
         _ => Err(crate::errors::Error::rejected("unsupported_operation")),
     }
 }
@@ -350,11 +309,15 @@ fn resolve_default(
             operation: SpaceLayoutOperation::ToggleTiledVisibility,
         },
         Action::Window(
-            operation @ (Operation::Move(_)
+            operation @ (Operation::Center
+            | Operation::Move(_)
             | Operation::Resize { .. }
             | Operation::SetWidth(_)
             | Operation::Maximize
-            | Operation::ToggleStack),
+            | Operation::Snap
+            | Operation::ToggleFloating
+            | Operation::ToggleStack
+            | Operation::ToNextDisplay(_)),
         ) => Action::TargetedWindow {
             window_id: focused_id()?,
             operation,
@@ -576,39 +539,6 @@ impl Admission<'_, '_> {
             .ok_or(Rejection::WindowUnavailable)
     }
 
-    /// The focused window when it is visible, writable, and a member of `strip`.
-    #[cfg(test)]
-    pub(crate) fn active_space_target(&self, strip: &LayoutStrip) -> Result<Entity, Rejection> {
-        Self::active_space_target_in(&self.windows, &self.focus, strip, &self.manager)
-    }
-
-    /// The focused window when visible, writable, and a member of `strip`,
-    /// against explicit query, focus, and manager references.
-    pub(crate) fn active_space_target_in(
-        windows: &Windows,
-        focus: &FocusCoordinator,
-        strip: &LayoutStrip,
-        manager: &WindowManager,
-    ) -> Result<Entity, Rejection> {
-        let entity = Self::focused_target_in(windows, focus)?;
-        if !windows.layout_is_writable(entity) {
-            return Err(Rejection::WindowUnavailable);
-        }
-        let (window, _, state) = windows
-            .get_tracked(entity)
-            .ok_or(Rejection::WindowUnavailable)?;
-        let belongs = if state.is_tiled() {
-            strip.contains(entity)
-        } else {
-            manager
-                .windows_in_workspace(strip.id())
-                .is_ok_and(|ids| ids.contains(&window.id()))
-        };
-        belongs
-            .then_some(entity)
-            .ok_or(Rejection::FocusedWindowOutsideSpace)
-    }
-
     /// The window's one visible, non-fullscreen Native Space.
     pub(crate) fn visible_space(&mut self, window_id: WinID) -> Result<WorkspaceId, Rejection> {
         let space = self
@@ -779,16 +709,17 @@ impl Admission<'_, '_> {
     }
 
     /// The one strip owning `space`, refusing an absent or duplicated layout.
+    ///
+    /// Shares [`Self::space_scope_strip_in`]'s uniqueness rule rather than
+    /// restating it.
     #[cfg(test)]
     pub(crate) fn unique_strip(&self, space: WorkspaceId) -> Result<&LayoutStrip, Rejection> {
-        let mut matches = self
-            .strips
-            .iter()
-            .filter(|(_, strip, _, _)| strip.id() == space);
-        let (_, strip, _, _) = matches.next().ok_or(Rejection::LayoutNotFound)?;
-        (matches.next().is_none())
-            .then_some(strip)
-            .ok_or(Rejection::AmbiguousLayout)
+        Self::space_scope_strip_in(
+            self.strips
+                .iter()
+                .map(|(_, strip, _, active)| (active, strip)),
+            Some(space),
+        )
     }
 
     /// The one strip owning the active Space, or `space` when named, refusing an

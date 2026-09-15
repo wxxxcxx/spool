@@ -478,8 +478,13 @@ A retained source strip does not grant permission to modify an in-flight move.
 `Windows::layout_is_writable` requires an available window without either
 `NativeMoveOwner` or `WindowSpaceReassignmentPending`. Local geometry/structure
 commands and named script mutations check this before changing layout or
-publishing resize/reposition requests. Focus and floating classification retain
-their separate admission paths.
+publishing resize/reposition requests. Ordered admission applies that check,
+the lifecycle gates and the session-writability gate for every action and every
+intake: a keybinding and a checked control request are refused together, and
+`Center`, `Snap` and a script plan no longer have their own route around them.
+Focus and floating classification retain their separate admission paths;
+floating classification edits Layout State but not geometry, so a move's
+ownership barrier does not refuse it.
 
 Column-wide changes check every affected member, not just the named or focused
 window. Stack/unstack and maximize include the original column; stacking also

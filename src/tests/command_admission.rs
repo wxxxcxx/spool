@@ -24,10 +24,6 @@ fn writable_window(In(window_id): In<i32>, admission: Admission) -> Result<Entit
 fn focus_target(admission: Admission) -> Result<Entity, Rejection> {
     admission.focus_target()
 }
-fn active_target_outside_strip(admission: Admission) -> Result<Entity, Rejection> {
-    admission.active_space_target(&LayoutStrip::new(9999))
-}
-
 fn unique_strip(In(space): In<u64>, admission: Admission) -> Result<(), Rejection> {
     admission.unique_strip(space).map(|_| ())
 }
@@ -208,18 +204,6 @@ fn no_focused_window_is_rejected() {
     harness.pump_frames(10);
     let result = harness.world().run_system_once(focus_target).unwrap();
     assert_eq!(result, Err(Rejection::NoFocusedWindow));
-}
-
-#[test]
-fn focused_window_outside_strip_is_rejected() {
-    let mut harness = harness();
-    harness.mock_state.focus_window(0);
-    harness.pump_frames(5);
-    let result = harness
-        .world()
-        .run_system_once(active_target_outside_strip)
-        .unwrap();
-    assert_eq!(result, Err(Rejection::FocusedWindowOutsideSpace));
 }
 
 #[test]

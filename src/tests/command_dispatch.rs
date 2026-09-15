@@ -609,20 +609,131 @@ fn command_batch_preserves_script_and_named_focus_order() {
     }
 }
 
+/// Centering brings the pointer to the display under the option that governs
+/// keyboard pointer movement, and the default and the explicit target agree:
+/// the keybinding and the control request share one `Center` implementation.
 #[test]
-fn dispatched_center_uses_the_active_display_and_wraps_the_mouse() {
-    use bevy::ecs::system::RunSystemOnce;
-    let mut harness = harness();
-    let expected = harness
-        .world()
-        .run_system_once(
-            |active: crate::ecs::params::ActiveDisplay, config: Res<crate::config::Config>| {
-                active.actual_bounds(&config).center()
+fn center_moves_the_pointer_only_when_configured_to() {
+    use crate::config::MainOptions;
+    for (mouse_follows_focus, moves) in [(true, true), (false, false)] {
+        for action in [
+            Action::Window(Operation::Center),
+            Action::TargetedWindow {
+                window_id: 0,
+                operation: Operation::Center,
             },
-        )
-        .unwrap();
-    dispatch(&mut harness, [Action::Window(Operation::Center)]);
-    assert_eq!(harness.mock_state.cursor_position(), expected);
+        ] {
+            let config: crate::config::Config = (
+                MainOptions {
+                    mouse_follows_focus: Some(mouse_follows_focus),
+                    ..Default::default()
+                },
+                vec![],
+            )
+                .into();
+            let mut harness = TestHarness::new().with_config(config).with_windows(4);
+            harness.pump_frames(10);
+            harness.mock_state.focus_window(0);
+            harness.pump_frames(5);
+            harness.mock_state.take_focus_requests();
+            let before = harness.mock_state.cursor_position();
+            dispatch(&mut harness, [action.clone()]);
+            assert_eq!(
+                harness.mock_state.cursor_position() != before,
+                moves,
+                "mouse_follows_focus={mouse_follows_focus} for {action:?}"
+            );
+        }
+    }
+}
+
+/// The whole point of one admission table: the intake decides whether the
+/// requester is owed a receipt, never whether the action is admitted.
+#[test]
+fn one_action_is_admitted_the_same_way_from_either_intake() {
+    use spool_shared_types::wire::{AdmissionStatus, CheckedAction, Response};
+    for refusing in [false, true] {
+        let action = Action::Window(Operation::FocusTiled);
+
+        let mut bus = harness();
+        if refusing {
+            bus.world()
+                .resource_mut::<crate::ecs::MissionControlActive>()
+                .0 = true;
+        }
+        bus.world()
+            .write_message(Event::action_requested(action.clone()));
+        bus.world().run_schedule(PreUpdate);
+        let bus_acted = !bus.mock_state.take_focus_requests().is_empty();
+
+        let mut wire = harness();
+        if refusing {
+            wire.world()
+                .resource_mut::<crate::ecs::MissionControlActive>()
+                .0 = true;
+        }
+        let (reply, received) = async_channel::bounded(1);
+        wire.world().write_message(Event::CheckedActionRequested {
+            request: CheckedAction {
+                request_id: "intake-parity".into(),
+                action,
+            },
+            respond_to: reply,
+        });
+        wire.world().run_schedule(PreUpdate);
+        let Response::Admission(receipt) = received.try_recv().expect("execution receipt") else {
+            panic!("admission response")
+        };
+
+        assert_eq!(
+            !wire.mock_state.take_focus_requests().is_empty(),
+            bus_acted,
+            "refusing={refusing}: both intakes must reach the same outcome"
+        );
+        assert_eq!(
+            receipt.status,
+            if bus_acted {
+                AdmissionStatus::Accepted
+            } else {
+                AdmissionStatus::Rejected
+            },
+            "refusing={refusing}: the receipt must agree with the bus outcome"
+        );
+        if refusing {
+            assert_eq!(receipt.code.as_deref(), Some("session_not_writable"));
+        }
+    }
+}
+
+fn repositions(harness: &mut TestHarness) -> usize {
+    let world = harness.world();
+    world.query::<&RepositionMarker>().iter(world).count()
+}
+
+/// `Center` and `Snap` reach the strip through the one admission table now, so
+/// the session gate applies to them on the bus intake too — it never did.
+#[test]
+fn center_and_snap_obey_the_session_gate_from_the_bus() {
+    for operation in [Operation::Center, Operation::Snap] {
+        let mut writable = harness();
+        dispatch(&mut writable, [Action::Window(operation.clone())]);
+        assert!(
+            repositions(&mut writable) > 0,
+            "{operation:?} must reach the strip while the session is writable"
+        );
+
+        let mut blocked = harness();
+        blocked
+            .world()
+            .resource_mut::<crate::ecs::MissionControlActive>()
+            .0 = true;
+        dispatch(&mut blocked, [Action::Window(operation)]);
+        assert_eq!(
+            repositions(&mut blocked),
+            0,
+            "Mission Control must refuse the action on the bus intake"
+        );
+    }
 }
 
 #[test]

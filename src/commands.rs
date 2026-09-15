@@ -22,16 +22,13 @@ use display_navigation::{DisplayTarget, display_at, select_display, visible_fram
 use crate::config::Config;
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::FocusCoordinator;
-use crate::ecs::layout::{
-    Column, LayoutStrip, StackItem, centered_origin_in_viewport, clamp_origin_to_viewport,
-};
+use crate::ecs::layout::{Column, LayoutStrip, StackItem, centered_origin_in_viewport};
 use crate::ecs::native_space::VisibleNativeSpaceMarker;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::window_frame::{checked_frame_size, checked_window_frame};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Floating, FocusedMarker, FullWidthMarker,
-    NativeFullscreenMarker, RaiseWindow, RetilePending, RetileWindow, SendMessageTrigger,
-    SpawnCommandsExt,
+    NativeFullscreenMarker, RaiseWindow, SendMessageTrigger, SpawnCommandsExt,
 };
 use crate::events::{Event, ReconcileScope};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -114,18 +111,6 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
             continue;
         };
         match action {
-            // A script's returned plan is its own ordered batch boundary:
-            // `layout_ops` applies it op-by-op, and each inner operation takes
-            // its own admission path.
-            #[cfg(feature = "lua")]
-            Action::Layout(plan) => {
-                commands.run_system_cached_with(
-                    crate::ecs::layout_ops::apply_layout_plan,
-                    plan.clone(),
-                );
-            }
-            #[cfg(not(feature = "lua"))]
-            Action::Layout(_) => {}
             // Lua execution is asynchronous; its returned plan enters this queue later.
             Action::Lua(_) => {}
             action => {
@@ -207,15 +192,6 @@ fn command_system_overview(
 /// a destructive action back to the previously confirmed window.
 fn command_entity(windows: &Windows, focus: &FocusCoordinator) -> Option<Entity> {
     admission::Admission::focused_target_in(windows, focus).ok()
-}
-
-fn active_command_entity(
-    windows: &Windows,
-    focus: &FocusCoordinator,
-    strip: &LayoutStrip,
-    manager: &WindowManager,
-) -> Option<Entity> {
-    admission::Admission::active_space_target_in(windows, focus, strip, manager).ok()
 }
 
 fn writable_column_range(windows: &Windows, strip: &LayoutStrip, a: Entity, b: Entity) -> bool {
@@ -783,50 +759,6 @@ fn command_focus_other_layer(
     debug!("focused other layer: floating={focus_floating}");
 }
 
-/// Centers the focused window on the active display.
-fn command_center_window(
-    windows: Windows,
-    focus: Res<FocusCoordinator>,
-    active_display: ActiveDisplay,
-    config: Res<Config>,
-    window_manager: Res<WindowManager>,
-    mut commands: Commands,
-) {
-    if let Some((_, entity, state)) = active_command_entity(
-        &windows,
-        &focus,
-        active_display.active_strip(),
-        &window_manager,
-    )
-    .and_then(|entity| windows.get_tracked(entity))
-        && let Some(frame) = windows.requested_frame(entity)
-    {
-        let size = frame.size();
-        let mut origin = frame.min;
-        let viewport = active_display.actual_bounds(&config);
-        if viewport.width() <= 0 || viewport.height() <= 0 {
-            return;
-        }
-
-        if state.is_tiled()
-            && active_display.active_strip().contains(entity)
-            && let Some(layout_position) = windows.layout_position(entity)
-        {
-            origin.x = active_display.bounds().center().x - size.x / 2;
-            // Directly reposition the strip (bypasses hidden_ratio check).
-            let strip_position = origin - layout_position.0;
-            commands.reposition_entity(active_display.active_strip_entity(), strip_position);
-        } else {
-            origin.x = viewport.center().x - size.x / 2;
-            origin.y = viewport.center().y - size.y / 2;
-            origin = clamp_origin_to_viewport(origin, size, viewport);
-            commands.reposition_entity(entity, origin);
-        }
-
-        window_manager.warp_mouse(viewport.center());
-    }
-}
-
 fn resized_dimension(current: i32, delta: i32, available: i32) -> Option<i32> {
     if available <= 0 {
         return None;
@@ -931,62 +863,6 @@ fn tiled_width_ratio(operation: &Operation, current: f64, config: &Config) -> Op
     }
 }
 
-/// Toggles the focused window between the tiling layout and floating mode.
-fn toggle_floating_window(
-    windows: Windows,
-    focus: Res<FocusCoordinator>,
-    pending_retiles: Query<(), With<RetilePending>>,
-    mut commands: Commands,
-) {
-    let Some((window, entity, state)) =
-        command_entity(&windows, &focus).and_then(|entity| windows.get_tracked(entity))
-    else {
-        return;
-    };
-    debug!(
-        "window: {} {entity} floating: {}.",
-        window.id(),
-        state.is_floating()
-    );
-    if !state.is_visible() {
-        return;
-    }
-    let was_floating = state.is_floating();
-    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        if pending_retiles.contains(entity) {
-            // A second toggle cancels the outstanding tile intent.
-            entity_commands.try_remove::<RetilePending>();
-        } else if was_floating {
-            commands.trigger(RetileWindow(entity));
-        } else {
-            entity_commands.try_insert(Floating);
-        }
-    }
-}
-
-/// Plans the complete transfer before publishing layout or geometry changes.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn move_to_display(
-    In((move_focus, target)): In<(MoveFocus, DisplayTarget)>,
-    windows: Windows,
-    focus: Res<FocusCoordinator>,
-    mut commands: Commands,
-) {
-    let Some(window_id) = command_entity(&windows, &focus)
-        .and_then(|entity| windows.get(entity))
-        .map(|window| window.id())
-    else {
-        return;
-    };
-    commands.queue(move |world: &mut bevy::prelude::World| {
-        match world.run_system_cached_with(transfer::execute, (window_id, move_focus, target)) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => debug!(%error, "display transfer rejected"),
-            Err(error) => debug!(%error, "display transfer unavailable"),
-        }
-    });
-}
-
 #[derive(bevy::ecs::system::SystemParam)]
 struct MouseContext<'w, 's> {
     admission: admission::Admission<'w, 's>,
@@ -1074,69 +950,6 @@ fn checked_focus_other_display(
         commands.focus_entity(entity, true);
     }
     Ok(())
-}
-
-/// Slides the strip so the focused window is fully visible, snapping to the
-/// nearest edge: left-aligned when the window overflows left, right-aligned
-/// when it overflows right. No resize — the window keeps its current size.
-/// Bypasses the lazy-viewport check since the user explicitly asked to reveal.
-fn snap_window(
-    windows: Windows,
-    focus: Res<FocusCoordinator>,
-    window_manager: Res<WindowManager>,
-    active_display: ActiveDisplay,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    let Some((_, entity, state)) = active_command_entity(
-        &windows,
-        &focus,
-        active_display.active_strip(),
-        &window_manager,
-    )
-    .and_then(|entity| windows.get_tracked(entity)) else {
-        return;
-    };
-    let Some(mut frame) = windows.moving_frame(entity) else {
-        return;
-    };
-
-    let display_bounds = active_display.actual_bounds(&config);
-    if checked_frame_size(display_bounds).is_none() {
-        return;
-    }
-
-    // Clamp the frame into the display and reposition the *strip* (not the
-    // window) so the layout stays consistent.
-    let size = frame.size();
-    frame.min = clamp_origin_to_viewport(frame.min, size, display_bounds);
-    frame.max = frame.min + size;
-
-    if state.is_floating() {
-        commands.reposition_entity(entity, frame.min);
-        return;
-    }
-
-    if active_display
-        .active_strip()
-        .column_containing(entity)
-        .is_none_or(|column| matches!(column, Column::Fullscren(_)))
-    {
-        return;
-    }
-
-    let Some(layout_position) = windows.layout_position(entity) else {
-        return;
-    };
-
-    let Some(x) = frame.min.x.checked_sub(layout_position.0.x) else {
-        return;
-    };
-    let Some(y) = frame.min.y.checked_sub(layout_position.0.y) else {
-        return;
-    };
-    let strip_position = Origin::new(x, y);
-    commands.reposition_entity(active_display.active_strip_entity(), strip_position);
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]

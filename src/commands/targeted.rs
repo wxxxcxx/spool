@@ -35,6 +35,7 @@ pub(super) fn execute(
     blocked: BlockedWindows,
     mut admission: Admission,
     config: Res<Config>,
+    window_manager: Res<crate::manager::WindowManager>,
     mut commands: Commands,
 ) -> crate::errors::Result<()> {
     let Action::TargetedWindow {
@@ -46,13 +47,30 @@ pub(super) fn execute(
             "unsupported explicit operation",
         ));
     };
-    let entity = admission.writable_window(window_id)?;
-    if blocked.contains(entity) {
-        return Err(crate::errors::Error::rejected("window_unavailable"));
-    }
+    let entity = admission.window(window_id).map(|(_, entity)| entity)?;
     let (_, _, state) = windows
         .get_tracked(entity)
         .ok_or_else(|| crate::errors::Error::rejected("window_unavailable"))?;
+    if !state.is_visible() {
+        return Err(crate::errors::Error::rejected("window_unavailable"));
+    }
+    // Floating classification edits Layout State without touching geometry, so
+    // it needs neither a writable layout nor a resolved Space: a native move in
+    // flight does not refuse it. It is still refused by the session gate, and a
+    // default and an explicit target admit it the same way.
+    if matches!(operation, Operation::ToggleFloating) {
+        if pending_retiles.contains(entity) {
+            commands.entity(entity).remove::<RetilePending>();
+        } else if state.is_floating() {
+            commands.trigger(RetileWindow(entity));
+        } else {
+            commands.entity(entity).insert(Floating);
+        }
+        return Ok(());
+    }
+    if !windows.layout_is_writable(entity) || blocked.contains(entity) {
+        return Err(crate::errors::Error::rejected("window_unavailable"));
+    }
     let space = admission.visible_space(window_id)?;
     let view = admission.space_view(space)?;
     let strip_entity = view.strip_entity;
@@ -88,16 +106,7 @@ pub(super) fn execute(
             }
             Err(crate::errors::Error::rejected("invalid_geometry_domain"))
         }
-        Operation::ToggleFloating => {
-            if pending_retiles.contains(entity) {
-                commands.entity(entity).remove::<RetilePending>();
-            } else if state.is_floating() {
-                commands.trigger(RetileWindow(entity));
-            } else {
-                commands.entity(entity).insert(Floating);
-            }
-            Ok(())
-        }
+        Operation::ToggleFloating => unreachable!("answered above the geometry bar"),
         Operation::Snap => {
             let frame = windows
                 .moving_frame(entity)
@@ -200,6 +209,12 @@ pub(super) fn execute(
                     viewport,
                 );
                 commands.reposition_entity(entity, origin);
+            }
+            // Centering also brings the pointer to the display, but only under
+            // the option that governs keyboard pointer movement: a user who
+            // turned that off still expects no pointer jump.
+            if config.mouse_follows_focus() {
+                window_manager.warp_mouse(viewport.center());
             }
             Ok(())
         }
