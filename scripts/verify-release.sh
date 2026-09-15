@@ -25,10 +25,14 @@ mkdir -p "$artifacts/default" "$artifacts/without-lua" "$artifacts/lua"
 cargo fmt --all -- --check
 cargo check --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked -- --test-threads=1
+# Parallel by default: the suite isolates its own state (per-test Bevy `App`,
+# per-test mock `WindowManager`, pid+nonce temp files, temporary IPC sockets),
+# and running it serially costs ~4x the wall clock for no isolation benefit.
+# `--test-threads=1` is a debugging tool for order-dependent flakes, not a gate.
+cargo test --workspace --locked
 cargo check -p spool --no-default-features --locked
 cargo clippy -p spool --all-targets --no-default-features --locked -- -D warnings
-cargo test -p spool --no-default-features --locked -- --test-threads=1
+cargo test -p spool --no-default-features --locked
 cargo clippy -p spool-lua --lib --no-default-features --features module --locked -- -D warnings
 
 build_candidate() {

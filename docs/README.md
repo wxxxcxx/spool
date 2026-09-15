@@ -2,6 +2,7 @@
 
 ## Guides
 
+- [Development loop](DEVELOPMENT.md)
 - [Configuration](CONFIGURATION.md)
 - [Window admission and layout policy](WINDOW_POLICY.md)
 - [Lua scripting](SCRIPTING.md)

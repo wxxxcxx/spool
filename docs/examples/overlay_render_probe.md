@@ -9,7 +9,7 @@ error if accidentally reached.
 cargo build -p spool --example overlay_render_probe
 target/debug/examples/overlay_render_probe --full-redraw
 target/debug/examples/overlay_render_probe
-cargo test -p spool --bin spool overlay::tests -- --test-threads=1
+cargo test -p spool --bin spool overlay::tests
 ```
 
 ## What It Measures

@@ -49,8 +49,28 @@ Spool is built on Bevy and follows a strict Data-Driven Design (ECS).
 *   **System Tests:** Add tests to `src/tests.rs` or new files in `src/tests/` that drive a mock Bevy `World`.
 *   **Pure Functions:** Extract complex layout math into pure functions (e.g., in `src/ecs/layout.rs`) and add unit tests.
 
+### Fast feedback
+
+The test suite is one target (the `spool` bin), so any edit costs a fixed ~9s
+rebuild plus whatever you run. Run the cheapest step that can answer your
+question; [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) has the measurements.
+
+| When | Command | Cost |
+| --- | --- | --- |
+| Type/borrow check | `cargo check -p spool --tests` | ~5s |
+| The module you changed | `cargo test -p spool -- <module>::` | ~10s |
+| Finishing a work item | `cargo test -p spool` | ~32s |
+| Handoff or release | `cargo test --workspace` | ~35s |
+
+**Never pass `--test-threads=1` in a routine run.** The suite isolates its own
+state (per-test Bevy `App` and mock `WindowManager`, pid+nonce temp files,
+temporary IPC sockets) and passes in parallel; serial execution costs 4x the
+wall clock for no isolation benefit. It is a debugging tool for order-dependent
+flakes only — keep it out of scripts and CI. Do not `cargo clean` to "freshen"
+the tree: that throws away the incremental caches the ~9s rebuild depends on.
+
 ## 6. Contribution Workflow
 
 *   **Research:** Before implementing, check `src/ecs/systems.rs` to see if a similar system already exists.
 *   **Implementation:** Follow the **Plan -> Act -> Validate** cycle.
-*   **Verification:** Run `cargo fmt`, `cargo check`, and relevant tests. If the change affects layout, verify it doesn't break existing tiling behavior.
+*   **Verification:** Run `cargo fmt`, `cargo test -p spool`, and `cargo clippy` before calling a work item done. Use the targeted filters from [Fast feedback](#fast-feedback) while iterating; the full suite is for the end of the item, not for every edit. If the change affects layout, verify it doesn't break existing tiling behavior.

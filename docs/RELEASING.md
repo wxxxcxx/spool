@@ -14,11 +14,12 @@ in `Cargo.toml`, Xcode Command Line Tools, and the rustfmt and Clippy components
 bash scripts/verify-release.sh
 ```
 
-The script checks formatting, locked compilation, strict Clippy, and serial
-workspace tests. It separately checks and tests the Lua-free daemon, then builds
-both release variants and the independently loadable LuaJIT module. Do not use
-`--workspace --all-features` as a substitute: the daemon embeds LuaJIT, while the
-module resolves its Lua symbols from its host.
+The script checks formatting, locked compilation, strict Clippy, and workspace
+tests (in parallel; see [Development](DEVELOPMENT.md) for why the suite no longer
+needs `--test-threads=1`). It separately checks and tests the Lua-free daemon,
+then builds both release variants and the independently loadable LuaJIT module.
+Do not use `--workspace --all-features` as a substitute: the daemon embeds
+LuaJIT, while the module resolves its Lua symbols from its host.
 
 The script propagates Rust's resolved `MACOSX_DEPLOYMENT_TARGET` to native C and
 Objective-C dependencies so they do not silently inherit a newer SDK default.
