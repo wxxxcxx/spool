@@ -9,6 +9,8 @@
 CLAUDE.md
 # CommandCode project config
 .commandcode/
+# Remote-pi local state (agent name, relay preference)
+.pi/
 .direnv
 **/.DS_Store
 flamegraph.svg
