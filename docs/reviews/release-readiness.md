@@ -242,6 +242,20 @@ the successful complete rerun. Only documentation was edited after that run.
   including `src/manager/discovery.rs` and `src/window_policy.rs`. Package
   metadata evaluation is not evidence that this working candidate builds through
   Nix. No staging, commit, or source-export change was made.
+- *(Later, 2026-09-15.)* The first half of that finding is closed: the work is
+  committed now, so the Git-backed flake source carries every module. Re-checked
+  at `c3ab0f8`: the evaluated source at
+  `/nix/store/h6yq4cahfgddfja1b1qbw6ah7rvzv8ar-source` holds 128 `.rs` files,
+  the same count the working tree has, including both modules that were missing
+  and the floating-geometry module added since; `nix flake show` evaluates all
+  aarch64-darwin outputs, `.#spool.version` is `0.4.4`, `meta.mainProgram` is
+  `spool`, and the package-contract, launch-arguments, darwin-module and devShell
+  outputs all resolve to derivations.
+  The second half is still open and now scoped: `nix build .#spool` plans **615
+  derivations** (the vendored Rust dependency tree, Bevy and LuaJIT included),
+  which is a cold build and was not run. The Intel half of the finding above is
+  unchanged: the lock still identifies itself as 26.11 and rejects
+  `x86_64-darwin`.
 
 ## Release Decision
 
