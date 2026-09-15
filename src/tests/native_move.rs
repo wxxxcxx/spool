@@ -481,6 +481,39 @@ fn an_unreadable_inventory_does_not_repair_a_declaration() {
     assert_eq!(after.repairs, before.repairs);
 }
 
+/// Focusing a window "in" a Space answers with the fact that is wrong. The
+/// window is tracked and alive; the Space the caller named is where it no longer
+/// is, which the focus-preference path already calls `window_not_in_space`. It
+/// used to answer `native_precondition_failed`, the same code it used for a
+/// window that does not exist.
+#[test]
+fn focusing_a_window_in_the_wrong_space_names_the_mismatch() {
+    use spool_shared_types::wire::{AdmissionStatus, CheckedAction, Response};
+    let (mut harness, _, _) = column_harness();
+    harness.pump_frames(5);
+
+    // Window 0 is in TEST_WORKSPACE_ID; the caller claims TARGET.
+    let (reply, received) = async_channel::bounded(1);
+    harness
+        .world()
+        .write_message(Event::CheckedActionRequested {
+            request: CheckedAction {
+                request_id: "focus-in-space".into(),
+                action: Action::FocusWindowInSpace {
+                    window_id: 0,
+                    space_id: TARGET,
+                },
+            },
+            respond_to: reply,
+        });
+    harness.world().run_schedule(PreUpdate);
+    let Response::Admission(receipt) = received.try_recv().expect("execution receipt") else {
+        panic!("admission response")
+    };
+    assert_eq!(receipt.status, AdmissionStatus::Rejected);
+    assert_eq!(receipt.code.as_deref(), Some("window_not_in_space"));
+}
+
 /// The last membership attempt is recorded, so `window inspect` can show what
 /// Spool tried for a window and how it ended instead of leaving that in the logs.
 #[test]

@@ -76,6 +76,7 @@ Blocked by: none
 - 列/成员已不可用 → `window_unavailable`；列不存在 → `layout_not_found`；浮动窗口不属列 → `ineligible_layout_entry`
 - 脚本计划的快照绑定已失效 → `snapshot_binding_stale`（新增）
 - 显示器清单读取失败 → `topology_unresolved`（读取失败不是“不存在”）
+- 聚焦路径同样具体化（本片延伸）：`window focus <id> --space <id>` 在窗口实际不在该 Space 时答 `window_not_in_space`（聚焦偏好路径早就用这个码表达同一事实），不再与"窗口不存在"共用 `native_precondition_failed`；`native_space.rs` 现在没有混装码。
 
 测试：`space_move_refusals_name_their_own_cause`（每种原因一个断言）、`an_unreachable_target_is_not_a_fullscreen_one`。两测在改动前的代码上均失败（分别得到 `native_precondition_failed` 与 `TargetSpaceUnavailable`）。
 

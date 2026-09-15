@@ -888,7 +888,10 @@ pub(crate) fn execute_native_space_command(
                 window_id,
                 space_id, observed, "window is no longer in the Space it was drawn in"
             );
-            return Err(crate::errors::Error::rejected("native_precondition_failed"));
+            // The window is fine and tracked; the Space the operation names is
+            // the stale part. This is the same fact the focus-preference path
+            // already answers with `window_not_in_space`.
+            return Err(crate::errors::Error::rejected("window_not_in_space"));
         }
         let member = MoveWindowIdentity {
             window_id: *window_id,
