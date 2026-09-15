@@ -7,6 +7,8 @@
 
 # Claude Code project config
 CLAUDE.md
+# CommandCode project config
+.commandcode/
 .direnv
 **/.DS_Store
 flamegraph.svg
