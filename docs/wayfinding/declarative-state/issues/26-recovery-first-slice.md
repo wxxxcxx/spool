@@ -28,6 +28,7 @@ Blocked by: none
    - `spool session restore --bindings <path|->`（JSON），内容按域分组：
      - `columns: [{space, column, structure_revision, intent_revision}]`（沿用既有 `TrustedColumnBinding` 语义）
      - `floating: [{window_id, frame}]`（新；`frame` 必须与候选一致，否则拒绝整条）
+   - **绑定必须被佐证**：`window_id` 是调用者的声明，不是本模块的推断（沿用 `restore.rs` 既有规则："the caller must prove the mapping; this module never infers it from IDs, titles, positions, PID, or process-local native hashes"）。daemon 侧除校验编号指向一个**已跟踪**窗口外，还要求候选缓存的 `pid` 与 `bundle_id` 与之一致；只有编号而无佐证时拒绝该条（编号的作用域是当前登录会话，寿命与复用行为无文档保证，见 25 号票）。
    - 退出码沿用资源 CLI 约定（0 完成 / 1 失败 / 2 参数 / 3 部分）；未知空间/列/窗口或 revisions 不符 → 拒绝并说明，不部分应用。
 3. **浮动帧导入**：新增纯函数 `import_floating_frames(candidates, windows, bindings)`，语义与列版一致（候选未过期、基线已冻结、逐条校验、重复拒绝、整体拒绝而不部分应用）。
 4. **声明归属仍不保存**（留后续票）；本片不引入自动绑定、不恢复在途尝试、不新增跳变路径。
