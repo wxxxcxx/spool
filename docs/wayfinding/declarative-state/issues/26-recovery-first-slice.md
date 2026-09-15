@@ -3,7 +3,7 @@
 Id: 26
 Type: task
 Label: wayfinder:task
-Status: open
+Status: resolved
 Assignee: none
 Parent: [跨重启恢复的入口票（恢复地图）](25-cross-restart-recovery.md)
 Blocked by: none
@@ -50,8 +50,17 @@ Blocked by: none
 
 ## Resolution
 
-待用户确认接口形状（一节"切片提案"第 2 条）后实施。
+用户于 2026-09-15 确认按提案实施（资源式子命令为入口，daemon 校验）。
 
 ## Implementation follow-up
 
-未实施。
+### 已实施（2026-09-15）
+
+- **启动所有者**：`freeze_restore_baseline`（`Update`，`Initializing` 消失且有条带时冻结一次）与 `close_restore_window`（30 秒，实现默认值而非实测值）；两者都在 `RestoreCandidates` 缺席时安静跳过，而不是让 Bevy 的参数校验 panic。
+- **受理入口**：`Action::RestoreIntents(RestoreBindings)`（wire 类型，JSON 自描述，信封不变）；`admission` 分类为 `Running`（它只改保留状态、不写原生，且自身有启动窗口作为新鲜度门；若按 `Writable` 分类反而会拒绝它存在的那段启动期），执行走 `restore::restore_intents` 缓存系统。
+- **导入语义**：先校验全部绑定再应用任何一条（一条坏绑定拒绝整次导入）；列绑定按 Space 分组走既有 `import_intents`，浮动绑定走新增的 `import_floating_frames`。
+- **佐证规则**：`TrustedFloatingBinding::new` 要求候选缓存的 `window_id`、`pid`、`bundle_id` 与现场窗口**三者全等**；只有编号而无佐证时拒绝（编号的作用域与复用行为见 25/27 号票）。
+- **浮动帧的来源**：来自候选本身（调用者只指认候选条目与现场窗口），因此不存在"调用者重述帧"的比对；这一条比原提案更简单，已在此记录。
+- **CLI**：`spool session restore --bindings <file|->`（`-` 读标准输入），JSON 解析失败是参数错误而不是静默无效。
+- **测试**：可信浮动绑定导入帧并被应用、导入后启动窗口关闭；未佐证绑定拒绝且不应用任何东西；窗口过期拒绝；无冻结基线拒绝；CLI 文档解析与不可读文档报错。
+- **边界**：不引入自动绑定、不恢复归属/焦点/在途尝试、不新增跳变路径；`SavedFloatingWindow` 之外的域仍未接入导入。

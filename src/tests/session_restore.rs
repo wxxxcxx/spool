@@ -6,7 +6,7 @@ use bevy::prelude::World;
 use crate::ecs::layout::{ColumnId, LayoutStrip, WidthIntent};
 use crate::ecs::restore::{RestoreCandidates, TrustedColumnBinding, import_intents};
 use crate::ecs::state::{INTENT_STATE_VERSION, SavedColumn, SavedSpace, SpoolState};
-use crate::tests::{TEST_WORKSPACE_ID, TestHarness};
+use crate::tests::{TEST_PROCESS_ID, TEST_WORKSPACE_ID, TestHarness};
 
 fn candidates(widths: &[WidthIntent]) -> RestoreCandidates {
     SpoolState {
@@ -360,4 +360,183 @@ fn height_import_requires_matching_arrangement_and_complete_trusted_slots() {
         target.height_state(windows[0]).unwrap().weight.to_bits(),
         2.0_f64.to_bits()
     );
+}
+
+// --- Trusted intent import with a runtime owner (issue 26) ------------------
+
+/// A candidate document with one floating window, whose cached identity is the
+/// harness's first window.
+fn floating_candidates(pid: i32, bundle_id: &str) -> RestoreCandidates {
+    SpoolState {
+        version: INTENT_STATE_VERSION,
+        revision: 7,
+        floating: vec![crate::ecs::state::SavedFloatingWindow {
+            window_id: 0,
+            pid,
+            bundle_id: bundle_id.into(),
+            frame: spool_shared_types::state::Frame {
+                x: 240,
+                y: 120,
+                width: 400,
+                height: 400,
+            },
+        }],
+        spaces: Vec::new(),
+    }
+    .into()
+}
+
+/// The startup owner freezes the baseline on its own, and a corroborated binding
+/// imports the frame as retained intent.
+#[test]
+fn a_trusted_floating_binding_imports_the_candidate_frame() {
+    use spool_shared_types::commands::{RestoreBindings, RestoreFloatingBinding};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(10);
+    harness
+        .world()
+        .insert_resource(floating_candidates(TEST_PROCESS_ID, "test"));
+    // The owner freezes the baseline once the session can be read.
+    harness.pump_frames(2);
+    assert_eq!(
+        harness
+            .world()
+            .resource::<RestoreCandidates>()
+            .state()
+            .floating
+            .len(),
+        1
+    );
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        RestoreBindings {
+            columns: Vec::new(),
+            floating: vec![RestoreFloatingBinding {
+                candidate_window: 0,
+                target_window_id: 0,
+            }],
+        },
+    );
+    assert!(result.is_ok(), "{result:?}");
+
+    let entity = crate::tests::find_window_entity(0, harness.world());
+    let geometry = harness
+        .world()
+        .get::<crate::ecs::floating_geometry::FloatingGeometry>(entity)
+        .expect("the imported frame is retained state");
+    assert_eq!(
+        geometry.frame,
+        bevy::math::IRect::new(240, 120, 640, 520),
+        "the candidate's frame is what was imported"
+    );
+    // Applying an import closes the window its owner owns.
+    assert!(
+        !harness
+            .world()
+            .resource::<RestoreCandidates>()
+            .import_window_open(),
+        "an explicit import ends the startup window"
+    );
+}
+
+/// A binding the candidate does not corroborate is refused, and nothing is
+/// applied: the caller's claim alone never authorizes a binding.
+#[test]
+fn an_uncorroborated_floating_binding_is_refused() {
+    use spool_shared_types::commands::{RestoreBindings, RestoreFloatingBinding};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(10);
+    // The candidate claims a different application.
+    harness
+        .world()
+        .insert_resource(floating_candidates(TEST_PROCESS_ID + 7, "somewhere-else"));
+    harness.pump_frames(2);
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        RestoreBindings {
+            columns: Vec::new(),
+            floating: vec![RestoreFloatingBinding {
+                candidate_window: 0,
+                target_window_id: 0,
+            }],
+        },
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("a corroboration failure is a rejection");
+    assert_eq!(error.admission_code(), "import_binding_rejected");
+
+    let entity = crate::tests::find_window_entity(0, harness.world());
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::floating_geometry::FloatingGeometry>(entity)
+            .is_none(),
+        "a refused import applies nothing"
+    );
+}
+
+/// After the startup window closes, an import is refused rather than applied late.
+#[test]
+fn a_late_import_is_refused() {
+    use spool_shared_types::commands::{RestoreBindings, RestoreFloatingBinding};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(10);
+    harness
+        .world()
+        .insert_resource(floating_candidates(TEST_PROCESS_ID, "test"));
+    harness.pump_frames(2);
+    harness
+        .world()
+        .resource_mut::<RestoreCandidates>()
+        .close_import_window();
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        RestoreBindings {
+            columns: Vec::new(),
+            floating: vec![RestoreFloatingBinding {
+                candidate_window: 0,
+                target_window_id: 0,
+            }],
+        },
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("a closed window refuses the import");
+    assert_eq!(error.admission_code(), "import_window_expired");
+}
+
+/// Without a frozen baseline the import is refused: the owner must have taken
+/// its baseline before current-session edits, not after.
+#[test]
+fn an_import_without_a_frozen_baseline_is_refused() {
+    use spool_shared_types::commands::{RestoreBindings, RestoreFloatingBinding};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(10);
+    // No owner ran: the resource exists with its candidates but no baseline.
+    harness
+        .world()
+        .insert_resource(floating_candidates(TEST_PROCESS_ID, "test"));
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        RestoreBindings {
+            columns: Vec::new(),
+            floating: vec![RestoreFloatingBinding {
+                candidate_window: 0,
+                target_window_id: 0,
+            }],
+        },
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("an unfrozen baseline refuses the import");
+    assert_eq!(error.admission_code(), "import_baseline_missing");
 }

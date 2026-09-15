@@ -166,6 +166,10 @@ fn session_reach(action: &Action) -> SessionReach {
         | Action::ReconcileWindows
         | Action::MissionControl
         | Action::ShowDesktop
+        // A trusted intent import changes retained state without a native
+        // effect, and its own startup window is the freshness gate; the session
+        // being unwritable would refuse exactly the startup it exists for.
+        | Action::RestoreIntents(_)
         // Answered before this classification is consulted: the Lua worker reads
         // a bound callback off the same bus, and a wire request for one is
         // refused rather than owed a receipt — a handler is user code of
@@ -341,6 +345,9 @@ fn execute_action(world: &mut World, action: Action) -> crate::errors::Result<()
         } => invoked(world.run_system_cached_with(crate::ecs::tiled_visibility::toggle, space_id))?,
         action @ Action::ReorderColumn { .. } => {
             invoked(world.run_system_cached_with(super::command_reorder_column, action))
+        }
+        Action::RestoreIntents(bindings) => {
+            invoked(world.run_system_cached_with(crate::ecs::restore::restore_intents, bindings))?
         }
         #[cfg(feature = "lua")]
         Action::Layout(plan) => {

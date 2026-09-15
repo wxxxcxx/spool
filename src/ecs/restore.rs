@@ -1,19 +1,29 @@
-//! Isolated intent candidates and a pure import seam. There is deliberately no
-//! native identity matcher, startup observer, timer, or automatic restore writer.
+//! Isolated intent candidates and a trusted-mapping import seam.
+//!
+//! There is still no native identity matcher: a startup owner must prove every
+//! mapping it submits. What exists here is that owner's side — the baseline it
+//! freezes, the window in which it may submit, and the import itself.
 
 #![allow(
     dead_code,
-    reason = "the first intent slice exposes only a trusted-mapping pure import seam; no runtime automatic binding provider exists"
+    reason = "the seam exposes more than the current startup owner uses; nothing here writes a native effect"
 )]
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
+use bevy::ecs::entity::Entity;
 use bevy::ecs::resource::Resource;
+use bevy::math::{IRect, IVec2};
+use bevy::prelude::{Commands, In, Local, Query, Res, ResMut, Time};
+use tracing::{debug, warn};
 
+use crate::ecs::floating_geometry::FloatingGeometry;
 use crate::ecs::layout::{ColumnId, LayoutStrip, StackItemId};
 use crate::ecs::state::SpoolState;
 use crate::errors::{Error, Result};
-use bevy::ecs::entity::Entity;
+use crate::manager::Window;
+use crate::platform::{Pid, WinID};
 
 /// Reading a file only creates this resource. Its numeric binding hints never
 /// become macOS topology or authorize an effect.
@@ -44,6 +54,11 @@ impl From<SpoolState> for RestoreCandidates {
 impl RestoreCandidates {
     pub fn state(&self) -> &SpoolState {
         &self.state
+    }
+
+    /// Whether a startup owner may still submit trusted mappings.
+    pub fn import_window_open(&self) -> bool {
+        self.import_window_open
     }
 
     /// Called once by a trusted startup owner after initial discovery and before
@@ -341,4 +356,270 @@ pub fn import_intents(
         *target = staged;
     }
     Ok(changed)
+}
+
+/// One floating window's candidate entry, already validated against the live
+/// window it claims.
+#[derive(Clone, Debug)]
+pub struct TrustedFloatingBinding {
+    candidate_window: usize,
+    target_window_id: WinID,
+}
+
+impl TrustedFloatingBinding {
+    /// The caller must prove the mapping. The candidate's cached native id, pid
+    /// and bundle id must all agree with the live window: the native id has no
+    /// documented lifetime or reuse behaviour, so it never authorizes a binding
+    /// on its own.
+    pub fn new(
+        candidate_window: usize,
+        candidates: &RestoreCandidates,
+        target_window_id: WinID,
+        pid: Pid,
+        bundle_id: &str,
+    ) -> Result<Self> {
+        if !candidates.import_window_open || candidates.initial_layouts.is_none() {
+            return Err(Error::InvalidInput(
+                "intent import candidates are invalid or expired".into(),
+            ));
+        }
+        let saved = candidates
+            .state
+            .floating
+            .get(candidate_window)
+            .ok_or_else(|| {
+                Error::InvalidInput("candidate floating window does not exist".into())
+            })?;
+        if saved.window_id != target_window_id || saved.pid != pid || saved.bundle_id != bundle_id {
+            return Err(Error::InvalidInput(
+                "candidate floating window's cached identity does not match the live window".into(),
+            ));
+        }
+        Ok(Self {
+            candidate_window,
+            target_window_id,
+        })
+    }
+}
+
+/// Imports floating frames from candidates the caller has proven.
+///
+/// The frame comes from the candidate and is written as retained intent, so no
+/// platform write happens here. The caller validates every binding before any is
+/// applied: one bad binding refuses the whole import.
+pub fn import_floating_frames(
+    candidates: &RestoreCandidates,
+    windows: &mut Query<(
+        Entity,
+        &Window,
+        &bevy::ecs::hierarchy::ChildOf,
+        Option<&mut FloatingGeometry>,
+    )>,
+    commands: &mut Commands,
+    bindings: &[TrustedFloatingBinding],
+) -> Result<usize> {
+    if !candidates.import_window_open || !candidates.state.valid() {
+        return Err(Error::InvalidInput(
+            "intent import candidates are invalid or expired".into(),
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut applied = 0;
+    for binding in bindings {
+        if !seen.insert(binding.candidate_window) {
+            return Err(Error::InvalidInput(
+                "duplicate floating import binding".into(),
+            ));
+        }
+        let saved = candidates
+            .state
+            .floating
+            .get(binding.candidate_window)
+            .ok_or_else(|| {
+                Error::InvalidInput("candidate floating window does not exist".into())
+            })?;
+        let frame = checked_frame_from(saved.frame).ok_or_else(|| {
+            Error::InvalidInput("candidate floating frame is not representable".into())
+        })?;
+        let entity = windows
+            .iter()
+            .find_map(|(entity, window, _, _)| {
+                (window.id() == binding.target_window_id).then_some(entity)
+            })
+            .ok_or_else(|| Error::InvalidInput("import target window is not tracked".into()))?;
+        let Ok((_, _, _, geometry)) = windows.get_mut(entity) else {
+            return Err(Error::InvalidInput(
+                "import target window is unavailable".into(),
+            ));
+        };
+        match geometry {
+            Some(mut geometry) => geometry.state(frame),
+            None => {
+                commands
+                    .entity(entity)
+                    .try_insert(FloatingGeometry::new(frame));
+            }
+        }
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+/// A saved frame as a representable window frame.
+fn checked_frame_from(frame: spool_shared_types::state::Frame) -> Option<IRect> {
+    let origin = IVec2::new(frame.x, frame.y);
+    let size = IVec2::new(frame.width, frame.height);
+    crate::ecs::window_frame::checked_window_frame(origin, size)
+}
+
+/// The startup owner: freezes the candidate baseline once, after initial
+/// discovery and before current-session edits are admitted.
+pub(crate) fn freeze_restore_baseline(
+    candidates: Option<ResMut<RestoreCandidates>>,
+    strips: Query<&LayoutStrip>,
+    initializing: Option<Res<crate::ecs::Initializing>>,
+    mut frozen: Local<bool>,
+) {
+    let Some(mut candidates) = candidates else {
+        return;
+    };
+    if *frozen || initializing.is_some() || strips.iter().next().is_none() {
+        return;
+    }
+    match candidates.freeze_initial_layouts(strips.iter()) {
+        Ok(()) => *frozen = true,
+        Err(error) => warn!(%error, "unable to freeze the startup import baseline"),
+    }
+}
+
+/// How long a startup owner may submit trusted mappings before the candidate set
+/// closes. An implementation default, not a measured native value.
+const RESTORE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Closes the startup import window when no import arrives in time.
+pub(crate) fn close_restore_window(
+    candidates: Option<ResMut<RestoreCandidates>>,
+    time: Res<Time>,
+    mut elapsed: Local<Duration>,
+) {
+    let Some(mut candidates) = candidates else {
+        return;
+    };
+    if !candidates.import_window_open {
+        return;
+    }
+    *elapsed = elapsed.saturating_add(time.delta());
+    if *elapsed >= RESTORE_WINDOW {
+        candidates.close_import_window();
+        debug!("startup intent import window closed after {RESTORE_WINDOW:?}");
+    }
+}
+
+/// Where a startup owner's trusted mappings are applied.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct RestoreIntentsCtx<'w, 's> {
+    candidates: Option<ResMut<'w, RestoreCandidates>>,
+    strips: Query<'w, 's, &'static mut LayoutStrip>,
+    windows: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static Window,
+            &'static bevy::ecs::hierarchy::ChildOf,
+            Option<&'static mut FloatingGeometry>,
+        ),
+    >,
+    apps: Query<'w, 's, &'static crate::manager::Application>,
+    commands: Commands<'w, 's>,
+}
+
+/// Applies the trusted mappings a startup owner submitted.
+///
+/// Every binding is validated before any is applied, so one bad binding refuses
+/// the whole import instead of applying part of it. Nothing here writes to the
+/// platform: it changes retained intent, and the effect layer realizes it later.
+pub(crate) fn restore_intents(
+    In(bindings): In<spool_shared_types::commands::RestoreBindings>,
+    mut ctx: RestoreIntentsCtx,
+) -> crate::errors::Result<()> {
+    let Some(mut candidates) = ctx.candidates.take() else {
+        return Err(crate::errors::Error::rejected("import_unavailable"));
+    };
+    if !candidates.import_window_open {
+        return Err(crate::errors::Error::rejected("import_window_expired"));
+    }
+    if candidates.initial_layouts.is_none() {
+        return Err(crate::errors::Error::rejected("import_baseline_missing"));
+    }
+
+    let mut columns: HashMap<crate::platform::WorkspaceId, Vec<TrustedColumnBinding>> =
+        HashMap::new();
+    for binding in &bindings.columns {
+        let strip = ctx
+            .strips
+            .iter()
+            .find(|strip| strip.id() == binding.target_space)
+            .ok_or_else(|| crate::errors::Error::rejected("import_target_space_not_found"))?;
+        let trusted = TrustedColumnBinding::new(
+            binding.candidate_space,
+            binding.candidate_column,
+            &candidates,
+            strip,
+            ColumnId(binding.target_column),
+        )
+        .map_err(|error| {
+            crate::errors::Error::rejection_with_cause("import_binding_rejected", error)
+        })?;
+        columns
+            .entry(binding.target_space)
+            .or_default()
+            .push(trusted);
+    }
+
+    let mut floating = Vec::new();
+    for binding in &bindings.floating {
+        let Some((_, window, parent, _)) = ctx
+            .windows
+            .iter()
+            .find(|(_, window, _, _)| window.id() == binding.target_window_id)
+        else {
+            return Err(crate::errors::Error::rejected(
+                "import_target_window_not_tracked",
+            ));
+        };
+        let app = ctx.apps.get(parent.parent()).map_err(|error| {
+            crate::errors::Error::rejection_with_cause("import_target_window_unavailable", error)
+        })?;
+        let bundle_id = app.bundle_id().unwrap_or_default();
+        let trusted = TrustedFloatingBinding::new(
+            binding.candidate_window,
+            &candidates,
+            window.id(),
+            app.pid(),
+            &bundle_id,
+        )
+        .map_err(|error| {
+            crate::errors::Error::rejection_with_cause("import_binding_rejected", error)
+        })?;
+        floating.push(trusted);
+    }
+
+    let mut imported = 0;
+    for (space, trusted) in columns {
+        let Some(mut strip) = ctx.strips.iter_mut().find(|strip| strip.id() == space) else {
+            continue;
+        };
+        imported += import_intents(&candidates, &mut strip, &trusted)
+            .map_err(|error| crate::errors::Error::rejection_with_cause("import_failed", error))?;
+    }
+    imported += import_floating_frames(&candidates, &mut ctx.windows, &mut ctx.commands, &floating)
+        .map_err(|error| crate::errors::Error::rejection_with_cause("import_failed", error))?;
+
+    if imported > 0 {
+        // The startup owner asked explicitly; its window closes with the request.
+        candidates.close_import_window();
+    }
+    debug!(imported, "trusted intent import applied");
+    Ok(())
 }

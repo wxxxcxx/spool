@@ -53,7 +53,7 @@ pub(crate) struct FloatingRepair {
 }
 
 impl FloatingGeometry {
-    fn new(frame: IRect) -> Self {
+    pub(crate) fn new(frame: IRect) -> Self {
         Self {
             frame,
             anchor: None,

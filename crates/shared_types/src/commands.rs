@@ -365,6 +365,14 @@ pub enum Action {
     /// Window-addressed, unlike every other action here, and applied
     /// best-effort: see `ecs::layout_ops`. Never produced by parsing.
     Layout(crate::windowset::LayoutPlan),
+    /// Imports trusted intent mappings for the current session.
+    ///
+    /// The caller proves every mapping by pointing at a candidate entry and
+    /// naming the live target; Spool never infers one from ids, titles,
+    /// positions, PIDs or process-local native hashes. Bindings are validated
+    /// against the frozen startup baseline, and one bad binding refuses the whole
+    /// import rather than applying part of it.
+    RestoreIntents(RestoreBindings),
     /// Reorders the complete tiled column containing `window_id` relative to
     /// the complete tiled column containing `anchor_window_id`.
     ReorderColumn {
@@ -430,4 +438,42 @@ pub enum SpaceLayoutOperation {
     Equalize { column: Option<usize> },
     Balance { reference_column: Option<usize> },
     ToggleTiledVisibility,
+}
+
+/// Trusted mappings a startup owner submits for the current session's intent.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RestoreBindings {
+    #[serde(default)]
+    pub columns: Vec<RestoreColumnBinding>,
+    #[serde(default)]
+    pub floating: Vec<RestoreFloatingBinding>,
+}
+
+/// One column's candidate entry and the live column it is imported into.
+///
+/// Indices address the candidate document; the live ids are the caller's claim,
+/// checked against the frozen startup baseline before anything is written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreColumnBinding {
+    /// Index into the candidate document's Spaces.
+    pub candidate_space: usize,
+    /// Index into that candidate Space's columns.
+    pub candidate_column: usize,
+    /// The live native Space the candidate applies to.
+    pub target_space: u64,
+    /// The live column inside that Space.
+    pub target_column: u64,
+}
+
+/// One floating window's candidate entry and the live window it belongs to.
+///
+/// The frame comes from the candidate; the live window id is the caller's claim
+/// and is only accepted when the candidate's cached pid and bundle id agree with
+/// a tracked window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreFloatingBinding {
+    /// Index into the candidate document's floating windows.
+    pub candidate_window: usize,
+    /// The live native window id.
+    pub target_window_id: i32,
 }

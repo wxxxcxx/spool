@@ -246,6 +246,7 @@ removed in this breaking migration. See [the CLI contract](docs/CLI_IMPLEMENTATI
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse next-display`        | Warp the mouse pointer to the next display       |
 | `session mission-control`          | Open or close the system Mission Control overview |
+| `session restore --bindings <file\|->` | Submits trusted intent mappings for this session (see [Layout intent persistence](#layout-intent-persistence)) |
 | `session show-desktop`             | Toggle the system Show Desktop overview          |
 | `service dump-state`               | Print the internal ECS state to the debug log    |
 | `service quit`                     | Quit Spool                                      |

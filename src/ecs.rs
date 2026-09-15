@@ -329,6 +329,15 @@ pub fn register_systems(app: &mut bevy::app::App) {
         ),
     );
     app.add_systems(PostUpdate, state::capture_state_changes);
+    // The startup owner of the intent import: it freezes the baseline once the
+    // session can be read, and closes the window it owns when no import arrives.
+    app.add_systems(
+        Update,
+        (
+            restore::freeze_restore_baseline,
+            restore::close_restore_window,
+        ),
+    );
     app.add_systems(Last, exit_restore::restore_launch_windows);
 }
 
