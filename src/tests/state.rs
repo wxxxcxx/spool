@@ -563,6 +563,7 @@ fn intent_snapshot(width: crate::ecs::layout::WidthIntent) -> SpoolState {
     SpoolState {
         version: INTENT_STATE_VERSION,
         revision: 0,
+        floating: Vec::new(),
         spaces: vec![SavedSpace {
             space_id: TEST_WORKSPACE_ID,
             columns: vec![SavedColumn {
@@ -808,7 +809,8 @@ fn persistence_tracks_arrangement_and_raw_height_without_native_geometry() {
     let mut strip = LayoutStrip::new(TEST_WORKSPACE_ID);
     strip.append(first);
     strip.append(second);
-    let capture = |strip: &LayoutStrip| SpoolState::from_layouts([strip], |_| None);
+    let capture =
+        |strip: &LayoutStrip| SpoolState::from_layouts([strip], |_| None, std::iter::empty());
     let mut persistence = StatePersistence::default();
     persistence.capture(capture(&strip)).unwrap();
     let first_revision = persistence.accepted_revision();
@@ -865,7 +867,7 @@ fn unresolved_members_are_persisted_as_explicit_slots() {
     strip.append(first);
     strip.append(second);
     strip.stack(second).unwrap();
-    let unresolved = SpoolState::from_layouts([&strip], |_| None);
+    let unresolved = SpoolState::from_layouts([&strip], |_| None, std::iter::empty());
     assert!(unresolved.valid());
     let item = &unresolved.spaces[0].columns[0].items[0];
     assert_eq!(
@@ -884,14 +886,18 @@ fn unresolved_members_are_persisted_as_explicit_slots() {
     assert_eq!(roundtrip, unresolved);
 
     let mut seen = 0;
-    let mixed = SpoolState::from_layouts([&strip], |entity| {
-        seen += 1;
-        (entity == first).then(|| crate::ecs::state::SavedWindow {
-            window_id: 7,
-            pid: 11,
-            bundle_id: "fixture".into(),
-        })
-    });
+    let mixed = SpoolState::from_layouts(
+        [&strip],
+        |entity| {
+            seen += 1;
+            (entity == first).then(|| crate::ecs::state::SavedWindow {
+                window_id: 7,
+                pid: 11,
+                bundle_id: "fixture".into(),
+            })
+        },
+        std::iter::empty(),
+    );
     let members = &mixed.spaces[0].columns[0].items[0].members;
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].hint.as_ref().unwrap().window_id, 7);
@@ -915,19 +921,23 @@ fn saved_native_tabs_remain_one_height_slot_inside_a_stack() {
     strip.append(lower);
     strip.stack(lower).unwrap();
     strip.set_height_weight(tab, 2.0).unwrap();
-    let saved = SpoolState::from_layouts([&strip], |entity| {
-        Some(crate::ecs::state::SavedWindow {
-            window_id: if entity == first {
-                1
-            } else if entity == tab {
-                2
-            } else {
-                3
-            },
-            pid: 42,
-            bundle_id: "fixture".into(),
-        })
-    });
+    let saved = SpoolState::from_layouts(
+        [&strip],
+        |entity| {
+            Some(crate::ecs::state::SavedWindow {
+                window_id: if entity == first {
+                    1
+                } else if entity == tab {
+                    2
+                } else {
+                    3
+                },
+                pid: 42,
+                bundle_id: "fixture".into(),
+            })
+        },
+        std::iter::empty(),
+    );
     assert!(saved.valid());
     let items = &saved.spaces[0].columns[0].items;
     assert_eq!(items.len(), 2);
@@ -936,4 +946,43 @@ fn saved_native_tabs_remain_one_height_slot_inside_a_stack() {
     assert_eq!(items[0].weight.to_bits(), 2.0_f64.to_bits());
     assert!(!items[1].tabs);
     assert_eq!(items[1].members.len(), 1);
+}
+
+/// A floating frame is saved as isolated intent, and a file written before the
+/// field existed still loads: the frame is an addition to the format, not a new
+/// format, so no existing state is discarded.
+#[test]
+fn a_floating_frame_round_trips_and_an_older_file_still_loads() {
+    use crate::ecs::state::{INTENT_STATE_VERSION, SavedFloatingWindow};
+    use bevy::ecs::entity::Entity as BevyEntity;
+    use spool_shared_types::state::Frame;
+
+    let mut saved = SpoolState::from_layouts(
+        std::iter::empty(),
+        |_: BevyEntity| None,
+        [SavedFloatingWindow {
+            window_id: 7,
+            pid: 11,
+            bundle_id: "fixture".into(),
+            frame: Frame {
+                x: 240,
+                y: 120,
+                width: 400,
+                height: 400,
+            },
+        }],
+    );
+    saved.revision = 3;
+
+    let encoded = serde_json::to_string(&saved).expect("serialize");
+    let decoded: SpoolState = serde_json::from_str(&encoded).expect("deserialize");
+    assert_eq!(decoded, saved, "the frame survives the round trip");
+
+    let older = serde_json::json!({
+        "version": INTENT_STATE_VERSION,
+        "revision": 1,
+        "spaces": [],
+    });
+    let loaded: SpoolState = serde_json::from_value(older).expect("a file without the field loads");
+    assert!(loaded.floating.is_empty());
 }

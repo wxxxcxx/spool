@@ -12,6 +12,7 @@ fn candidates(widths: &[WidthIntent]) -> RestoreCandidates {
     SpoolState {
         version: INTENT_STATE_VERSION,
         revision: 7,
+        floating: Vec::new(),
         spaces: vec![SavedSpace {
             // Intentionally different from the current Space. Matching is
             // supplied externally, not guessed from a coincident numeric ID.
@@ -337,7 +338,7 @@ fn height_import_requires_matching_arrangement_and_complete_trusted_slots() {
         "a saved single is not a proved stack mapping"
     );
 
-    let mut saved = SpoolState::from_layouts([&target], |_| None);
+    let mut saved = SpoolState::from_layouts([&target], |_| None, std::iter::empty());
     saved.spaces[0].columns[0].items[0].weight = 2.0;
     let mut candidate = RestoreCandidates::from(saved);
     candidate.freeze_initial_layouts([&target]).unwrap();

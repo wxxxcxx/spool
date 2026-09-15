@@ -152,17 +152,18 @@ Balance的继承语义经过三位专家一致确认：若参考列继承规则0
 - 三个写入者陈述意图：浮动编辑命令、外部手势观察、reconcile 的观测采纳（原 `update_floating_intent` → `adopt_floating_frame` 并在采纳处写意图）；第一次见到的浮动窗口由投影从其当前帧初始化。
 - 修复（不写原生）：`clamped_to_viewport`、`display_gone`（保持相对原显示器的偏移）、`unresolved`（清单不可读时保留意图、不派生）。
 - 意图在平铺期间休眠、再浮动时恢复；`window inspect --source spool` 的 window row 新增 `floating` 组（`intent` / `unresolved` / `repairs`），并进入默认选择与叶子路径。
+- 保存：`SpoolState` 新增 `floating`（带 `#[serde(default)]`，不升版本，旧文件仍可加载），三条保存路径与 inspection 的抓取都包含它；浮动帧作为隔离候选进入 `RestoreCandidates`，无自动应用或自动绑定。
 
 ### 本片验证
 
-- `cargo test -p spool`：1176通过、0失败、2项忽略；`--workspace --locked` 1176 / 96 / 24 等全绿；`--no-default-features` 1034通过。
+- `cargo test -p spool`：1177通过、0失败、2项忽略；`--workspace --locked` 1177 / 96 / 24 等全绿；`--no-default-features` 1035通过。
 - `cargo fmt --all --check`、`cargo clippy -p spool --all-targets`（默认与 `--no-default-features -- -D warnings`）通过。
-- 新增 9 条浮动几何测试（编辑陈述意图、连续移动累积、显示器移动夹取、显示器移除迁移并保持偏移、清单不可读未解析、平铺往返恢复、最小化保留、显式目标陈述意图、帧随意图派生）。
+- 新增 10 条测试（9 条浮动几何 + 1 条保存往返）（编辑陈述意图、连续移动累积、显示器移动夹取、显示器移除迁移并保持偏移、清单不可读未解析、平铺往返恢复、最小化保留、显式目标陈述意图、帧随意图派生）。
 - 实施中由既有测试逼出两处修正：① 投影必须容忍"还没有意图"的浮动窗口（从当前帧初始化）；② 派生需要投影版本闸门，否则同一帧内更早的观测采纳会被旧意图覆盖。
 
 ### 本片实际边界
 
 - marker/手势吸附作为效果管道保留（见 issue 24 的偏差记录）；权威已是意图。
-- 浮动几何**未进保存格式**（步骤 4 未做）；跨重启恢复仍属地图 Out of scope。
+- 浮动几何已进保存格式并作为隔离候选；跨重启恢复（自动应用与身份绑定）仍属地图 Out of scope。
 - 与 03 号票的一处刻意差异：越界夹取记为修复（改写意图），而非"保留原始意图 + 只写有效目标"。
 - mock 通过不证明真实 macOS 行为；真实桌面验收另行授权。

@@ -94,9 +94,13 @@ Blocked by: none
 
 03 号票的约束模型是"保留原始意图 + 派生有效目标"；本片按已裁决的修复顺序，把**越界夹取记为修复**（`clamped_to_viewport`，意图被改写为夹取后的帧）。若将来更希望保留原始帧、只写有效目标，改动很小：把该分支改成只写派生结果、不动意图。
 
-### 未实施：保存与候选隔离（第 4 步）
+### 已实施：保存与候选隔离（第 4 步，2026-09-15）
 
-浮动几何尚未进入新格式（`SavedWindow` 仍只有身份）。它是本片唯一可单独落地的部分，也是跨重启恢复的前置（恢复本身仍在地图的 Out of scope）。
+- `SpoolState` 新增 `floating: Vec<SavedFloatingWindow>`（`window_id` / `pid` / `bundle_id` + `frame`），字段带 `#[serde(default)]`：**不升版本**，因此旧文件仍可加载（升版会按"旧格式被忽略"丢弃用户已有的列宽/高度意图），新文件多一个字段。
+- 抓取：`SpoolState::extract` 与三条保存路径（变更捕获、周期保存、退出保存）都带上浮动窗口；`window inspect` 的 `capture_current_intent` 同样。
+- 候选隔离：浮动帧随 `SpoolState` 进入 `RestoreCandidates`，**没有任何路径自动应用或自动绑定身份**；跨重启恢复本身仍在地图的 Out of scope。
+- 测试：往返（序列化→反序列化后帧保留）+ 旧文件（无该字段）仍可加载并得到空列表。
+- 文档：`CONFIGURATION.md` 的 Layout Intent Persistence 段落写明保存内容与"字段是新增而非新格式"。
 
 ## 原计划（保留作对照）
 

@@ -128,8 +128,9 @@ impl Budget {
 
 impl Projection<'_, '_> {
     fn capture_current_intent(&mut self) -> std::io::Result<()> {
-        let snapshot =
-            crate::ecs::state::SpoolState::from_layouts(self.all_strips.iter(), |entity| {
+        let snapshot = crate::ecs::state::SpoolState::from_layouts(
+            self.all_strips.iter(),
+            |entity| {
                 let (_, window, parent, ..) = self.windows.get(entity).ok()?;
                 let (_, app) = self.apps.get(parent.parent()).ok()?;
                 Some(crate::ecs::state::SavedWindow {
@@ -137,7 +138,25 @@ impl Projection<'_, '_> {
                     pid: app.pid(),
                     bundle_id: app.bundle_id().unwrap_or_default().clone(),
                 })
-            });
+            },
+            self.windows.iter().filter_map(|row| {
+                let (_, window, parent, .., geometry) = row;
+                let geometry = geometry?;
+                let (_, app) = self.apps.get(parent.parent()).ok()?;
+                let frame = geometry.frame;
+                Some(crate::ecs::state::SavedFloatingWindow {
+                    window_id: window.id(),
+                    pid: app.pid(),
+                    bundle_id: app.bundle_id().unwrap_or_default().clone(),
+                    frame: spool_shared_types::state::Frame {
+                        x: frame.min.x,
+                        y: frame.min.y,
+                        width: frame.width(),
+                        height: frame.height(),
+                    },
+                })
+            }),
+        );
         self.persistence.capture(snapshot).map(|_| ())
     }
 

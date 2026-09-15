@@ -22,7 +22,7 @@ use crate::ecs::native_space::{NativeSpace, SpaceControl, VisibleNativeSpaceMark
 use crate::ecs::params::Windows;
 use crate::ecs::topology::{SpaceMemberships, WindowMemberships};
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker};
-use crate::manager::{Application, Display, WindowManager};
+use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, WinID, WorkspaceId};
 use spool_shared_types::windowset::{ColumnKind, ColumnSet, StackItemSet, WindowRec, WindowSet};
 
@@ -55,6 +55,20 @@ pub struct SpoolState {
     pub version: u32,
     pub revision: u64,
     pub spaces: Vec<SavedSpace>,
+    /// Floating frames retain their own intent; an older file simply has none,
+    /// which is why the field is defaulted rather than versioned.
+    #[serde(default)]
+    pub floating: Vec<SavedFloatingWindow>,
+}
+
+/// One floating window's authored frame, with cached identity hints only.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SavedFloatingWindow {
+    pub window_id: WinID,
+    pub pid: Pid,
+    pub bundle_id: String,
+    pub frame: Frame,
 }
 
 /// Numeric Space and column IDs are candidate hints, not cross-daemon identity.
@@ -117,16 +131,39 @@ impl SpoolState {
         strips: &Query<&LayoutStrip>,
         windows: &Windows,
         apps: &Query<&Application>,
+        floating: &Query<(
+            &Window,
+            &ChildOf,
+            &crate::ecs::floating_geometry::FloatingGeometry,
+        )>,
     ) -> Self {
-        Self::from_layouts(strips.iter(), |entity| {
-            let (window, _, app_entity) = windows.get_parent_any(entity)?;
-            let app = apps.get(app_entity).ok()?;
-            Some(SavedWindow {
-                window_id: window.id(),
-                pid: app.pid(),
-                bundle_id: app.bundle_id().unwrap_or_default().clone(),
-            })
-        })
+        Self::from_layouts(
+            strips.iter(),
+            |entity| {
+                let (window, _, app_entity) = windows.get_parent_any(entity)?;
+                let app = apps.get(app_entity).ok()?;
+                Some(SavedWindow {
+                    window_id: window.id(),
+                    pid: app.pid(),
+                    bundle_id: app.bundle_id().unwrap_or_default().clone(),
+                })
+            },
+            floating.iter().filter_map(|(window, parent, geometry)| {
+                let app = apps.get(parent.parent()).ok()?;
+                let frame = geometry.frame;
+                Some(SavedFloatingWindow {
+                    window_id: window.id(),
+                    pid: app.pid(),
+                    bundle_id: app.bundle_id().unwrap_or_default().clone(),
+                    frame: Frame {
+                        x: frame.min.x,
+                        y: frame.min.y,
+                        width: frame.width(),
+                        height: frame.height(),
+                    },
+                })
+            }),
+        )
     }
 
     /// Shared capture for persistence and inspection. The caller supplies only
@@ -134,6 +171,7 @@ impl SpoolState {
     pub(crate) fn from_layouts<'a>(
         strips: impl IntoIterator<Item = &'a LayoutStrip>,
         mut window_hint: impl FnMut(Entity) -> Option<SavedWindow>,
+        floating: impl IntoIterator<Item = SavedFloatingWindow>,
     ) -> Self {
         let mut spaces = strips
             .into_iter()
@@ -180,10 +218,13 @@ impl SpoolState {
             })
             .collect::<Vec<_>>();
         spaces.sort_by_key(|space| space.space_id);
+        let mut floating = floating.into_iter().collect::<Vec<_>>();
+        floating.sort_by_key(|window| window.window_id);
         Self {
             version: INTENT_STATE_VERSION,
             revision: 0,
             spaces,
+            floating,
         }
     }
 
@@ -829,9 +870,16 @@ pub fn capture_state_changes(
     strips: Query<&LayoutStrip>,
     windows: Windows,
     apps: Query<&Application>,
+    floating: Query<(
+        &Window,
+        &ChildOf,
+        &crate::ecs::floating_geometry::FloatingGeometry,
+    )>,
     mut persistence: ResMut<StatePersistence>,
 ) {
-    if let Err(error) = persistence.capture(SpoolState::extract(&strips, &windows, &apps)) {
+    if let Err(error) =
+        persistence.capture(SpoolState::extract(&strips, &windows, &apps, &floating))
+    {
         warn!(%error, "Unable to capture accepted layout intent");
     }
 }
@@ -840,10 +888,15 @@ pub fn periodic_state_save(
     strips: Query<&LayoutStrip>,
     windows: Windows,
     apps: Query<&Application>,
+    floating: Query<(
+        &Window,
+        &ChildOf,
+        &crate::ecs::floating_geometry::FloatingGeometry,
+    )>,
     path: Res<StateFilePath>,
     mut persistence: ResMut<StatePersistence>,
 ) {
-    let state = SpoolState::extract(&strips, &windows, &apps);
+    let state = SpoolState::extract(&strips, &windows, &apps, &floating);
     match persistence
         .capture(state)
         .and_then(|snapshot| persistence.commit(&snapshot, path.as_path()))
@@ -862,11 +915,16 @@ pub fn cleanup_on_exit(
     strips: Query<&LayoutStrip>,
     windows: Windows,
     apps: Query<&Application>,
+    floating: Query<(
+        &Window,
+        &ChildOf,
+        &crate::ecs::floating_geometry::FloatingGeometry,
+    )>,
     path: Res<StateFilePath>,
     mut persistence: ResMut<StatePersistence>,
 ) {
     if exit_events.read().next().is_some() {
-        let state = SpoolState::extract(&strips, &windows, &apps);
+        let state = SpoolState::extract(&strips, &windows, &apps, &floating);
         if let Err(error) = persistence
             .capture(state)
             .and_then(|snapshot| persistence.commit(&snapshot, path.as_path()))
