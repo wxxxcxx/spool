@@ -296,13 +296,20 @@ fn an_in_flight_attempt_is_not_repaired_back_by_the_observation() {
     );
 
     // Past the confirmation window the transaction gives up, and the declaration
-    // returns to where the window actually is.
+    // returns to where the window actually is, saying why.
+    let intents = harness.mock_state.native_space_intents().len();
     harness.pump_frames(45);
     let settled = declared_space(&mut harness, members[0]);
     assert_eq!(settled.target, Some(TEST_WORKSPACE_ID));
-    assert!(
-        !settled.repairs.is_empty(),
-        "an unconfirmed attempt is recorded as a repair"
+    assert_eq!(
+        settled.repairs.last().map(|repair| repair.reason),
+        Some("attempt_unconfirmed"),
+        "an unconfirmed attempt repairs the declaration and says so"
+    );
+    assert_eq!(
+        harness.mock_state.native_space_intents().len(),
+        intents,
+        "an unconfirmed attempt is not retried"
     );
 }
 

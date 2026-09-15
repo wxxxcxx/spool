@@ -177,6 +177,7 @@ pub(crate) struct DeclaredSpaceCtx<'w, 's> {
     previous: Query<'w, 's, &'static PreviousTiledStrip>,
     topology: Res<'w, NativeTopology>,
     declared: Query<'w, 's, &'static mut DeclaredSpace>,
+    attempts: Query<'w, 's, &'static SpaceMoveAttempt>,
     moving: Query<'w, 's, (), With<NativeMoveOwner>>,
     commands: Commands<'w, 's>,
 }
@@ -196,6 +197,7 @@ pub(crate) fn reconcile_declared_space(
         previous,
         topology,
         mut declared,
+        attempts,
         moving,
         mut commands,
     }: DeclaredSpaceCtx,
@@ -253,9 +255,24 @@ pub(crate) fn reconcile_declared_space(
             };
             state.repair(replacement, reason);
         } else if replacement.is_some_and(|observed| observed != target) {
-            // The window belongs somewhere else while its target still exists:
-            // an external move, or a merge into another strip. Observed wins.
-            state.repair(replacement, "membership_changed");
+            // The window belongs somewhere else while its target still exists.
+            // The attempt record says whether this is our own attempt failing to
+            // land: its target still equals the declaration only until the repair
+            // below moves the declaration on, so a later external move cannot
+            // inherit this reason.
+            let reason = attempts
+                .get(entity)
+                .ok()
+                // Only the attempt this declaration was waiting for can explain
+                // the move; once the repair below moves the declaration on, a
+                // later external move no longer matches its target.
+                .filter(|attempt| attempt.target_space_id == target)
+                .map_or("membership_changed", |attempt| match attempt.result {
+                    SpaceMoveResult::TimedOut => "attempt_unconfirmed",
+                    SpaceMoveResult::Retired => "member_retired",
+                    _ => "membership_changed",
+                });
+            state.repair(replacement, reason);
         }
     }
 }

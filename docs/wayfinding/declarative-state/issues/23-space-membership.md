@@ -130,6 +130,13 @@ ADR 0006 的"不可见 Space 也应接受 desired-layout 编辑"在本票被**�
 - **在途尝试拥有实现权**：`reconcile_declared_space` 在窗口带 `NativeMoveOwner` 时只更新 `observed`、不做修复 —— 否则观测会立刻把刚被接纳的声明按回去，和被拒绝的编辑一样没用。事务放弃（2 秒）后所有权释放，声明才回到窗口实际所在处。
 - 测试：`an_accepted_move_declares_its_target_for_every_member`（含整列成员、且在确认前）、`a_refused_move_leaves_the_declaration_alone`、`an_in_flight_attempt_is_not_repaired_back_by_the_observation`（移除在途跳过时该测试失败：`left: Some(2) right: Some(3)`，即声明被观测按回源 Space）。
 
+### task-3：未确认的尝试带原因修复（已实施，2026-09-15）
+
+- 事务放弃（2 秒）后所有权释放，声明协调在下一轮把声明修复回窗口实际所在处，**并说明原因**：声明协调读取该窗口最近一次尝试记录，若 `TimedOut` 且其目标仍等于当前声明 → 原因 `attempt_unconfirmed`；`Retired` → `member_retired`；否则（外部移动/合并）→ `membership_changed`。
+- 守卫条件很重要：只有"这次尝试的目标 == 当前声明"时才用尝试记录解释该次修复，所以修复把声明移走之后，后续的外部移动不会再继承这个原因。
+- 不自动重试：测试断言超时修复后原生意图计数不变（只提交过那一次）。
+- 测试：`an_in_flight_attempt_is_not_repaired_back_by_the_observation` 覆盖"在途不修 → 超时带原因修回观测 → 不重试"；移除原因推导时该断言失败（`left: Some("membership_changed")`）。
+
 ## Resolution
 
 用户于 2026-09-15 逐项裁决：不变量 + 修复、修复不写原生、兜底顺序（观测 → 上次所在 → 未知）、一次尝试（2 秒，不自动重试）、以及"保留只在用户无法便宜重试且卡住状态常见持久时才做"这条判据。见上文 Answer。
