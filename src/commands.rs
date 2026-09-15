@@ -243,7 +243,7 @@ fn get_window_in_direction(
         Direction::Nth(index) => strip.get(*index).ok().and_then(|column| column.top()),
 
         Direction::North => match strip.get(index).ok()? {
-            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
+            Column::Single(_) | Column::Tabs(_) | Column::Fullscreen(_) => None,
             Column::Stack(stack) => stack
                 .iter()
                 .enumerate()
@@ -253,7 +253,7 @@ fn get_window_in_direction(
         },
 
         Direction::South => match strip.get(index).ok()? {
-            Column::Single(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
+            Column::Single(_) | Column::Tabs(_) | Column::Fullscreen(_) => None,
             Column::Stack(stack) => stack
                 .iter()
                 .enumerate()
@@ -1291,7 +1291,7 @@ mod tests {
                 .single_mut(world)
                 .unwrap()
                 .get_column_mut(0)
-                .unwrap() = Column::Fullscren(entity);
+                .unwrap() = Column::Fullscreen(entity);
             world.entity_mut(entity).insert(FullWidthMarker {
                 width_ratio: 0.5,
                 floating_frame: None,
@@ -1492,7 +1492,7 @@ mod tests {
                 let world = harness.world();
                 let mut strip = world.query::<&mut LayoutStrip>().single_mut(world).unwrap();
                 let member = strip.get(index).unwrap().top().unwrap();
-                *strip.get_column_mut(index).unwrap() = Column::Fullscren(member);
+                *strip.get_column_mut(index).unwrap() = Column::Fullscreen(member);
             }
             harness.world().entity_mut(entity).insert(FullWidthMarker {
                 width_ratio: 0.5,

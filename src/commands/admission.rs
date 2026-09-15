@@ -862,7 +862,7 @@ impl Admission<'_, '_> {
     /// A column addressed for editing must exist and not be native fullscreen.
     pub(crate) fn ineligible_column(strip: &LayoutStrip, index: usize) -> Result<(), Rejection> {
         match strip.get(index) {
-            Ok(column) if !matches!(column, Column::Fullscren(_)) => Ok(()),
+            Ok(column) if !matches!(column, Column::Fullscreen(_)) => Ok(()),
             _ => Err(Rejection::IneligibleLayoutEntry),
         }
     }
@@ -889,7 +889,7 @@ impl Admission<'_, '_> {
         index: usize,
     ) -> Result<(), Rejection> {
         let column = strip.get(index).map_err(|_| Rejection::ColumnUnavailable)?;
-        if matches!(column, Column::Fullscren(_)) {
+        if matches!(column, Column::Fullscreen(_)) {
             return Err(Rejection::IneligibleLayoutEntry);
         }
         if column.window_iter().any(|member| {
@@ -903,7 +903,7 @@ impl Admission<'_, '_> {
     /// A tiled window's containing column must exist and not be fullscreen.
     pub(crate) fn tiled_column(strip: &LayoutStrip, entity: Entity) -> Result<(), Rejection> {
         match strip.column_containing(entity) {
-            Some(column) if !matches!(column, Column::Fullscren(_)) => Ok(()),
+            Some(column) if !matches!(column, Column::Fullscreen(_)) => Ok(()),
             _ => Err(Rejection::IneligibleLayoutEntry),
         }
     }

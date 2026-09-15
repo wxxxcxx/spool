@@ -100,7 +100,7 @@ fn column_kind(column: &Column) -> &'static str {
     match column {
         Column::Stack(_) => "stack",
         Column::Tabs(_) => "tabs",
-        Column::Fullscren(_) => "fullscreen",
+        Column::Fullscreen(_) => "fullscreen",
         Column::Single(_) => "single",
     }
 }

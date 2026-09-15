@@ -194,7 +194,7 @@ impl TrustedColumnBinding {
                 spool_shared_types::windowset::ColumnKind::Stack
             }
             crate::ecs::layout::Column::Tabs(_) => spool_shared_types::windowset::ColumnKind::Tabs,
-            crate::ecs::layout::Column::Fullscren(_) => {
+            crate::ecs::layout::Column::Fullscreen(_) => {
                 spool_shared_types::windowset::ColumnKind::Fullscreen
             }
         };

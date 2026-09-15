@@ -149,7 +149,7 @@ impl SpoolState {
                             Column::Single(_) => ColumnKind::Single,
                             Column::Stack(_) => ColumnKind::Stack,
                             Column::Tabs(_) => ColumnKind::Tabs,
-                            Column::Fullscren(_) => ColumnKind::Fullscreen,
+                            Column::Fullscreen(_) => ColumnKind::Fullscreen,
                         },
                         items: state
                             .height_items
@@ -577,7 +577,7 @@ impl QueryStateParams<'_, '_> {
             StackItemSet::from_windows(tiled)
         };
         let items = match column {
-            Column::Single(entity) | Column::Fullscren(entity) => {
+            Column::Single(entity) | Column::Fullscreen(entity) => {
                 project_item(std::slice::from_ref(entity))
                     .into_iter()
                     .collect()
@@ -592,7 +592,7 @@ impl QueryStateParams<'_, '_> {
                 .collect(),
         };
         let mut projected = ColumnSet::from_items(items, width_ratio)?;
-        if matches!(column, Column::Fullscren(_)) {
+        if matches!(column, Column::Fullscreen(_)) {
             projected.kind = ColumnKind::Fullscreen;
         }
         let selected = column

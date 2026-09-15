@@ -418,7 +418,8 @@ pub enum Column {
     Stack(Vec<StackItem>),
     /// A panel containing a group of native tabs.
     Tabs(Vec<Entity>),
-    Fullscren(Entity),
+    /// A panel holding a window that macOS made natively fullscreen.
+    Fullscreen(Entity),
 }
 
 impl Column {
@@ -430,7 +431,7 @@ impl Column {
                 .contains(&entity)
                 .then(|| StackItem::Tabs(tabs.clone())),
             Self::Stack(items) => items.iter().find(|item| item.contains(entity)).cloned(),
-            Self::Fullscren(_) => None,
+            Self::Fullscreen(_) => None,
         }
     }
 
@@ -439,7 +440,7 @@ impl Column {
     /// For a `Stack` or `Tabs`, it's the first window in the vector.
     pub fn top(&self) -> Option<Entity> {
         match self {
-            Column::Single(id) | Column::Fullscren(id) => Some(*id),
+            Column::Single(id) | Column::Fullscreen(id) => Some(*id),
             Column::Stack(stack) => stack.first().and_then(StackItem::top),
             Column::Tabs(tabs) => tabs.first().copied(),
         }
@@ -448,7 +449,7 @@ impl Column {
     /// Returns an iterator over all window entities in this column
     pub fn window_iter(&self) -> ColumnWindowIter<'_> {
         match self {
-            Column::Single(entity) | Column::Fullscren(entity) => {
+            Column::Single(entity) | Column::Fullscreen(entity) => {
                 ColumnWindowIter::Single(std::iter::once(*entity))
             }
             Column::Tabs(tabs) => ColumnWindowIter::Tabs(tabs.iter().copied()),
@@ -461,7 +462,7 @@ impl Column {
     /// Returns the entity at the given index, or the last entity if the index exceeds the size.
     pub fn at_or_last(&self, index: usize) -> Option<Entity> {
         match self {
-            Column::Single(id) | Column::Fullscren(id) => Some(*id),
+            Column::Single(id) | Column::Fullscreen(id) => Some(*id),
             Column::Stack(stack) => stack
                 .get(index)
                 .or_else(|| stack.last())
@@ -473,7 +474,7 @@ impl Column {
     /// Returns the position of an entity within this column (0 for Single/Tabs, index for Stack).
     pub fn position_of(&self, entity: Entity) -> Option<usize> {
         match self {
-            Column::Single(id) | Column::Fullscren(id) => (*id == entity).then_some(0),
+            Column::Single(id) | Column::Fullscreen(id) => (*id == entity).then_some(0),
             Column::Stack(stack) => stack.iter().position(|item| item.contains(entity)),
             Column::Tabs(tabs) => tabs.contains(&entity).then_some(0),
         }
@@ -483,7 +484,7 @@ impl Column {
     /// Native tab ordering is stable; the focused tab is tracked by `FocusedMarker`.
     pub fn move_to_front(&mut self, entity: Entity) {
         match self {
-            Column::Single(_) | Column::Fullscren(_) => {}
+            Column::Single(_) | Column::Fullscreen(_) => {}
             Column::Stack(stack) => {
                 if let Some(StackItem::Tabs(tabs)) =
                     stack.iter_mut().find(|item| item.contains(entity))
@@ -549,7 +550,7 @@ impl LayoutStrip {
 
     pub fn fullscreen(id: WorkspaceId, entity: Entity) -> Self {
         let mut columns = VecDeque::new();
-        columns.push_back(Column::Fullscren(entity));
+        columns.push_back(Column::Fullscreen(entity));
         let mut strip = Self {
             id,
             columns,
@@ -711,7 +712,7 @@ impl LayoutStrip {
             .column_states
             .get(index)
             .ok_or(WidthProjectionBlocked::InvalidIntent)?;
-        let width = if matches!(self.columns[index], Column::Fullscren(_)) {
+        let width = if matches!(self.columns[index], Column::Fullscreen(_)) {
             WidthIntent::ViewportRatio(1.0)
         } else {
             state.width
@@ -797,7 +798,7 @@ impl LayoutStrip {
         self.columns
             .iter()
             .position(|column| match column {
-                Column::Single(id) | Column::Fullscren(id) => *id == entity,
+                Column::Single(id) | Column::Fullscreen(id) => *id == entity,
                 Column::Stack(stack) => stack.iter().any(|item| item.contains(entity)),
                 Column::Tabs(stack) => stack.contains(&entity),
             })
@@ -810,7 +811,7 @@ impl LayoutStrip {
     /// Returns `true` if the strip contains the given entity.
     pub fn contains(&self, entity: Entity) -> bool {
         self.columns.iter().any(|column| match column {
-            Column::Single(id) | Column::Fullscren(id) => *id == entity,
+            Column::Single(id) | Column::Fullscreen(id) => *id == entity,
             Column::Stack(stack) => stack.iter().any(|item| item.contains(entity)),
             Column::Tabs(stack) => stack.contains(&entity),
         })
@@ -896,7 +897,7 @@ impl LayoutStrip {
 
     pub(crate) fn append_column_with_state(&mut self, column: Column, state: ColumnState) {
         let column = match column {
-            Column::Fullscren(entity) => Column::Single(entity),
+            Column::Fullscreen(entity) => Column::Single(entity),
             other => other,
         };
         for entity in column.window_iter().collect::<Vec<_>>() {
@@ -974,7 +975,7 @@ impl LayoutStrip {
             }
         }
         for column in &mut extracted.columns {
-            if let Column::Fullscren(entity) = column {
+            if let Column::Fullscreen(entity) = column {
                 *column = Column::Single(*entity);
             }
         }
@@ -1067,7 +1068,7 @@ impl LayoutStrip {
         let index = self.index_of(leader)?;
         let column = self.columns.remove(index).unwrap();
         match column {
-            Column::Single(id) | Column::Fullscren(id) => {
+            Column::Single(id) | Column::Fullscreen(id) => {
                 self.columns.insert(index, Column::Tabs(vec![follower, id]));
             }
             Column::Stack(mut items) => {
@@ -1113,7 +1114,7 @@ impl LayoutStrip {
         if let Some((column, index)) = removed {
             let count_after_removal = self.columns.len();
             match column {
-                Column::Single(_) | Column::Fullscren(_) => {
+                Column::Single(_) | Column::Fullscreen(_) => {
                     // Already removed from self.columns.
                 }
                 Column::Stack(mut stack) => {
@@ -1265,7 +1266,7 @@ impl LayoutStrip {
         }
         if [index - 1, index]
             .into_iter()
-            .any(|index| matches!(self.columns[index], Column::Fullscren(_)))
+            .any(|index| matches!(self.columns[index], Column::Fullscreen(_)))
         {
             return Ok(false);
         }
@@ -1276,7 +1277,7 @@ impl LayoutStrip {
             .height_items
             .extend(source_state.height_items);
         let items_to_stack = match column_to_stack {
-            Column::Fullscren(_) => unreachable!("fullscreen endpoints rejected before removal"),
+            Column::Fullscreen(_) => unreachable!("fullscreen endpoints rejected before removal"),
             Column::Single(id) => vec![StackItem::Single(id)],
             Column::Tabs(tabs) => vec![StackItem::Tabs(tabs)],
             Column::Stack(items) => items,
@@ -1284,7 +1285,7 @@ impl LayoutStrip {
 
         let target_column = self.columns.remove(index - 1).unwrap();
         let new_column = match target_column {
-            Column::Fullscren(_) => unreachable!("fullscreen endpoints rejected before removal"),
+            Column::Fullscreen(_) => unreachable!("fullscreen endpoints rejected before removal"),
             Column::Single(id) => {
                 Column::Stack([vec![StackItem::Single(id)], items_to_stack].concat())
             }
@@ -1304,7 +1305,7 @@ impl LayoutStrip {
     pub(crate) fn stack_onto(&mut self, entity: Entity, onto: Entity) -> Result<bool> {
         let source = self.index_of(entity)?;
         let target = self.index_of(onto)?;
-        if source == target || matches!(self.columns[target], Column::Fullscren(_)) {
+        if source == target || matches!(self.columns[target], Column::Fullscreen(_)) {
             return Ok(false);
         }
         let Some(item) = self.columns[source].item_containing(entity) else {
@@ -1329,7 +1330,7 @@ impl LayoutStrip {
                 self.columns[target] = Column::Stack(vec![StackItem::Tabs(tabs), item]);
             }
             Column::Stack(items) => items.push(item),
-            Column::Fullscren(_) => unreachable!("validated before removing the source"),
+            Column::Fullscreen(_) => unreachable!("validated before removing the source"),
         }
         self.structure_changed();
         Ok(true)
@@ -1440,7 +1441,7 @@ impl LayoutStrip {
         self.columns
             .iter()
             .flat_map(|column| match column {
-                Column::Single(entity) | Column::Fullscren(entity) => vec![*entity],
+                Column::Single(entity) | Column::Fullscreen(entity) => vec![*entity],
                 Column::Stack(items) => items.iter().flat_map(StackItem::window_iter).collect(),
                 Column::Tabs(ids) => ids.clone(),
             })
@@ -1570,7 +1571,7 @@ impl LayoutStrip {
                         false
                     }
                 }),
-                Column::Single(_) | Column::Fullscren(_) => false,
+                Column::Single(_) | Column::Fullscreen(_) => false,
             })
             .is_ok_and(|t| t)
     }
@@ -1595,14 +1596,14 @@ impl LayoutStrip {
                 }
                 StackItem::Single(_) | StackItem::Tabs(_) => None,
             }),
-            Column::Single(_) | Column::Fullscren(_) | Column::Tabs(_) => None,
+            Column::Single(_) | Column::Fullscreen(_) | Column::Tabs(_) => None,
         })
     }
 
     pub fn is_fullscreen(&self) -> bool {
         self.columns
             .front()
-            .is_some_and(|column| matches!(column, Column::Fullscren(_)))
+            .is_some_and(|column| matches!(column, Column::Fullscreen(_)))
     }
 }
 
@@ -1651,7 +1652,7 @@ fn strip_has_changed_window(strip: &LayoutStrip, changed_entities: &EntityHashSe
 
 fn column_has_changed_window(column: &Column, changed_entities: &EntityHashSet) -> bool {
     match column {
-        Column::Single(entity) | Column::Fullscren(entity) => changed_entities.contains(entity),
+        Column::Single(entity) | Column::Fullscreen(entity) => changed_entities.contains(entity),
         Column::Stack(stack) => stack
             .iter()
             .any(|item| stack_item_has_changed_window(item, changed_entities)),
@@ -1966,7 +1967,7 @@ fn insert_column_window_contexts(
     stacked: bool,
 ) {
     match column {
-        Column::Single(entity) | Column::Fullscren(entity) => {
+        Column::Single(entity) | Column::Fullscreen(entity) => {
             contexts.insert(
                 *entity,
                 StripWindowContext {
@@ -2854,7 +2855,7 @@ mod tests {
     fn stacking_a_native_fullscreen_endpoint_preserves_every_column() {
         for fullscreen_index in [0, 1] {
             let (_, mut strip, entities) = setup_world_and_strip();
-            strip.columns[fullscreen_index] = Column::Fullscren(entities[fullscreen_index]);
+            strip.columns[fullscreen_index] = Column::Fullscreen(entities[fullscreen_index]);
             let before: Vec<Vec<Entity>> = strip
                 .columns()
                 .map(|column| column.window_iter().collect())
@@ -2867,7 +2868,7 @@ mod tests {
             assert_eq!(after, before, "fullscreen column {fullscreen_index}");
             assert!(matches!(
                 strip.get(fullscreen_index).unwrap(),
-                Column::Fullscren(_)
+                Column::Fullscreen(_)
             ));
         }
     }
@@ -3024,7 +3025,7 @@ mod tests {
                 assert_eq!(stack[0], StackItem::Single(entities[0]));
                 assert_eq!(stack[1], StackItem::Single(entities[1]));
             }
-            Column::Single(_) | Column::Fullscren(_) | Column::Tabs(_) => {
+            Column::Single(_) | Column::Fullscreen(_) | Column::Tabs(_) => {
                 panic!("Expected a stack")
             }
         }
@@ -3669,7 +3670,7 @@ mod tests {
         assert_eq!(target.all_windows(), vec![c, b, a]);
         assert!(matches!(target.get(1), Ok(Column::Tabs(_))));
 
-        target.append_column(Column::Fullscren(a));
+        target.append_column(Column::Fullscreen(a));
         assert!(matches!(target.last(), Ok(Column::Single(entity)) if entity == a));
     }
 }

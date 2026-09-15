@@ -164,7 +164,7 @@ pub(super) fn execute(
         let ids = proposed
             .columns()
             .enumerate()
-            .filter(|(_, column)| !matches!(column, Column::Fullscren(_)))
+            .filter(|(_, column)| !matches!(column, Column::Fullscreen(_)))
             .filter_map(|(index, _)| proposed.column_state(index).map(|s| s.id))
             .collect::<Vec<_>>();
         ids.into_iter()

@@ -263,7 +263,7 @@ fn bottom_to_top(
                     }
                 }
             }
-            Column::Fullscren(_) => {}
+            Column::Fullscreen(_) => {}
         }
         members.retain(|entity| eligible(*entity));
         if !members.is_empty() {

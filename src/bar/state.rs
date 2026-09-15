@@ -130,7 +130,7 @@ impl BarStateParams<'_, '_> {
                         Column::Single(_) => ColumnKind::Single,
                         Column::Stack(_) => ColumnKind::Stack,
                         Column::Tabs(_) => ColumnKind::Tabs,
-                        Column::Fullscren(_) => ColumnKind::Fullscreen,
+                        Column::Fullscreen(_) => ColumnKind::Fullscreen,
                     },
                     selected,
                     windows,
