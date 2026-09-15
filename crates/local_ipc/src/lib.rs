@@ -555,7 +555,7 @@ impl Client {
     pub fn subscribe(mut self, request: &Request) -> Result<EventStream> {
         match self.exchange(RequestMode::Subscribe, request)? {
             ServerFrame::Ack => {
-                self.stream.set_read_timeout(None).map_err(Error::Io)?;
+                clear_read_timeout(&self.stream)?;
                 Ok(EventStream {
                     stream: self.stream,
                 })
@@ -847,6 +847,38 @@ fn connect_with_timeout(path: &Path, deadline: Duration) -> Result<UnixStream> {
 
     set_nonblocking(&fd, false)?;
     Ok(UnixStream::from(fd))
+}
+
+/// Ensures a subscribed stream blocks indefinitely.
+///
+/// The postcondition is `read_timeout() == None`, so it is checked rather than
+/// assumed: clearing an already-clear `SO_RCVTIMEO` is a no-op, and a connected
+/// macOS socket can reject that redundant write with `EINVAL` — which surfaced
+/// as an unrelated failed subscription in roughly one run in six. The write
+/// still uses an explicit zero `timeval` instead of std's `None`, so the call
+/// does not depend on how std spells "no timeout".
+fn clear_read_timeout(stream: &UnixStream) -> Result<()> {
+    if stream.read_timeout().map_err(Error::Io)?.is_none() {
+        return Ok(());
+    }
+    let zero = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let status = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const zero).cast(),
+            libc::socklen_t::try_from(std::mem::size_of::<libc::timeval>())
+                .expect("timeval size fits socklen_t"),
+        )
+    };
+    if status < 0 {
+        return Err(Error::Io(io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 fn set_nonblocking(fd: &OwnedFd, enabled: bool) -> Result<()> {
@@ -1530,6 +1562,30 @@ mod tests {
             result.expect_err("blocked write").kind(),
             io::ErrorKind::TimedOut
         );
+    }
+
+    #[test]
+    fn a_subscription_clears_a_receive_timeout() {
+        let (stream, mut peer) = UnixStream::pair().expect("fixture pair");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .expect("read timeout");
+        write_frame(&mut peer, &ServerFrame::Ack).expect("queue compatibility acknowledgement");
+        write_frame(&mut peer, &ServerFrame::Ack).expect("queue subscription acknowledgement");
+        let events = Client {
+            stream,
+            timeout: Duration::from_millis(100),
+            started: Instant::now(),
+            submitted: false,
+        }
+        .subscribe(&Request::Subscribe { raw: false })
+        .expect("subscribe");
+        assert_eq!(
+            events.stream.read_timeout().expect("read timeout"),
+            None,
+            "a subscribed stream must block indefinitely"
+        );
+        let _: ClientFrame = read_frame(&mut peer).expect("request");
     }
 
     #[test]
