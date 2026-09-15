@@ -317,7 +317,7 @@ or a frozen world revision.
 
 `commands::dispatch_actions` is a thin reader: it turns checked IPC requests into
 admission receipts and forwards every bus action to `commands::admission`.
-`admission::execute` (the checked path) and `admission::execute_dispatched` (the
+`admission::execute` (the checked path) and `admission::admit` (the
 fire-and-forget path) are the single readers for runtime actions, including
 directional window operations, named focus, Space commands, column reorder, and
 effect-only actions. They share one ordered pipeline: the lifecycle and
@@ -328,6 +328,15 @@ place, and the bounded typed `Rejection` maps to the existing snake-case IPC
 codes. The reader runs after the event pump and before topology refresh. Each
 command flushes its deferred changes and observers before the next command is
 accepted.
+
+The one decision that ends the session is `admission::aftermath`, a pure total
+function over the action: `Stop` for `Quit`, `Restart` for `Restart`, `Nothing`
+otherwise. The table marks the session `Stopping` for both, so every further
+action is refused while the requester still waits; whoever owns the transport
+performs the effect — `conclude_from_wire` after the receipt is written for a
+checked request, `conclude_in_world` as soon as `admit` returns for a
+fire-and-forget one. The reader and the command systems no longer re-derive
+which actions end the session.
 
 `Action::Layout(plan)` is the one deliberate second boundary:
 `layout_ops::apply_layout_plan` replays the captured plan operation by operation,

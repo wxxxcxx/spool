@@ -710,6 +710,32 @@ fn repositions(harness: &mut TestHarness) -> usize {
     world.query::<&RepositionMarker>().iter(world).count()
 }
 
+fn phase(harness: &mut TestHarness) -> crate::lifecycle::Phase {
+    harness
+        .world()
+        .resource::<crate::lifecycle::Lifecycle>()
+        .phase()
+}
+
+/// A quitted session closes through the same decision a checked request uses,
+/// and only once: the bus path used to stop without marking the session at all.
+#[test]
+fn a_bus_quit_stops_the_session_once() {
+    let mut harness = harness();
+    assert_eq!(phase(&mut harness), crate::lifecycle::Phase::Running);
+
+    dispatch(&mut harness, [Action::Quit]);
+    assert_eq!(phase(&mut harness), crate::lifecycle::Phase::Stopping);
+    assert_eq!(harness.mock_state.take_quit_requests(), 1);
+
+    dispatch(&mut harness, [Action::Quit]);
+    assert_eq!(
+        harness.mock_state.take_quit_requests(),
+        0,
+        "a session already stopping must not stop again"
+    );
+}
+
 /// `Center` and `Snap` reach the strip through the one admission table now, so
 /// the session gate applies to them on the bus intake too — it never did.
 #[test]

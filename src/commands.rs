@@ -10,6 +10,7 @@ use tracing::{Level, instrument};
 use tracing::{debug, error, info};
 
 pub(crate) mod admission;
+pub(crate) use admission::{Aftermath, aftermath};
 mod column_width;
 mod display_navigation;
 mod layout_edit;
@@ -116,7 +117,7 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
             action => {
                 let action = action.clone();
                 commands.queue(move |world: &mut bevy::prelude::World| {
-                    if let Err(reason) = admission::execute_dispatched(world, action) {
+                    if let Err(reason) = admission::admit(world, action) {
                         debug!(%reason, "command rejected");
                     }
                 });
@@ -950,18 +951,6 @@ fn checked_focus_other_display(
         commands.focus_entity(entity, true);
     }
     Ok(())
-}
-
-#[instrument(level = Level::DEBUG, skip_all)]
-fn command_quit_handler(window_manager: Res<WindowManager>) {
-    _ = window_manager.quit();
-}
-
-#[instrument(level = Level::DEBUG, skip_all)]
-fn command_restart_handler() {
-    if let Err(err) = crate::platform::service::Service::request_restart() {
-        error!("failed to restart service: {err}");
-    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]

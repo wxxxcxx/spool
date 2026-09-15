@@ -110,6 +110,7 @@ struct MockStateInner {
     fullscreen_spaces: HashSet<WorkspaceId>,
     active_display_id: u32,
     cursor_position: Origin,
+    quit_requests: usize,
     event_queue: VecDeque<Event>,
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
@@ -194,6 +195,7 @@ impl MockState {
                 fullscreen_spaces: HashSet::new(),
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
+                quit_requests: 0,
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 stale_window_incarnations: HashMap::new(),
@@ -987,6 +989,11 @@ impl MockState {
         self.inner.force_read().cursor_position
     }
 
+    /// How many graceful stops this platform was asked for, resetting the count.
+    pub fn take_quit_requests(&self) -> usize {
+        std::mem::take(&mut self.inner.force_write().quit_requests)
+    }
+
     // --- Mock Factory Methods ---
 
     #[allow(clippy::too_many_lines)]
@@ -1755,6 +1762,12 @@ impl MockState {
             .returning(move |workspace_id| s.query_workspace_windows(workspace_id));
 
         self.mock_window_server_inventory(&mut wm);
+
+        let s = self.clone();
+        wm.expect_quit().returning(move || {
+            s.inner.force_write().quit_requests += 1;
+            Ok(())
+        });
 
         let s = self.clone();
         wm.expect_warp_mouse()

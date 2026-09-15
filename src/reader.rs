@@ -87,15 +87,14 @@ impl RequestReader {
         } = delivery;
 
         if let Some(reason) = self.lifecycle.rejection() {
-            use crate::commands::Action;
+            use crate::commands::{Action, Aftermath, aftermath};
             use crate::lifecycle::Phase;
             use spool_shared_types::wire::{AdmissionReceipt, Response};
             let can_quit = self.lifecycle.phase() != Phase::Stopping;
-            let quitting = can_quit
-                && matches!(&request, Request::Command(command) if command.action == Action::Quit);
+            let stopping = |action: &Action| can_quit && aftermath(action) == Aftermath::Stop;
             if let Request::Command(command) = &request {
                 if let Some(reply) = reply {
-                    let result = if quitting {
+                    let result = if stopping(&command.action) {
                         self.lifecycle.set(Phase::Stopping);
                         Ok(())
                     } else {
@@ -105,8 +104,8 @@ impl RequestReader {
                         command.request_id.clone(),
                         result,
                     )));
-                    if quitting {
-                        _ = self.events.send(Event::Exit);
+                    if stopping(&command.action) {
+                        Aftermath::Stop.conclude_from_wire(&self.events);
                     }
                 }
             } else if let Request::Inspect(request) = &request {
@@ -115,11 +114,13 @@ impl RequestReader {
                         spool_shared_types::inspection::Report::failure(request, reason, reason),
                     )));
                 }
-            } else if can_quit && matches!(&request, Request::Dispatch(Action::Quit)) {
+            } else if let Request::Dispatch(action) = &request
+                && stopping(action)
+            {
                 if let Some(acknowledgement) = acknowledgement {
                     self.lifecycle.set(Phase::Stopping);
                     _ = acknowledgement.accepted();
-                    _ = self.events.send(Event::Exit);
+                    Aftermath::Stop.conclude_from_wire(&self.events);
                 }
             } else {
                 if let Some(reply) = reply {
@@ -143,8 +144,7 @@ impl RequestReader {
                 },
             ),
             Request::Command(request) => {
-                let quitting = matches!(request.action, crate::commands::Action::Quit);
-                let restarting = matches!(request.action, crate::commands::Action::Restart);
+                let aftermath = crate::commands::aftermath(&request.action);
                 let events = self.events.clone();
                 answer_then(
                     self.events.clone(),
@@ -155,17 +155,11 @@ impl RequestReader {
                         respond_to,
                     },
                     move |response| {
+                        // The receipt is on the wire; only now may the process
+                        // go, and only in the way the decision asked for.
                         if matches!(response, spool_shared_types::wire::Response::Admission(receipt) if receipt.status == spool_shared_types::wire::AdmissionStatus::Accepted)
                         {
-                            if quitting {
-                                _ = events.send(Event::Exit);
-                            }
-                            if restarting
-                                && let Err(error) =
-                                    crate::platform::service::Service::request_restart()
-                            {
-                                error!(%error, "unable to start admitted service restart");
-                            }
+                            aftermath.conclude_from_wire(&events);
                         }
                     },
                 );

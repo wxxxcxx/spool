@@ -30,14 +30,25 @@ decides whether an action is accepted before any domain effect runs.
 ## Decision
 
 **One reader for every action.** `commands::admission::execute` (the checked,
-receipt-bearing path) and `commands::admission::execute_dispatched` (the
-fire-and-forget bus path) are the only readers of a runtime `Action`. Both call
-one ordered pipeline: evaluate the lifecycle gate, run effect-only actions
-(`MissionControl`, `ShowDesktop`, `PrintState`, `ReconcileWindows`, the two
-lifecycle actions, `ToggleBarCollapse`), resolve a default target, then dispatch
+receipt-bearing path) and `commands::admission::admit` (the fire-and-forget bus
+path) are the only readers of a runtime `Action`. Both call one ordered
+pipeline: evaluate the lifecycle gate, answer a session-ending action, run
+effect-only actions (`MissionControl`, `ShowDesktop`, `PrintState`,
+`ReconcileWindows`, `ToggleBarCollapse`), resolve a default target, then dispatch
 to the domain executor. `dispatch_actions` becomes a thin reader: it turns
 `CheckedActionRequested` into an `AdmissionReceipt` and forwards every
-`ActionRequested` to `execute_dispatched`.
+`ActionRequested` to `admit`.
+
+**One decision ends the session, and the intake concludes it.**
+`admission::aftermath` is a pure, total function over an action: `Stop` for
+`Quit`, `Restart` for `Restart`, `Nothing` otherwise. The table marks the
+lifecycle `Stopping` in both cases — so every other action is refused while the
+requester still waits — and then returns without performing the effect. Whoever
+owns the transport performs it: a checked request answers first and calls
+`conclude_from_wire`, a fire-and-forget `admit` concludes in-world as soon as
+the decision is made. `command_quit_handler`, `command_restart_handler` and the
+reader's own derivation are gone, so the transport no longer has to know what a
+`Quit` means.
 
 **The `Layout(plan)` batch is one admitted action, replayed op by op.** A
 script's returned plan is admitted by the session's writability like any other
@@ -95,11 +106,12 @@ and the command helpers call these recipes instead of reconstructing the checks.
   Admitting the batch while replaying it as a batch keeps both the session gate
   and the snapshot binding; splitting the replay across reader passes would lose
   the latter and re-order operations behind the actions that followed.
-- **One entry point with a receipt flag** instead of `execute` and
-  `execute_dispatched`. Rejected: a checked command defers the lifecycle effect
-  until after its receipt is attempted, while a dispatched action has no receipt
-  and runs the effect inline; the two are genuinely distinct, and a boolean would
-  obscure that at every call site.
+- **One entry point with a receipt flag** instead of `execute` and `admit`.
+  Rejected: a checked command defers the lifecycle effect until after its receipt
+  is attempted, while a dispatched action has no receipt and runs the effect
+  inline; the two are genuinely distinct, and a boolean would obscure that at
+  every call site. The pipeline itself takes no such flag: `admit` is `execute`
+  plus the conclusion the requester does not own.
 
 ## Consequences
 
@@ -113,8 +125,10 @@ and `session_not_writable` gates; an action that used to run while
 initialization, Mission Control, or exit restoration was in progress may now be
 refused, and a script's plan can no longer edit an unwritable session. `Center`
 moves the pointer only under `mouse_follows_focus`, on both the default and the
-explicit target. The migrated executors now share one recipe vocabulary instead
-of reconstructing it.
+explicit target. A `quit` or `restart` arriving from a keybinding, the Bar or Lua
+now marks the session `Stopping` as the checked path already did, and stops the
+session once rather than once per intake. The migrated executors now share one
+recipe vocabulary instead of reconstructing it.
 
 Three exceptions are deliberate and easy to lose later:
 
@@ -130,9 +144,9 @@ Three exceptions are deliberate and easy to lose later:
   the table decides and marks the lifecycle `Stopping`, and the intake that owns
   the transport performs the termination after the receipt is written. A
   fire-and-forget termination has nobody to answer and terminates as soon as it
-  is admitted. `Event::LayoutSpaceRequested` stays the one named non-action: it
-  is a script plan's deferred continuation, and its gate must stay identical to
-  that of the action it continues.
+  is admitted, once. `Event::LayoutSpaceRequested` stays the one named
+  non-action: it is a script plan's deferred continuation, and its gate must stay
+  identical to that of the action it continues.
 
 Desktop and native acceptance are not required for this routing change and were
 not run. Whether a specific native write is accepted remains the domain of the

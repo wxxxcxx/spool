@@ -16,22 +16,73 @@ use crate::manager::{Display, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
 
 pub(super) fn execute(world: &mut World, action: Action) -> crate::errors::Result<()> {
-    execute_action(world, action, LifecycleEffect::Deferred)
+    execute_action(world, action)
 }
 
-/// The fire-and-forget dispatch path. Unlike a checked command, it has no
-/// receipt to deliver first, so a lifecycle action performs its native effect
-/// immediately instead of leaving it to the reply adapter.
-pub(super) fn execute_dispatched(world: &mut World, action: Action) -> crate::errors::Result<()> {
-    execute_action(world, action, LifecycleEffect::Immediate)
+/// The common caller: decide, then conclude whatever is not waiting on a reply.
+/// A checked request uses [`execute`] instead, so its requester owns that step.
+pub(super) fn admit(world: &mut World, action: Action) -> crate::errors::Result<()> {
+    let aftermath = aftermath(&action);
+    execute(world, action)?;
+    aftermath.conclude_in_world(world);
+    Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LifecycleEffect {
-    /// The checked-command adapter attempts the receipt before shutdown.
-    Deferred,
-    /// The dispatch path runs the native effect inline.
-    Immediate,
+/// What an admitted action owes the process once its effect has run.
+///
+/// Not a status: a refused action has no aftermath, and a refusal travels as
+/// `Err` with a stable code. `Stop` and `Restart` stay distinct — a restart is
+/// an external stop, so raising `Event::Exit` for it would stop the process
+/// twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Aftermath {
+    /// Nothing follows. Every action but two.
+    Nothing,
+    /// The daemon stops gracefully: `Event::Exit` on the internal channel.
+    Stop,
+    /// A detached service restart takes this process down from outside.
+    Restart,
+}
+
+/// Which actions end the session. Pure and total, so the transport can ask it
+/// before the World exists and the table asks the same thing later.
+pub(crate) fn aftermath(action: &Action) -> Aftermath {
+    match action {
+        Action::Quit => Aftermath::Stop,
+        Action::Restart => Aftermath::Restart,
+        _ => Aftermath::Nothing,
+    }
+}
+
+impl Aftermath {
+    /// From inside the world: nobody is waiting to be answered, so the effect
+    /// may follow the decision immediately.
+    fn conclude_in_world(self, world: &mut World) {
+        match self {
+            Self::Nothing => {}
+            Self::Stop => {
+                _ = world.resource::<crate::manager::WindowManager>().quit();
+            }
+            Self::Restart => hand_over(),
+        }
+    }
+
+    /// From whoever owns the transport, once the receipt has been written.
+    pub(crate) fn conclude_from_wire(self, events: &crate::events::EventSender) {
+        match self {
+            Self::Nothing => {}
+            Self::Stop => {
+                _ = events.send(crate::events::Event::Exit);
+            }
+            Self::Restart => hand_over(),
+        }
+    }
+}
+
+fn hand_over() {
+    if let Err(error) = crate::platform::service::Service::request_restart() {
+        tracing::error!(%error, "unable to start admitted service restart");
+    }
 }
 
 /// Which gates one action passes before its effect may run.
@@ -105,25 +156,15 @@ fn invoked<T, E: std::fmt::Display>(outcome: Result<T, E>) -> crate::errors::Res
     clippy::too_many_lines,
     reason = "exhaustive command/source branches share one admission or capture boundary"
 )]
-fn execute_action(
-    world: &mut World,
-    action: Action,
-    lifecycle_effect: LifecycleEffect,
-) -> crate::errors::Result<()> {
+fn execute_action(world: &mut World, action: Action) -> crate::errors::Result<()> {
     let lifecycle = world.resource::<crate::lifecycle::Lifecycle>().clone();
-    if lifecycle_effect == LifecycleEffect::Immediate
-        && matches!(action, Action::Quit | Action::Restart)
-    {
-        return match action {
-            Action::Quit => invoked(world.run_system_cached(super::command_quit_handler)),
-            Action::Restart => invoked(world.run_system_cached(super::command_restart_handler)),
-            _ => unreachable!("lifecycle action"),
-        };
-    }
     if let Some(reason) = lifecycle.rejection() {
         return Err(crate::errors::Error::rejected(reason));
     }
-    if matches!(action, Action::Quit | Action::Restart) {
+    if aftermath(&action) != Aftermath::Nothing {
+        // The effect waits for whoever owns the transport, so a checked request
+        // has its receipt delivered first; this only refuses everything else
+        // while the requester still waits.
         lifecycle.set(crate::lifecycle::Phase::Stopping);
         return Ok(());
     }
