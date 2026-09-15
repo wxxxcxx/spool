@@ -73,4 +73,31 @@ Blocked by: none
 
 ## Implementation follow-up
 
-未实施。第一步是**帧权威的横切切换**：浮动窗口的期望帧目前有多个写入者（编辑命令经 `RepositionMarker`/`ResizeMarker`、外部手势直接写 `DesiredWindowFrame`、而 `position_layout_windows` 跳过浮动窗口），迁移要求这些写入者与"意图 → 有效目标"派生在同一次改动内一起切换，否则会互相覆盖；按仓库对列宽片的先例（"所有输入和 writer 同次迁移"），它必须在一次连贯、验证过的改动里落地，而不是分次留下双重权威。第 4 步（保存与候选隔离）可单独成一次改动。
+### 已实施：帧权威的横切切换（2026-09-15）
+
+- **新模块 `src/ecs/floating_geometry.rs`**：`FloatingGeometry { frame, anchor, unresolved, repairs }`（修复历史保留最近 4 次）与 `derive_floating_frames`（注册在 `layout.rs` 的 Update 链、紧接 legacy marker 适配器之后）。
+- **三个写入者都改为"陈述意图"**：浮动编辑命令（Move / Snap / Center / Maximize / Resize / SetWidth，另经 `TargetedWindow` 的显式目标路径）、外部手势观察（`window_geometry.rs` 的浮动分支）、以及既有的观测采纳路径（`reconcile.rs` 里原 `update_floating_intent`，现改名 `adopt_floating_frame`，并在采纳处写入意图）。第一次被看见的浮动窗口由投影从其当前帧初始化意图。
+- **投影即约束派生**：`derive_floating_frames` 从意图派生 `Position` / `Bounds` / `DesiredWindowFrame`（并在需要时插入 `WindowFrameMotion`，让修复可见而不是跳变）；**不写原生**。派生受"投影版本"闸门约束（`revision`/`derived`），因此同一帧内更早发生的观测采纳不会被同一帧内的旧意图覆盖——这是 4 个既有测试逼出来的修正。
+- **修复**：`clamped_to_viewport`（所属显示器仍在，帧被夹进其可用视口）、`display_gone`（所属显示器已消失，迁到当前显示器并**保持相对它原来所在显示器的偏移**）、`unresolved`（显示器清单读不出来时保留意图、不派生——未知不是缺席）。
+- **意图寿命**：窗口被平铺时意图休眠但保留（`With<Floating>` 过滤），再次浮动时回到保留的帧（有测试）。
+
+### 与票中"移除清单"的偏差（已记录）
+
+没有删除 marker 路径与手势的直接吸附，票中那两条"移除"因此被**取代**：
+
+- `reposition_entity`/`resize_entity` 的 marker 仍是**同一批命令内累积 pending 几何**的机制（`moving_frame` 读 pending；"两次移动累积"是既有语义，撤掉会让 `command_batch_floating_moves_accumulate_pending_geometry` 等测试失败），也是帧动画的入口；
+- 外部拖拽的直接吸附必须保留：否则拖动会经动画跟随，手感变差。
+
+权威已经转移：投影在每次意图 revision 变化时从意图重派生帧，所以**意图是保留的目标**，marker/吸附只是效果管道。这一点与列宽片"替换所有 writer"的目标部分一致（权威替换完成，管道保留）。
+
+### 与 issue 03 的一处刻意差异
+
+03 号票的约束模型是"保留原始意图 + 派生有效目标"；本片按已裁决的修复顺序，把**越界夹取记为修复**（`clamped_to_viewport`，意图被改写为夹取后的帧）。若将来更希望保留原始帧、只写有效目标，改动很小：把该分支改成只写派生结果、不动意图。
+
+### 未实施：保存与候选隔离（第 4 步）
+
+浮动几何尚未进入新格式（`SavedWindow` 仍只有身份）。它是本片唯一可单独落地的部分，也是跨重启恢复的前置（恢复本身仍在地图的 Out of scope）。
+
+## 原计划（保留作对照）
+
+第一步是**帧权威的横切切换**：浮动窗口的期望帧目前有多个写入者（编辑命令经 `RepositionMarker`/`ResizeMarker`、外部手势直接写 `DesiredWindowFrame`、而 `position_layout_windows` 跳过浮动窗口），迁移要求这些写入者与"意图 → 有效目标"派生在同一次改动内一起切换，否则会互相覆盖；按仓库对列宽片的先例（"所有输入和 writer 同次迁移"），它必须在一次连贯、验证过的改动里落地，而不是分次留下双重权威。第 4 步（保存与候选隔离）可单独成一次改动。

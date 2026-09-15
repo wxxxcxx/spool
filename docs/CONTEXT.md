@@ -279,3 +279,15 @@ _Avoid_: Fallback, correction, fixup
 The most recent try at realizing a window's Declared Space, and how it ended: submitted and awaiting the membership audit, confirmed, timed out, retired with its member, or refused with the caller's reason. It is diagnostic only — no layout, effect, or admission decision reads it.
 
 _Avoid_: Move request, pending move
+
+## Floating Frame Intent
+
+The frame a floating window's state says it should have: a position and size the user asked for, per window rather than per Space. The effective frame is derived from it against the display that holds the window; an observation does not become the frame, it becomes the intent.
+
+_Avoid_: Floating position, saved geometry, last frame
+
+## Floating Repair
+
+A recorded change of a Floating Frame Intent onto a frame a current display can hold, with the fact that required it: the frame was clamped into its display's usable viewport, or the display that held it is gone and the window moved to another while keeping its relative position. A repair changes state only; it performs no native write.
+
+_Avoid_: Clamp, snap, correction

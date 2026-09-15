@@ -141,3 +141,28 @@ Balance的继承语义经过三位专家一致确认：若参考列继承规则0
 - 跨重启恢复归属仍未实现：声明归属是会话内状态，新格式保存与候选隔离没有覆盖它（Out of scope，见 [地图](map.md)）。
 - 声明归属只覆盖已跟踪窗口；未解决的原生表面（无 AX 身份）不进入该状态。
 - `SpaceMoveAttempt` 与 `DeclaredSpace` 都不驱动行为：前者是只读诊断，后者由修复与**被接纳的编辑**写、被效果层读取的目标；没有任何路径用它们反向覆盖观测。
+
+## 浮动窗口切片（帧权威切换）
+
+用户于 2026-09-15 裁决六项后实施（见 [issue 24](issues/24-floating-windows.md)）。这一片只做**帧权威**的切换：浮动窗口的帧从"观测即期望、由若干写入者覆写"变成"保留意图 + 约束派生 + 修复"。
+
+### 已实施
+
+- 新增 `FloatingGeometry`（`frame` / `anchor` / `unresolved` / `repairs` / 投影版本）与 `derive_floating_frames`（`layout.rs` 的 Update 链，紧接 legacy marker 适配器）。
+- 三个写入者陈述意图：浮动编辑命令、外部手势观察、reconcile 的观测采纳（原 `update_floating_intent` → `adopt_floating_frame` 并在采纳处写意图）；第一次见到的浮动窗口由投影从其当前帧初始化。
+- 修复（不写原生）：`clamped_to_viewport`、`display_gone`（保持相对原显示器的偏移）、`unresolved`（清单不可读时保留意图、不派生）。
+- 意图在平铺期间休眠、再浮动时恢复；`window inspect --source spool` 的 window row 新增 `floating` 组（`intent` / `unresolved` / `repairs`），并进入默认选择与叶子路径。
+
+### 本片验证
+
+- `cargo test -p spool`：1176通过、0失败、2项忽略；`--workspace --locked` 1176 / 96 / 24 等全绿；`--no-default-features` 1034通过。
+- `cargo fmt --all --check`、`cargo clippy -p spool --all-targets`（默认与 `--no-default-features -- -D warnings`）通过。
+- 新增 9 条浮动几何测试（编辑陈述意图、连续移动累积、显示器移动夹取、显示器移除迁移并保持偏移、清单不可读未解析、平铺往返恢复、最小化保留、显式目标陈述意图、帧随意图派生）。
+- 实施中由既有测试逼出两处修正：① 投影必须容忍"还没有意图"的浮动窗口（从当前帧初始化）；② 派生需要投影版本闸门，否则同一帧内更早的观测采纳会被旧意图覆盖。
+
+### 本片实际边界
+
+- marker/手势吸附作为效果管道保留（见 issue 24 的偏差记录）；权威已是意图。
+- 浮动几何**未进保存格式**（步骤 4 未做）；跨重启恢复仍属地图 Out of scope。
+- 与 03 号票的一处刻意差异：越界夹取记为修复（改写意图），而非"保留原始意图 + 只写有效目标"。
+- mock 通过不证明真实 macOS 行为；真实桌面验收另行授权。
