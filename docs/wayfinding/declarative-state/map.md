@@ -3,7 +3,7 @@
 Label: wayfinder:map
 Status: resolved
 
-后续切片：[归属状态的不变量与修复](issues/23-space-membership.md)（用户已裁决：不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；实施未开始）。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
+已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（用户已裁决：不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）。下一片（待裁决）：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（已核对当前浮动几何「观测即期望、无保留意图、不进投影与保存」；裁决前不实施）。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
 
 ## Destination
 
@@ -49,7 +49,7 @@ Status: resolved
 - 排列/stack高度切片已按20号票完成并记录，进展与验证见 [实施记录](implementation.md)。用户随后指示不再使用三专家策略。地图原19张票与20号票保持历史结论，实施期决策单独记录。
 
 - [焦点偏好、激活请求与实际焦点的完整迁移切片](issues/21-focus-activation.md) — 已核对独立版本、单次尝试、让权证据与入口替换；焦点代码已实施，目标Space归属事务仍为后续切片。
-- [目标 Space 归属的不变量与修复](issues/23-space-membership.md) — 用户裁决：归属必须始终指向存在的用户 Space；编辑当场拒绝或当场尝试（2 秒、不重试）；外部事件触发状态修复且不写原生；保留与否按「用户无法便宜重试且卡住常见持久」判据。实施未开始。
+- [目标 Space 归属的不变量与修复](issues/23-space-membership.md) — 用户裁决：归属必须始终指向存在的用户 Space；编辑当场拒绝或当场尝试（2 秒、不重试）；外部事件触发状态修复且不写原生；保留与否按「用户无法便宜重试且卡住常见持久」判据。已实施、验证并推送（6 笔）。
 
 ## Not yet specified
 
