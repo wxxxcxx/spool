@@ -3,7 +3,7 @@
 Label: wayfinder:map
 Status: resolved
 
-已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）；已实施：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（帧权威切换、保存与候选隔离，均已验证并推送）；待裁决：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（七个问题待裁决，裁决前不实施）。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
+已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）；已实施：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（帧权威切换、保存与候选隔离，均已验证并推送）；已裁决、实施中：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（七项已裁决）；下一片待确认接口：[恢复第一个切片](issues/26-recovery-first-slice.md)。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
 
 ## Destination
 
@@ -62,5 +62,5 @@ Status: resolved
 - 完整跨重启恢复所有焦点/归属/执行进度及通用停机冲突解决；本轮仅规定首切片所需的新格式保存和导入。
 - 旧版本格式/接口兼容与旧快照迁移。
 - 跨daemon身份连续性研究、自动绑定和真实重启恢复另立恢复地图；本轮不创建相关研究票或假称已验证。
-  → 入口票：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（`Status: open`，裁决前不实施、不声称已验证）。
+  → 入口票：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（七项已裁决）；第一个实施切片待确认接口：[恢复第一个切片：可信映射的运行时入口](issues/26-recovery-first-slice.md)。
 - 规划轮不执行代码实现；后续授权的首片实现见实施记录。提交推送、安装部署、服务重启和真实桌面动作仍未执行。

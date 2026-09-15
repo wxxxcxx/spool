@@ -3,7 +3,7 @@
 Id: 25
 Type: task
 Label: wayfinder:task
-Status: open
+Status: resolved
 Assignee: none
 Parent: [Spool 声明式状态模型与迁移边界](../map.md)
 Blocked by: none
@@ -38,7 +38,7 @@ Blocked by: none
 
 ## Resolution
 
-待用户逐项裁决后填写；裁决前不实施，也不声称任何恢复能力已验证。
+用户于 2026-09-15 确认按票中倾向执行（七项）：① 身份连续性用 bundle + PID 存活 + AX 属性/几何的**组合证据**，证据不足不绑定，`window_id` 永不作身份；② 恢复域与顺序为布局 → 归属 → 焦点，**在途尝试不恢复**（重启后一律视为未确认，不重放）；③ 先做**显式确认**路径（可信映射由启动方提交），自动绑定另立研究票；④ 退出不改写意图，未确认的尝试只作为诊断呈现；⑤ 延续"新增可选字段不升版本、旧格式忽略"；⑥ 恢复的呈现交给既有动画管道，不加专用跳变路径；⑦ 不做安装部署、真实桌面验证、多 daemon 争写与恢复 UI。
 
 ## Implementation follow-up
 
