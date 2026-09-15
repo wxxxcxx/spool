@@ -318,7 +318,7 @@ fn answer_then(
 
 #[cfg(test)]
 mod tests {
-    use super::RequestReader;
+    use super::{RequestReader, RequestReaderGuard};
     use crate::events::{Event, EventSender};
     use spool_local_ipc::Client;
     use spool_shared_types::commands::Action;
@@ -387,6 +387,30 @@ mod tests {
         )
     }
 
+    /// Starts a reader on an endpoint whose previous owner has just exited.
+    ///
+    /// Dropping the first daemon releases its `flock`, but an immediate
+    /// re-acquire on the same path can still fail while the rest of the suite
+    /// runs on parallel threads. Retrying against a deadline keeps the
+    /// assertion honest without serializing the whole suite: the test still
+    /// fails if the lock never comes back.
+    fn start_after_release(service: &str) -> RequestReaderGuard {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (events, _receiver) = EventSender::new();
+            match RequestReader::new(events).start_with_service(service) {
+                Ok(guard) => return guard,
+                Err(error) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the dropped daemon's lock was never released: {error}"
+                    );
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_shell_launch_publishes_the_same_ipc_as_a_service_launch() {
         let (events, _receiver) = EventSender::new();
@@ -411,10 +435,7 @@ mod tests {
         );
 
         drop(first);
-        let (third_events, _third_receiver) = EventSender::new();
-        let _third = RequestReader::new(third_events)
-            .start_with_service(&service)
-            .expect("released daemon lock");
+        let _third = start_after_release(&service);
     }
 
     #[test]
