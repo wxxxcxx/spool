@@ -586,6 +586,9 @@ the shared visible-Space predicate also gates follow completion.
 - **`PresentedWindowFrame`:** The current animation/effect output and sole normal commit input.
 - **`ObservedWindowFrame`:** The latest geometry successfully read back from macOS.
 - **`ColumnState` / `WidthIntent`:** Stable column identity and original width, with separate intent and structure revisions.
+- **`DeclaredSpace`:** The Space a tracked window is declared to belong to, with the membership last observed and a bounded repair history.
+- **`FloatingGeometry`:** A floating window's authored frame, the display it was authored against, its unresolved flag, and a bounded repair history.
+- **`SpaceMoveAttempt`:** The last membership attempt and how it ended. Diagnostic only.
 - **`FocusedMarker`:** Identifies the currently focused window.
 - **`ActiveWorkspaceMarker`**: Identifies the currently active workspace.
 - **`VisibleNativeSpaceMarker`**: Marks the native Space currently visible on each display.

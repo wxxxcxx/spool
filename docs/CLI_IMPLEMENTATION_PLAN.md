@@ -131,7 +131,7 @@ child-control traversal is part of collection.
 
 | Resource/source | Default detail | Explicit expansion |
 | --- | --- | --- |
-| Window / Spool | identity; desired/presented/observed geometry; retained layout membership and the last membership attempt; availability, visibility, known motion/migration/blockers | `geometry`, `layout`, `membership`, `state`, or their documented leaf paths |
+| Window / Spool | identity; desired/presented/observed geometry; retained layout membership and the last membership attempt; a floating window's retained frame; availability, visibility, known motion/migration/blockers | `geometry`, `layout`, `membership`, `floating`, `state`, or their documented leaf paths |
 | Window / native | identity; common AX role/title/geometry/state; WindowServer fields; native Space membership evidence | `ax` reads all advertised window attributes; `cg`; `spaces`; `ax.AXRole` and other literal native attribute names; proposed `actions` and `parameterized-attributes` list names only |
 | Space | identity, kind, order, display/visibility relation, member window summaries from the selected source | `windows`; Spool arrangement stays under `space layout inspect` |
 | Display | identity, name/UUID, recorded or native bounds/usable frame/scale, main status, visible-Space relation | documented identity/geometry/Space groups supported by that source |
