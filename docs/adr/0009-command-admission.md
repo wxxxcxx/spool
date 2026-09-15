@@ -63,7 +63,17 @@ re-order operations behind the actions that followed.
 variant as needing a writable session or only a running one, and the compiler
 forces an answer for a new variant. The hand-written list this replaces named
 only the variants it happened to remember, so a new action could bypass the
-gate by omission.
+gate by omission. `Writable` is the geometry barrier: the actions whose
+realization has to wait for a quiescent layout. Everything else keeps the
+lighter reach, including the state edits, which are deferred rather than refused
+(below).
+
+**A plan's deferred continuation takes the same gate as its action.**
+`Event::LayoutSpaceRequested` is not an `Action` — it carries a snapshot binding
+no variant can hold — but `admission::session_is_ready` is one function asked by
+both the ordered pipeline and the continuation, so a plan cannot reach the
+native command system at a moment when the command it continues would have been
+refused.
 
 **One implementation per operation.** `Center`, `Snap` and `ToggleFloating` had
 a second implementation on the keybinding path; those are gone, and the
@@ -127,14 +137,23 @@ refused, and a script's plan can no longer edit an unwritable session. `Center`
 moves the pointer only under `mouse_follows_focus`, on both the default and the
 explicit target. A `quit` or `restart` arriving from a keybinding, the Bar or Lua
 now marks the session `Stopping` as the checked path already did, and stops the
-session once rather than once per intake. The migrated executors now share one
-recipe vocabulary instead of reconstructing it.
+session once rather than once per intake. A plan's deferred continuation takes
+the same lifecycle gate as the action it continues instead of reaching the
+native command system while the session was still starting or shutting down. The
+migrated executors now share one recipe vocabulary instead of reconstructing it.
 
 Three exceptions are deliberate and easy to lose later:
 
 - **Activation Intent is deferred, not refused.** A focus request during Mission
   Control, initialization or exit is held and realized later, so it must not be
-  gated as a Layout State mutation.
+  gated as a Layout State mutation. A Space focus preference and the native
+  Space commands keep the lighter reach for that reason: the preference is
+  state-only, and an activation is held pending by `focus::reconcile_activation`
+  and reported blocked when availability cannot be proven. Those commands
+  revalidate their own *snapshot identity* inside the native command system
+  (`LayoutSession::accepts`), which is a different question from these gates.
+  `mission_control_defers_state_edits_instead_of_refusing_them` pins the
+  distinction against a future promotion.
 - **Floating classification keeps its lighter admission.** It edits Layout State
   but not geometry, so no Space, display or viewport has to be resolved, and a
   native move's ownership barrier does not refuse it. It is still refused by the
@@ -145,8 +164,14 @@ Three exceptions are deliberate and easy to lose later:
   the transport performs the termination after the receipt is written. A
   fire-and-forget termination has nobody to answer and terminates as soon as it
   is admitted, once. `Event::LayoutSpaceRequested` stays the one named
-  non-action: it is a script plan's deferred continuation, and its gate must stay
-  identical to that of the action it continues.
+  non-action: it is a script plan's deferred continuation, and its gate is the
+  one its action takes.
+- **A bound Lua callback is not decided here.** `Action::Lua` is read off the
+  same bus by `lua::command_lua_handler`, which hands the callback to a worker
+  whose handlers are user code of unbounded duration. A wire request for one is
+  refused (`unsupported_operation`) rather than owed a receipt that could not
+  promise the handler ran. The consequence worth remembering: a callback reached
+  from a keybinding is not gated by this table.
 
 Desktop and native acceptance are not required for this routing change and were
 not run. Whether a specific native write is accepted remains the domain of the

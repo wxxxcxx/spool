@@ -79,8 +79,6 @@ pub fn register_commands(app: &mut bevy::app::App) {
     reason = "exhaustive command/source branches share one admission or capture boundary"
 )]
 pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands: Commands) {
-    use crate::ecs::native_space::apply_native_space_command;
-
     for event in messages.read() {
         if let Event::CheckedActionRequested {
             request,
@@ -107,7 +105,15 @@ pub(crate) fn dispatch_actions(mut messages: MessageReader<Event>, mut commands:
         }
         let Event::ActionRequested { action } = event else {
             if matches!(event, Event::LayoutSpaceRequested { .. }) {
-                commands.run_system_cached_with(apply_native_space_command, event.clone());
+                // A script's plan continuation is not an action, but one gate
+                // decides for it too: `admit_deferred` asks the same lifecycle
+                // question `insert` asks of the action it continues.
+                let event = event.clone();
+                commands.queue(move |world: &mut bevy::prelude::World| {
+                    if let Err(reason) = admission::admit_deferred(world, event) {
+                        debug!(%reason, "deferred native command rejected");
+                    }
+                });
             }
             continue;
         };

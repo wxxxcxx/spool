@@ -2199,6 +2199,57 @@ fn script_following_shift_focuses_after_native_confirmation() {
 
 #[cfg(feature = "lua")]
 #[test]
+fn a_deferred_space_command_obeys_the_same_gate_as_its_action() {
+    for stopping in [false, true] {
+        let (mut deferred, _, _) = column_harness();
+        let plan = script_set(&mut deferred).shift(0, TARGET).plan();
+        let event = Event::LayoutSpaceRequested {
+            op: plan.ops[0],
+            snapshot: plan.snapshot,
+        };
+        if stopping {
+            deferred
+                .world()
+                .resource::<crate::lifecycle::Lifecycle>()
+                .set(crate::lifecycle::Phase::Stopping);
+        }
+        deferred.world().write_message(event);
+        deferred
+            .world()
+            .run_system_once(crate::commands::dispatch_actions)
+            .unwrap();
+
+        let (mut direct, _, _) = column_harness();
+        if stopping {
+            direct
+                .world()
+                .resource::<crate::lifecycle::Lifecycle>()
+                .set(crate::lifecycle::Phase::Stopping);
+        }
+        dispatch_action(
+            &mut direct,
+            Action::MoveWindowToSpace {
+                window_id: 0,
+                space_id: TARGET,
+                move_focus: MoveFocus::Stay,
+            },
+        );
+
+        assert_eq!(
+            deferred.mock_state.native_space_intents().len(),
+            direct.mock_state.native_space_intents().len(),
+            "stopping={stopping}: a continuation and its action must agree"
+        );
+        assert_eq!(
+            deferred.mock_state.native_space_intents().is_empty(),
+            stopping,
+            "stopping={stopping}: only a ready session reaches the platform"
+        );
+    }
+}
+
+#[cfg(feature = "lua")]
+#[test]
 fn script_native_move_revalidates_identity_at_native_dispatch() {
     let (mut harness, _, members) = column_harness();
     let plan = script_set(&mut harness).shift(0, TARGET).plan();

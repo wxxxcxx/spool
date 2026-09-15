@@ -28,6 +28,33 @@ pub(super) fn admit(world: &mut World, action: Action) -> crate::errors::Result<
     Ok(())
 }
 
+/// The deferred continuation of a script's plan.
+///
+/// It is not an action — it carries a snapshot binding no `Action` variant can
+/// hold — but it takes the same gate as the action it continues, so a plan
+/// cannot reach the native command system at a moment when the same command
+/// would have been refused.
+pub(super) fn admit_deferred(
+    world: &mut World,
+    event: crate::events::Event,
+) -> crate::errors::Result<()> {
+    session_is_ready(world)?;
+    invoked(
+        world.run_system_cached_with(crate::ecs::native_space::apply_native_space_command, event),
+    )
+}
+
+/// The lifecycle decision: `Ok` when the session may act at all.
+///
+/// One question with one answer, asked by the ordered pipeline and by a plan's
+/// deferred continuation, so the two cannot drift into different gates.
+pub(super) fn session_is_ready(world: &World) -> crate::errors::Result<()> {
+    world
+        .resource::<crate::lifecycle::Lifecycle>()
+        .rejection()
+        .map_or(Ok(()), |reason| Err(crate::errors::Error::rejected(reason)))
+}
+
 /// What an admitted action owes the process once its effect has run.
 ///
 /// Not a status: a refused action has no aftermath, and a refusal travels as
@@ -95,7 +122,8 @@ fn hand_over() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionReach {
     /// The session must be writable as well: not initializing, not showing
-    /// Mission Control, not exiting.
+    /// Mission Control, not exiting. This is the geometry barrier — an edit whose
+    /// realization needs a quiescent layout to write through.
     Writable,
     /// The lifecycle gate alone decides.
     Running,
@@ -109,12 +137,17 @@ fn session_reach(action: &Action) -> SessionReach {
         | Action::TargetedWindow { .. }
         | Action::SpaceLayout { .. }
         | Action::Layout(_) => SessionReach::Writable,
-        // Everything else keeps the reach it has today. Several of these do
-        // edit state — a Space focus preference, a native Space command — and
-        // the native command system revalidates the session itself; promoting
-        // one to `Writable` is its own change, with its own tests.
+        // A Space focus preference and a native Space command edit state too,
+        // and keep the lighter reach deliberately: the preference is state-only,
+        // and an activation is held pending by `focus::reconcile_activation`
+        // while Mission Control is open and reported blocked when availability
+        // cannot be proven. Refusing them here would contradict ADR 0006's
+        // separation of accepted state from realized effects, and would break
+        // the Activation Intent deferral. These actions revalidate their own
+        // *snapshot identity* inside the native command system
+        // (`LayoutSession::accepts`), which is a different question from the
+        // gates asked here.
         Action::SetSpaceFocusPreference { .. }
-        | Action::Mouse(_)
         | Action::FocusWindow { .. }
         | Action::FocusWindowInSpace { .. }
         | Action::FocusSpace { .. }
@@ -123,14 +156,21 @@ fn session_reach(action: &Action) -> SessionReach {
         | Action::MoveFocusedWindowToSpace { .. }
         | Action::CreateSpace { .. }
         | Action::DeleteSpace { .. }
+        // Layout State without geometry, and effects that neither edit layout
+        // nor depend on a quiescent one. `Writable` exists for the geometry
+        // edits, whose realization has to wait for the ownership barrier.
+        | Action::Mouse(_)
         | Action::ToggleBarCollapse
         | Action::ReorderColumn { .. }
         | Action::PrintState
         | Action::ReconcileWindows
         | Action::MissionControl
         | Action::ShowDesktop
+        // Answered before this classification is consulted: the Lua worker reads
+        // a bound callback off the same bus, and a wire request for one is
+        // refused rather than owed a receipt — a handler is user code of
+        // unbounded duration, so no receipt could promise that it ran.
         | Action::Lua(_)
-        // Answered before this classification is consulted.
         | Action::Quit
         | Action::Restart => SessionReach::Running,
     }
@@ -157,10 +197,8 @@ fn invoked<T, E: std::fmt::Display>(outcome: Result<T, E>) -> crate::errors::Res
     reason = "exhaustive command/source branches share one admission or capture boundary"
 )]
 fn execute_action(world: &mut World, action: Action) -> crate::errors::Result<()> {
+    session_is_ready(world)?;
     let lifecycle = world.resource::<crate::lifecycle::Lifecycle>().clone();
-    if let Some(reason) = lifecycle.rejection() {
-        return Err(crate::errors::Error::rejected(reason));
-    }
     if aftermath(&action) != Aftermath::Nothing {
         // The effect waits for whoever owns the transport, so a checked request
         // has its receipt delivered first; this only refuses everything else
@@ -514,8 +552,6 @@ pub(crate) struct SpaceView<'a> {
 #[derive(SystemParam)]
 pub(crate) struct Admission<'w, 's> {
     windows: Windows<'w, 's>,
-    #[cfg(test)]
-    focus: Res<'w, FocusCoordinator>,
     topology: ResMut<'w, NativeTopology>,
     manager: Res<'w, WindowManager>,
     config: Res<'w, Config>,
@@ -553,13 +589,6 @@ impl Admission<'_, '_> {
         (state.is_visible() && self.windows.layout_is_writable(entity))
             .then_some(entity)
             .ok_or(Rejection::WindowUnavailable)
-    }
-
-    /// Pending focus wins over confirmed focus; an invisible target is refused
-    /// rather than redirected back to the previously confirmed window.
-    #[cfg(test)]
-    pub(crate) fn focus_target(&self) -> Result<Entity, Rejection> {
-        Self::focused_target_in(&self.windows, &self.focus)
     }
 
     /// Resolves pending or confirmed focus against explicit query and focus
@@ -749,20 +778,6 @@ impl Admission<'_, '_> {
         })
     }
 
-    /// The one strip owning `space`, refusing an absent or duplicated layout.
-    ///
-    /// Shares [`Self::space_scope_strip_in`]'s uniqueness rule rather than
-    /// restating it.
-    #[cfg(test)]
-    pub(crate) fn unique_strip(&self, space: WorkspaceId) -> Result<&LayoutStrip, Rejection> {
-        Self::space_scope_strip_in(
-            self.strips
-                .iter()
-                .map(|(_, strip, _, active)| (active, strip)),
-            Some(space),
-        )
-    }
-
     /// The one strip owning the active Space, or `space` when named, refusing an
     /// absent or duplicated layout. State-only edits scope their plan this way,
     /// against a caller-supplied strip view because the sharing caller needs a
@@ -865,17 +880,6 @@ impl Admission<'_, '_> {
                 .window_iter()
                 .any(|member| windows.layout_transition_pending(member))
         })
-    }
-
-    /// A state-edit column must exist, not be native fullscreen, and hold no
-    /// member whose native reassignment is in flight.
-    #[cfg(test)]
-    pub(crate) fn eligible_column(
-        &self,
-        strip: &LayoutStrip,
-        index: usize,
-    ) -> Result<(), Rejection> {
-        Self::eligible_column_in(&self.windows, strip, index)
     }
 
     /// Runs the state-edit column check against an explicit window query.

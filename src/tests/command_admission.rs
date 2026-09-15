@@ -3,14 +3,38 @@ use bevy::prelude::*;
 
 use super::*;
 use crate::commands::admission::{Admission, Rejection};
+use crate::ecs::ActiveWorkspaceMarker;
 use crate::ecs::WindowVisibility;
+use crate::ecs::focus::FocusCoordinator;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::native_space::NativeMoveOwner;
+use crate::ecs::params::Windows;
 
 fn harness() -> TestHarness {
     let mut harness = TestHarness::new().with_windows(2);
     harness.pump_frames(10);
     harness
+}
+
+/// The strip view the shared recipes accept, built from the test's own query, so a
+/// test asks the same question production asks instead of a second copy of it.
+type Strips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        Option<&'static ChildOf>,
+        Has<ActiveWorkspaceMarker>,
+    ),
+>;
+
+fn strip_of(space: u64, strips: &Strips) -> Result<LayoutStrip, Rejection> {
+    Admission::space_scope_strip_in(
+        strips.iter().map(|(_, strip, _, active)| (active, strip)),
+        Some(space),
+    )
+    .cloned()
 }
 
 fn window(In(window_id): In<i32>, admission: Admission) -> Result<Entity, Rejection> {
@@ -21,39 +45,49 @@ fn writable_window(In(window_id): In<i32>, admission: Admission) -> Result<Entit
     admission.writable_window(window_id)
 }
 
-fn focus_target(admission: Admission) -> Result<Entity, Rejection> {
-    admission.focus_target()
+fn focus_target(windows: Windows, focus: Res<FocusCoordinator>) -> Result<Entity, Rejection> {
+    Admission::focused_target_in(&windows, &focus)
 }
-fn unique_strip(In(space): In<u64>, admission: Admission) -> Result<(), Rejection> {
-    admission.unique_strip(space).map(|_| ())
+
+fn unique_strip(In(space): In<u64>, strips: Strips) -> Result<(), Rejection> {
+    strip_of(space, &strips).map(|_| ())
 }
 
 fn column_index(
     In((space, ordinal)): In<(u64, usize)>,
-    admission: Admission,
+    strips: Strips,
 ) -> Result<usize, Rejection> {
-    let strip = admission.unique_strip(space)?;
-    Admission::column_index(strip, ordinal)
+    let strip = strip_of(space, &strips)?;
+    Admission::column_index(&strip, ordinal)
 }
 
-fn eligible_window_column(In(window_id): In<i32>, admission: Admission) -> Result<(), Rejection> {
+fn eligible_window_column(
+    In(window_id): In<i32>,
+    windows: Windows,
+    admission: Admission,
+    strips: Strips,
+) -> Result<(), Rejection> {
     let (_, entity) = admission.window(window_id)?;
-    let strip = admission.unique_strip(TEST_WORKSPACE_ID)?;
+    let strip = strip_of(TEST_WORKSPACE_ID, &strips)?;
     let index = strip
         .index_of(entity)
         .map_err(|_| Rejection::ColumnUnavailable)?;
-    admission.eligible_column(strip, index)
+    Admission::eligible_column_in(&windows, &strip, index)
 }
 
-fn writable_window_column(In(window_id): In<i32>, admission: Admission) -> Result<(), Rejection> {
+fn writable_window_column(
+    In(window_id): In<i32>,
+    admission: Admission,
+    strips: Strips,
+) -> Result<(), Rejection> {
     let (_, entity) = admission.window(window_id)?;
-    let strip = admission.unique_strip(TEST_WORKSPACE_ID)?;
-    admission.writable_column(strip, entity)
+    let strip = strip_of(TEST_WORKSPACE_ID, &strips)?;
+    admission.writable_column(&strip, entity)
 }
 
-fn fullscreen_column(In(entity): In<Entity>, admission: Admission) -> Result<(), Rejection> {
+fn fullscreen_column(In(entity): In<Entity>, windows: Windows) -> Result<(), Rejection> {
     let strip = LayoutStrip::fullscreen(TEST_WORKSPACE_ID, entity);
-    admission.eligible_column(&strip, 0)?;
+    Admission::eligible_column_in(&windows, &strip, 0)?;
     Admission::tiled_column(&strip, entity)
 }
 

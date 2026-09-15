@@ -710,6 +710,97 @@ fn repositions(harness: &mut TestHarness) -> usize {
     world.query::<&RepositionMarker>().iter(world).count()
 }
 
+/// A bound Lua callback is read off the bus by the Lua worker (`lua::command_lua_handler`)
+/// rather than decided by this table, and a wire request for one is refused
+/// instead of owed a receipt: a handler is user code of unbounded duration, so no
+/// receipt could promise that it ran.
+#[test]
+fn a_checked_lua_callback_is_refused_rather_than_owed_a_receipt() {
+    use spool_shared_types::wire::{AdmissionStatus, CheckedAction, Response};
+
+    let mut harness = harness();
+    let (reply, received) = async_channel::bounded(1);
+    harness
+        .world()
+        .write_message(Event::CheckedActionRequested {
+            request: CheckedAction {
+                request_id: "lua".into(),
+                action: Action::Lua(0),
+            },
+            respond_to: reply,
+        });
+    harness.world().run_schedule(PreUpdate);
+    let Response::Admission(receipt) = received.try_recv().expect("execution receipt") else {
+        panic!("admission response")
+    };
+    assert_eq!(receipt.status, AdmissionStatus::Rejected);
+    assert_eq!(receipt.code.as_deref(), Some("unsupported_operation"));
+}
+
+/// `session_not_writable` exists for geometry edits, whose realization needs a
+/// quiescent layout. A state-only edit and a native Space command keep the
+/// lighter reach deliberately: the first is accepted while realization is
+/// blocked (ADR 0006), the second is held pending and reported blocked by
+/// `focus::reconcile_activation` rather than refused at admission.
+#[test]
+fn mission_control_defers_state_edits_instead_of_refusing_them() {
+    use spool_shared_types::wire::{AdmissionStatus, CheckedAction, Response};
+
+    let mut harness = harness();
+    harness
+        .world()
+        .resource_mut::<crate::ecs::MissionControlActive>()
+        .0 = true;
+
+    let receipt = |harness: &mut TestHarness, action: Action| {
+        let (reply, received) = async_channel::bounded(1);
+        harness
+            .world()
+            .write_message(Event::CheckedActionRequested {
+                request: CheckedAction {
+                    request_id: "reach".into(),
+                    action,
+                },
+                respond_to: reply,
+            });
+        harness.world().run_schedule(PreUpdate);
+        let Response::Admission(receipt) = received.try_recv().expect("execution receipt") else {
+            panic!("admission response")
+        };
+        receipt
+    };
+
+    let preference = receipt(
+        &mut harness,
+        Action::SetSpaceFocusPreference {
+            space_id: TEST_WORKSPACE_ID,
+            window_id: 0,
+        },
+    );
+    assert_eq!(
+        preference.status,
+        AdmissionStatus::Accepted,
+        "a state-only preference is accepted while realization is blocked: {:?}",
+        preference.code
+    );
+
+    let activation = receipt(
+        &mut harness,
+        Action::FocusSpace {
+            space_id: TEST_WORKSPACE_ID,
+        },
+    );
+    assert_ne!(
+        activation.code.as_deref(),
+        Some("session_not_writable"),
+        "an activation is deferred by its coordinator, not refused here"
+    );
+
+    let geometry = receipt(&mut harness, Action::Window(Operation::Center));
+    assert_eq!(geometry.status, AdmissionStatus::Rejected);
+    assert_eq!(geometry.code.as_deref(), Some("session_not_writable"));
+}
+
 fn phase(harness: &mut TestHarness) -> crate::lifecycle::Phase {
     harness
         .world()
