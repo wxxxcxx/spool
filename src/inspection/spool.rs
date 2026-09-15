@@ -156,6 +156,17 @@ impl Projection<'_, '_> {
                     },
                 })
             }),
+            self.windows.iter().filter_map(|row| {
+                let (_, window, parent, .., declared, _) = row;
+                let declared = declared?;
+                let (_, app) = self.apps.get(parent.parent()).ok()?;
+                Some(crate::ecs::state::SavedMembership {
+                    window_id: window.id(),
+                    pid: app.pid(),
+                    bundle_id: app.bundle_id().unwrap_or_default().clone(),
+                    space_id: declared.target?,
+                })
+            }),
         );
         self.persistence.capture(snapshot).map(|_| ())
     }

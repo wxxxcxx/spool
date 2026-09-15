@@ -59,6 +59,20 @@ pub struct SpoolState {
     /// which is why the field is defaulted rather than versioned.
     #[serde(default)]
     pub floating: Vec<SavedFloatingWindow>,
+    /// Declared Spaces are session-scoped intent; a Space id is a candidate hint
+    /// that a startup owner may map, never a cross-session identity.
+    #[serde(default)]
+    pub membership: Vec<SavedMembership>,
+}
+
+/// One tracked window's declared Space, with cached identity hints only.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SavedMembership {
+    pub window_id: WinID,
+    pub pid: Pid,
+    pub bundle_id: String,
+    pub space_id: crate::platform::WorkspaceId,
 }
 
 /// One floating window's authored frame, with cached identity hints only.
@@ -136,6 +150,7 @@ impl SpoolState {
             &ChildOf,
             &crate::ecs::floating_geometry::FloatingGeometry,
         )>,
+        membership: &Query<(&Window, &ChildOf, &crate::ecs::native_space::DeclaredSpace)>,
     ) -> Self {
         Self::from_layouts(
             strips.iter(),
@@ -163,6 +178,15 @@ impl SpoolState {
                     },
                 })
             }),
+            membership.iter().filter_map(|(window, parent, declared)| {
+                let app = apps.get(parent.parent()).ok()?;
+                Some(SavedMembership {
+                    window_id: window.id(),
+                    pid: app.pid(),
+                    bundle_id: app.bundle_id().unwrap_or_default().clone(),
+                    space_id: declared.target?,
+                })
+            }),
         )
     }
 
@@ -172,6 +196,7 @@ impl SpoolState {
         strips: impl IntoIterator<Item = &'a LayoutStrip>,
         mut window_hint: impl FnMut(Entity) -> Option<SavedWindow>,
         floating: impl IntoIterator<Item = SavedFloatingWindow>,
+        membership: impl IntoIterator<Item = SavedMembership>,
     ) -> Self {
         let mut spaces = strips
             .into_iter()
@@ -220,11 +245,14 @@ impl SpoolState {
         spaces.sort_by_key(|space| space.space_id);
         let mut floating = floating.into_iter().collect::<Vec<_>>();
         floating.sort_by_key(|window| window.window_id);
+        let mut membership = membership.into_iter().collect::<Vec<_>>();
+        membership.sort_by_key(|entry| entry.window_id);
         Self {
             version: INTENT_STATE_VERSION,
             revision: 0,
             spaces,
             floating,
+            membership,
         }
     }
 
@@ -875,11 +903,16 @@ pub fn capture_state_changes(
         &ChildOf,
         &crate::ecs::floating_geometry::FloatingGeometry,
     )>,
+    membership: Query<(&Window, &ChildOf, &crate::ecs::native_space::DeclaredSpace)>,
     mut persistence: ResMut<StatePersistence>,
 ) {
-    if let Err(error) =
-        persistence.capture(SpoolState::extract(&strips, &windows, &apps, &floating))
-    {
+    if let Err(error) = persistence.capture(SpoolState::extract(
+        &strips,
+        &windows,
+        &apps,
+        &floating,
+        &membership,
+    )) {
         warn!(%error, "Unable to capture accepted layout intent");
     }
 }
@@ -893,10 +926,11 @@ pub fn periodic_state_save(
         &ChildOf,
         &crate::ecs::floating_geometry::FloatingGeometry,
     )>,
+    membership: Query<(&Window, &ChildOf, &crate::ecs::native_space::DeclaredSpace)>,
     path: Res<StateFilePath>,
     mut persistence: ResMut<StatePersistence>,
 ) {
-    let state = SpoolState::extract(&strips, &windows, &apps, &floating);
+    let state = SpoolState::extract(&strips, &windows, &apps, &floating, &membership);
     match persistence
         .capture(state)
         .and_then(|snapshot| persistence.commit(&snapshot, path.as_path()))
@@ -910,6 +944,10 @@ pub fn periodic_state_save(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Bevy injects independent system parameters"
+)]
 pub fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
     strips: Query<&LayoutStrip>,
@@ -920,11 +958,12 @@ pub fn cleanup_on_exit(
         &ChildOf,
         &crate::ecs::floating_geometry::FloatingGeometry,
     )>,
+    membership: Query<(&Window, &ChildOf, &crate::ecs::native_space::DeclaredSpace)>,
     path: Res<StateFilePath>,
     mut persistence: ResMut<StatePersistence>,
 ) {
     if exit_events.read().next().is_some() {
-        let state = SpoolState::extract(&strips, &windows, &apps, &floating);
+        let state = SpoolState::extract(&strips, &windows, &apps, &floating, &membership);
         if let Err(error) = persistence
             .capture(state)
             .and_then(|snapshot| persistence.commit(&snapshot, path.as_path()))

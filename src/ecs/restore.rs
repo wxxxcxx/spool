@@ -530,6 +530,17 @@ pub(crate) struct RestoreIntentsCtx<'w, 's> {
             Option<&'static mut FloatingGeometry>,
         ),
     >,
+    declared: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static Window,
+            &'static bevy::ecs::hierarchy::ChildOf,
+            Option<&'static mut crate::ecs::native_space::DeclaredSpace>,
+        ),
+    >,
+    topology: Res<'w, crate::ecs::topology::NativeTopology>,
     apps: Query<'w, 's, &'static crate::manager::Application>,
     commands: Commands<'w, 's>,
 }
@@ -539,6 +550,10 @@ pub(crate) struct RestoreIntentsCtx<'w, 's> {
 /// Every binding is validated before any is applied, so one bad binding refuses
 /// the whole import instead of applying part of it. Nothing here writes to the
 /// platform: it changes retained intent, and the effect layer realizes it later.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one entry point validates and applies every trusted mapping group in order"
+)]
 pub(crate) fn restore_intents(
     In(bindings): In<spool_shared_types::commands::RestoreBindings>,
     mut ctx: RestoreIntentsCtx,
@@ -605,6 +620,51 @@ pub(crate) fn restore_intents(
         floating.push(trusted);
     }
 
+    let mut membership = Vec::new();
+    for binding in &bindings.membership {
+        // A declared Space must be a user Space that exists: the invariant the
+        // declaration keeps, checked here rather than repaired after the fact.
+        if !ctx
+            .strips
+            .iter()
+            .any(|strip| strip.id() == binding.target_space)
+        {
+            return Err(crate::errors::Error::rejected(
+                "import_target_space_not_found",
+            ));
+        }
+        if ctx.topology.is_fullscreen(binding.target_space) {
+            return Err(crate::errors::Error::rejected(
+                "import_target_space_not_user",
+            ));
+        }
+        let Some((_, window, parent, _)) = ctx
+            .declared
+            .iter()
+            .find(|(_, window, _, _)| window.id() == binding.target_window_id)
+        else {
+            return Err(crate::errors::Error::rejected(
+                "import_target_window_not_tracked",
+            ));
+        };
+        let app = ctx.apps.get(parent.parent()).map_err(|error| {
+            crate::errors::Error::rejection_with_cause("import_target_window_unavailable", error)
+        })?;
+        let bundle_id = app.bundle_id().unwrap_or_default();
+        let trusted = TrustedMembershipBinding::new(
+            binding.candidate_membership,
+            &candidates,
+            window.id(),
+            app.pid(),
+            &bundle_id,
+            binding.target_space,
+        )
+        .map_err(|error| {
+            crate::errors::Error::rejection_with_cause("import_binding_rejected", error)
+        })?;
+        membership.push(trusted);
+    }
+
     let mut imported = 0;
     for (space, trusted) in columns {
         let Some(mut strip) = ctx.strips.iter_mut().find(|strip| strip.id() == space) else {
@@ -615,6 +675,13 @@ pub(crate) fn restore_intents(
     }
     imported += import_floating_frames(&candidates, &mut ctx.windows, &mut ctx.commands, &floating)
         .map_err(|error| crate::errors::Error::rejection_with_cause("import_failed", error))?;
+    imported += import_declared_spaces(
+        &candidates,
+        &mut ctx.declared,
+        &mut ctx.commands,
+        &membership,
+    )
+    .map_err(|error| crate::errors::Error::rejection_with_cause("import_failed", error))?;
 
     if imported > 0 {
         // The startup owner asked explicitly; its window closes with the request.
@@ -622,4 +689,105 @@ pub(crate) fn restore_intents(
     }
     debug!(imported, "trusted intent import applied");
     Ok(())
+}
+
+/// One membership candidate, already validated against the live window it claims.
+#[derive(Clone, Debug)]
+pub struct TrustedMembershipBinding {
+    candidate_membership: usize,
+    target_window_id: WinID,
+    target_space: crate::platform::WorkspaceId,
+}
+
+impl TrustedMembershipBinding {
+    /// The caller must prove the mapping, and the candidate's cached identity must
+    /// agree with the live window: a native `WindowServer` id has no documented
+    /// lifetime or reuse behaviour and never authorizes a binding by itself.
+    pub fn new(
+        candidate_membership: usize,
+        candidates: &RestoreCandidates,
+        target_window_id: WinID,
+        pid: Pid,
+        bundle_id: &str,
+        target_space: crate::platform::WorkspaceId,
+    ) -> Result<Self> {
+        if !candidates.import_window_open || candidates.initial_layouts.is_none() {
+            return Err(Error::InvalidInput(
+                "intent import candidates are invalid or expired".into(),
+            ));
+        }
+        let saved = candidates
+            .state
+            .membership
+            .get(candidate_membership)
+            .ok_or_else(|| Error::InvalidInput("candidate membership does not exist".into()))?;
+        if saved.window_id != target_window_id || saved.pid != pid || saved.bundle_id != bundle_id {
+            return Err(Error::InvalidInput(
+                "candidate membership's cached identity does not match the live window".into(),
+            ));
+        }
+        Ok(Self {
+            candidate_membership,
+            target_window_id,
+            target_space,
+        })
+    }
+}
+
+/// Declares the Space an imported membership candidate names.
+///
+/// The declared Space is retained state, so nothing here reaches the platform:
+/// the effect layer realizes it when native conditions permit. All-or-nothing,
+/// like the other groups: the caller validates every binding first.
+pub fn import_declared_spaces(
+    candidates: &RestoreCandidates,
+    windows: &mut Query<(
+        Entity,
+        &Window,
+        &bevy::ecs::hierarchy::ChildOf,
+        Option<&mut crate::ecs::native_space::DeclaredSpace>,
+    )>,
+    commands: &mut Commands,
+    bindings: &[TrustedMembershipBinding],
+) -> Result<usize> {
+    if !candidates.import_window_open || !candidates.state.valid() {
+        return Err(Error::InvalidInput(
+            "intent import candidates are invalid or expired".into(),
+        ));
+    }
+    let mut seen_candidates = HashSet::new();
+    let mut seen_windows = HashSet::new();
+    let mut applied = 0;
+    for binding in bindings {
+        if !seen_candidates.insert(binding.candidate_membership)
+            || !seen_windows.insert(binding.target_window_id)
+        {
+            return Err(Error::InvalidInput(
+                "duplicate membership import binding".into(),
+            ));
+        }
+        let entity = windows
+            .iter()
+            .find_map(|(entity, window, _, _)| {
+                (window.id() == binding.target_window_id).then_some(entity)
+            })
+            .ok_or_else(|| Error::InvalidInput("import target window is not tracked".into()))?;
+        let Ok((_, _, _, declared)) = windows.get_mut(entity) else {
+            return Err(Error::InvalidInput(
+                "import target window is unavailable".into(),
+            ));
+        };
+        match declared {
+            Some(mut declared) => declared.declare(binding.target_space),
+            None => {
+                commands
+                    .entity(entity)
+                    .try_insert(crate::ecs::native_space::DeclaredSpace::new(Some(
+                        binding.target_space,
+                    )));
+            }
+        }
+        applied += 1;
+    }
+    Ok(applied)
 }

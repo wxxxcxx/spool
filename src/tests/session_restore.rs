@@ -13,6 +13,7 @@ fn candidates(widths: &[WidthIntent]) -> RestoreCandidates {
         version: INTENT_STATE_VERSION,
         revision: 7,
         floating: Vec::new(),
+        membership: Vec::new(),
         spaces: vec![SavedSpace {
             // Intentionally different from the current Space. Matching is
             // supplied externally, not guessed from a coincident numeric ID.
@@ -338,7 +339,8 @@ fn height_import_requires_matching_arrangement_and_complete_trusted_slots() {
         "a saved single is not a proved stack mapping"
     );
 
-    let mut saved = SpoolState::from_layouts([&target], |_| None, std::iter::empty());
+    let mut saved =
+        SpoolState::from_layouts([&target], |_| None, std::iter::empty(), std::iter::empty());
     saved.spaces[0].columns[0].items[0].weight = 2.0;
     let mut candidate = RestoreCandidates::from(saved);
     candidate.freeze_initial_layouts([&target]).unwrap();
@@ -381,6 +383,7 @@ fn floating_candidates(pid: i32, bundle_id: &str) -> RestoreCandidates {
                 height: 400,
             },
         }],
+        membership: Vec::new(),
         spaces: Vec::new(),
     }
     .into()
@@ -417,6 +420,7 @@ fn a_trusted_floating_binding_imports_the_candidate_frame() {
                 candidate_window: 0,
                 target_window_id: 0,
             }],
+            membership: Vec::new(),
         },
     );
     assert!(result.is_ok(), "{result:?}");
@@ -463,6 +467,7 @@ fn an_uncorroborated_floating_binding_is_refused() {
                 candidate_window: 0,
                 target_window_id: 0,
             }],
+            membership: Vec::new(),
         },
     );
     let error = result
@@ -504,6 +509,7 @@ fn a_late_import_is_refused() {
                 candidate_window: 0,
                 target_window_id: 0,
             }],
+            membership: Vec::new(),
         },
     );
     let error = result
@@ -533,10 +539,213 @@ fn an_import_without_a_frozen_baseline_is_refused() {
                 candidate_window: 0,
                 target_window_id: 0,
             }],
+            membership: Vec::new(),
         },
     );
     let error = result
         .expect("the system runs")
         .expect_err("an unfrozen baseline refuses the import");
     assert_eq!(error.admission_code(), "import_baseline_missing");
+}
+
+// --- Space membership candidates (issue 25's second domain) ------------------
+
+/// A candidate document with one membership entry for the harness's first window.
+fn membership_candidates(pid: i32, bundle_id: &str) -> RestoreCandidates {
+    SpoolState {
+        version: INTENT_STATE_VERSION,
+        revision: 7,
+        floating: Vec::new(),
+        membership: vec![crate::ecs::state::SavedMembership {
+            window_id: 0,
+            pid,
+            bundle_id: bundle_id.into(),
+            space_id: TEST_WORKSPACE_ID,
+        }],
+        spaces: Vec::new(),
+    }
+    .into()
+}
+
+/// The harness with two user Spaces, so a declared Space can move between them.
+fn two_space_harness() -> TestHarness {
+    let mut harness = TestHarness::new().with_windows(2).with_display(
+        crate::tests::TEST_DISPLAY_ID,
+        bevy::math::IRect::new(
+            0,
+            0,
+            crate::tests::TEST_DISPLAY_WIDTH,
+            crate::tests::TEST_DISPLAY_HEIGHT,
+        ),
+        vec![TEST_WORKSPACE_ID, TEST_WORKSPACE_ID + 1],
+    );
+    harness.pump_frames(10);
+    harness
+}
+
+/// A corroborated membership binding declares the Space it names, and the
+/// declaration is state: no platform write happens here.
+#[test]
+fn a_trusted_membership_binding_declares_the_space() {
+    use spool_shared_types::commands::{RestoreBindings, RestoreMembershipBinding};
+
+    let mut harness = two_space_harness();
+    harness
+        .world()
+        .insert_resource(membership_candidates(TEST_PROCESS_ID, "test"));
+    harness.pump_frames(2);
+    let entity = crate::tests::find_window_entity(0, harness.world());
+    let before = harness
+        .world()
+        .get::<crate::ecs::native_space::DeclaredSpace>(entity)
+        .expect("the reconciliation declares a Space")
+        .target;
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        RestoreBindings {
+            columns: Vec::new(),
+            floating: Vec::new(),
+            membership: vec![RestoreMembershipBinding {
+                candidate_membership: 0,
+                target_window_id: 0,
+                target_space: TEST_WORKSPACE_ID + 1,
+            }],
+        },
+    );
+    assert!(result.is_ok(), "{result:?}");
+
+    let declared = harness
+        .world()
+        .get::<crate::ecs::native_space::DeclaredSpace>(entity)
+        .expect("a declared Space");
+    assert_eq!(declared.target, Some(TEST_WORKSPACE_ID + 1));
+    assert_ne!(before, declared.target, "the import is what changed it");
+    assert!(
+        declared.repairs.is_empty(),
+        "an import is authored state, not a repair: {:?}",
+        declared.repairs
+    );
+}
+
+/// A binding the candidate does not corroborate is refused, and the declaration
+/// keeps the Space it had.
+#[test]
+fn an_uncorroborated_membership_binding_is_refused() {
+    use spool_shared_types::commands::{RestoreBindings, RestoreMembershipBinding};
+
+    let mut harness = two_space_harness();
+    harness
+        .world()
+        .insert_resource(membership_candidates(TEST_PROCESS_ID + 5, "elsewhere"));
+    harness.pump_frames(2);
+    let entity = crate::tests::find_window_entity(0, harness.world());
+    let before = harness
+        .world()
+        .get::<crate::ecs::native_space::DeclaredSpace>(entity)
+        .unwrap()
+        .target;
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        RestoreBindings {
+            columns: Vec::new(),
+            floating: Vec::new(),
+            membership: vec![RestoreMembershipBinding {
+                candidate_membership: 0,
+                target_window_id: 0,
+                target_space: TEST_WORKSPACE_ID + 1,
+            }],
+        },
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("an uncorroborated binding is refused");
+    assert_eq!(error.admission_code(), "import_binding_rejected");
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::native_space::DeclaredSpace>(entity)
+            .unwrap()
+            .target,
+        before
+    );
+}
+
+/// A declared Space must exist and be a user Space: the invariant is checked at
+/// import rather than repaired afterwards.
+#[test]
+fn a_membership_import_to_an_unknown_space_is_refused() {
+    use spool_shared_types::commands::{RestoreBindings, RestoreMembershipBinding};
+
+    let mut harness = two_space_harness();
+    harness
+        .world()
+        .insert_resource(membership_candidates(TEST_PROCESS_ID, "test"));
+    harness.pump_frames(2);
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        RestoreBindings {
+            columns: Vec::new(),
+            floating: Vec::new(),
+            membership: vec![RestoreMembershipBinding {
+                candidate_membership: 0,
+                target_window_id: 0,
+                target_space: TEST_WORKSPACE_ID + 100,
+            }],
+        },
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("an unknown Space is refused");
+    assert_eq!(error.admission_code(), "import_target_space_not_found");
+}
+
+/// One bad binding refuses the whole import: the membership group is not applied
+/// when another group fails.
+#[test]
+fn one_bad_binding_refuses_the_whole_import() {
+    use spool_shared_types::commands::{
+        RestoreBindings, RestoreFloatingBinding, RestoreMembershipBinding,
+    };
+
+    let mut harness = two_space_harness();
+    // The membership candidate is fine; the floating one does not exist.
+    harness
+        .world()
+        .insert_resource(membership_candidates(TEST_PROCESS_ID, "test"));
+    harness.pump_frames(2);
+    let entity = crate::tests::find_window_entity(0, harness.world());
+    let before = harness
+        .world()
+        .get::<crate::ecs::native_space::DeclaredSpace>(entity)
+        .unwrap()
+        .target;
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        RestoreBindings {
+            columns: Vec::new(),
+            floating: vec![RestoreFloatingBinding {
+                candidate_window: 0,
+                target_window_id: 0,
+            }],
+            membership: vec![RestoreMembershipBinding {
+                candidate_membership: 0,
+                target_window_id: 0,
+                target_space: TEST_WORKSPACE_ID + 1,
+            }],
+        },
+    );
+    assert!(result.expect("the system runs").is_err());
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::native_space::DeclaredSpace>(entity)
+            .unwrap()
+            .target,
+        before,
+        "a refused import applies nothing, including its valid group"
+    );
 }

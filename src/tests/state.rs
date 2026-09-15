@@ -564,6 +564,7 @@ fn intent_snapshot(width: crate::ecs::layout::WidthIntent) -> SpoolState {
         version: INTENT_STATE_VERSION,
         revision: 0,
         floating: Vec::new(),
+        membership: Vec::new(),
         spaces: vec![SavedSpace {
             space_id: TEST_WORKSPACE_ID,
             columns: vec![SavedColumn {
@@ -809,8 +810,9 @@ fn persistence_tracks_arrangement_and_raw_height_without_native_geometry() {
     let mut strip = LayoutStrip::new(TEST_WORKSPACE_ID);
     strip.append(first);
     strip.append(second);
-    let capture =
-        |strip: &LayoutStrip| SpoolState::from_layouts([strip], |_| None, std::iter::empty());
+    let capture = |strip: &LayoutStrip| {
+        SpoolState::from_layouts([strip], |_| None, std::iter::empty(), std::iter::empty())
+    };
     let mut persistence = StatePersistence::default();
     persistence.capture(capture(&strip)).unwrap();
     let first_revision = persistence.accepted_revision();
@@ -867,7 +869,8 @@ fn unresolved_members_are_persisted_as_explicit_slots() {
     strip.append(first);
     strip.append(second);
     strip.stack(second).unwrap();
-    let unresolved = SpoolState::from_layouts([&strip], |_| None, std::iter::empty());
+    let unresolved =
+        SpoolState::from_layouts([&strip], |_| None, std::iter::empty(), std::iter::empty());
     assert!(unresolved.valid());
     let item = &unresolved.spaces[0].columns[0].items[0];
     assert_eq!(
@@ -896,6 +899,7 @@ fn unresolved_members_are_persisted_as_explicit_slots() {
                 bundle_id: "fixture".into(),
             })
         },
+        std::iter::empty(),
         std::iter::empty(),
     );
     let members = &mixed.spaces[0].columns[0].items[0].members;
@@ -937,6 +941,7 @@ fn saved_native_tabs_remain_one_height_slot_inside_a_stack() {
             })
         },
         std::iter::empty(),
+        std::iter::empty(),
     );
     assert!(saved.valid());
     let items = &saved.spaces[0].columns[0].items;
@@ -971,6 +976,7 @@ fn a_floating_frame_round_trips_and_an_older_file_still_loads() {
                 height: 400,
             },
         }],
+        std::iter::empty(),
     );
     saved.revision = 3;
 

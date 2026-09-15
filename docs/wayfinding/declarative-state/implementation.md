@@ -167,3 +167,13 @@ Balance的继承语义经过三位专家一致确认：若参考列继承规则0
 - 浮动几何已进保存格式并作为隔离候选；跨重启恢复（自动应用与身份绑定）仍属地图 Out of scope。
 - 与 03 号票的一处刻意差异：越界夹取记为修复（改写意图），而非"保留原始意图 + 只写有效目标"。
 - mock 通过不证明真实 macOS 行为；真实桌面验收另行授权。
+
+## 恢复切片（可信映射导入）
+
+按 [25 号票](issues/25-cross-restart-recovery.md) 的裁决，把"有缝但没人用"的候选/导入缝接上所有者与入口，并逐个域接入：
+
+- **入口与所有者**（[26 号票](issues/26-recovery-first-slice.md)）：`Action::RestoreIntents(RestoreBindings)`（JSON 自描述，信封不变；分类 `Running`，因为它是只改保留状态、且有自身启动窗口作新鲜度门的启动期操作）；启动所有者 `freeze_restore_baseline` + `close_restore_window`（30 秒，实现默认值）；`spool session restore --bindings <file|->`。
+- **已接入的域**：列宽/高度（既有 `import_intents`）、浮动帧（`import_floating_frames`，2026-09-15）、Space 归属（`import_declared_spaces` + `SavedMembership`，见 [28 号票](issues/28-recovery-membership.md)）。
+- **共同语义**：先校验全部绑定再应用（一条坏绑定拒绝整次导入）；导入只改保留状态、不写原生；绑定必须由候选缓存的 `window_id`/`pid`/`bundle_id` 佐证；目标 Space 必须存在且为用户 Space。
+- **未接入**：焦点域（每 Space 偏好/逻辑选择）、在途尝试（按裁决永不恢复）。
+- **边界**：全部恢复仍只在同一登录会话内有意义（编号是会话作用域）；跨登出/重启的连续性等待 [27 号票](issues/27-window-identity-verification.md) 的核实结论。

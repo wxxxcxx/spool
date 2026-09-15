@@ -149,12 +149,21 @@ pub(crate) struct SpaceRepair {
 }
 
 impl DeclaredSpace {
-    fn new(target: Option<WorkspaceId>) -> Self {
+    pub(crate) fn new(target: Option<WorkspaceId>) -> Self {
         Self {
             target,
             observed: target,
             repairs: Vec::new(),
         }
+    }
+
+    /// Declares the Space an accepted edit or a trusted import names.
+    ///
+    /// This is the authored transition, not a repair: the declaration takes the
+    /// value the caller asked for, and the effect layer realizes it. Recording a
+    /// repair here would misreport it as something that was invalidated.
+    pub(crate) fn declare(&mut self, space: WorkspaceId) {
+        self.target = Some(space);
     }
 
     fn repair(&mut self, to: Option<WorkspaceId>, reason: &'static str) {

@@ -447,6 +447,8 @@ pub struct RestoreBindings {
     pub columns: Vec<RestoreColumnBinding>,
     #[serde(default)]
     pub floating: Vec<RestoreFloatingBinding>,
+    #[serde(default)]
+    pub membership: Vec<RestoreMembershipBinding>,
 }
 
 /// One column's candidate entry and the live column it is imported into.
@@ -476,4 +478,19 @@ pub struct RestoreFloatingBinding {
     pub candidate_window: usize,
     /// The live native window id.
     pub target_window_id: i32,
+}
+
+/// One membership candidate and the live window and Space it belongs to.
+///
+/// The declared Space comes from the candidate; the live window id and Space id
+/// are the caller's claims, accepted only when the candidate's cached identity
+/// agrees with a tracked window and the Space exists as a user Space.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreMembershipBinding {
+    /// Index into the candidate document's membership entries.
+    pub candidate_membership: usize,
+    /// The live native window id.
+    pub target_window_id: i32,
+    /// The live native Space id.
+    pub target_space: u64,
 }

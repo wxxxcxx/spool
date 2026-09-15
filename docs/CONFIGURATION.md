@@ -305,9 +305,9 @@ preserves whether a width inherits current configuration, uses absolute logical 
 or uses a viewport ratio, together with each stack item's raw positive height weight and
 one member slot per retained member. A member slot whose identity could not be cached is
 stored as an explicit unresolved slot rather than dropped, so a saved item always keeps
-its member count. A floating window's authored frame is saved too, with the same cached
-identity hints; the field is an addition to the existing format, so a file written before
-it existed still loads. Effective frames, constraints, native observations, animations,
+its member count. A floating window's authored frame and each tracked window's declared
+Space are saved too, with the same cached identity hints; the fields are additions to the
+existing format, so a file written before they existed still loads. Effective frames, constraints, native observations, animations,
 and retry state are not persisted.
 
 A successful command accepts intent; it does not guarantee a completed native
