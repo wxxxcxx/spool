@@ -96,6 +96,10 @@ impl Plugin for WorkspaceEventsPlugin {
             (
                 reconcile_destroyed_workspace_membership,
                 native_space::reconcile_native_space_transactions,
+                // Declared membership is reconciled after the layout has followed
+                // the facts, so a repair names the Space the window is actually
+                // in rather than one the transaction is about to leave.
+                native_space::reconcile_declared_space,
             )
                 .chain(),
         );

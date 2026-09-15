@@ -33,6 +33,7 @@ type WindowRows<'w, 's> = Query<
         Has<ParkedTile>,
         Option<&'static PreviousTiledStrip>,
         Option<&'static crate::ecs::native_space::SpaceMoveAttempt>,
+        Option<&'static crate::ecs::native_space::DeclaredSpace>,
     ),
 >;
 type GeometryRows<'w, 's> = Query<
@@ -140,7 +141,7 @@ impl Projection<'_, '_> {
     }
 
     fn window_rows(&self, budget: &Budget) -> Vec<Value> {
-        self.windows.iter().take_while(|_| budget.admit()).map(|(entity, window, parent, floating, focused, hidden, unavailable, parked, previous, attempt)| {
+        self.windows.iter().take_while(|_| budget.admit()).map(|(entity, window, parent, floating, focused, hidden, unavailable, parked, previous, attempt, declared)| {
             let app = self.apps.get(parent.parent()).ok().map(|(_, app)| app);
             let geometry = self.geometry.get(entity).ok();
             let observed = geometry.and_then(|row| row.2).map(|frame| frame.0);
@@ -166,7 +167,7 @@ impl Projection<'_, '_> {
                 "identity":{"id":window.id(),"pid":recorded(app.map(|app| app.pid())),"title":recorded(window.retained_title()),"bundle_id":recorded(app.and_then(|app| app.bundle_id())),"app_name":recorded(app.map(|app| app.name()))},
                 "geometry":{"realization": self.sync.frame_progress(entity).map(|progress| json!({"attempts":progress.attempts,"active":progress.active,"blocked":progress.blocked,"confirmed":progress.confirmed,"checks_pending":progress.checks_pending})),"desired":recorded(geometry.and_then(|row| row.0).map(|frame_| frame(frame_.0))),"presented":recorded(geometry.and_then(|row| row.1).map(|frame_| frame(frame_.0))),"observed":recorded(observed.map(frame))},
                 "layout":{"space_id":recorded(space_id),"column":column,"display_id":recorded(display_id),"previous_column":previous.map(|previous| previous.index+1)},
-                "membership":{"attempt":recorded(attempt.map(|attempt| json!({"target_space_id":attempt.target_space_id,"result":attempt.result.name(),"code":attempt.result.code()})))},
+                "membership":{"declared":recorded(declared.map(|declared| declared.target)),"observed":recorded(declared.map(|declared| declared.observed)),"repairs":recorded(declared.map(|declared| declared.repairs.iter().map(|repair| json!({"from":repair.from,"to":repair.to,"reason":repair.reason})).collect::<Vec<_>>())),"attempt":recorded(attempt.map(|attempt| json!({"target_space_id":attempt.target_space_id,"result":attempt.result.name(),"code":attempt.result.code()})))},
                 "state":{"available":!unavailable,"floating":floating,"focused":focused,"visible":hidden.is_none()&&!parked,"minimized":matches!(hidden,Some(WindowVisibility::Minimized)),"on_screen":recorded(on_screen),"motion":geometry.is_some_and(|row|row.3),"migration":geometry.is_some_and(|row|row.4||row.5),"blockers":{"unavailable":unavailable,"native_move":geometry.is_some_and(|row|row.4),"space_reassignment":geometry.is_some_and(|row|row.5),"parked":parked,"commit_suspended":geometry.is_some_and(|row|row.6)}}
             })
         }).collect()

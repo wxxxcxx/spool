@@ -116,6 +116,14 @@ ADR 0006 的"不可见 Space 也应接受 desired-layout 编辑"在本票被**�
 - `window inspect --source spool` 的 window row 新增 `membership.attempt`（`target_space_id` / `result` / `code`），并把 `membership` 加入默认选择与可选路径。
 - 测试：`the_last_membership_attempt_is_recorded`（五种结果各自的断言）、`window_detail_reports_the_last_membership_attempt`（诊断投影）。
 
+### task-2a：声明归属状态 + 修复 + 三栏诊断（已实施，2026-09-15）
+
+- 新增 `DeclaredSpace`（`target` / `observed` / `repairs`）：`target` 是声明的归属，必须指向一个存在且非全屏的用户 Space，或在没有有效目标时为 `None`；`observed` 是本次协调看到的归属；`repairs` 是最近 4 次修复（`from` / `to` / `reason`）。
+- 新增 `reconcile_declared_space`（调度在 `Last`：销毁处理 → 事务协调 → 声明协调，这样修复命名的是窗口**实际所在**的 Space 而不是事务即将离开的那个）。**不写原生**：搬窗口是效果层的事。
+- 修复触发器已覆盖并各有测试：目标 Space 被销毁/合并（旗舰场景：手动关掉声明所在的 Space → 修复为窗口实际所在的 Space、原因 `target_space_destroyed`、零原生写入；此后新建的 Space 不会被自动吸引）、外部移动（`membership_changed`）、目标变原生全屏（`target_space_fullscreen`）、显示器断开（目标仍存在 → **不修**）、实例退休（旧实体的声明随实体消失，新实例不继承修复历史）、读失败（不可读时**不修**，未知不等于缺席）。
+- 诊断：window row 的 `membership` 现在含 `declared` / `observed` / `repairs`（`membership` 已在默认选择内，叶子路径 `membership.declared|observed|repairs` 可单独选）。
+- 测试在改动前的代码上无法编译（`cannot find type DeclaredSpace`）——新状态类型的固有形态；行为断言由此建立。
+
 ## Resolution
 
 用户于 2026-09-15 逐项裁决：不变量 + 修复、修复不写原生、兜底顺序（观测 → 上次所在 → 未知）、一次尝试（2 秒，不自动重试）、以及"保留只在用户无法便宜重试且卡住状态常见持久时才做"这条判据。见上文 Answer。

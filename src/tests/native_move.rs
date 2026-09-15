@@ -114,6 +114,203 @@ fn move_attempt(
         .clone()
 }
 
+fn declared_space(
+    harness: &mut TestHarness,
+    entity: Entity,
+) -> crate::ecs::native_space::DeclaredSpace {
+    harness
+        .world()
+        .get::<crate::ecs::native_space::DeclaredSpace>(entity)
+        .expect("a declared Space")
+        .clone()
+}
+
+/// Moves one tracked entity into another Space's strip, the way an external move
+/// or a Space merge leaves it, without touching the platform.
+fn relocate_entity(harness: &mut TestHarness, entity: Entity, space: WorkspaceId) {
+    let world = harness.world();
+    for (_, mut strip) in world.query::<(Entity, &mut LayoutStrip)>().iter_mut(world) {
+        strip.remove(entity);
+    }
+    let world = harness.world();
+    for (_, mut strip) in world.query::<(Entity, &mut LayoutStrip)>().iter_mut(world) {
+        if strip.id() == space {
+            strip.append_column(Column::Single(entity));
+        }
+    }
+}
+
+/// A declared Space is state: it must name a Space that exists, so a fact that
+/// removes the Space repairs the declaration instead of leaving a target that can
+/// never be realized. The user scenario: a window declared in a Space that the
+/// user then closes by hand. Nothing here writes to the platform, and a Space
+/// created later does not attract the window back.
+#[test]
+fn a_destroyed_target_repairs_the_declared_space_to_where_the_window_is() {
+    let (mut harness, _, members) = column_harness();
+    relocate_entity(&mut harness, members[0], TARGET);
+    harness.pump_frames(5);
+    assert_eq!(
+        declared_space(&mut harness, members[0]).target,
+        Some(TARGET),
+        "the declaration starts from the Space the window is in"
+    );
+    let intents = harness.mock_state.native_space_intents().len();
+
+    // The user closes the Space by hand; macOS moves the window to the neighbour.
+    harness
+        .mock_state
+        .destroy_workspace(TEST_DISPLAY_ID, TARGET);
+    harness
+        .mock_state
+        .update_window(0, |window| window.workspace_id = TEST_WORKSPACE_ID);
+    harness.pump_frames(10);
+
+    let state = declared_space(&mut harness, members[0]);
+    assert_eq!(
+        state.target,
+        Some(TEST_WORKSPACE_ID),
+        "the declaration follows the window to where it actually is"
+    );
+    assert_eq!(state.observed, Some(TEST_WORKSPACE_ID));
+    assert_eq!(
+        state.repairs.last().map(|repair| repair.reason),
+        Some("target_space_destroyed")
+    );
+    assert_eq!(
+        harness.mock_state.native_space_intents().len(),
+        intents,
+        "a repair never writes to the platform"
+    );
+
+    // A Space created later is a new target only if the user asks for it.
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, TARGET + 10, false);
+    harness.pump_frames(10);
+    let after = declared_space(&mut harness, members[0]);
+    assert_eq!(after.target, Some(TEST_WORKSPACE_ID));
+    assert_eq!(after.repairs, state.repairs);
+    assert_eq!(harness.mock_state.native_space_intents().len(), intents);
+}
+
+/// A window that ends up somewhere else while its declared Space still exists
+/// repairs the declaration to the observation, because observation is what the
+/// layout follows and a declaration that disagrees would fight the user.
+#[test]
+fn an_external_move_repairs_the_declared_space() {
+    let (mut harness, _, members) = column_harness();
+    harness.pump_frames(5);
+    assert_eq!(
+        declared_space(&mut harness, members[0]).target,
+        Some(TEST_WORKSPACE_ID)
+    );
+
+    relocate_entity(&mut harness, members[0], TARGET);
+    harness.pump_frames(10);
+
+    let state = declared_space(&mut harness, members[0]);
+    assert_eq!(state.target, Some(TARGET));
+    assert_eq!(state.observed, Some(TARGET));
+    assert_eq!(
+        state.repairs.last().map(|repair| repair.reason),
+        Some("membership_changed")
+    );
+}
+
+/// A Space that became native fullscreen is not a user Space, so a declaration
+/// pointing at it stops being valid and is repaired with that reason.
+#[test]
+fn a_fullscreen_target_is_repaired() {
+    let (mut harness, _, members) = column_harness();
+    harness.pump_frames(5);
+    assert_eq!(
+        declared_space(&mut harness, members[0]).target,
+        Some(TEST_WORKSPACE_ID)
+    );
+
+    harness
+        .mock_state
+        .activate_workspace(TEST_DISPLAY_ID, TEST_WORKSPACE_ID, true);
+    harness.pump_frames(10);
+
+    let state = declared_space(&mut harness, members[0]);
+    assert_ne!(state.target, Some(TEST_WORKSPACE_ID));
+    assert_eq!(
+        state.repairs.last().map(|repair| repair.reason),
+        Some("target_space_fullscreen")
+    );
+}
+
+/// A disconnected display leaves the Space itself intact, and the ticket's rule is
+/// that a target which still exists is not repaired.
+#[test]
+fn a_detached_display_keeps_a_declaration_that_still_exists() {
+    let (mut harness, _, members) = column_harness();
+    harness.pump_frames(5);
+    let before = declared_space(&mut harness, members[0]);
+
+    harness.mock_state.remove_display(TEST_DISPLAY_ID);
+    harness.pump_frames(10);
+
+    let after = declared_space(&mut harness, members[0]);
+    assert_eq!(after.target, before.target);
+    assert_eq!(after.repairs, before.repairs);
+}
+
+/// Identity retirement ends the old declaration with the entity; a replacement
+/// instance starts from the layout it is actually in, and inherits nothing.
+#[test]
+fn a_replaced_instance_does_not_inherit_a_declaration() {
+    let (mut harness, _, members) = column_harness();
+    harness.pump_frames(5);
+
+    harness.world().despawn(members[0]);
+    let replacement = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::new(0, 20, 400, 700),
+    );
+    harness
+        .world()
+        .trigger(crate::ecs::SpawnWindowTrigger::new(vec![replacement]));
+    harness.pump_frames(10);
+
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::native_space::DeclaredSpace>(members[0])
+            .is_none(),
+        "the retired instance keeps no declaration"
+    );
+    let replacement_entity = find_window_entity(0, harness.world());
+    let fresh = declared_space(&mut harness, replacement_entity);
+    assert_eq!(fresh.target, Some(TEST_WORKSPACE_ID));
+    assert!(
+        fresh.repairs.is_empty(),
+        "a replacement inherits no repair history: {:?}",
+        fresh.repairs
+    );
+}
+
+/// A fact that cannot be read is unknown, not absence: an unreadable display
+/// inventory repairs nothing, so a declaration survives a failed observation.
+#[test]
+fn an_unreadable_inventory_does_not_repair_a_declaration() {
+    let (mut harness, _, members) = column_harness();
+    harness.pump_frames(5);
+    let before = declared_space(&mut harness, members[0]);
+    assert_eq!(before.target, Some(TEST_WORKSPACE_ID));
+
+    harness.mock_state.set_display_inventory_available(false);
+    harness.pump_frames(10);
+
+    let after = declared_space(&mut harness, members[0]);
+    assert_eq!(after.target, before.target);
+    assert_eq!(after.repairs, before.repairs);
+}
+
 /// The last membership attempt is recorded, so `window inspect` can show what
 /// Spool tried for a window and how it ended instead of leaving that in the logs.
 #[test]

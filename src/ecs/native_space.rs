@@ -123,6 +123,135 @@ impl SpaceMoveResult {
     }
 }
 
+/// How many repairs the diagnostic history keeps, newest last.
+const SPACE_REPAIR_HISTORY: usize = 4;
+
+/// The Space state keeps for one tracked window.
+///
+/// `target` is the declared membership: it must name a Space that exists and is
+/// a user Space, or be `None` while no valid target is known. `observed` is the
+/// membership this reconciliation last saw, kept for diagnosis. There is no
+/// waiting target here: a fact that invalidates a target which *was* valid
+/// repairs it, and a fact that cannot be read is unknown rather than absence.
+#[derive(Component, Clone, Debug)]
+pub(crate) struct DeclaredSpace {
+    pub(crate) target: Option<WorkspaceId>,
+    pub(crate) observed: Option<WorkspaceId>,
+    pub(crate) repairs: Vec<SpaceRepair>,
+}
+
+/// One recorded repair of a declared Space, with the fact that caused it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SpaceRepair {
+    pub(crate) from: Option<WorkspaceId>,
+    pub(crate) to: Option<WorkspaceId>,
+    pub(crate) reason: &'static str,
+}
+
+impl DeclaredSpace {
+    fn new(target: Option<WorkspaceId>) -> Self {
+        Self {
+            target,
+            observed: target,
+            repairs: Vec::new(),
+        }
+    }
+
+    fn repair(&mut self, to: Option<WorkspaceId>, reason: &'static str) {
+        self.repairs.push(SpaceRepair {
+            from: self.target,
+            to,
+            reason,
+        });
+        if self.repairs.len() > SPACE_REPAIR_HISTORY {
+            self.repairs.remove(0);
+        }
+        self.target = to;
+    }
+}
+
+#[derive(SystemParam)]
+pub(crate) struct DeclaredSpaceCtx<'w, 's> {
+    windows: Windows<'w, 's>,
+    spaces: Query<'w, 's, (&'static LayoutStrip, Has<PendingSpaceDestruction>)>,
+    previous: Query<'w, 's, &'static PreviousTiledStrip>,
+    topology: Res<'w, NativeTopology>,
+    declared: Query<'w, 's, &'static mut DeclaredSpace>,
+    commands: Commands<'w, 's>,
+}
+
+/// Keeps every tracked window's declared Space valid, and records each repair.
+///
+/// The declaration is state, not a request. It names the Space the window is
+/// declared to belong to and must always name one that exists and is a user
+/// Space, so a fact that invalidates a target which was valid — the Space was
+/// destroyed, merged away, or became native fullscreen, or the window was moved
+/// somewhere else — repairs the declaration and says why. Nothing here writes to
+/// the platform: moving a window is the effect layer's work.
+pub(crate) fn reconcile_declared_space(
+    DeclaredSpaceCtx {
+        windows,
+        spaces,
+        previous,
+        topology,
+        mut declared,
+        mut commands,
+    }: DeclaredSpaceCtx,
+) {
+    let known: Vec<(WorkspaceId, bool)> = spaces
+        .iter()
+        .map(|(strip, destroying)| (strip.id(), destroying))
+        .collect();
+    let is_valid_target = |space: WorkspaceId| {
+        known
+            .iter()
+            .any(|(id, destroying)| *id == space && !destroying)
+            && !topology.is_fullscreen(space)
+    };
+    let owner = |entity: Entity| {
+        spaces
+            .iter()
+            .find_map(|(strip, _)| strip.contains(entity).then_some(strip.id()))
+            .or_else(|| {
+                previous
+                    .get(entity)
+                    .ok()
+                    .map(|previous| previous.workspace_id)
+            })
+    };
+
+    for (_, entity) in windows.iter_any().collect::<Vec<_>>() {
+        let observed = owner(entity);
+        let Ok(mut state) = declared.get_mut(entity) else {
+            commands.entity(entity).try_insert(DeclaredSpace::new(
+                observed.filter(|space| is_valid_target(*space)),
+            ));
+            continue;
+        };
+        state.observed = observed;
+        let Some(target) = state.target else {
+            // No valid target is known yet; adopt one as soon as there is one.
+            if let Some(observed) = observed.filter(|space| is_valid_target(*space)) {
+                state.repair(Some(observed), "target_resolved");
+            }
+            continue;
+        };
+        let replacement = observed.filter(|space| is_valid_target(*space));
+        if !is_valid_target(target) {
+            let reason = if topology.is_fullscreen(target) {
+                "target_space_fullscreen"
+            } else {
+                "target_space_destroyed"
+            };
+            state.repair(replacement, reason);
+        } else if replacement.is_some_and(|observed| observed != target) {
+            // The window belongs somewhere else while its target still exists:
+            // an external move, or a merge into another strip. Observed wins.
+            state.repair(replacement, "membership_changed");
+        }
+    }
+}
+
 /// Records the outcome of one attempt on the addressed window, if it is tracked.
 ///
 /// A refusal happens before the transaction exists, so the record is the only
