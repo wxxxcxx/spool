@@ -318,6 +318,10 @@ pub(crate) fn observe_external_window_geometry(
             if presented.0 != frame {
                 presented.0 = frame;
             }
+            // The observation becomes the intent: a floating frame is state, and
+            // this is the fact that replaces it. The snap above keeps a drag
+            // responsive; the derivation then agrees with what is already here.
+            super::floating_geometry::set_floating_frame(&mut commands, entity, frame);
             continue;
         }
 

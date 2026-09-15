@@ -9,6 +9,12 @@ use crate::ecs::layout::clamp_origin_to_viewport;
 use crate::ecs::params::Windows;
 use crate::ecs::{Floating, FullWidthMarker, RetilePending, RetileWindow, SpawnCommandsExt};
 
+/// A floating frame the intent can hold: origin and size, both representable.
+fn floating_target(origin: IVec2, size: IVec2) -> crate::errors::Result<IRect> {
+    super::checked_window_frame(origin, size)
+        .ok_or_else(|| crate::errors::Error::rejected("invalid_geometry"))
+}
+
 type BlockedWindows<'w, 's> = Query<
     'w,
     's,
@@ -98,10 +104,14 @@ pub(super) fn execute(
                     frame.min.x.saturating_add(delta.x),
                     frame.min.y.saturating_add(delta.y),
                 );
-                commands.reposition_entity(
-                    entity,
+                let target = floating_target(
                     clamp_origin_to_viewport(origin, frame.size(), viewport),
-                );
+                    frame.size(),
+                )?;
+                // The effect keeps its pending overlay (two moves in one batch
+                // accumulate); the intent records where the window should be.
+                crate::ecs::floating_geometry::set_floating_frame(&mut commands, entity, target);
+                commands.reposition_entity(entity, origin);
                 return Ok(());
             }
             Err(crate::errors::Error::rejected("invalid_geometry_domain"))
@@ -113,6 +123,11 @@ pub(super) fn execute(
                 .ok_or_else(|| crate::errors::Error::rejected("geometry_unavailable"))?;
             let origin = clamp_origin_to_viewport(frame.min, frame.size(), viewport);
             if state.is_floating() {
+                crate::ecs::floating_geometry::set_floating_frame(
+                    &mut commands,
+                    entity,
+                    floating_target(origin, frame.size())?,
+                );
                 commands.reposition_entity(entity, origin);
             } else {
                 Admission::tiled_column(strip, entity)?;
@@ -166,13 +181,15 @@ pub(super) fn execute(
             if !state.is_floating() {
                 return Err(crate::errors::Error::rejected("invalid_geometry_domain"));
             }
-            let sizes = vec![(entity, target.size())];
-            super::apply_column_sizes(sizes, &mut commands);
+            super::apply_column_sizes(vec![(entity, target.size())], &mut commands);
             if !restoring {
                 commands.entity(entity).insert(FullWidthMarker {
                     width_ratio: f64::from(frame.width()) / f64::from(viewport.width()),
                     floating_frame: state.is_floating().then_some(frame),
                 });
+            }
+            if state.is_floating() {
+                crate::ecs::floating_geometry::set_floating_frame(&mut commands, entity, target);
             }
             commands.reposition_entity(entity, target.min);
             if state.is_tiled() {
@@ -208,6 +225,11 @@ pub(super) fn execute(
                     frame.size(),
                     viewport,
                 );
+                crate::ecs::floating_geometry::set_floating_frame(
+                    &mut commands,
+                    entity,
+                    floating_target(origin, frame.size())?,
+                );
                 commands.reposition_entity(entity, origin);
             }
             // Centering also brings the pointer to the display, but only under
@@ -224,6 +246,11 @@ pub(super) fn execute(
                     .ok_or_else(|| crate::errors::Error::rejected("invalid_geometry"))?;
                 if target != frame {
                     commands.entity(entity).remove::<FullWidthMarker>();
+                    crate::ecs::floating_geometry::set_floating_frame(
+                        &mut commands,
+                        entity,
+                        target,
+                    );
                     commands.reposition_entity(entity, target.min);
                     commands.resize_entity(entity, target.size());
                 }

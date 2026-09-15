@@ -238,6 +238,9 @@ impl Plugin for LayoutEventsPlugin {
                 // sits in the active strip regardless of its real display.
                 (
                     super::window_frame::apply_window_frame_requests,
+                    // Floating frames are derived from their own intent; the
+                    // marker adapter above serves the tiled layout's inputs.
+                    super::floating_geometry::derive_floating_frames,
                     super::tiled_visibility::release_detached,
                     display_viewport_changed,
                     super::triggers::refresh_column_width_defaults,

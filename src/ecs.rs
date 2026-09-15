@@ -65,6 +65,7 @@ use crate::platform::{Modifiers, Pid, PlatformCallbacks, WinID, WorkspaceId};
 pub(crate) mod defaults;
 pub mod display;
 pub(crate) mod exit_restore;
+pub mod floating_geometry;
 pub mod focus;
 pub mod layout;
 #[cfg(feature = "lua")]

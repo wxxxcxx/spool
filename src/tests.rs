@@ -5,6 +5,7 @@ mod cross_display_focus;
 mod display;
 mod display_commands;
 mod exit_restore;
+mod floating_geometry;
 mod harness;
 mod height_intent;
 mod independent_windows;

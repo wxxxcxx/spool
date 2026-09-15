@@ -419,9 +419,14 @@ fn defaults(resource: Resource, source: Source) -> &'static [&'static str] {
             "cg",
             "spaces",
         ],
-        (Resource::Window, Source::Spool) => {
-            &["identity", "geometry", "layout", "membership", "state"]
-        }
+        (Resource::Window, Source::Spool) => &[
+            "identity",
+            "geometry",
+            "layout",
+            "membership",
+            "floating",
+            "state",
+        ],
         (Resource::Space | Resource::App, _) => &["identity", "state", "windows"],
         (Resource::Display, _) => &["identity", "geometry", "spaces"],
         (Resource::Session, _) => &[
@@ -466,6 +471,8 @@ fn valid_path(resource: Resource, source: Source, path: &str) -> bool {
                 | "membership.declared"
                 | "membership.observed"
                 | "membership.repairs"
+                | "floating.intent"
+                | "floating.repairs"
                 | "state.floating"
                 | "state.visible"
                 | "state.available"

@@ -1009,13 +1009,16 @@ impl ReconcileState<'_, '_> {
                     remove_observed_frame(entity, commands);
                     continue;
                 };
-                update_floating_intent(
+                adopt_floating_frame(
                     &mut position,
                     &mut bounds,
                     &mut desired,
                     &mut presented,
                     frame,
                 );
+                // The retained intent follows the adopted observation: a floating
+                // window's frame is state, and this is the fact that replaces it.
+                super::floating_geometry::set_floating_frame(commands, entity, frame);
                 if let Some(mut observed) = observed {
                     if observed.0 != frame {
                         observed.0 = frame;
@@ -1107,13 +1110,14 @@ impl ReconcileState<'_, '_> {
             }
 
             if floating && can_adopt_frame {
-                update_floating_intent(
+                adopt_floating_frame(
                     &mut position,
                     &mut bounds,
                     &mut desired,
                     &mut presented,
                     frame,
                 );
+                super::floating_geometry::set_floating_frame(commands, entity, frame);
             }
         }
     }
@@ -1513,7 +1517,11 @@ fn remove_observed_frame(entity: Entity, commands: &mut Commands) {
     }
 }
 
-fn update_floating_intent(
+/// Adopts an observed frame as a floating window's frame.
+///
+/// The retained intent is written alongside it by the caller; this only moves
+/// the frame the pipeline presents and commits.
+fn adopt_floating_frame(
     position: &mut Position,
     bounds: &mut Bounds,
     desired: &mut DesiredWindowFrame,
