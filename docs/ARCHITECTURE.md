@@ -328,9 +328,10 @@ admission receipts and forwards every bus action to `commands::admission`.
 `admission::execute` (the checked path) and `admission::admit` (the
 fire-and-forget path) are the single readers for runtime actions, including
 directional window operations, named focus, Space commands, column reorder, and
-effect-only actions. They share one ordered pipeline: the lifecycle and
-`session_not_writable` gate, the effect-only actions, default-target resolution,
-then the domain executor. The shared `Admission` recipes resolve target windows,
+effect-only actions. They share one ordered pipeline: the lifecycle gate, the
+handover gate (the one state in which nothing but `quit`/`restart` is accepted,
+because the desktop is being put back the way Spool found it), the effect-only
+actions, default-target resolution, then the domain executor. The shared `Admission` recipes resolve target windows,
 unique strips and displays, native membership, and layout writability in one
 place, and the bounded typed `Rejection` maps to the existing snake-case IPC
 codes. The reader runs after the event pump and before topology refresh. Each
@@ -503,10 +504,14 @@ A retained source strip does not grant permission to modify an in-flight move.
 `Windows::layout_is_writable` requires an available window without either
 `NativeMoveOwner` or `WindowSpaceReassignmentPending`. Local geometry/structure
 commands and named script mutations check this before changing layout or
-publishing resize/reposition requests. Ordered admission applies that check,
-the lifecycle gates and the session-writability gate for every action and every
-intake: a keybinding and a checked control request are refused together, and
-`Center`, `Snap` and a script plan no longer have their own route around them.
+publishing resize/reposition requests. Ordered admission applies that check and
+the lifecycle gates for every action and every intake: a keybinding and a checked
+control request are refused together, and `Center`, `Snap` and a script plan no
+longer have their own route around them. Mission Control and initialization are
+not refusals: an edit accepted there is realized when the desktop allows it, and
+an unrealized one aligns its authored field to what the display shows
+(ADR 0011). While the exit path is putting the windows back where Spool found
+them, every action but `quit`/`restart` is refused.
 Focus and floating classification retain their separate admission paths;
 floating classification edits Layout State but not geometry, so a move's
 ownership barrier does not refuse it.

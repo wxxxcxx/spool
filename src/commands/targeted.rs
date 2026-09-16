@@ -1,6 +1,7 @@
 //! Explicit command targets are resolved without changing focus or active markers.
 
 use bevy::prelude::*;
+use tracing::debug;
 
 use super::admission::Admission;
 use super::{Action, Direction, Operation};
@@ -42,6 +43,8 @@ pub(super) fn execute(
     mut admission: Admission,
     config: Res<Config>,
     window_manager: Res<crate::manager::WindowManager>,
+    mission_control: Option<Res<crate::ecs::MissionControlActive>>,
+    exiting: Option<Res<crate::ecs::exit_restore::ExitInProgress>>,
     mut commands: Commands,
 ) -> crate::errors::Result<()> {
     let Action::TargetedWindow {
@@ -235,8 +238,23 @@ pub(super) fn execute(
             // Centering also brings the pointer to the display, but only under
             // the option that governs keyboard pointer movement: a user who
             // turned that off still expects no pointer jump.
+            //
+            // The centering itself is retained state and waits for the desktop
+            // like any other edit; the pointer move is an immediate side effect
+            // with no later realization, so it happens only when the desktop is
+            // Spool's to move a pointer on, and is skipped with a reason
+            // otherwise (ADR 0011).
             if config.mouse_follows_focus() {
-                window_manager.warp_mouse(viewport.center());
+                if mission_control.as_ref().is_some_and(|overview| overview.0) || exiting.is_some()
+                {
+                    debug!(
+                        window_id,
+                        "centered the window but skipped the pointer move: the session is not \
+                         moving the pointer now"
+                    );
+                } else {
+                    window_manager.warp_mouse(viewport.center());
+                }
             }
             Ok(())
         }

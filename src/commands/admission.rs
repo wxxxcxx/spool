@@ -115,39 +115,34 @@ fn hand_over() {
 /// Which gates one action passes before its effect may run.
 ///
 /// The compiler demands an answer for every `Action` variant, so a new action
-/// cannot be added without stating its reach. A hand-written list of the gated
-/// variants would instead let a new one bypass the session gate by omission,
-/// which is how the same action came to be admitted differently on different
-/// intakes.
+/// cannot be added without stating whether it must still work while the session
+/// is handing the desktop back.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionReach {
-    /// The session must be writable as well: not initializing, not showing
-    /// Mission Control, not exiting. This is the geometry barrier — an edit whose
-    /// realization needs a quiescent layout to write through.
-    Writable,
-    /// The lifecycle gate alone decides.
+    /// Refused while the session is handing the desktop back (ADR 0011). The exit
+    /// path is putting the windows Spool managed back where it found them, so an
+    /// edit accepted now would describe a screen that no longer exists, and there
+    /// is no later realization to wait for.
+    HandingOver,
+    /// The lifecycle gate alone decides. An accepted edit is realized when the
+    /// desktop allows it: Mission Control and initialization are states to wait
+    /// out through the realization outcome, not states to refuse in (ADR 0011).
     Running,
 }
 
 fn session_reach(action: &Action) -> SessionReach {
     match action {
-        // Layout State edits. `Layout(plan)` is one admitted batch whose inner
-        // operations still take their own admission path during replay.
+        // Ending the session has to stay possible while it is ending: a repeated
+        // quit is idempotent, and a restart is the handover itself.
+        Action::Quit | Action::Restart => SessionReach::Running,
+        // Everything else edits retained state or asks for an effect on a desktop
+        // that is already being handed back. The variants are listed rather than
+        // wildcarded on purpose: a new action must state which side it is on.
         Action::Window(_)
         | Action::TargetedWindow { .. }
         | Action::SpaceLayout { .. }
-        | Action::Layout(_) => SessionReach::Writable,
-        // A Space focus preference and a native Space command edit state too,
-        // and keep the lighter reach deliberately: the preference is state-only,
-        // and an activation is held pending by `focus::reconcile_activation`
-        // while Mission Control is open and reported blocked when availability
-        // cannot be proven. Refusing them here would contradict ADR 0006's
-        // separation of accepted state from realized effects, and would break
-        // the Activation Intent deferral. These actions revalidate their own
-        // *snapshot identity* inside the native command system
-        // (`LayoutSession::accepts`), which is a different question from the
-        // gates asked here.
-        Action::SetSpaceFocusPreference { .. }
+        | Action::Layout(_)
+        | Action::SetSpaceFocusPreference { .. }
         | Action::FocusWindow { .. }
         | Action::FocusWindowInSpace { .. }
         | Action::FocusSpace { .. }
@@ -156,9 +151,6 @@ fn session_reach(action: &Action) -> SessionReach {
         | Action::MoveFocusedWindowToSpace { .. }
         | Action::CreateSpace { .. }
         | Action::DeleteSpace { .. }
-        // Layout State without geometry, and effects that neither edit layout
-        // nor depend on a quiescent one. `Writable` exists for the geometry
-        // edits, whose realization has to wait for the ownership barrier.
         | Action::Mouse(_)
         | Action::ToggleBarCollapse
         | Action::ReorderColumn { .. }
@@ -166,26 +158,18 @@ fn session_reach(action: &Action) -> SessionReach {
         | Action::ReconcileWindows
         | Action::MissionControl
         | Action::ShowDesktop
-        // A trusted intent import changes retained state without a native
-        // effect, and its own startup window is the freshness gate; the session
-        // being unwritable would refuse exactly the startup it exists for.
         | Action::RestoreIntents(_)
-        // Answered before this classification is consulted: the Lua worker reads
-        // a bound callback off the same bus, and a wire request for one is
-        // refused rather than owed a receipt — a handler is user code of
-        // unbounded duration, so no receipt could promise that it ran.
-        | Action::Lua(_)
-        | Action::Quit
-        | Action::Restart => SessionReach::Running,
+        | Action::Lua(_) => SessionReach::HandingOver,
     }
 }
 
-fn session_is_writable(world: &World) -> bool {
-    !world.contains_resource::<crate::ecs::Initializing>()
-        && !world
-            .get_resource::<crate::ecs::MissionControlActive>()
-            .is_some_and(|overview| overview.0)
-        && !world.contains_resource::<crate::ecs::exit_restore::ExitInProgress>()
+/// Whether the desktop is still Spool's to change.
+///
+/// It is not while the exit path is restoring the windows Spool managed. Mission
+/// Control and initialization are deliberately not part of this question: their
+/// answer is "not yet", which the realization outcome already says (ADR 0011).
+fn session_owns_desktop(world: &World) -> bool {
+    !world.contains_resource::<crate::ecs::exit_restore::ExitInProgress>()
 }
 
 /// One translation for every effect arm: a cached system that could not run at
@@ -209,6 +193,17 @@ fn execute_action(world: &mut World, action: Action) -> crate::errors::Result<()
         // while the requester still waits.
         lifecycle.set(crate::lifecycle::Phase::Stopping);
         return Ok(());
+    }
+    // The handover gate comes before every effect, including the effect-only
+    // ones: while the windows Spool managed are being put back where it found
+    // them, nothing is accepted — an overview command or an audit would write
+    // geometry into a desktop that is already leaving. Ending the session stays
+    // possible through this same gate (`session_reach`).
+    if session_reach(&action) == SessionReach::HandingOver && !session_owns_desktop(world) {
+        // The wire code keeps its string: scripts match on it, and what changed
+        // is the situation it answers, not the situation's name (ADR 0009's
+        // unchanged-wire rule).
+        return Err(Rejection::SessionHandingOver.into());
     }
     // Effect-only actions carry no state to validate; they run before the
     // arrangement recipes so a session that cannot answer a layout query still
@@ -247,9 +242,6 @@ fn execute_action(world: &mut World, action: Action) -> crate::errors::Result<()
         invoked(world.run_system_cached_with(super::layout_edit::execute, action.clone()))?
     {
         return result;
-    }
-    if session_reach(&action) == SessionReach::Writable && !session_is_writable(world) {
-        return Err(crate::errors::Error::rejected("session_not_writable"));
     }
     if let Action::Window(
         operation @ (Operation::FocusFloating | Operation::FocusTiled | Operation::FocusOtherLayer),
@@ -519,6 +511,10 @@ pub(crate) enum Rejection {
     DisplayGeometryStale,
     InvalidDisplayFrame,
     LayoutOwnershipUnresolved,
+    /// The session is putting the desktop back the way it found it, so no edit is
+    /// accepted. The serialized code deliberately stays `session_not_writable`
+    /// (ADR 0011 narrowed the reach; ADR 0009 keeps the wire string).
+    SessionHandingOver,
 }
 
 impl Rejection {
@@ -542,6 +538,7 @@ impl Rejection {
             Self::DisplayGeometryStale => "display_geometry_stale",
             Self::InvalidDisplayFrame => "invalid_display_frame",
             Self::LayoutOwnershipUnresolved => "layout_ownership_unresolved",
+            Self::SessionHandingOver => "session_not_writable",
         }
     }
 }

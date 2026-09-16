@@ -657,9 +657,9 @@ fn one_action_is_admitted_the_same_way_from_either_intake() {
 
         let mut bus = harness();
         if refusing {
+            // The exit handover is the one state that still refuses edits.
             bus.world()
-                .resource_mut::<crate::ecs::MissionControlActive>()
-                .0 = true;
+                .insert_resource(crate::ecs::exit_restore::ExitInProgress);
         }
         bus.world()
             .write_message(Event::action_requested(action.clone()));
@@ -669,8 +669,7 @@ fn one_action_is_admitted_the_same_way_from_either_intake() {
         let mut wire = harness();
         if refusing {
             wire.world()
-                .resource_mut::<crate::ecs::MissionControlActive>()
-                .0 = true;
+                .insert_resource(crate::ecs::exit_restore::ExitInProgress);
         }
         let (reply, received) = async_channel::bounded(1);
         wire.world().write_message(Event::CheckedActionRequested {
@@ -737,13 +736,11 @@ fn a_checked_lua_callback_is_refused_rather_than_owed_a_receipt() {
     assert_eq!(receipt.code.as_deref(), Some("unsupported_operation"));
 }
 
-/// `session_not_writable` exists for geometry edits, whose realization needs a
-/// quiescent layout. A state-only edit and a native Space command keep the
-/// lighter reach deliberately: the first is accepted while realization is
-/// blocked (ADR 0006), the second is held pending and reported blocked by
-/// `focus::reconcile_activation` rather than refused at admission.
+/// Mission Control no longer refuses anything: every edit is accepted into
+/// retained state, and how it converges is the realization outcome's question
+/// (ADR 0011). `session_not_writable` now answers only the exit handover.
 #[test]
-fn mission_control_defers_state_edits_instead_of_refusing_them() {
+fn mission_control_accepts_every_edit_instead_of_refusing_it() {
     use spool_shared_types::wire::{AdmissionStatus, CheckedAction, Response};
 
     let mut harness = harness();
@@ -797,8 +794,63 @@ fn mission_control_defers_state_edits_instead_of_refusing_them() {
     );
 
     let geometry = receipt(&mut harness, Action::Window(Operation::Center));
-    assert_eq!(geometry.status, AdmissionStatus::Rejected);
-    assert_eq!(geometry.code.as_deref(), Some("session_not_writable"));
+    assert_eq!(
+        geometry.status,
+        AdmissionStatus::Accepted,
+        "a geometry edit is accepted too; waiting for the desktop is not this gate's job anymore: {:?}",
+        geometry.code
+    );
+    assert_ne!(geometry.code.as_deref(), Some("session_not_writable"));
+}
+
+/// The exit handover is the one place the session gate still answers: the
+/// desktop is being put back the way Spool found it, so no edit is accepted
+/// (ADR 0011, the owner's scope-one choice).
+#[test]
+fn the_exit_handover_refuses_every_edit() {
+    use spool_shared_types::wire::{AdmissionStatus, CheckedAction, Response};
+
+    let mut harness = harness();
+    harness
+        .world()
+        .insert_resource(crate::ecs::exit_restore::ExitInProgress);
+    let receipt = |harness: &mut TestHarness, action: Action| {
+        let (reply, received) = async_channel::bounded(1);
+        harness
+            .world()
+            .write_message(Event::CheckedActionRequested {
+                request: CheckedAction {
+                    request_id: "handover".into(),
+                    action,
+                },
+                respond_to: reply,
+            });
+        harness.world().run_schedule(PreUpdate);
+        let Response::Admission(receipt) = received.try_recv().expect("execution receipt") else {
+            panic!("admission response")
+        };
+        receipt
+    };
+
+    for action in [
+        Action::Window(Operation::Center),
+        Action::SetSpaceFocusPreference {
+            space_id: TEST_WORKSPACE_ID,
+            window_id: 0,
+        },
+        Action::FocusSpace {
+            space_id: TEST_WORKSPACE_ID,
+        },
+        Action::PrintState,
+    ] {
+        let refused = receipt(&mut harness, action.clone());
+        assert_eq!(
+            refused.status,
+            AdmissionStatus::Rejected,
+            "{action:?} must be refused while the desktop is handed back"
+        );
+        assert_eq!(refused.code.as_deref(), Some("session_not_writable"));
+    }
 }
 
 fn phase(harness: &mut TestHarness) -> crate::lifecycle::Phase {
@@ -827,30 +879,74 @@ fn a_bus_quit_stops_the_session_once() {
     );
 }
 
-/// `Center` and `Snap` reach the strip through the one admission table now, so
-/// the session gate applies to them on the bus intake too — it never did.
+/// `Center` and `Snap` reach the strip through the one admission table, and since
+/// ADR 0011 the table does not refuse them for the session's state: the same
+/// state edit lands whether Mission Control is open or not.
 #[test]
-fn center_and_snap_obey_the_session_gate_from_the_bus() {
+fn center_and_snap_reach_the_strip_under_mission_control_too() {
     for operation in [Operation::Center, Operation::Snap] {
-        let mut writable = harness();
-        dispatch(&mut writable, [Action::Window(operation.clone())]);
-        assert!(
-            repositions(&mut writable) > 0,
-            "{operation:?} must reach the strip while the session is writable"
-        );
-
-        let mut blocked = harness();
-        blocked
-            .world()
-            .resource_mut::<crate::ecs::MissionControlActive>()
-            .0 = true;
-        dispatch(&mut blocked, [Action::Window(operation)]);
-        assert_eq!(
-            repositions(&mut blocked),
-            0,
-            "Mission Control must refuse the action on the bus intake"
-        );
+        for overview in [false, true] {
+            let mut harness = harness();
+            if overview {
+                harness
+                    .world()
+                    .resource_mut::<crate::ecs::MissionControlActive>()
+                    .0 = true;
+            }
+            dispatch(&mut harness, [Action::Window(operation.clone())]);
+            assert!(
+                repositions(&mut harness) > 0,
+                "{operation:?} must reach the strip (Mission Control open: {overview})"
+            );
+        }
     }
+}
+
+/// The pointer move `Center` performs is an immediate side effect with no later
+/// realization, so it is skipped while the session is not moving the pointer —
+/// while Mission Control is open — and the centering still lands (ADR 0011).
+#[test]
+fn centering_skips_the_pointer_move_while_mission_control_is_open() {
+    use crate::config::{Config, MainOptions};
+
+    let config: Config = (
+        MainOptions {
+            mouse_follows_focus: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut open = TestHarness::new()
+        .with_config(config.clone())
+        .with_windows(2);
+    open.pump_frames(10);
+    open.mock_state.take_focus_requests();
+    open.world()
+        .resource_mut::<crate::ecs::MissionControlActive>()
+        .0 = true;
+    let before = open.mock_state.cursor_position();
+    dispatch(&mut open, [Action::Window(Operation::Center)]);
+    assert_eq!(
+        open.mock_state.cursor_position(),
+        before,
+        "the pointer does not move while the overview is open"
+    );
+    assert!(
+        repositions(&mut open) > 0,
+        "the centering itself is still an accepted state edit"
+    );
+
+    let mut closed = TestHarness::new().with_config(config).with_windows(2);
+    closed.pump_frames(10);
+    closed.mock_state.take_focus_requests();
+    let before = closed.mock_state.cursor_position();
+    dispatch(&mut closed, [Action::Window(Operation::Center)]);
+    assert_ne!(
+        closed.mock_state.cursor_position(),
+        before,
+        "with the overview closed the pointer follows the centering again"
+    );
 }
 
 #[test]

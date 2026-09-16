@@ -1212,11 +1212,13 @@ fn layout_plan_keeps_inner_operations_on_the_admission_path() {
     assert_eq!(harness.mock_state.take_focus_requests(), vec![1]);
 }
 
-/// A script's plan is a Layout State edit like any other, so it is admitted by
-/// the session's writability, not by which intake delivered it. The batch is
-/// refused as one action; the replay stays snapshot-bound and op-by-op.
+/// A script's plan is a Layout State edit like any other, so it is admitted the
+/// same way whichever intake delivered it — and since ADR 0011 that means
+/// accepted, not refused: the plan's edit reaches Layout State while Mission
+/// Control is open, and realization is the frame pipeline's question. The batch
+/// stays snapshot-bound and op-by-op.
 #[test]
-fn a_layout_plan_cannot_edit_an_unwritable_session() {
+fn a_layout_plan_edits_layout_state_while_mission_control_is_open() {
     let mut harness = TestHarness::new().with_windows(2);
     harness.pump_frames(5);
     let intent = |harness: &mut TestHarness| {
@@ -1242,9 +1244,9 @@ fn a_layout_plan_cannot_edit_an_unwritable_session() {
             ratio: 0.75,
         }],
     );
-    assert_eq!(
+    assert_ne!(
         intent(&mut harness),
         before,
-        "a plan must not edit Layout State while the session is not writable"
+        "the plan's edit is accepted into Layout State; its realization is not this test's subject"
     );
 }

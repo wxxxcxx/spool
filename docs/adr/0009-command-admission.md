@@ -63,10 +63,21 @@ re-order operations behind the actions that followed.
 variant as needing a writable session or only a running one, and the compiler
 forces an answer for a new variant. The hand-written list this replaces named
 only the variants it happened to remember, so a new action could bypass the
-gate by omission. `Writable` is the geometry barrier: the actions whose
-realization has to wait for a quiescent layout. Everything else keeps the
-lighter reach, including the state edits, which are deferred rather than refused
-(below).
+gate by omission. `Writable` was the geometry barrier: the actions whose
+realization had to wait for a quiescent layout. Everything else kept the
+lighter reach, including the state edits, which were deferred rather than
+refused (below).
+
+> **Amended 2026-09-16 (ADR 0011).** The `Writable` reach judgement is retired.
+> Its one remaining answer is the exit handover, where every action but
+> `quit`/`restart` is refused because the desktop is being put back the way Spool
+> found it; Mission Control and initialization are answered by the realization
+> outcome (wait and converge) rather than by refusing the edit. The reason is
+> that the classification had stopped deciding anything: the column-width and
+> layout-edit recipes were dispatched *before* the single `session_is_writable`
+> check, so exactly the edits the table named were the ones that bypassed it,
+> while `Center` was refused. `session_not_writable` keeps its wire string for the
+> handover refusal (unchanged-wire rule above).
 
 **A plan's deferred continuation takes the same gate as its action.**
 `Event::LayoutSpaceRequested` is not an `Action` — it carries a snapshot binding
