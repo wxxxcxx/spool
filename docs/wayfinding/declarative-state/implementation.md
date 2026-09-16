@@ -43,7 +43,7 @@
 | 脚本身份门禁 | [layout_ops.rs](../../../src/ecs/layout_ops.rs)、[layout_snapshot.rs](../../../src/ecs/layout_snapshot.rs) |
 | 动画与协调 | [window_frame.rs](../../../src/ecs/window_frame.rs)、[reconcile.rs](../../../src/ecs/reconcile.rs)、[systems.rs](../../../src/ecs/systems.rs) |
 | 外部几何接纳 | [window_geometry.rs](../../../src/ecs/window_geometry.rs) |
-| 保存与隔离导入 | [state.rs](../../../src/ecs/state.rs)、[restore.rs](../../../src/ecs/restore.rs) |
+| 保存与隔离导入 | [state.rs](../../../src/ecs/state.rs)、`state.rs`（落盘与恢复线已于 2026-09-16 退役） |
 | 诊断 | [inspection/spool.rs](../../../src/inspection/spool.rs) |
 | 首片端到端测试 | [column_intent.rs](../../../src/tests/column_intent.rs) |
 | 高度端到端测试 | [height_intent.rs](../../../src/tests/height_intent.rs) |

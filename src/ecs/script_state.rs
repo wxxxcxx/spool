@@ -5,11 +5,10 @@
 //! through this single-authority resource; the Lua worker caches a copy and
 //! checks [`ScriptStateStore::revision_handle`] to know when to re-read.
 //!
-//! Kept separate from [`SpoolState`] (which is rebuilt from the world on every
-//! save) since script state has neither that property nor a reason to be
-//! removed once session restore finishes.
-//!
-//! [`SpoolState`]: super::state::SpoolState
+//! Kept separate from retained layout intent (which lives only in the running
+//! world and is rebuilt from rules and observations at each start, ADR 0010):
+//! a script's own store is data the script owns, so it is written to disk and
+//! read back.
 
 use std::fs;
 use std::path::{Path, PathBuf};

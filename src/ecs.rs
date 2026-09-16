@@ -49,7 +49,6 @@ use crate::bar::BarManager;
 use crate::commands::register_commands;
 use crate::config::{Config, WindowParams};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::state::{SpoolState, StateFilePath};
 use crate::errors::Result;
 use crate::events::{Event, EventSender, FocusObservation, InputEvent};
 #[cfg(feature = "lua")]
@@ -76,7 +75,6 @@ pub mod mouse;
 pub mod native_space;
 pub mod params;
 pub(crate) mod reconcile;
-pub(crate) mod restore;
 pub mod script_state;
 pub mod scroll;
 pub mod state;
@@ -213,7 +211,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.init_resource::<topology::NativeTopology>();
     app.init_resource::<layout_snapshot::LayoutSession>();
     app.init_resource::<defaults::DefaultRetries>();
-    app.init_resource::<state::StatePersistence>();
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
@@ -287,8 +284,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(not(resource_exists::<exit_restore::ExitInProgress>)),
             reconcile::confirm_unavailable_windows,
             systems::refresh_window_notifications,
-            state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
-            state::cleanup_on_exit,
             script_state::periodic_script_state_save.run_if(on_timer(Duration::from_mins(5))),
             script_state::script_state_cleanup_on_exit,
         ),
@@ -328,16 +323,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 crate::bar::animate_bar,
             )
                 .chain(),
-        ),
-    );
-    app.add_systems(PostUpdate, state::capture_state_changes);
-    // The startup owner of the intent import: it freezes the baseline once the
-    // session can be read, and closes the window it owns when no import arrives.
-    app.add_systems(
-        Update,
-        (
-            restore::freeze_restore_baseline,
-            restore::close_restore_window,
         ),
     );
     app.add_systems(Last, exit_restore::restore_launch_windows);
@@ -873,15 +858,6 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_non_send(flash_message_manager)
         .insert_non_send(bar_manager)
         .insert_non_send(receiver);
-
-    let state_file_path = StateFilePath::default();
-    if let Some(previous_state) = SpoolState::load_from_file(state_file_path.as_path()) {
-        app.insert_resource(state::StatePersistence::starting_after(
-            previous_state.revision,
-        ));
-        app.insert_resource(restore::RestoreCandidates::from(previous_state));
-    }
-    app.insert_resource(state_file_path);
 
     // Overwrites the empty store `register_commands` put there, which is what
     // the mock harness keeps: only the real app reads the user's file.

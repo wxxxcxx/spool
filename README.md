@@ -161,18 +161,18 @@ Changes made to the active configuration file are automatically reloaded while
 Spool is running. This is useful for tweaking keyboard bindings and other
 settings without restarting the application.
 
-### Layout intent persistence
+### Layout intent and restarts
 
-Spool saves original column width intent to the user state directory
-(`$XDG_STATE_HOME/spool/state.json`, usually
-`~/.local/state/spool/state.json`). The file retains inherited, absolute-point,
-and viewport-ratio widths, including edits to currently invisible Spaces.
-
-Startup reads saved data as isolated candidates. Windows and Spaces initialize
-from current native observations and configuration; saved widths are not
-reapplied automatically. Previous file formats are ignored without migration.
-See [Layout Intent Persistence](docs/CONFIGURATION.md#layout-intent-persistence)
-for the current boundary.
+Retained layout intent lives only while Spool runs. A restart rebuilds it from
+the configured window rules, then from current native observations, then from
+defaults: a rule states how an application's windows should start, macOS says
+where a window already is, and anything neither covers falls back to the
+defaults. Nothing about the runtime layout is written to disk or restored from a
+saved document, so a column dragged wider, an adjusted stack share, an exact
+floating position or a Space's remembered focus does not survive a restart unless
+a rule expresses it. See
+[Layout Intent and Restarts](docs/CONFIGURATION.md#layout-intent-and-restarts) for
+the boundary and the current rule vocabulary.
 
 ### Running as a service
 
@@ -246,7 +246,6 @@ removed in this breaking migration. See [the CLI contract](docs/CLI_IMPLEMENTATI
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse next-display`        | Warp the mouse pointer to the next display       |
 | `session mission-control`          | Open or close the system Mission Control overview |
-| `session restore --bindings <file\|->` | Submits trusted intent mappings for this session (see [Layout intent persistence](#layout-intent-persistence)) |
 | `session show-desktop`             | Toggle the system Show Desktop overview          |
 | `service dump-state`               | Print the internal ECS state to the debug log    |
 | `service quit`                     | Quit Spool                                      |

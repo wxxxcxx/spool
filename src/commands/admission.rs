@@ -158,7 +158,6 @@ fn session_reach(action: &Action) -> SessionReach {
         | Action::ReconcileWindows
         | Action::MissionControl
         | Action::ShowDesktop
-        | Action::RestoreIntents(_)
         | Action::Lua(_) => SessionReach::HandingOver,
     }
 }
@@ -337,9 +336,6 @@ fn execute_action(world: &mut World, action: Action) -> crate::errors::Result<()
         } => invoked(world.run_system_cached_with(crate::ecs::tiled_visibility::toggle, space_id))?,
         action @ Action::ReorderColumn { .. } => {
             invoked(world.run_system_cached_with(super::command_reorder_column, action))
-        }
-        Action::RestoreIntents(bindings) => {
-            invoked(world.run_system_cached_with(crate::ecs::restore::restore_intents, bindings))?
         }
         #[cfg(feature = "lua")]
         Action::Layout(plan) => {

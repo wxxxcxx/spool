@@ -8,6 +8,9 @@ Assignee: none
 Parent: [跨重启恢复的入口票（恢复地图）](25-cross-restart-recovery.md)
 Blocked by: none
 
+
+> **2026-09-16 反转**：本票整体被 [ADR 0010](../../../adr/0010-runtime-state-rebuilt-from-rules.md) 取代——retained state 只在运行期存在，没有落盘、候选、导入缝或 `session restore`。跨会话偏好改由**规则**表达（字段按需增补），未表达者按"观测 → 默认"重建、接受丢失。反转原因与落地见 [运行期状态与实现对账](../../runtime-state/map.md)。
+
 ## Question
 
 恢复地图（25 号票）已裁决七项。但**今天所有恢复能力都是惰性的**：候选与可信映射导入缝（`RestoreCandidates` / `import_intents`）已经存在且经过测试，却**没有任何运行时调用者**——`restore.rs` 的注释直接写着 *"No automatic binding provider exists"*、*"A caller owning a future startup protocol must close its frozen candidate set when the startup window ends."*。本票确定第一个可实施切片的边界与**接口形状**（接口是用户可见 API，因此先提案再实施）。

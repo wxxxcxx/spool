@@ -305,7 +305,6 @@ impl Action {
             Self::Window(Operation::SetWidth(_))
             | Self::Lua(_)
             | Self::Layout(_)
-            | Self::RestoreIntents(_)
             | Self::ReorderColumn { .. }
             | Self::MoveColumnToSpace { .. } => return None,
 

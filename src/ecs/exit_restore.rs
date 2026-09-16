@@ -1,9 +1,10 @@
 //! Restores launch geometry and brings tracked windows inside present displays.
 //!
-//! This session-local launch snapshot is deliberately separate from
-//! [`super::state::SpoolState`], which persists Spool's layout for a later
-//! launch. Native Space membership, visibility, focus and z-order remain owned
-//! by macOS and are never changed during exit restoration.
+//! This session-local launch snapshot is the only thing Spool restores at exit:
+//! retained layout intent is runtime-only and is rebuilt from rules and
+//! observations at the next start (ADR 0010). Native Space membership, visibility,
+//! focus and z-order remain owned by macOS and are never changed during exit
+//! restoration.
 
 use std::cmp::Reverse;
 

@@ -8,6 +8,9 @@ Assignee: none
 Parent: [跨重启恢复的入口票（恢复地图）](25-cross-restart-recovery.md)
 Blocked by: none
 
+
+> **2026-09-16 反转**：本票整体被 [ADR 0010](../../../adr/0010-runtime-state-rebuilt-from-rules.md) 取代——retained state 只在运行期存在，没有落盘、候选、导入缝或 `session restore`。跨会话偏好改由**规则**表达（字段按需增补），未表达者按"观测 → 默认"重建、接受丢失。反转原因与落地见 [运行期状态与实现对账](../../runtime-state/map.md)。
+
 ## Question
 
 恢复地图（25 号票）裁决的域顺序是布局 → 归属 → 焦点。前两个域已落地（[26 号票](26-recovery-first-slice.md) 的入口与启动所有者、[28 号票](28-recovery-membership.md) 的声明 Space）；本票是第三个域：把**每 Space 的焦点偏好与逻辑选择**保存成候选，并接进同一个可信映射入口。不重新表决任何已有政策。

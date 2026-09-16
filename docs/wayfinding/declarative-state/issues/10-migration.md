@@ -40,7 +40,7 @@ Blocked by: 05, 06, 07, 08, 09, 16, 17
 | [triggers.rs](../../../../src/ecs/triggers.rs)、[window_geometry.rs](../../../../src/ecs/window_geometry.rs) | 初始化走已定来源政策；resize verifier/外部几何只通过证据政策改约束或提交领域转移 |
 | [window_frame.rs](../../../../src/ecs/window_frame.rs)、[systems.rs](../../../../src/ecs/systems.rs)、[reconcile.rs](../../../../src/ecs/reconcile.rs) | 几何派生、呈现、提交、读回分权；移除Bounds/ResizeMarker/WidthRatio作为tiled宽度第二写者的旁路 |
 | [layout_snapshot.rs](../../../../src/ecs/layout_snapshot.rs) | ordinal/列及窗口身份绑定、延迟结构编辑的版本核验；它不是磁盘保存器 |
-| [state.rs](../../../../src/ecs/state.rs)、[restore.rs](../../../../src/ecs/restore.rs) | 新格式意图保存、候选隔离、純导入；旧自动恢复writer退出新模型 |
+| [state.rs](../../../../src/ecs/state.rs)、`state.rs`（落盘与恢复线已于 2026-09-16 退役） | 新格式意图保存、候选隔离、純导入；旧自动恢复writer退出新模型 |
 | [inspection/spool.rs](../../../../src/inspection/spool.rs) | 目标、有效值、原生观察投影、差异、阻塞和接纳/保存版本；独立native来源仍只报告现实证据 |
 
 ### 验收矩阵

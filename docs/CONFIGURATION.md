@@ -297,34 +297,33 @@ spool.setup { windows = {
 } }
 ```
 
-### Layout Intent Persistence
+### Layout Intent and Restarts
 
-Spool saves accepted original layout intent and minimal candidate binding hints to
-`$XDG_STATE_HOME/spool/state.json` (usually `~/.local/state/spool/state.json`). It
-preserves whether a width inherits current configuration, uses absolute logical points,
-or uses a viewport ratio, together with each stack item's raw positive height weight and
-one member slot per retained member. A member slot whose identity could not be cached is
-stored as an explicit unresolved slot rather than dropped, so a saved item always keeps
-its member count. A floating window's authored frame and each tracked window's declared
-Space are saved too, with the same cached identity hints; the fields are additions to the
-existing format, so a file written before they existed still loads. Each Space's focus
-preference and logical navigation selection are saved the same way, one entry per Space;
-a hint whose identity could not be cached is omitted rather than written as `null`,
-because unlike a member slot it carries no structure and `null` would claim "no
-preference". Effective frames, constraints, native observations, animations,
-and retry state are not persisted.
+Retained layout intent exists only while Spool runs. A restart rebuilds it from
+three sources, in order:
+
+| Rebuilt | Configured rule | Native observation | Default |
+| --- | --- | --- | --- |
+| Floating or tiled | `floating` | - | admission default |
+| Column width | `width` (a ratio) | the admitted window's width, adopted once | config default ratio |
+| Stack height shares | - | observed heights | equal |
+| Floating position | `grid` | the window's own position at launch | placed in the viewport |
+| Which Space a window is in | - | native membership | the visible Space |
+| Which window a Space focuses | - | the window macOS focuses | the first eligible window |
+| Column order | `index` | discovery order | discovery order |
+
+What no rule expresses is not preserved: a width dragged at runtime, an adjusted
+stack share, an exact floating position and per-Space focus memory are lost on
+restart. Arrangement structure (columns, stacks, tabs and their order) is rebuilt
+from discovery order, which `index` can influence. There is no state file, no
+candidate document and no import command.
 
 A successful command accepts intent; it does not guarantee a completed native
-adjustment or a durable save. Saving uses a versioned atomic replacement, and a
-failed save leaves the latest intent dirty for a later attempt. Valid intent
-can be saved even when its Space is invisible or native observation is unavailable.
-
-Startup reads the new file format into isolated candidates only. It initializes
-windows from current native observations and current rules; it does not match
-old IDs or titles, reconstruct old groups, or reapply saved widths. Automatic
-cross-daemon restoration and a user-facing manual import command are not part
-of this implementation. Previous formats are ignored without migration. There
-is no `restore` configuration section or restore-enabled switch.
+adjustment. An edit the display never reaches follows the display instead: after
+its readback grace period the authored field takes the value the window actually
+shows, so retained state and the screen agree. See
+[ADR 0010](adr/0010-runtime-state-rebuilt-from-rules.md) and
+[ADR 0011](adr/0011-realization-outcomes-and-alignment.md).
 
 ---
 

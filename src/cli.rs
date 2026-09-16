@@ -218,15 +218,7 @@ pub(crate) fn command() -> Command {
                 .subcommand(read(Command::new("inspect"), true))
                 .subcommand(control(Command::new("watch").arg(flag("raw"))))
                 .subcommand(control(Command::new("mission-control")))
-                .subcommand(control(Command::new("show-desktop")))
-                .subcommand(control(
-                    Command::new("restore")
-                        .about("Submits trusted intent mappings for this session")
-                        .arg(
-                            option("bindings")
-                                .help("JSON file of trusted mappings, or - for standard input"),
-                        ),
-                )),
+                .subcommand(control(Command::new("show-desktop"))),
         )
         .subcommand(service)
         .subcommand(
@@ -438,42 +430,14 @@ where
         }
     }
     let borrowed = action_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let action = match borrowed.as_slice() {
-        // The trusted-mapping import carries a document, not argv tokens, so it
-        // is read here and dispatched as the action it is.
-        ["session", "restore", "--bindings", source] => {
-            Action::RestoreIntents(read_restore_bindings(source).map_err(invalid)?)
-        }
-        _ => spool_shared_types::argv::parse_action(&borrowed)
-            .map_err(|error| invalid(error.to_string()))?,
-    };
+    let action = spool_shared_types::argv::parse_action(&borrowed)
+        .map_err(|error| invalid(error.to_string()))?;
+    let _ = borrowed;
     Ok(Invocation::Action {
         action,
         timeout_ms,
         json,
     })
-}
-
-/// Reads the trusted-mapping document a startup owner submits.
-///
-/// `-` reads standard input, so a caller can generate the mappings without
-/// keeping a file on disk.
-fn read_restore_bindings(
-    source: &str,
-) -> Result<spool_shared_types::commands::RestoreBindings, String> {
-    use std::io::Read as _;
-
-    let document = if source == "-" {
-        let mut buffer = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buffer)
-            .map_err(|error| format!("unable to read standard input: {error}"))?;
-        buffer
-    } else {
-        std::fs::read_to_string(source)
-            .map_err(|error| format!("unable to read {source}: {error}"))?
-    };
-    serde_json::from_str(&document).map_err(|error| format!("unable to parse {source}: {error}"))
 }
 
 #[cfg(test)]
@@ -562,36 +526,6 @@ mod tests {
             panic!("read")
         };
         assert_eq!(request.show, ["ax.AXTitle", "cg"]);
-    }
-
-    #[test]
-    fn session_restore_reads_its_bindings_document() {
-        use spool_shared_types::commands::FocusRole;
-        use std::io::Write as _;
-
-        let path = std::env::temp_dir().join(format!(
-            "spool-restore-bindings-{}.json",
-            std::process::id()
-        ));
-        let mut file = std::fs::File::create(&path).expect("create the bindings document");
-        file.write_all(
-            br#"{"columns":[{"candidate_space":0,"candidate_column":1,"target_space":2,"target_column":3}],"floating":[{"candidate_window":0,"target_window_id":7}],"focus":[{"candidate_focus":0,"target_space":2,"role":"preference","target_window_id":7},{"candidate_focus":0,"target_space":2,"role":"selection","target_window_id":8}]}"#,
-        )
-        .expect("write the bindings document");
-        let bindings = read_restore_bindings(path.to_str().expect("path")).expect("parse");
-        assert_eq!(bindings.columns.len(), 1);
-        assert_eq!(bindings.columns[0].target_space, 2);
-        assert_eq!(bindings.floating.len(), 1);
-        assert_eq!(bindings.floating[0].target_window_id, 7);
-        assert_eq!(bindings.focus.len(), 2);
-        assert_eq!(bindings.focus[0].role, FocusRole::Preference);
-        assert_eq!(bindings.focus[1].role, FocusRole::Selection);
-        assert_eq!(bindings.focus[1].target_window_id, 8);
-        let _ = std::fs::remove_file(&path);
-
-        // An omitted group is empty rather than an error; an unreadable document
-        // is an argument error, never a silent no-op.
-        assert!(read_restore_bindings("/nonexistent/spool-restore.json").is_err());
     }
 
     #[test]

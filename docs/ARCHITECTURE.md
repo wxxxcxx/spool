@@ -189,12 +189,11 @@ objects stay on their owning threads.
 | `src/ecs/systems.rs` | Bevy systems for lifecycle management, event pumping, and state syncing. |
 | `src/ecs/params.rs` | High-level Bevy `SystemParam` abstractions for querying the World. |
 | `src/ecs/triggers.rs` | Reactive event handlers (Observers) for OS and internal events. |
-| `src/ecs/restore.rs` | Isolated saved candidates and pure atomic import of every recovered domain (column/height intent, floating frames, declared Spaces, per-Space focus memory) with explicitly trusted bindings and a frozen initial baseline; no automatic matching. |
 | `src/ecs/native_space.rs` | Native Space topology, visibility, capability-gated commands, and post-operation reconciliation. |
 | `src/ecs/workspace.rs` | Native Space/display lifecycle event handling. |
 | `src/ecs/scroll.rs` | Input handling for trackpad swipe gestures, inertia, and snapping. |
 | `src/ecs/focus.rs` | Focus management logic, including focus-follows-mouse and mouse-follows-focus. |
-| `src/ecs/state.rs` | Persistence of window layout and workspace state across restarts. |
+| `src/ecs/state.rs` | Read models over retained state: the public query projection built from the live world. |
 | `src/manager/` | OS-agnostic traits (`WindowApi`, `ProcessApi`) and their macOS implementations (`WindowOS`). |
 | `src/platform/` | Low-level macOS FFI, event loop integration, and workspace/input hooks. |
 | `src/config/` | Configuration parsing, validation, and hot-reloading logic. |
@@ -611,7 +610,6 @@ the shared visible-Space predicate also gates follow completion.
 - **`Config`:** The current user configuration.
 - **`SpoolState`**: The v6 snapshot of original column-width and stack-height intent, stack item identity, candidate member hints, floating frames, declared Spaces, and per-Space focus memory.
 - **`StatePersistence`**: Accepted/saved revisions, dirty state, and monotonic atomic publication.
-- **`RestoreCandidates`**: Isolated input; loading it does not alter layout or issue effects.
 - **`MissionControlActive`:** A flag indicating if macOS Mission Control is visible (disabling tiling).
 - **`FocusFollowsMouse`:** Tracks which window should gain focus based on mouse position.
 
@@ -637,25 +635,19 @@ the shared visible-Space predicate also gates follow completion.
 
 ## 6. Intent persistence
 
-`src/ecs/state.rs` captures retained original intent independently of native inventory
-availability. Each column persists its kind and width intent, and each independently
-arranged stack item persists its identity, raw positive height weight, and one member
-slot per retained member. A member slot records a cached binding hint or an explicit
-absence, so an identity that was not resolvable at capture shortens nothing. A floating
-window's authored frame, each tracked window's declared Space, and each Space's focus
-preference and logical selection are captured with the same cached identity hints; a
-focus hint that could not be resolved is omitted instead of being written as a "no
-preference" claim. In-memory
-capture publishes accepted and dirty revisions; periodic and exit saves sync a temporary
-file, rename it atomically, and sync its directory. An old snapshot cannot replace a
-newer accepted snapshot, and failure retains dirty state.
+`src/ecs/state.rs` owns the read models over retained state (the public query
+projection), and nothing else: retained layout intent is rebuilt at startup and
+never persisted (ADR 0010). A restart derives it from the configured window
+rules, then from current native observations, then from defaults — a rule states
+how an application's windows start, macOS says where a window already is, and
+what neither covers falls back to the defaults. A width dragged at runtime, an
+adjusted stack share, an exact floating position and per-Space focus memory are
+therefore not preserved unless a rule expresses them. There is no state file, no
+candidate document and no import seam.
 
-The v6 file lives at `spool/state.json` in the XDG state directory. Older formats are
-ignored, not migrated. Loading creates `RestoreCandidates` only. No AX ID, title, PID or
-saved Space number proves cross-daemon continuity, and an unresolved member slot never
-authorizes a binding. The pure import seam validates supplied trusted bindings against a
-once-frozen initial layout and refuses later edits or structural changes. No automatic
-recovery or manual binding UI is supplied by this slice.
+An edit whose realization the display never reaches is reconciled rather than
+kept forever: after the readback grace period the authored field takes the value
+the window actually shows, under the evidence rules of ADR 0011.
 
 ## 7. Data Flow Diagram
 
@@ -681,7 +673,6 @@ graph TD
 
 1. **Pure Unit Tests:** Located in `src/tests.rs` and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.
 2. **ECS Integration Tests:** Use Bevy's `App` or `World` to drive systems in isolation. macOS APIs are typically mocked via the `WindowApi` and `WindowManagerApi` traits.
-3. **Session Restore Tests:** `src/tests/session_restore.rs` covers candidate isolation, trusted atomic import, frozen baselines, and rejection of stale edits or structural changes.
 4. **FFI Verification:** Manual or semi-automated tests on macOS to ensure the Accessibility API calls behave as expected with native windows.
 5. **Agent Support:** The `AGENTS.md` file provides project-specific guidance for AI agents to ensure contributions follow these architectural patterns.
 

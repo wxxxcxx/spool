@@ -1822,6 +1822,9 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                     .ok()
                     .and_then(|index| strip.column_state(index))
             {
+                let item_revision = strip
+                    .height_state(entity)
+                    .map_or(0, |item| item.intent_revision);
                 sync.bind_frame_intent(
                     entity,
                     window.incarnation(),
@@ -1831,6 +1834,7 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                         state.intent_revision,
                         strip.structure_revision(),
                         state.height_revision,
+                        item_revision,
                     ),
                 );
             }

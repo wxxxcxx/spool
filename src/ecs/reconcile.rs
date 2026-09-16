@@ -50,17 +50,24 @@ struct ApplicationAxRetry {
     retry_after: Duration,
 }
 
+/// The domain edit a frame round is bound to (see `FrameConvergence::intent`).
+type FrameIntent = (super::layout::ColumnId, u64, u64, u64, u64);
+
 #[derive(Clone, Copy, Debug)]
 struct FrameConvergence {
     target: IRect,
     attempts: u8,
     incarnation: Option<WindowIncarnation>,
-    intent: Option<(super::layout::ColumnId, u64, u64, u64)>,
+    /// The domain edit this round is bound to: the column, the width intent
+    /// revision, the structure revision, the column's height revision, and this
+    /// window's own stack-item revision. The item revision is what lets a height
+    /// alignment answer only for the item whose edit failed (ADR 0011).
+    intent: Option<FrameIntent>,
     /// The intent tuple this entity's frame last provably reached. A round whose
     /// bound width intent revision is already this one is a correction or a
     /// drift, not an accepted edit that failed, and it may not rewrite the
     /// authored width (ADR 0011).
-    realized_intent: Option<(super::layout::ColumnId, u64, u64, u64)>,
+    realized_intent: Option<FrameIntent>,
     active: bool,
     blocked: bool,
     confirmed: bool,
@@ -103,6 +110,10 @@ pub(crate) struct FrameProgress {
 /// gaps when AX, SLS, or `WindowServer` drops an event.
 #[derive(Resource, Debug, Default)]
 pub(crate) struct WindowStateSync {
+    /// The intent each entity's round was bound to before its current one. Kept
+    /// outside the round so dropping and rebuilding a round (startup defaults, a
+    /// Space reassignment) cannot erase which edits are still new (ADR 0011).
+    last_bound_intent: HashMap<Entity, FrameIntent>,
     elapsed: Duration,
     since_heartbeat: Duration,
     frame_convergence: HashMap<Entity, FrameConvergence>,
@@ -129,6 +140,7 @@ impl WindowStateSync {
 
     pub(crate) fn forget_window(&mut self, entity: Entity) {
         self.frame_convergence.remove(&entity);
+        self.last_bound_intent.remove(&entity);
         self.window_observers.remove(&entity);
     }
 
@@ -261,20 +273,27 @@ impl WindowStateSync {
         entity: Entity,
         incarnation: WindowIncarnation,
         target: IRect,
-        intent: (super::layout::ColumnId, u64, u64, u64),
+        intent: FrameIntent,
     ) {
         let round = self
             .frame_convergence
             .entry(entity)
             .or_insert_with(|| FrameConvergence::new(target, Some(incarnation)));
+        let previous = round.intent;
         if round.intent != Some(intent)
             || round.target != target
             || round.incarnation != Some(incarnation)
         {
-            let realized = round.realized_intent;
             *round = FrameConvergence::new(target, Some(incarnation));
             round.intent = Some(intent);
-            round.realized_intent = realized;
+        }
+        // Recorded only when the bind carries a *different* edit, so the newest
+        // edit stays visible for as long as it takes to judge it. The baseline is
+        // the first intent this entity was ever bound to, so a window whose first
+        // round is still running aligns nothing.
+        if previous != Some(intent) {
+            self.last_bound_intent
+                .insert(entity, previous.unwrap_or(intent));
         }
     }
 
@@ -337,41 +356,42 @@ impl WindowStateSync {
         self.elapsed
     }
 
-    /// Whether the round's bound edit is one the display never realized.
-    ///
-    /// This is the alignment gate for an authored field: a round whose width
-    /// intent revision was already confirmed — a drift correction, a failed
-    /// internal retry — does not authorize rewriting the authored value, however
-    /// long the window keeps showing something else.
+    /// Whether the width this round is bound to was edited since the previous
+    /// bind: the gate for letting the authored width follow the display.
     pub(crate) fn unrealized_edit(&self, entity: Entity) -> bool {
-        self.unrealized_intent(entity, |realized, intent| realized.1 != intent.1)
+        self.field_changed(entity, |previous, current| previous.1 != current.1)
     }
 
-    /// The same gate for the height intent a round bound: a height that was never
-    /// realized is what lets the item's weight follow the display.
+    /// The same gate for the stack item's height: only the item whose weight was
+    /// edited follows the display, never a neighbour that merely shares the
+    /// column's height revision.
     pub(crate) fn unrealized_height_edit(&self, entity: Entity) -> bool {
-        self.unrealized_intent(entity, |realized, intent| realized.3 != intent.3)
+        self.field_changed(entity, |previous, current| previous.4 != current.4)
     }
 
-    fn unrealized_intent(
+    /// Whether the round's bound edit is newer than the edit the previous bind
+    /// carried for the same column.
+    ///
+    /// This is the alignment gate for an authored field, and it is deliberately
+    /// about the *edit* rather than about confirmed history: a round that was
+    /// dropped and rebuilt (startup defaults, a Space reassignment) must not make
+    /// an untouched weight look like a failed edit, and a correction or a drift
+    /// never edits the authored value at all.
+    fn field_changed(
         &self,
         entity: Entity,
-        differs: impl Fn(
-            (super::layout::ColumnId, u64, u64, u64),
-            (super::layout::ColumnId, u64, u64, u64),
-        ) -> bool,
+        differs: impl Fn(FrameIntent, FrameIntent) -> bool,
     ) -> bool {
         let Some(round) = self.frame_convergence.get(&entity) else {
             return false;
         };
-        let Some(intent) = round.intent else {
+        let Some(current) = round.intent else {
             return false;
         };
-        match round.realized_intent {
-            Some(realized) if realized.0 == intent.0 => differs(realized, intent),
-            // Never realized, or the window changed columns: the edit is unrealized.
-            _ => true,
-        }
+        let Some(previous) = self.last_bound_intent.get(&entity) else {
+            return false;
+        };
+        previous.0 == current.0 && differs(*previous, current)
     }
 
     /// Whether the judgement of a round is suspended: the grace period measures
@@ -1136,6 +1156,9 @@ impl ReconcileState<'_, '_> {
                     .ok()
                     .and_then(|index| strip.column_state(index))
             {
+                let item_revision = strip
+                    .height_state(entity)
+                    .map_or(0, |item| item.intent_revision);
                 sync.bind_frame_intent(
                     entity,
                     window.incarnation(),
@@ -1145,6 +1168,7 @@ impl ReconcileState<'_, '_> {
                         state.intent_revision,
                         strip.structure_revision(),
                         state.height_revision,
+                        item_revision,
                     ),
                 );
             }
@@ -2164,7 +2188,7 @@ mod tests {
         let entity = Entity::from_bits(1);
         let target = IRect::new(0, 0, 800, 200);
         let mut sync = WindowStateSync::default();
-        let first = (super::super::layout::ColumnId(1), 0, 0, 0);
+        let first = (super::super::layout::ColumnId(1), 0, 0, 0, 0);
         sync.bind_frame_intent(entity, 7, target, first);
         for _ in 0..3 {
             assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true, false));
@@ -2173,7 +2197,7 @@ mod tests {
         assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true, false));
         sync.bind_frame_intent(entity, 7, target, first);
         assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true, false));
-        sync.bind_frame_intent(entity, 7, target, (first.0, 0, 0, 1));
+        sync.bind_frame_intent(entity, 7, target, (first.0, 0, 0, 1, 0));
         assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true, false));
         assert_eq!(sync.frame_progress(entity).unwrap().attempts, 1);
     }
