@@ -78,6 +78,17 @@ It never adopts a value read while a window is in motion. And state may be
 written continuously: the realizer chases the newest target, while an older
 request's failure cannot touch a field a newer edit owns.
 
+**The rule underneath all of it, stated plainly (2026-09-16).** Spool keeps
+trying to make the window match the state. An attempt ends in exactly two ways:
+the platform answers that the request is invalid, or the grace period runs out
+with the display still showing something else. Only those two ends are judged,
+and the judgement is alignment. Mission Control and initialization do not change
+the attempt — the writes still happen — they **postpone the judgement**: no
+attempt is charged, no checkpoint advances, a refusal that arrives during the
+suspension is not read as a definitive one, and nothing aligns. When the
+suspension ends the round is judged normally, from a fresh attempt. The exit
+handover is not a postponement: there nothing is accepted at all.
+
 ## Consequences
 
 - ARCHITECTURE.md's single-direction invariant ("no projection writes backward
