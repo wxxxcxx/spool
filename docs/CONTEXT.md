@@ -73,6 +73,10 @@ A retained request to tile after temporary capability or native-state uncertaint
 **Layout State**:
 The Spool-owned arrangement of tiled windows, including strip membership, column structure, ordering, and logical sizes.
 
+**Retained State**:
+The desired arrangement, declared Spaces, floating frames and focus memory Spool holds while the daemon runs. It exists only for that run: a restart rebuilds it from rules and current native observation, and no document of it is kept.
+_Avoid_: saved state, persisted state, snapshot
+
 **Declarative Window Management**:
 Window management in which explicit desired state expresses intent and native observations establish what has actually been realized. A valid desired arrangement remains meaningful while its Space is invisible or its realization is temporarily blocked.
 
@@ -84,6 +88,12 @@ The layout outcome derived from the latest Window Management Intent under eviden
 
 **Constrained Realization**:
 A layout outcome that meets its Effective Layout Target while an applicable constraint prevents full satisfaction of the original Window Management Intent.
+
+**Realization Alignment**:
+The authored-state correction that follows a realization Spool gives up on: retained intent is updated to the value the display actually shows, so state and display agree again. It applies only to a definitively refused realization (the platform answered that this request is invalid, or the target provably ceased to exist) or to one still unrealized after its grace period. It corrects an authored intent field, never a derived target, and the evidence for the displayed value is the same fresh, stable observation external adoption already requires. Also called alignment; _avoid_ "rollback", which implies restoring the previous authored value.
+
+**Realization Grace Period**:
+The bounded time an accepted intent may remain unrealized before Spool treats it as unachieved and aligns state to the display. It begins when the realization is submitted and ends at the last readback checkpoint; an observation that is unreadable or still in motion does not end it, because unknown is not a shown value.
 
 **Space Focus Preference**:
 A Native Space's preferred focus target, covering tiled and floating windows. It is distinct from a request to activate that Space or window now.

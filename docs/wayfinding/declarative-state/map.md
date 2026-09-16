@@ -3,6 +3,8 @@
 Label: wayfinder:map
 Status: resolved
 
+> **2026-09-16 后续**：本图的恢复线（24 号票保存半、26/28/29 号票、25 号票 2026-09-15 裁决）已被 [ADR 0010](../../adr/0010-runtime-state-rebuilt-from-rules.md)（state 只在运行期存在）与 [ADR 0011](../../adr/0011-realization-outcomes-and-alignment.md)（结局三分类 + 对齐显示值）取代；落地与票面更新见 [运行期状态与实现对账](../runtime-state/map.md)。本图其余结论（列宽、高度、焦点激活、归属、浮动帧的运行时模型）仍然有效。
+
 已完成：[归属状态的不变量与修复](issues/23-space-membership.md)（不保留悬空目标、编辑当场拒绝或当场尝试、外部事件修复状态；已实施、验证并推送）；已实施：[浮动窗口的完整迁移切片](issues/24-floating-windows.md)（帧权威切换、保存与候选隔离，均已验证并推送）；已裁决、实施中：[跨重启恢复的入口票（恢复地图）](issues/25-cross-restart-recovery.md)（七项已裁决）；下一片待确认接口：[恢复第一个切片](issues/26-recovery-first-slice.md)；已实施：[恢复：Space 归属的候选与导入](issues/28-recovery-membership.md)；已实施：[恢复：每 Space 焦点记忆的候选与导入](issues/29-recovery-focus.md)；待核实：[窗口唯一标识的核实](issues/27-window-identity-verification.md)。前一片：[每 Space 焦点的边框与 Bar 表达](issues/22-space-focus-presentation.md)（四项裁决已实现，测试及构建通过，原生视觉复验待加载新版）。
 
 ## Destination
