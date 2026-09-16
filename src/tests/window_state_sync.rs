@@ -3579,23 +3579,134 @@ fn external_frame_recovery_resumes_presentation_without_another_write() {
     assert_eq!(harness.mock_state.frame_write_attempts(0), attempts);
 }
 
+/// A width edit the display never realized follows the display once its round is
+/// over: the authored column intent becomes what the window actually shows, so
+/// state and display agree again (ADR 0011). Before that decision the edited
+/// target was kept forever and only reported as blocked.
 #[test]
-fn constrained_resize_animation_preserves_tiled_bounds_intent() {
+fn a_constrained_width_edit_aligns_to_what_the_window_shows() {
+    use crate::ecs::alignment::{AlignmentReason, RealizationAlignments};
+    use crate::ecs::layout::WidthIntent;
+
     let mut harness = TestHarness::new().with_windows(1);
     harness.pump_frames(15);
 
     let entity = find_window_entity(0, harness.world());
     let original = harness.world().get::<Bounds>(entity).expect("bounds").0;
     let target = original + IVec2::new(240, 0);
+    // The window accepts the write and stays where it is: the display cannot
+    // reach the edited width, which is what a native minimum size looks like.
     harness.mock_state.constrain_frame_writes(0, true);
     set_column_width_intent(&mut harness, entity, target.x);
-
-    harness.pump_frames(50);
-
+    // The projection publishes the edit, and the layout target stays the edited
+    // value through the readback grace period: alignment waits it out.
+    harness.pump_frames(2);
     assert_eq!(
         harness.world().get::<Bounds>(entity).expect("bounds").0,
         target,
-        "a constrained AX readback must not overwrite the tiled layout target"
+        "the edit is the layout target while it is still being tried"
+    );
+
+    harness.pump_frames(60);
+
+    assert_eq!(
+        harness.world().get::<Bounds>(entity).expect("bounds").0,
+        original,
+        "the authored width follows the display once the round is over"
+    );
+    let width = {
+        let mut strips = harness.world().query::<&LayoutStrip>();
+        let strip = strips
+            .iter(harness.world())
+            .find(|strip| strip.column_id(entity).is_some())
+            .expect("the window still has a column");
+        let id = strip.column_id(entity).expect("column");
+        strip
+            .column_states()
+            .find(|state| state.id == id)
+            .expect("column state")
+            .width
+    };
+    assert_eq!(
+        width,
+        WidthIntent::Absolute(f64::from(original.x)),
+        "the column intent is the displayed width, not the unrealized edit"
+    );
+    let records = {
+        let alignments = harness.world().resource::<RealizationAlignments>();
+        alignments
+            .records(entity)
+            .map(|record| record.reason)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        records,
+        vec![AlignmentReason::NotRealizedWithinGrace],
+        "one alignment is recorded, and re-aligning the same value stops"
+    );
+    let attempts = harness.mock_state.frame_write_attempts(0);
+    harness.pump_frames(40);
+    assert_eq!(
+        harness.mock_state.frame_write_attempts(0),
+        attempts,
+        "the aligned value needs no further writes: state and display already agree"
+    );
+}
+
+/// A write the platform answers as invalid is a definitive refusal: the authored
+/// width follows the display at once, without waiting out the readback grace
+/// period, and the record says which error answered (ADR 0011).
+#[test]
+fn a_refused_width_write_aligns_to_what_the_window_shows_immediately() {
+    use crate::ecs::alignment::{AlignmentReason, RealizationAlignments};
+    use crate::ecs::layout::WidthIntent;
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(15);
+
+    let entity = find_window_entity(0, harness.world());
+    let original = harness.world().get::<Bounds>(entity).expect("bounds").0;
+    let target = original + IVec2::new(240, 0);
+    let code = accessibility_sys::kAXErrorIllegalArgument;
+    harness
+        .mock_state
+        .refuse_frame_writes_with_code(0, Some(code));
+    set_column_width_intent(&mut harness, entity, target.x);
+    harness.pump_frames(5);
+
+    assert_eq!(
+        harness.world().get::<Bounds>(entity).expect("bounds").0,
+        original,
+        "a refused write aligns the authored width to the display without a grace period"
+    );
+    let width = {
+        let mut strips = harness.world().query::<&LayoutStrip>();
+        let strip = strips
+            .iter(harness.world())
+            .find(|strip| strip.column_id(entity).is_some())
+            .expect("the window still has a column");
+        let id = strip.column_id(entity).expect("column");
+        strip
+            .column_states()
+            .find(|state| state.id == id)
+            .expect("column state")
+            .width
+    };
+    assert_eq!(width, WidthIntent::Absolute(f64::from(original.x)));
+    let records = {
+        let alignments = harness.world().resource::<RealizationAlignments>();
+        alignments
+            .records(entity)
+            .map(|record| record.reason)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(records, vec![AlignmentReason::WriteRefused { code }]);
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::alignment::FrameWriteRefused>(entity)
+            .is_none(),
+        "the refusal is consumed once it has been answered"
     );
 }
 

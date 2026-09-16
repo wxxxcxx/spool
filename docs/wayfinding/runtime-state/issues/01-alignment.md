@@ -42,6 +42,29 @@ Blocked by: none
 - 连续编辑（连按"加 50"）→ 实现器只追最新目标，期间旧请求的失败不触碰状态。
 - 导出：对齐后 `state == 显示`（同一字段比较），且诊断记录有界。
 
+## 已实施（2026-09-16，第一增量：机制 + 列宽域）
+
+- **结局模型**（`src/ecs/alignment.rs`）：`refusal_is_definitive(code)` 把 macOS 错误码分为“这次请求无效”（`IllegalArgument`/`AttributeUnsupported`/`ActionUnsupported` → 明确拒绝）与其余“暂不可判定”（`CannotComplete`/权限类/`NotImplemented`/含糊的 `Failure`）。`FrameWriteRefused { code }` 把提交点的拒绝带给拥有 strip 的对账层。
+- **对齐记录**：`RealizationAlignments` 资源，每窗口最多 4 条，含字段（目前 `ColumnWidth { column, prior, adopted }`）、原因（`NotRealizedWithinGrace` / `WriteRefused { code }`）与时间；窗口销毁时清理；`window inspect --source spool` 的 window row 新增 `alignment.records`。
+- **换算**：`aligned_width_intent` 保持变体——`Absolute`/`InheritConfig` → `Absolute(显示宽)`，`ViewportRatio` → 按当前 viewport 重算比例，viewport 未知或宽 ≤ 0 时**不采纳**。`LayoutStrip::viewport_width()` 为此开放。
+- **两条路径**：提交失败且错误码是明确拒绝 → **立即对齐**；回合已 exhausted 且**已经过最后一个只读检查点**（宽限期 = 250ms/1s/5s 全序列）且观测稳定 → 对齐。
+- **作者编辑门（本次实施中发现的关键约束）**：只在“这回合绑定的宽度意图版本尚未被证实实现过”时对齐（`WindowStateSync::unrealized_edit`，经 `realized_intent` 跟踪）。否则**外部漂移**与**内部修正**会把 authored 宽度一路拖走——那正是既有测试护住的“有界重试不得变成无界循环”。最初版本没有这道门，四个既有测试立刻失败（多出一次尝试 / 目标被写回）；补门后它们全部恢复原断言。
+- **不再无限 blocked**：回合结束后不再每帧重插 `WindowFrameCorrection` 标记（只在回合仍活时插）。
+
+### 本增量验证
+
+- `cargo test --workspace --locked`：主程序 1203 通过 / 2 原有忽略（本次 +13：7 条纯函数单测 + 改写 1 条 + 新增 1 条 + 其余为本票机制）；local-ipc 24、shared-types 96、其余 6/4；`--no-default-features` 1061 通过。
+- `cargo fmt --all --check`、`cargo clippy -p spool --all-targets`（默认与 `--no-default-features --locked -- -D warnings`）通过。
+- **旧代码上失败的证据**：把两条对齐分支禁用后重跑——`a_constrained_width_edit_aligns_to_what_the_window_shows` 与 `a_refused_width_write_aligns_to_what_the_window_shows_immediately` 均失败于 `left: IVec2(640, 748) right: IVec2(400, 748)`（左＝未实现的编辑目标，右＝屏幕实际值），正是本票要消除的“意图永久覆盖显示”。
+- 被反转的既有断言（已按 ADR 0011 改写并注明）：`constrained_resize_animation_preserves_tiled_bounds_intent` → `a_constrained_width_edit_aligns_to_what_the_window_shows`。
+
+## 尚未实施（本票剩余）
+
+- 其余三个域的接入：stack 高度（按观测高度成比例归一）、浮动帧、声明归属（后两者多为恒等）。
+- 逐域采纳前提里“观测新鲜稳定”的强化：目前用“上一次观测 == 本次观测”＋`can_adopt_frame`（已排除动画/手势/过渡），未做 `settling` 之外的时间长度要求。
+- `Center` 的 warp 与准入闸门属于 02 票。
+- 未做真实桌面验收。
+
 ## 边界
 
 - 不做：准入闸门（02 票）、落盘与恢复线的退役（03 票）、规则字段（04 票）、真实桌面验收、原生约束采集器。

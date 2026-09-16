@@ -85,6 +85,7 @@ pub(crate) struct Projection<'w, 's> {
     config: Res<'w, Config>,
     sync: Res<'w, crate::ecs::reconcile::WindowStateSync>,
     focus: Res<'w, crate::ecs::focus::FocusCoordinator>,
+    alignments: Res<'w, crate::ecs::alignment::RealizationAlignments>,
     persistence: ResMut<'w, crate::ecs::state::StatePersistence>,
     lifecycle: Res<'w, crate::lifecycle::Lifecycle>,
 }
@@ -200,6 +201,7 @@ impl Projection<'_, '_> {
                 "geometry":{"realization": self.sync.frame_progress(entity).map(|progress| json!({"attempts":progress.attempts,"active":progress.active,"blocked":progress.blocked,"confirmed":progress.confirmed,"checks_pending":progress.checks_pending})),"desired":recorded(geometry.and_then(|row| row.0).map(|frame_| frame(frame_.0))),"presented":recorded(geometry.and_then(|row| row.1).map(|frame_| frame(frame_.0))),"observed":recorded(observed.map(frame))},
                 "layout":{"space_id":recorded(space_id),"column":column,"display_id":recorded(display_id),"previous_column":previous.map(|previous| previous.index+1)},
                 "floating":recorded(floating_geometry.map(|geometry| json!({"intent":frame(geometry.frame),"unresolved":geometry.unresolved,"repairs":geometry.repairs.iter().map(|repair| json!({"from":frame(repair.from),"to":frame(repair.to),"reason":repair.reason})).collect::<Vec<_>>()}))),
+                "alignment":{"records":self.alignments.records(entity).map(alignment_record).collect::<Vec<_>>()},
                 "membership":{"declared":recorded(declared.map(|declared| declared.target)),"observed":recorded(declared.map(|declared| declared.observed)),"repairs":recorded(declared.map(|declared| declared.repairs.iter().map(|repair| json!({"from":repair.from,"to":repair.to,"reason":repair.reason})).collect::<Vec<_>>())),"attempt":recorded(attempt.map(|attempt| json!({"target_space_id":attempt.target_space_id,"result":attempt.result.name(),"code":attempt.result.code()})))},
                 "state":{"available":!unavailable,"floating":floating,"focused":focused,"visible":hidden.is_none()&&!parked,"minimized":matches!(hidden,Some(WindowVisibility::Minimized)),"on_screen":recorded(on_screen),"motion":geometry.is_some_and(|row|row.3),"migration":geometry.is_some_and(|row|row.4||row.5),"blockers":{"unavailable":unavailable,"native_move":geometry.is_some_and(|row|row.4),"space_reassignment":geometry.is_some_and(|row|row.5),"parked":parked,"commit_suspended":geometry.is_some_and(|row|row.6)}}
             })
@@ -241,6 +243,23 @@ impl Projection<'_, '_> {
                 }).collect::<Vec<_>>()})
         }).collect()
     }
+}
+
+/// One alignment, as the diagnostic surface reports it.
+fn alignment_record(record: &crate::ecs::alignment::AlignmentRecord) -> Value {
+    use crate::ecs::alignment::{AlignedField, AlignmentReason};
+    let field = match record.field {
+        AlignedField::ColumnWidth {
+            column,
+            prior,
+            adopted,
+        } => json!({"kind":"column_width","column":column.0,"prior":prior,"adopted":adopted}),
+    };
+    let (reason, code) = match record.reason {
+        AlignmentReason::NotRealizedWithinGrace => ("not_realized_within_grace", None),
+        AlignmentReason::WriteRefused { code } => ("write_refused", Some(code)),
+    };
+    json!({"field":field,"reason":reason,"code":code,"at_ms":record.at.as_millis()})
 }
 
 fn window_summary(row: &Value) -> Value {

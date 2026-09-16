@@ -62,6 +62,7 @@ use crate::manager::{
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, Pid, PlatformCallbacks, WinID, WorkspaceId};
 
+pub(crate) mod alignment;
 pub(crate) mod defaults;
 pub mod display;
 pub(crate) mod exit_restore;
@@ -207,6 +208,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     const LOW_POWER_MODE_CHECK_SEC: u64 = 60;
 
     app.init_resource::<reconcile::WindowStateSync>();
+    app.init_resource::<alignment::RealizationAlignments>();
     app.init_resource::<window_geometry::WindowGeometrySettling>();
     app.init_resource::<topology::NativeTopology>();
     app.init_resource::<layout_snapshot::LayoutSession>();

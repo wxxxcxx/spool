@@ -1251,6 +1251,7 @@ pub(super) fn window_destroyed_trigger(
     mut apps: Query<&mut Application>,
     mut focus: ResMut<FocusCoordinator>,
     mut sync: ResMut<WindowStateSync>,
+    mut alignments: ResMut<crate::ecs::alignment::RealizationAlignments>,
     windows: Windows,
     mut commands: Commands,
 ) {
@@ -1302,6 +1303,7 @@ pub(super) fn window_destroyed_trigger(
         app.unobserve_window(window);
         sync.retire_window(parent, window);
         sync.forget_window(entity);
+        alignments.forget(entity);
 
         focus.observe(FocusSignal::Invalidated { entity });
         focus.forget(entity);

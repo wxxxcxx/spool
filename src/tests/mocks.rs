@@ -153,6 +153,10 @@ struct MockStateInner {
     application_liveness_failures: HashMap<Pid, u32>,
     constrained_frame_writes: HashSet<WinID>,
     rejected_frame_writes: HashSet<WinID>,
+    /// Windows whose frame writes fail with a specific macOS error, so tests can
+    /// exercise the difference between "not right now" and "this request is
+    /// invalid" (ADR 0011).
+    refused_frame_writes: HashMap<WinID, i32>,
     progressive_frame_writes: HashSet<WinID>,
     frame_write_attempts: HashMap<WinID, u32>,
     position_write_attempts: HashMap<WinID, u32>,
@@ -229,6 +233,7 @@ impl MockState {
                 application_liveness_failures: HashMap::new(),
                 constrained_frame_writes: HashSet::new(),
                 rejected_frame_writes: HashSet::new(),
+                refused_frame_writes: HashMap::new(),
                 progressive_frame_writes: HashSet::new(),
                 frame_write_attempts: HashMap::new(),
                 position_write_attempts: HashMap::new(),
@@ -707,6 +712,19 @@ impl MockState {
         }
     }
 
+    /// Fails frame writes for one window with a macOS error code, until cleared.
+    pub fn refuse_frame_writes_with_code(&self, id: WinID, code: Option<i32>) {
+        let mut inner = self.inner.force_write();
+        match code {
+            Some(code) => {
+                inner.refused_frame_writes.insert(id, code);
+            }
+            None => {
+                inner.refused_frame_writes.remove(&id);
+            }
+        }
+    }
+
     pub fn reject_frame_writes(&self, id: WinID, rejected: bool) {
         let mut inner = self.inner.force_write();
         if rejected {
@@ -1137,6 +1155,9 @@ impl MockState {
         mw.expect_set_frame().returning(move |frame| {
             let mut inner = s.inner.force_write();
             *inner.frame_write_attempts.entry(id).or_default() += 1;
+            if let Some(code) = inner.refused_frame_writes.get(&id).copied() {
+                return Err(Error::macos("mock AX frame write refused", code));
+            }
             if inner.rejected_frame_writes.contains(&id) {
                 return Err(Error::Generic("mock AX frame write rejected".to_string()));
             }

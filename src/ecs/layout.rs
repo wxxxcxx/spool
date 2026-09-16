@@ -691,6 +691,13 @@ impl LayoutStrip {
         true
     }
 
+    /// The viewport width this Space's width intents are resolved against, when
+    /// the display has been observed. Used to keep a ratio intent a ratio when an
+    /// unrealized width aligns to the display.
+    pub fn viewport_width(&self) -> Option<i32> {
+        self.viewport_width
+    }
+
     /// Read projection of original width. Unknown viewport never invents a ratio.
     pub fn width_ratio(&self, index: usize) -> Option<f64> {
         let state = self.column_state(index)?;

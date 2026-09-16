@@ -1576,9 +1576,18 @@ fn suspend_failed_frame_commit(
     // AX can partially mutate a frame before returning an error. Publish only
     // readback and leave retries to the bounded correction policy.
     let readback = window.update_frame();
+    // An error that answers "this exact request is invalid for this window" is a
+    // definitive refusal, unlike the moment-shaped errors above. Record it for the
+    // alignment pass, which owns the strips a correction needs (ADR 0011).
+    let refused = error
+        .macos_code()
+        .filter(|code| super::alignment::refusal_is_definitive(*code));
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_remove::<WindowFrameMotion>();
         entity_commands.try_insert(WindowFrameCommitSuspended::new(desired));
+        if let Some(code) = refused {
+            entity_commands.try_insert(super::alignment::FrameWriteRefused { code });
+        }
         match readback {
             Ok(frame) => {
                 entity_commands.try_insert(ObservedWindowFrame(frame));

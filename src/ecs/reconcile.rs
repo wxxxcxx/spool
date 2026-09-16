@@ -56,6 +56,11 @@ struct FrameConvergence {
     attempts: u8,
     incarnation: Option<WindowIncarnation>,
     intent: Option<(super::layout::ColumnId, u64, u64, u64)>,
+    /// The intent tuple this entity's frame last provably reached. A round whose
+    /// bound width intent revision is already this one is a correction or a
+    /// drift, not an accepted edit that failed, and it may not rewrite the
+    /// authored width (ADR 0011).
+    realized_intent: Option<(super::layout::ColumnId, u64, u64, u64)>,
     active: bool,
     blocked: bool,
     confirmed: bool,
@@ -69,6 +74,7 @@ impl FrameConvergence {
             target,
             incarnation,
             intent: None,
+            realized_intent: None,
             attempts: 0,
             active: false,
             blocked: false,
@@ -235,9 +241,12 @@ impl WindowStateSync {
         if let Some(round) = self.frame_convergence.get_mut(&entity) {
             if round.target != target {
                 let intent = round.intent;
+                let realized = round.realized_intent;
                 *round = FrameConvergence::new(target, round.incarnation);
                 round.intent = intent;
+                round.realized_intent = realized;
             }
+            round.realized_intent = round.intent;
             round.confirmed = true;
             round.blocked = false;
             round.active = false;
@@ -262,8 +271,10 @@ impl WindowStateSync {
             || round.target != target
             || round.incarnation != Some(incarnation)
         {
+            let realized = round.realized_intent;
             *round = FrameConvergence::new(target, Some(incarnation));
             round.intent = Some(intent);
+            round.realized_intent = realized;
         }
     }
 
@@ -282,7 +293,9 @@ impl WindowStateSync {
             .entry(entity)
             .or_insert_with(|| FrameConvergence::new(target, Some(incarnation)));
         if round.target != target || round.incarnation != Some(incarnation) {
+            let realized = round.realized_intent;
             *round = FrameConvergence::new(target, Some(incarnation));
+            round.realized_intent = realized;
         }
         if round.blocked || round.confirmed {
             return false;
@@ -306,6 +319,32 @@ impl WindowStateSync {
         {
             round.active = false;
             round.blocked |= blocked;
+        }
+    }
+
+    /// The monotonic clock the frame rounds are measured against, for callers
+    /// that record when they gave up on a target.
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    /// Whether the round's bound edit is one the display never realized.
+    ///
+    /// This is the alignment gate for an authored field: a round whose width
+    /// intent revision was already confirmed — a drift correction, a failed
+    /// internal retry — does not authorize rewriting the authored value, however
+    /// long the window keeps showing something else.
+    pub(crate) fn unrealized_edit(&self, entity: Entity) -> bool {
+        let Some(round) = self.frame_convergence.get(&entity) else {
+            return false;
+        };
+        let Some(intent) = round.intent else {
+            return false;
+        };
+        match round.realized_intent {
+            Some(realized) if realized.0 == intent.0 => realized.1 != intent.1,
+            // Never realized, or the window changed columns: the edit is unrealized.
+            _ => true,
         }
     }
 
@@ -608,6 +647,8 @@ pub(super) struct ReconcileState<'w, 's> {
     initializing: Option<Res<'w, Initializing>>,
     settling: Res<'w, WindowGeometrySettling>,
     topology: Res<'w, super::topology::NativeTopology>,
+    alignments: ResMut<'w, super::alignment::RealizationAlignments>,
+    refusals: Query<'w, 's, &'static super::alignment::FrameWriteRefused>,
     native_moves: Query<'w, 's, (), bevy::ecs::query::With<super::native_space::NativeMoveOwner>>,
 }
 
@@ -1075,6 +1116,7 @@ impl ReconcileState<'_, '_> {
                     ),
                 );
             }
+            let refusal = self.refusals.get(entity).ok().copied();
             let can_adopt_frame = !projection_blocked
                 && visibility.is_none()
                 && !repositioning
@@ -1089,6 +1131,50 @@ impl ReconcileState<'_, '_> {
                     if let Ok(mut entity_commands) = commands.get_entity(entity) {
                         entity_commands.try_remove::<WindowFrameCommitSuspended>();
                     }
+                } else if let Some(refusal) = refusal
+                    && sync.unrealized_edit(entity)
+                {
+                    // The platform answered that this request is invalid for this
+                    // window: the authored width follows the display at once, with
+                    // no grace period to wait out (ADR 0011).
+                    align_column_width(
+                        &mut self.workspaces,
+                        &mut self.alignments,
+                        entity,
+                        frame,
+                        super::alignment::AlignmentReason::WriteRefused { code: refusal.code },
+                        sync.elapsed(),
+                    );
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_remove::<super::alignment::FrameWriteRefused>();
+                    }
+                } else if sync.frame_progress(entity).is_some_and(|progress| {
+                    // The grace period is the whole readback sequence: the
+                    // authored value follows the display once the last
+                    // checkpoint has passed and the window has kept showing
+                    // something else (ADR 0011).
+                    progress.blocked && !progress.checks_pending
+                }) && sync.unrealized_edit(entity)
+                {
+                    // The round is over: the target was never reached and the code
+                    // has stopped trying. If the window keeps showing the same
+                    // value, the authored width follows the display so state and
+                    // display agree again (ADR 0011). A value the window is still
+                    // moving away from is not an observation, and a field the
+                    // previous pass already aligned is already equal to it.
+                    let stable = observed
+                        .as_ref()
+                        .is_some_and(|observed| observed.0 == frame);
+                    if stable {
+                        align_column_width(
+                            &mut self.workspaces,
+                            &mut self.alignments,
+                            entity,
+                            frame,
+                            super::alignment::AlignmentReason::NotRealizedWithinGrace,
+                            sync.elapsed(),
+                        );
+                    }
                 } else if !request.checkpoint_only_ids.contains(&window_id)
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
@@ -1097,7 +1183,10 @@ impl ReconcileState<'_, '_> {
             } else if floating {
                 sync.frame_convergence.remove(&entity);
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_remove::<WindowFrameCommitSuspended>();
+                    entity_commands.try_remove::<(
+                        WindowFrameCommitSuspended,
+                        super::alignment::FrameWriteRefused,
+                    )>();
                 }
             }
 
@@ -1514,6 +1603,58 @@ fn should_skip_frame(
 fn remove_observed_frame(entity: Entity, commands: &mut Commands) {
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_remove::<ObservedWindowFrame>();
+    }
+}
+
+/// Aligns one tiled column's authored width to the width its window keeps
+/// showing, after the derived target was never reached.
+///
+/// Only the authored intent is corrected; the derived target is recomputed from
+/// it, so the alignment converges by construction — the display already shows
+/// that value. A column whose intent already equals the displayed width is left
+/// alone, which is also what stops a native constraint that keeps clamping the
+/// result from aligning the same value forever.
+fn align_column_width(
+    workspaces: &mut Query<&mut LayoutStrip, Without<Window>>,
+    alignments: &mut super::alignment::RealizationAlignments,
+    entity: Entity,
+    observed: IRect,
+    reason: super::alignment::AlignmentReason,
+    now: Duration,
+) {
+    use super::alignment::{AlignedField, AlignmentRecord, aligned_width_intent};
+    for mut strip in workspaces.iter_mut() {
+        let Ok(index) = strip.index_of(entity) else {
+            continue;
+        };
+        let Some((column, prior)) = strip
+            .column_state(index)
+            .map(|state| (state.id, state.width))
+        else {
+            return;
+        };
+        let Some(adopted) = aligned_width_intent(prior, observed.width(), strip.viewport_width())
+        else {
+            return;
+        };
+        if adopted == prior {
+            return;
+        }
+        if strip.set_width_intent(column, adopted).unwrap_or(false) {
+            alignments.record(
+                entity,
+                AlignmentRecord {
+                    field: AlignedField::ColumnWidth {
+                        column,
+                        prior,
+                        adopted,
+                    },
+                    reason,
+                    at: now,
+                },
+            );
+        }
+        return;
     }
 }
 
