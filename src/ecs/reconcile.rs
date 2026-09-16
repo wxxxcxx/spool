@@ -1146,7 +1146,10 @@ impl ReconcileState<'_, '_> {
                 let target = desired.0;
                 if sync.confirm_frame_convergence(entity, frame, target) {
                     if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                        entity_commands.try_remove::<WindowFrameCommitSuspended>();
+                        entity_commands.try_remove::<(
+                            WindowFrameCommitSuspended,
+                            super::floating_geometry::FloatingMoveRefused,
+                        )>();
                     }
                 } else if let Some(refusal) = refusal
                     && (sync.unrealized_edit(entity) || sync.unrealized_height_edit(entity))
@@ -1209,6 +1212,16 @@ impl ReconcileState<'_, '_> {
                         WindowFrameCommitSuspended,
                         super::alignment::FrameWriteRefused,
                     )>();
+                    // A floating window's frame follows the observation, so a
+                    // refused move aligns itself on the next pass. What the
+                    // refusal is worth keeping for is the question "why did it not
+                    // move" (ADR 0011, the owner's 3+2 choice).
+                    if let Some(refusal) = refusal {
+                        entity_commands.try_insert(super::floating_geometry::FloatingMoveRefused {
+                            code: refusal.code,
+                            at: sync.elapsed(),
+                        });
+                    }
                 }
             }
 

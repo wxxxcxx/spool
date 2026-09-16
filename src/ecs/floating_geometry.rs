@@ -22,6 +22,19 @@ use crate::manager::Display;
 /// How many repairs the diagnostic history keeps, newest last.
 const FLOATING_REPAIR_HISTORY: usize = 4;
 
+/// The last frame write the platform answered as invalid for this floating
+/// window.
+///
+/// A floating window's frame follows the observation, so a refused move needs no
+/// alignment — the next observation is the intent again (ADR 0011). This record
+/// exists only so `window inspect` can answer "why did it not move"; it drives
+/// nothing, and a later tiled convergence drops it.
+#[derive(Component, Clone, Copy, Debug)]
+pub(crate) struct FloatingMoveRefused {
+    pub(crate) code: i32,
+    pub(crate) at: std::time::Duration,
+}
+
 /// The frame a floating window's state says it should have.
 #[derive(Component, Clone, Debug)]
 pub(crate) struct FloatingGeometry {

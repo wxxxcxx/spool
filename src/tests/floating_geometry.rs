@@ -336,3 +336,60 @@ fn a_targeted_floating_command_states_the_intent() {
     );
     let _ = MoveFocus::Stay;
 }
+
+/// A refused floating move drives nothing — the frame follows the observation on
+/// the next pass — but the refusal is kept so `window inspect` can answer why the
+/// window did not move (ADR 0011, the owner's 3+2 choice).
+#[test]
+fn a_refused_floating_move_is_kept_as_a_diagnostic() {
+    use crate::ecs::floating_geometry::{FloatingGeometry, FloatingMoveRefused};
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(15);
+    let entity = find_window_entity(0, harness.world());
+    harness.world().entity_mut(entity).insert(Floating);
+    harness.pump_frames(10);
+    let intent = harness
+        .world()
+        .get::<FloatingGeometry>(entity)
+        .expect("a floating window keeps an intent")
+        .frame;
+    let observed_before = harness.mock_state.actual_window_frame(0);
+
+    // The platform refuses frame writes as invalid for this exact request.
+    let code = accessibility_sys::kAXErrorIllegalArgument;
+    harness
+        .mock_state
+        .refuse_frame_writes_with_code(0, Some(code));
+    let moved = IRect::new(
+        intent.min.x + 120,
+        intent.min.y + 80,
+        intent.width(),
+        intent.height(),
+    );
+    harness
+        .world()
+        .entity_mut(entity)
+        .insert(FloatingGeometry::authored(moved, None));
+    harness.pump_frames(20);
+
+    let refused = harness
+        .world()
+        .get::<FloatingMoveRefused>(entity)
+        .expect("the refusal is recorded for diagnosis");
+    assert_eq!(refused.code, code);
+    assert_eq!(
+        harness.mock_state.actual_window_frame(0),
+        observed_before,
+        "a refused write leaves the window where it was, and the intent follows it"
+    );
+    let intent_after = harness
+        .world()
+        .get::<FloatingGeometry>(entity)
+        .expect("a floating window keeps an intent")
+        .frame;
+    assert_ne!(
+        intent_after, moved,
+        "the refused target does not survive as intent"
+    );
+}

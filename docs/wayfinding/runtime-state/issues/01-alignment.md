@@ -80,7 +80,16 @@ Blocked by: none
 - “稳定”判据的进一步强化（目前是“上次观测 == 本次观测”＋已排除动画与手势）。
 - `Center` 的 warp 与准入闸门属于 02 票；真实桌面验收未做。
 
-### 待裁决：浮动窗口要不要有自己的回合？
+### 已裁决（2026-09-16）：浮动窗口 = 3+2，已实施
+
+用户选择 **3+2**：不给浮动窗口加对账回合（它的帧权威本来就是观测），只把"被明确拒绝的浮动移动"留成一条**纯诊断**。
+
+- 依据（查证）：浮动分支本来就每帧把观测写回意图（`adopt_floating_frame` + `set_floating_frame`，条件 `can_adopt_frame`），所以"失败 → 状态跟随显示"在下一帧自动成立，连宽限期都不需要；而"意图随观测走"意味着**漂移就是意图**，对齐门在此域没有意义。
+- 实现：提交点给出的明确拒绝在浮动分支不再被丢弃，而是写成 `FloatingMoveRefused { code, at }`（每窗口一条，仅诊断、不驱动行为）；窗口重新平铺并收敛时清除；`window inspect --source spool` 的 floating 组新增 `refused` 字段。
+- **测试**：`a_refused_floating_move_is_kept_as_a_diagnostic`（浮动窗口 + 编码拒绝 → 组件带该 code、屏幕不动、被拒的目标不残留为意图）。去掉诊断写入后该测试失败于 `the refusal is recorded for diagnosis`。
+- 验证：workspace 1207 / 24 / 96 / 6 / 4，`--no-default-features` 1065，fmt 与两套 clippy `-D warnings` 通过。
+
+### 当时的三个选项（保留记录）
 
 平铺窗口的对账回合（`FrameConvergence`：attempts/checkpoints/blocked/realized_intent）在浮动窗口上是**被移除**的（`sync.frame_convergence.remove(&entity)`），浮动帧由观测采纳（手势/外部移动）驱动。于是“某个浮动窗口的移动命令失败”今天没有任何记录，对齐门也无从判断。三个选项：
 
