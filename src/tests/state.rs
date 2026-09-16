@@ -1050,28 +1050,53 @@ fn focus_memory_is_saved_as_cached_identity_hints() {
             FocusMemory {
                 space_id: TEST_WORKSPACE_ID + 1,
                 preference: Some(unresolvable),
+                selection: Some(selection),
+            },
+            FocusMemory {
+                space_id: TEST_WORKSPACE_ID + 2,
+                preference: Some(unresolvable),
                 selection: None,
             },
         ],
     );
     assert_eq!(
         saved.focus,
-        vec![SavedFocus {
-            space_id: TEST_WORKSPACE_ID,
-            preference: Some(SavedWindow {
-                window_id: 7,
-                pid: 11,
-                bundle_id: "fixture".into(),
-            }),
-            selection: Some(SavedWindow {
-                window_id: 8,
-                pid: 11,
-                bundle_id: "fixture".into(),
-            }),
-        }],
-        "an unresolvable hint is omitted, never written as a claim of no preference"
+        vec![
+            SavedFocus {
+                space_id: TEST_WORKSPACE_ID,
+                preference: Some(SavedWindow {
+                    window_id: 7,
+                    pid: 11,
+                    bundle_id: "fixture".into(),
+                }),
+                selection: Some(SavedWindow {
+                    window_id: 8,
+                    pid: 11,
+                    bundle_id: "fixture".into(),
+                }),
+            },
+            SavedFocus {
+                space_id: TEST_WORKSPACE_ID + 1,
+                preference: None,
+                selection: Some(SavedWindow {
+                    window_id: 8,
+                    pid: 11,
+                    bundle_id: "fixture".into(),
+                }),
+            },
+        ],
+        "an entry whose roles both failed is not written, and a role that failed is dropped"
     );
     assert!(saved.valid());
+    let encoded = serde_json::to_value(&saved).expect("serialize");
+    assert!(
+        encoded["focus"][1].get("preference").is_none(),
+        "an unresolvable hint is absent from the file, never a null 'no preference' claim: {encoded}"
+    );
+    assert_eq!(
+        encoded["focus"][1]["selection"]["window_id"], 8,
+        "the role that did resolve is still saved"
+    );
     let roundtrip: SpoolState =
         serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
     assert_eq!(roundtrip, saved, "the memory survives the round trip");

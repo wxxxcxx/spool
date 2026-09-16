@@ -142,7 +142,7 @@ the same lifecycle gate as the action it continues instead of reaching the
 native command system while the session was still starting or shutting down. The
 migrated executors now share one recipe vocabulary instead of reconstructing it.
 
-Three exceptions are deliberate and easy to lose later:
+Four exceptions are deliberate and easy to lose later:
 
 - **Activation Intent is deferred, not refused.** A focus request during Mission
   Control, initialization or exit is held and realized later, so it must not be

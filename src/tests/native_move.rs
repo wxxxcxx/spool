@@ -367,6 +367,34 @@ fn a_floating_window_declares_the_space_membership_reports() {
     );
 }
 
+/// A pass that never needed the membership scan leaves the generation available:
+/// a window that needs the observation later in the same generation still gets
+/// it, instead of falling back to the strip it was remembered in.
+#[test]
+fn a_pass_that_needed_no_scan_does_not_consume_the_generation() {
+    let (mut harness, _, members) = column_harness();
+    // Every window is still in a strip, so this pass has nothing to scan for.
+    harness.pump_frames(70);
+    assert_eq!(
+        declared_space(&mut harness, members[1]).observed,
+        Some(TEST_WORKSPACE_ID)
+    );
+
+    // The window floats and macOS reports it on another Space, still inside the
+    // same topology generation.
+    float_window(&mut harness, members[1]);
+    harness
+        .mock_state
+        .update_window(1, |window| window.workspace_id = TARGET);
+    harness.pump_frames(3);
+
+    assert_eq!(
+        declared_space(&mut harness, members[1]).observed,
+        Some(TARGET),
+        "a generation that was never scanned for still answers with its observation"
+    );
+}
+
 /// The scan is an observation like any other: when it cannot be read, a
 /// declaration that still names a valid Space is left alone.
 #[test]

@@ -71,17 +71,18 @@ pub struct SpoolState {
 
 /// One Space's saved focus memory, with cached identity hints only.
 ///
-/// A role whose identity was not resolvable at capture is omitted rather than
-/// written as `null`: unlike a member slot, an absent focus hint carries no
-/// structure, and `null` would claim "no preference", which capture cannot
-/// support. No reader may infer identity from either hint.
+/// A role whose identity was not resolvable at capture is left out of the file
+/// entirely, not written as `null`: unlike a member slot, an absent focus hint
+/// carries no structure, and `null` would claim "no preference", which capture
+/// cannot support. An entry whose roles both failed is not written at all. No
+/// reader may infer identity from either hint.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SavedFocus {
     pub space_id: WorkspaceId,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preference: Option<SavedWindow>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<SavedWindow>,
 }
 

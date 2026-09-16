@@ -358,12 +358,37 @@ pub fn import_intents(
     Ok(changed)
 }
 
+/// The rejection an import failure reports, so a validation failure caught by the
+/// caller reads exactly like one caught inside a group.
+fn import_failed(error: Error) -> crate::errors::Error {
+    crate::errors::Error::rejection_with_cause("import_failed", error)
+}
+
+/// Rejects a group whose bindings name the same candidate or the same live
+/// target twice.
+///
+/// Every group runs this before it writes anything: a duplicate found inside the
+/// write loop would leave the bindings before it already applied.
+fn ensure_unique<T: std::hash::Hash + Eq>(
+    keys: impl IntoIterator<Item = T>,
+    group: &'static str,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    if keys.into_iter().all(|key| seen.insert(key)) {
+        return Ok(());
+    }
+    Err(Error::InvalidInput(format!(
+        "duplicate {group} import binding"
+    )))
+}
+
 /// One floating window's candidate entry, already validated against the live
 /// window it claims.
 #[derive(Clone, Debug)]
 pub struct TrustedFloatingBinding {
     candidate_window: usize,
     target_window_id: WinID,
+    frame: IRect,
 }
 
 impl TrustedFloatingBinding {
@@ -395,9 +420,16 @@ impl TrustedFloatingBinding {
                 "candidate floating window's cached identity does not match the live window".into(),
             ));
         }
+        // The frame is validated here, with the rest of the binding: a candidate
+        // that is not representable must refuse the import before any group is
+        // written, not halfway through this one.
+        let frame = checked_frame_from(saved.frame).ok_or_else(|| {
+            Error::InvalidInput("candidate floating frame is not representable".into())
+        })?;
         Ok(Self {
             candidate_window,
             target_window_id,
+            frame,
         })
     }
 }
@@ -423,24 +455,18 @@ pub fn import_floating_frames(
             "intent import candidates are invalid or expired".into(),
         ));
     }
-    let mut seen = HashSet::new();
+    // Duplicates are refused before the write loop, so an earlier binding of this
+    // group is never left applied.
+    ensure_unique(
+        bindings.iter().map(|binding| binding.candidate_window),
+        "floating",
+    )?;
+    ensure_unique(
+        bindings.iter().map(|binding| binding.target_window_id),
+        "floating",
+    )?;
     let mut applied = 0;
     for binding in bindings {
-        if !seen.insert(binding.candidate_window) {
-            return Err(Error::InvalidInput(
-                "duplicate floating import binding".into(),
-            ));
-        }
-        let saved = candidates
-            .state
-            .floating
-            .get(binding.candidate_window)
-            .ok_or_else(|| {
-                Error::InvalidInput("candidate floating window does not exist".into())
-            })?;
-        let frame = checked_frame_from(saved.frame).ok_or_else(|| {
-            Error::InvalidInput("candidate floating frame is not representable".into())
-        })?;
         let entity = windows
             .iter()
             .find_map(|(entity, window, _, _)| {
@@ -452,6 +478,7 @@ pub fn import_floating_frames(
                 "import target window is unavailable".into(),
             ));
         };
+        let frame = binding.frame;
         match geometry {
             Some(mut geometry) => geometry.state(frame),
             None => {
@@ -559,7 +586,6 @@ pub fn import_space_focus(
     }
     Ok(bindings.len())
 }
-
 /// A saved frame as a representable window frame.
 fn checked_frame_from(frame: spool_shared_types::state::Frame) -> Option<IRect> {
     let origin = IVec2::new(frame.x, frame.y);
@@ -663,6 +689,72 @@ pub(crate) fn restore_intents(
     if candidates.initial_layouts.is_none() {
         return Err(crate::errors::Error::rejected("import_baseline_missing"));
     }
+
+    // Every group's duplicates are refused here, before any group is applied: a
+    // duplicate discovered inside an apply loop would leave the groups before it
+    // already written. Each group function checks its own bindings too, for
+    // callers that reach it directly.
+    ensure_unique(
+        bindings
+            .columns
+            .iter()
+            .map(|binding| (binding.candidate_space, binding.candidate_column)),
+        "column",
+    )
+    .map_err(import_failed)?;
+    ensure_unique(
+        bindings.columns.iter().map(|binding| binding.target_column),
+        "column",
+    )
+    .map_err(import_failed)?;
+    ensure_unique(
+        bindings
+            .floating
+            .iter()
+            .map(|binding| binding.candidate_window),
+        "floating",
+    )
+    .map_err(import_failed)?;
+    ensure_unique(
+        bindings
+            .floating
+            .iter()
+            .map(|binding| binding.target_window_id),
+        "floating",
+    )
+    .map_err(import_failed)?;
+    ensure_unique(
+        bindings
+            .membership
+            .iter()
+            .map(|binding| binding.candidate_membership),
+        "membership",
+    )
+    .map_err(import_failed)?;
+    ensure_unique(
+        bindings
+            .membership
+            .iter()
+            .map(|binding| binding.target_window_id),
+        "membership",
+    )
+    .map_err(import_failed)?;
+    ensure_unique(
+        bindings
+            .focus
+            .iter()
+            .map(|binding| (binding.candidate_focus, binding.role)),
+        "focus",
+    )
+    .map_err(import_failed)?;
+    ensure_unique(
+        bindings
+            .focus
+            .iter()
+            .map(|binding| (binding.target_space, binding.role)),
+        "focus",
+    )
+    .map_err(import_failed)?;
 
     let mut columns: HashMap<crate::platform::WorkspaceId, Vec<TrustedColumnBinding>> =
         HashMap::new();
@@ -805,20 +897,18 @@ pub(crate) fn restore_intents(
         let Some(mut strip) = ctx.strips.iter_mut().find(|strip| strip.id() == space) else {
             continue;
         };
-        imported += import_intents(&candidates, &mut strip, &trusted)
-            .map_err(|error| crate::errors::Error::rejection_with_cause("import_failed", error))?;
+        imported += import_intents(&candidates, &mut strip, &trusted).map_err(import_failed)?;
     }
     imported += import_floating_frames(&candidates, &mut ctx.windows, &mut ctx.commands, &floating)
-        .map_err(|error| crate::errors::Error::rejection_with_cause("import_failed", error))?;
+        .map_err(import_failed)?;
     imported += import_declared_spaces(
         &candidates,
         &mut ctx.declared,
         &mut ctx.commands,
         &membership,
     )
-    .map_err(|error| crate::errors::Error::rejection_with_cause("import_failed", error))?;
-    imported += import_space_focus(&candidates, &mut ctx.focus, &focus)
-        .map_err(|error| crate::errors::Error::rejection_with_cause("import_failed", error))?;
+    .map_err(import_failed)?;
+    imported += import_space_focus(&candidates, &mut ctx.focus, &focus).map_err(import_failed)?;
 
     if imported > 0 {
         // The startup owner asked explicitly; its window closes with the request.
@@ -892,17 +982,18 @@ pub fn import_declared_spaces(
             "intent import candidates are invalid or expired".into(),
         ));
     }
-    let mut seen_candidates = HashSet::new();
-    let mut seen_windows = HashSet::new();
+    // Duplicates are refused before the write loop, so an earlier binding of this
+    // group is never left applied.
+    ensure_unique(
+        bindings.iter().map(|binding| binding.candidate_membership),
+        "membership",
+    )?;
+    ensure_unique(
+        bindings.iter().map(|binding| binding.target_window_id),
+        "membership",
+    )?;
     let mut applied = 0;
     for binding in bindings {
-        if !seen_candidates.insert(binding.candidate_membership)
-            || !seen_windows.insert(binding.target_window_id)
-        {
-            return Err(Error::InvalidInput(
-                "duplicate membership import binding".into(),
-            ));
-        }
         let entity = windows
             .iter()
             .find_map(|(entity, window, _, _)| {

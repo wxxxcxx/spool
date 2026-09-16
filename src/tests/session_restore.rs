@@ -579,6 +579,20 @@ fn membership_candidates(pid: i32, bundle_id: &str) -> RestoreCandidates {
     .into()
 }
 
+/// A candidate document carrying one floating window and one membership entry,
+/// both naming the harness's first window.
+fn mixed_candidates(pid: i32, bundle_id: &str) -> RestoreCandidates {
+    let candidates = floating_candidates(pid, bundle_id);
+    let mut state = candidates.state().clone();
+    state.membership = vec![crate::ecs::state::SavedMembership {
+        window_id: 0,
+        pid,
+        bundle_id: bundle_id.into(),
+        space_id: TEST_WORKSPACE_ID,
+    }];
+    RestoreCandidates::from(state)
+}
+
 /// The harness with two user Spaces, so a declared Space can move between them.
 fn two_space_harness() -> TestHarness {
     let mut harness = TestHarness::new().with_windows(2).with_display(
@@ -715,6 +729,73 @@ fn a_membership_import_to_an_unknown_space_is_refused() {
         .expect("the system runs")
         .expect_err("an unknown Space is refused");
     assert_eq!(error.admission_code(), "import_target_space_not_found");
+}
+
+/// A duplicate refuses the import before any group is written: an earlier group
+/// does not stay applied just because the duplicate was discovered later.
+#[test]
+fn a_duplicate_binding_refuses_the_whole_import_before_any_group_applies() {
+    use spool_shared_types::commands::{
+        RestoreBindings, RestoreFloatingBinding, RestoreMembershipBinding,
+    };
+
+    let mut harness = two_space_harness();
+    // Both groups are individually valid; the membership group names its only
+    // window twice.
+    harness
+        .world()
+        .insert_resource(mixed_candidates(TEST_PROCESS_ID, "test"));
+    harness.pump_frames(2);
+    let entity = crate::tests::find_window_entity(0, harness.world());
+    let before = harness
+        .world()
+        .get::<crate::ecs::native_space::DeclaredSpace>(entity)
+        .unwrap()
+        .target;
+
+    let result = harness.world().run_system_cached_with(
+        crate::ecs::restore::restore_intents,
+        RestoreBindings {
+            columns: Vec::new(),
+            floating: vec![RestoreFloatingBinding {
+                candidate_window: 0,
+                target_window_id: 0,
+            }],
+            membership: vec![
+                RestoreMembershipBinding {
+                    candidate_membership: 0,
+                    target_window_id: 0,
+                    target_space: TEST_WORKSPACE_ID + 1,
+                },
+                RestoreMembershipBinding {
+                    candidate_membership: 0,
+                    target_window_id: 0,
+                    target_space: TEST_WORKSPACE_ID + 1,
+                },
+            ],
+            focus: Vec::new(),
+        },
+    );
+    let error = result
+        .expect("the system runs")
+        .expect_err("a duplicate binding is refused");
+    assert_eq!(error.admission_code(), "import_failed");
+    assert_eq!(
+        harness
+            .world()
+            .get::<crate::ecs::native_space::DeclaredSpace>(entity)
+            .unwrap()
+            .target,
+        before,
+        "the membership group is not applied"
+    );
+    assert!(
+        harness
+            .world()
+            .get::<crate::ecs::floating_geometry::FloatingGeometry>(entity)
+            .is_none(),
+        "the earlier floating group is not applied either"
+    );
 }
 
 /// One bad binding refuses the whole import: the membership group is not applied

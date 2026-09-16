@@ -212,7 +212,7 @@ pub(crate) fn reconcile_declared_space(
         moving,
         mut commands,
     }: DeclaredSpaceCtx,
-    mut scanned: Local<u64>,
+    mut memberships: Local<(u64, Option<WindowMemberships>)>,
 ) {
     let known: Vec<(WorkspaceId, bool)> = spaces
         .iter()
@@ -226,11 +226,10 @@ pub(crate) fn reconcile_declared_space(
     };
     // A window with no layout membership — a floating window, or one whose layout
     // is unresolved — takes its observation from native membership instead. The
-    // scan covers every Space, so it is taken once for the whole pass, only when
-    // some window needs it, and at most once per topology generation: a failed
-    // read waits for the next observation rather than being retried per frame.
-    let scan_allowed = topology.generation() != *scanned;
-    let mut memberships: Option<WindowMemberships> = None;
+    // scan covers every Space, so it is taken at most once per topology
+    // generation and only when some window needs it: a failed read waits for the
+    // next generation rather than being retried per window, and every later pass
+    // in the same generation reuses the observation instead of reporting none.
     let mut owner = |entity: Entity| {
         let layout = spaces
             .iter()
@@ -248,16 +247,13 @@ pub(crate) fn reconcile_declared_space(
         // is unresolved. The observation comes first — a floating window is
         // wherever macOS says — and the remembered strip is the fallback for a
         // window the scan cannot see, not a competing authority.
-        let native = if scan_allowed {
-            if memberships.is_none() {
-                memberships = topology.observe_memberships(&manager).ok();
-            }
-            windows
-                .get_any(entity)
-                .and_then(|window| memberships.as_ref()?.unique_space(window.id()))
-        } else {
-            None
-        };
+        if memberships.0 != topology.generation() {
+            memberships.0 = topology.generation();
+            memberships.1 = topology.observe_memberships(&manager).ok();
+        }
+        let native = windows
+            .get_any(entity)
+            .and_then(|window| memberships.1.as_ref()?.unique_space(window.id()));
         native.or_else(|| {
             previous
                 .get(entity)
@@ -316,9 +312,6 @@ pub(crate) fn reconcile_declared_space(
                 });
             state.repair(replacement, reason);
         }
-    }
-    if scan_allowed {
-        *scanned = topology.generation();
     }
 }
 

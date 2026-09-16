@@ -184,6 +184,7 @@ objects stay on their owning threads.
 | `src/ecs/window_frame.rs` | Desired/presented frame projections and animation. |
 | `src/ecs/window_geometry.rs` | Debounced adoption of externally initiated move/resize gestures. |
 | `src/ecs/reconcile.rs` | Lifecycle audits and bounded desired/observed convergence. |
+| `src/ecs/floating_geometry.rs` | A floating window's retained frame intent, its anchor and unresolved state, and the bounded repair history that stands in for a native write. |
 | `src/ecs/exit_restore.rs` | Session-local launch-frame restoration and on-screen placement of live tracked windows at exit. |
 | `src/ecs/systems.rs` | Bevy systems for lifecycle management, event pumping, and state syncing. |
 | `src/ecs/params.rs` | High-level Bevy `SystemParam` abstractions for querying the World. |
