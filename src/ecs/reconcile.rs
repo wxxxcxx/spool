@@ -287,7 +287,16 @@ impl WindowStateSync {
         target: IRect,
         now: Duration,
         correction: bool,
+        postponed: bool,
     ) -> bool {
+        if postponed {
+            // The desktop cannot answer for this window right now (the overview is
+            // up, or discovery has not finished). Spool keeps trying — the write
+            // still happens — but nothing is charged and nothing is judged, so a
+            // suspension can never be mistaken for a failed realization and
+            // aligned away (ADR 0011).
+            return true;
+        }
         let round = self
             .frame_convergence
             .entry(entity)
@@ -365,7 +374,12 @@ impl WindowStateSync {
         }
     }
 
-    fn due_frame_checks(&mut self) -> Vec<Entity> {
+    /// Whether the judgement of a round is suspended: the grace period measures
+    /// time during which realization was possible, not wall time (ADR 0011).
+    fn due_frame_checks(&mut self, postponed: bool) -> Vec<Entity> {
+        if postponed {
+            return Vec::new();
+        }
         let mut due = Vec::new();
         for (entity, round) in &mut self.frame_convergence {
             let elapsed = self.elapsed.saturating_sub(round.issued_at);
@@ -1006,6 +1020,7 @@ impl ReconcileState<'_, '_> {
         audit: &LifecycleAudit,
         sync: &mut WindowStateSync,
         commands: &mut Commands,
+        postponed: bool,
     ) {
         let height_participants = self
             .windows
@@ -1152,6 +1167,7 @@ impl ReconcileState<'_, '_> {
                         )>();
                     }
                 } else if let Some(refusal) = refusal
+                    && !postponed
                     && (sync.unrealized_edit(entity) || sync.unrealized_height_edit(entity))
                 {
                     // The platform answered that this request is invalid for this
@@ -1170,14 +1186,15 @@ impl ReconcileState<'_, '_> {
                     if let Ok(mut entity_commands) = commands.get_entity(entity) {
                         entity_commands.try_remove::<super::alignment::FrameWriteRefused>();
                     }
-                } else if sync.frame_progress(entity).is_some_and(|progress| {
-                    // The grace period is the whole readback sequence: the
-                    // authored value follows the display once the last
-                    // checkpoint has passed and the window has kept showing
-                    // something else (ADR 0011).
-                    progress.blocked && !progress.checks_pending
-                }) && (sync.unrealized_edit(entity)
-                    || sync.unrealized_height_edit(entity))
+                } else if !postponed
+                    && sync.frame_progress(entity).is_some_and(|progress| {
+                        // The grace period is the whole readback sequence: the
+                        // authored value follows the display once the last
+                        // checkpoint has passed and the window has kept showing
+                        // something else (ADR 0011).
+                        progress.blocked && !progress.checks_pending
+                    })
+                    && (sync.unrealized_edit(entity) || sync.unrealized_height_edit(entity))
                 {
                     // The round is over: the target was never reached and the code
                     // has stopped trying. If the window keeps showing the same
@@ -1199,6 +1216,14 @@ impl ReconcileState<'_, '_> {
                             sync.unrealized_edit(entity),
                             sync.unrealized_height_edit(entity),
                         );
+                    }
+                } else if postponed {
+                    // A refusal that arrives while the session is suspended is
+                    // about the suspension, not about the request. It is dropped
+                    // rather than kept, and the round answers again from a fresh
+                    // attempt once the suspension ends (ADR 0011).
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_remove::<super::alignment::FrameWriteRefused>();
                     }
                 } else if !request.checkpoint_only_ids.contains(&window_id)
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -1359,9 +1384,12 @@ pub(super) fn reconcile_windows(
 ) {
     // The heartbeat always reads frames; collect gates only its full sweep.
     let heartbeat = sync.tick(time.delta());
+    // A suspension postpones the failure and timeout checks; it does not stop the
+    // attempt (ADR 0011). Exit is not a suspension: admission refuses everything.
+    let postponed = state.mission_control.0 || state.initializing.is_some();
     let automatic = config.automatic_reconcile();
     let mut request = SyncRequest::collect(&mut messages, heartbeat, automatic);
-    for entity in sync.due_frame_checks() {
+    for entity in sync.due_frame_checks(postponed) {
         if let Ok((_, window, ..)) = state.windows.get(entity) {
             let id = window.id();
             if !request.all && !request.frame_ids.contains(&id) {
@@ -1382,7 +1410,7 @@ pub(super) fn reconcile_windows(
     if (request.frames || !request.pids.is_empty()) && focus_audit_enabled {
         state.audit_frontmost_focus(&request, &mut sync, &mut commands);
     }
-    state.reconcile_frames(&request, &audit, &mut sync, &mut commands);
+    state.reconcile_frames(&request, &audit, &mut sync, &mut commands, postponed);
 }
 
 fn refresh_application_observer(
@@ -1876,6 +1904,43 @@ pub(super) fn confirm_unavailable_windows(
 
 #[cfg(test)]
 mod tests {
+
+    /// A suspended round records nothing to judge: no attempt is charged, no
+    /// checkpoint advances, and the grace period measures only time during which
+    /// realization was possible (ADR 0011).
+    #[test]
+    fn a_postponed_round_charges_nothing() {
+        let mut world = bevy::prelude::World::new();
+        let entity = world.spawn(()).id();
+        let target = IRect::new(0, 0, 10, 10);
+        let mut sync = WindowStateSync::default();
+        for tick in 0..5 {
+            assert!(sync.begin_frame_attempt(
+                entity,
+                7,
+                target,
+                Duration::from_millis(tick * 16),
+                false,
+                true
+            ));
+        }
+        assert!(
+            sync.frame_progress(entity).is_none(),
+            "a suspended round records nothing to judge"
+        );
+        assert!(
+            sync.due_frame_checks(true).is_empty(),
+            "and it does not advance the grace period"
+        );
+
+        // The same attempt once the suspension ends is charged normally.
+        assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, false, false));
+        assert_eq!(
+            sync.frame_progress(entity)
+                .map(|progress| progress.attempts),
+            Some(1)
+        );
+    }
     use std::sync::{Arc, Mutex};
 
     use bevy::prelude::World;
@@ -2024,25 +2089,33 @@ mod tests {
                 7,
                 target,
                 Duration::from_millis(tick * 16),
+                false,
                 false
             ));
         }
         assert_eq!(sync.frame_convergence[&entity].attempts, 1);
         sync.finish_frame_attempt(entity, target, false);
         for expected in [2, 3] {
-            assert!(sync.begin_frame_attempt(entity, 7, target, Duration::from_secs(1), true));
+            assert!(sync.begin_frame_attempt(
+                entity,
+                7,
+                target,
+                Duration::from_secs(1),
+                true,
+                false
+            ));
             assert_eq!(sync.frame_convergence[&entity].attempts, expected);
             sync.finish_frame_attempt(entity, target, false);
         }
         for seconds in [5, 30, 300] {
             sync.tick(Duration::from_secs(seconds));
-            assert!(!sync.begin_frame_attempt(entity, 7, target, sync.elapsed, true));
-            assert!(!sync.begin_frame_attempt(entity, 7, target, sync.elapsed, false));
+            assert!(!sync.begin_frame_attempt(entity, 7, target, sync.elapsed, true, false));
+            assert!(!sync.begin_frame_attempt(entity, 7, target, sync.elapsed, false, false));
         }
         assert!(sync.confirm_frame_convergence(entity, target, target));
         assert_eq!(sync.frame_convergence[&entity].attempts, 3);
         let new_target = IRect::new(0, 0, 1000, 600);
-        assert!(sync.begin_frame_attempt(entity, 7, new_target, sync.elapsed, false));
+        assert!(sync.begin_frame_attempt(entity, 7, new_target, sync.elapsed, false, false));
         assert_eq!(sync.frame_convergence[&entity].attempts, 1);
     }
 
@@ -2051,7 +2124,7 @@ mod tests {
         let entity = World::new().spawn_empty().id();
         let target = IRect::new(0, 0, 900, 600);
         let mut sync = WindowStateSync::default();
-        assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, false));
+        assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, false, false));
         for (millis, due) in [
             (249, false),
             (250, true),
@@ -2062,17 +2135,17 @@ mod tests {
             (60000, false),
         ] {
             sync.elapsed = Duration::from_millis(millis);
-            assert_eq!(sync.due_frame_checks().contains(&entity), due);
+            assert_eq!(sync.due_frame_checks(false).contains(&entity), due);
             assert_eq!(
                 sync.frame_convergence[&entity].attempts, 1,
                 "reading never starts an attempt"
             );
         }
         let target = IRect::new(0, 0, 1000, 600);
-        assert!(sync.begin_frame_attempt(entity, 7, target, sync.elapsed, false));
+        assert!(sync.begin_frame_attempt(entity, 7, target, sync.elapsed, false, false));
         assert!(sync.confirm_frame_convergence(entity, target, target));
         sync.tick(Duration::from_secs(10));
-        assert!(sync.due_frame_checks().is_empty());
+        assert!(sync.due_frame_checks(false).is_empty());
     }
 
     #[test]
@@ -2080,9 +2153,9 @@ mod tests {
         let entity = World::new().spawn_empty().id();
         let target = IRect::new(0, 0, 900, 600);
         let mut sync = WindowStateSync::default();
-        assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, false));
+        assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, false, false));
         sync.finish_frame_attempt(entity, target, true);
-        assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::from_secs(10), true));
+        assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::from_secs(10), true, false));
         assert_eq!(sync.frame_convergence[&entity].attempts, 1);
         assert!(sync.confirm_frame_convergence(entity, target, target));
     }
@@ -2094,14 +2167,14 @@ mod tests {
         let first = (super::super::layout::ColumnId(1), 0, 0, 0);
         sync.bind_frame_intent(entity, 7, target, first);
         for _ in 0..3 {
-            assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true));
+            assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true, false));
             sync.finish_frame_attempt(entity, target, false);
         }
-        assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true));
+        assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true, false));
         sync.bind_frame_intent(entity, 7, target, first);
-        assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true));
+        assert!(!sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true, false));
         sync.bind_frame_intent(entity, 7, target, (first.0, 0, 0, 1));
-        assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true));
+        assert!(sync.begin_frame_attempt(entity, 7, target, Duration::ZERO, true, false));
         assert_eq!(sync.frame_progress(entity).unwrap().attempts, 1);
     }
 }

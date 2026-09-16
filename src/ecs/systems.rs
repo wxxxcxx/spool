@@ -1521,6 +1521,8 @@ pub(super) struct WindowFrameCommitCtx<'w, 's> {
     window_manager: Res<'w, WindowManager>,
     settling: ResMut<'w, super::window_geometry::WindowGeometrySettling>,
     sync: ResMut<'w, WindowStateSync>,
+    mission_control: Option<Res<'w, MissionControlActive>>,
+    initializing: Option<Res<'w, Initializing>>,
     time: Res<'w, Time>,
     commands: Commands<'w, 's>,
 }
@@ -1624,9 +1626,16 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
         window_manager,
         mut settling,
         mut sync,
+        mission_control,
+        initializing,
         time,
         mut commands,
     } = ctx;
+    // A suspended session postpones the failure and timeout checks without
+    // stopping the attempt (ADR 0011): the write still happens, nothing is
+    // charged, and a suspension can never be read as a failed realization.
+    let postponed =
+        mission_control.as_ref().is_some_and(|overview| overview.0) || initializing.is_some();
     for (
         entity,
         mut window,
@@ -1835,6 +1844,7 @@ fn commit_window_frames(ctx: WindowFrameCommitCtx, defaults_phase: bool) {
                 desired.0,
                 time.elapsed(),
                 correcting,
+                postponed,
             ) {
                 commands
                     .entity(entity)

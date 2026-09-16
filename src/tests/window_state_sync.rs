@@ -3772,3 +3772,73 @@ fn assert_window_suspended(world: &mut World, id: i32, expected: bool) {
         "window {id} suspension state"
     );
 }
+
+/// While the session is suspended — the overview is up — Spool keeps trying but
+/// judges nothing: an edit that cannot land is not aligned away, and it is judged
+/// normally once the suspension ends (ADR 0011).
+#[test]
+fn a_suspension_postpones_the_alignment_and_judges_it_afterwards() {
+    use crate::ecs::alignment::RealizationAlignments;
+    use crate::ecs::layout::WidthIntent;
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(15);
+
+    let entity = find_window_entity(0, harness.world());
+    let original = harness.world().get::<Bounds>(entity).expect("bounds").0;
+    let target = original + IVec2::new(240, 0);
+    let alignments = |harness: &mut TestHarness| {
+        harness
+            .world()
+            .resource::<RealizationAlignments>()
+            .records(entity)
+            .count()
+    };
+    // The window never reaches the edited width, so without a suspension this is
+    // exactly the case that aligns after its grace period.
+    harness.mock_state.constrain_frame_writes(0, true);
+    harness
+        .world()
+        .resource_mut::<crate::ecs::MissionControlActive>()
+        .0 = true;
+    set_column_width_intent(&mut harness, entity, target.x);
+    harness.pump_frames(80);
+
+    assert_eq!(
+        harness.world().get::<Bounds>(entity).expect("bounds").0,
+        target,
+        "while the overview is up nothing is judged, so the edit is kept"
+    );
+    assert_eq!(alignments(&mut harness), 0, "and nothing aligns");
+
+    harness
+        .world()
+        .resource_mut::<crate::ecs::MissionControlActive>()
+        .0 = false;
+    harness.pump_frames(80);
+
+    assert_eq!(
+        harness.world().get::<Bounds>(entity).expect("bounds").0,
+        original,
+        "once the suspension ends the same unrealized edit follows the display"
+    );
+    assert_eq!(
+        alignments(&mut harness),
+        1,
+        "one alignment, judged after the wait"
+    );
+    let width = {
+        let mut strips = harness.world().query::<&LayoutStrip>();
+        let strip = strips
+            .iter(harness.world())
+            .find(|strip| strip.column_id(entity).is_some())
+            .expect("the window still has a column");
+        let id = strip.column_id(entity).expect("column");
+        strip
+            .column_states()
+            .find(|state| state.id == id)
+            .expect("column state")
+            .width
+    };
+    assert_eq!(width, WidthIntent::Absolute(f64::from(original.x)));
+}
