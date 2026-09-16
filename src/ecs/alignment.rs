@@ -19,7 +19,7 @@ use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::resource::Resource;
 
-use crate::ecs::layout::{ColumnId, WidthIntent};
+use crate::ecs::layout::{ColumnId, StackItemId, WidthIntent};
 
 /// How many alignments one window keeps for diagnostics. Repairs keep a similar
 /// bound; the file this used to feed no longer exists (ADR 0010).
@@ -42,6 +42,11 @@ pub(crate) enum AlignedField {
         column: ColumnId,
         prior: WidthIntent,
         adopted: WidthIntent,
+    },
+    StackItemHeight {
+        item: StackItemId,
+        prior: f64,
+        adopted: f64,
     },
 }
 
@@ -131,6 +136,27 @@ pub(crate) fn aligned_width_intent(
     }
 }
 
+/// The weight that makes one stack item's derived height match what the display
+/// shows, keeping every other item's weight — and therefore its share — as it is.
+///
+/// The projection distributes `viewport * weight / sum(weights)`, so solving for
+/// the one weight gives `w = S * h / (V - h)` for the other items' weight sum
+/// `S`. `None` means the displayed height cannot be expressed this way: nothing
+/// to divide, an unrepresentable height, or no room left for the other items.
+pub(crate) fn aligned_item_weight(
+    others_weight: f64,
+    observed_height: i32,
+    viewport_height: i32,
+) -> Option<f64> {
+    let observed = f64::from(observed_height);
+    let viewport = f64::from(viewport_height);
+    if others_weight <= 0.0 || observed <= 0.0 || viewport <= observed {
+        return None;
+    }
+    let weight = others_weight * observed / (viewport - observed);
+    (weight.is_finite() && weight > 0.0).then_some(weight)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +226,25 @@ mod tests {
             aligned_width_intent(WidthIntent::Absolute(900.0), 0, Some(1600)),
             None
         );
+    }
+
+    #[test]
+    fn an_item_weight_reproduces_the_displayed_height() {
+        // Two items sharing 800 points, the other holding weight 1.0. A displayed
+        // height of 600 asks for 1.0 * 600 / (800 - 600) = 3.0, and the projection
+        // then gives 800 * 3 / 4 = 600 for this item and 200 for the other.
+        let weight = aligned_item_weight(1.0, 600, 800).expect("a representable height");
+        assert!((weight - 3.0).abs() < f64::EPSILON);
+        let projected = 800.0 * weight / (weight + 1.0);
+        assert!((projected - 600.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_unrepresentable_item_height_is_not_adopted() {
+        assert_eq!(aligned_item_weight(1.0, 0, 800), None);
+        assert_eq!(aligned_item_weight(1.0, 800, 800), None);
+        assert_eq!(aligned_item_weight(1.0, 900, 800), None);
+        assert_eq!(aligned_item_weight(0.0, 600, 800), None);
     }
 
     #[test]

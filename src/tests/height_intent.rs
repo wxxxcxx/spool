@@ -453,3 +453,88 @@ fn external_top_edge_adoption_donates_from_the_previous_participant() {
     assert_eq!(heights[1].1.slot, viewport - 200);
     assert_eq!(projection.len(), 2);
 }
+
+/// A height edit the display never realized follows the display once its round is
+/// over: the item's authored weight becomes the one that derives the height the
+/// window actually shows, so state and display agree again (ADR 0011). Before
+/// that decision the edited share was kept forever.
+#[test]
+fn a_constrained_height_edit_aligns_to_what_the_window_shows() {
+    use crate::ecs::alignment::{AlignedField, AlignmentReason, RealizationAlignments};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    harness.pump_frames(15);
+    stack(&mut harness, 1);
+    harness.pump_frames(10);
+    let (owner, window) = owner(&mut harness, 1);
+    let (viewport, prior_weight) = {
+        let strip = harness.world().get::<LayoutStrip>(owner).expect("strip");
+        (
+            strip.height_viewport().expect("a known viewport"),
+            strip.height_state(window).expect("item state").weight,
+        )
+    };
+    let observed_height = harness
+        .world()
+        .get::<crate::ecs::Bounds>(window)
+        .expect("bounds")
+        .0
+        .y;
+    assert!(observed_height > 0);
+
+    // The platform stops moving either window, then the owner asks for a much
+    // taller item. The split cannot change, so the round never reaches its target.
+    harness.mock_state.constrain_frame_writes(0, true);
+    harness.mock_state.constrain_frame_writes(1, true);
+    harness
+        .world()
+        .get_mut::<LayoutStrip>(owner)
+        .expect("strip")
+        .set_height_weight(window, prior_weight * 4.0)
+        .expect("weight edit");
+    harness.pump_frames(60);
+
+    let (weight, derived) = {
+        let strip = harness.world().get::<LayoutStrip>(owner).expect("strip");
+        let item = strip.height_state(window).expect("item state");
+        let heights = strip
+            .effective_stack_heights_for(0, Some(viewport), &|_| true)
+            .expect("a complete projection");
+        let derived = heights
+            .iter()
+            .find(|(id, _)| *id == item.id)
+            .map(|(_, height)| height.slot)
+            .expect("the item's derived height");
+        (item.weight, derived)
+    };
+    assert!(
+        (weight - prior_weight).abs() < 0.001,
+        "the authored weight follows the displayed split: {weight} vs {prior_weight}"
+    );
+    assert_eq!(
+        derived, observed_height,
+        "and it derives exactly the height the window shows"
+    );
+    let records = {
+        let alignments = harness.world().resource::<RealizationAlignments>();
+        alignments
+            .records(window)
+            .map(|record| (record.field, record.reason))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        records,
+        vec![(
+            AlignedField::StackItemHeight {
+                item: {
+                    let strip = harness.world().get::<LayoutStrip>(owner).expect("strip");
+                    strip.height_state(window).expect("item state").id
+                },
+                prior: prior_weight * 4.0,
+                adopted: weight,
+            },
+            AlignmentReason::NotRealizedWithinGrace,
+        )],
+        "one alignment is recorded, with both values"
+    );
+}

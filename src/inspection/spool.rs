@@ -254,6 +254,11 @@ fn alignment_record(record: &crate::ecs::alignment::AlignmentRecord) -> Value {
             prior,
             adopted,
         } => json!({"kind":"column_width","column":column.0,"prior":prior,"adopted":adopted}),
+        AlignedField::StackItemHeight {
+            item,
+            prior,
+            adopted,
+        } => json!({"kind":"stack_item_height","item":item.0,"prior":prior,"adopted":adopted}),
     };
     let (reason, code) = match record.reason {
         AlignmentReason::NotRealizedWithinGrace => ("not_realized_within_grace", None),

@@ -335,6 +335,23 @@ impl WindowStateSync {
     /// internal retry — does not authorize rewriting the authored value, however
     /// long the window keeps showing something else.
     pub(crate) fn unrealized_edit(&self, entity: Entity) -> bool {
+        self.unrealized_intent(entity, |realized, intent| realized.1 != intent.1)
+    }
+
+    /// The same gate for the height intent a round bound: a height that was never
+    /// realized is what lets the item's weight follow the display.
+    pub(crate) fn unrealized_height_edit(&self, entity: Entity) -> bool {
+        self.unrealized_intent(entity, |realized, intent| realized.3 != intent.3)
+    }
+
+    fn unrealized_intent(
+        &self,
+        entity: Entity,
+        differs: impl Fn(
+            (super::layout::ColumnId, u64, u64, u64),
+            (super::layout::ColumnId, u64, u64, u64),
+        ) -> bool,
+    ) -> bool {
         let Some(round) = self.frame_convergence.get(&entity) else {
             return false;
         };
@@ -342,7 +359,7 @@ impl WindowStateSync {
             return false;
         };
         match round.realized_intent {
-            Some(realized) if realized.0 == intent.0 => realized.1 != intent.1,
+            Some(realized) if realized.0 == intent.0 => differs(realized, intent),
             // Never realized, or the window changed columns: the edit is unrealized.
             _ => true,
         }
@@ -1132,18 +1149,20 @@ impl ReconcileState<'_, '_> {
                         entity_commands.try_remove::<WindowFrameCommitSuspended>();
                     }
                 } else if let Some(refusal) = refusal
-                    && sync.unrealized_edit(entity)
+                    && (sync.unrealized_edit(entity) || sync.unrealized_height_edit(entity))
                 {
                     // The platform answered that this request is invalid for this
                     // window: the authored width follows the display at once, with
                     // no grace period to wait out (ADR 0011).
-                    align_column_width(
+                    align_unrealized_fields(
                         &mut self.workspaces,
                         &mut self.alignments,
                         entity,
                         frame,
                         super::alignment::AlignmentReason::WriteRefused { code: refusal.code },
                         sync.elapsed(),
+                        sync.unrealized_edit(entity),
+                        sync.unrealized_height_edit(entity),
                     );
                     if let Ok(mut entity_commands) = commands.get_entity(entity) {
                         entity_commands.try_remove::<super::alignment::FrameWriteRefused>();
@@ -1154,7 +1173,8 @@ impl ReconcileState<'_, '_> {
                     // checkpoint has passed and the window has kept showing
                     // something else (ADR 0011).
                     progress.blocked && !progress.checks_pending
-                }) && sync.unrealized_edit(entity)
+                }) && (sync.unrealized_edit(entity)
+                    || sync.unrealized_height_edit(entity))
                 {
                     // The round is over: the target was never reached and the code
                     // has stopped trying. If the window keeps showing the same
@@ -1166,13 +1186,15 @@ impl ReconcileState<'_, '_> {
                         .as_ref()
                         .is_some_and(|observed| observed.0 == frame);
                     if stable {
-                        align_column_width(
+                        align_unrealized_fields(
                             &mut self.workspaces,
                             &mut self.alignments,
                             entity,
                             frame,
                             super::alignment::AlignmentReason::NotRealizedWithinGrace,
                             sync.elapsed(),
+                            sync.unrealized_edit(entity),
+                            sync.unrealized_height_edit(entity),
                         );
                     }
                 } else if !request.checkpoint_only_ids.contains(&window_id)
@@ -1603,6 +1625,90 @@ fn should_skip_frame(
 fn remove_observed_frame(entity: Entity, commands: &mut Commands) {
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_remove::<ObservedWindowFrame>();
+    }
+}
+
+/// Aligns every authored field of this window's column that a finished round
+/// never realized: the width, the item's height weight, or both.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call site pairs the two fields"
+)]
+fn align_unrealized_fields(
+    workspaces: &mut Query<&mut LayoutStrip, Without<Window>>,
+    alignments: &mut super::alignment::RealizationAlignments,
+    entity: Entity,
+    observed: IRect,
+    reason: super::alignment::AlignmentReason,
+    now: Duration,
+    width: bool,
+    height: bool,
+) {
+    if width {
+        align_column_width(workspaces, alignments, entity, observed, reason, now);
+    }
+    if height {
+        align_stack_item_height(workspaces, alignments, entity, observed, reason, now);
+    }
+}
+
+/// Aligns one stack item's authored weight to the height its window keeps
+/// showing, after the derived target was never reached.
+///
+/// Only the failing item's weight moves: the other items keep their weights, and
+/// therefore their share, so the display's split is reproduced rather than
+/// re-derived. `None` from the conversion means the displayed height cannot be
+/// expressed against this viewport, and the round is left as it is.
+fn align_stack_item_height(
+    workspaces: &mut Query<&mut LayoutStrip, Without<Window>>,
+    alignments: &mut super::alignment::RealizationAlignments,
+    entity: Entity,
+    observed: IRect,
+    reason: super::alignment::AlignmentReason,
+    now: Duration,
+) {
+    use super::alignment::{AlignedField, AlignmentRecord, aligned_item_weight};
+    for mut strip in workspaces.iter_mut() {
+        let Ok(index) = strip.index_of(entity) else {
+            continue;
+        };
+        let Some(items) = strip.column_height_items(index).map(<[_]>::to_vec) else {
+            return;
+        };
+        // A single item fills the viewport: there is no split to align.
+        if items.len() < 2 {
+            return;
+        }
+        let Some(item) = items.iter().find(|item| item.members.contains(&entity)) else {
+            return;
+        };
+        let others = items
+            .iter()
+            .filter(|other| other.id != item.id)
+            .map(|other| other.weight)
+            .sum::<f64>();
+        let Some(viewport) = strip.height_viewport() else {
+            return;
+        };
+        let Some(adopted) = aligned_item_weight(others, observed.height(), viewport) else {
+            return;
+        };
+        let prior = item.weight;
+        if strip.set_height_weight(entity, adopted).unwrap_or(false) {
+            alignments.record(
+                entity,
+                AlignmentRecord {
+                    field: AlignedField::StackItemHeight {
+                        item: item.id,
+                        prior,
+                        adopted,
+                    },
+                    reason,
+                    at: now,
+                },
+            );
+        }
+        return;
     }
 }
 
