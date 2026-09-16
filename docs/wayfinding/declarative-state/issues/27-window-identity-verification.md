@@ -48,4 +48,11 @@ Blocked by: none
 
 ## Resolution
 
-待核实。核实前，25/26 号票中"编号可能被复用"的表述按推断对待。
+部分核实（2026-09-16）。第一轮取证（本机运行时探针 + 一手文档/头文件）已写入 [窗口身份：编号复用、NSWindow.windowNumber 与 CFHash(AXUIElement)](../../../research/window-identity-2026-09-16.md)，探针留存于 [`scripts/probe-window-identity.m`](../../../../scripts/probe-window-identity.m)。
+
+- **问题 1（编号复用）**：一手文档只声明“当前用户会话内唯一”，不声明寿命与复用；实机在同一登录会话内做了 275 次“创建→销毁→再创建”循环、3 轮 4 窗口批量、“释放中间槽位”，以及 4 个进程依次运行，**都没有复现复用**（编号单调递增 48264…48614）。结论：①“会被复用”的断言既无一手出处也无现场证据，**不成立为事实**；②但也没有文档保证不复用（未覆盖编号空间耗尽、极长会话等），所以**证据阶梯维持**：编号仍需 pid/bundle（必要时再叠加 AX 属性/几何）佐证，不单独充当身份，跨登录无效。
+- **问题 2（跨窗口稳定唯一标识）**：`kAXIdentifierAttribute` 在文档里只有符号（无 Discussion），头文件只有一行定义，**没有任何稳定性/唯一性保证**；`NSWindow.identifier` 是应用自己维护的**应用内**恢复标识。`AXIdentifier` 是否自动反映 `NSWindow.identifier` 仍**待测**（需要辅助功能权限）。
+- **问题 3（`CFHash(AXUIElement)`）**：应用级元素已证为**取值哈希而非指针**（同一 pid 的两次 `AXUIElementCreateApplication` 指针不同、`CFEqual=1`、`CFHash` 相等；不同 pid 不等且哈希不同）。**窗口级**元素经不同 AX 路径是否 `CFHash` 相等仍**待测**。
+- **附带结论**：`NSWindow.windowNumber` 与 `kCGWindowNumber` 在本机是同一个数值（尽管文档把二者写成不同概念），因此今后不得把二者当作两条独立证据互相佐证。
+
+**仍未验证**（需给探针进程所属应用辅助功能权限后重跑：`/tmp/probe-window-identity 20 prompt-trust`，授权后重启探针）：`AXIdentifier` 的填充与稳定性、窗口元素两路径的哈希等价性、`_AXUIElementGetWindow` 是否等于该窗口的 `kCGWindowNumber`。因此本票保持 `open`；在补齐之前，25/26/28/29 号票里“编号可能被复用”的表述继续按推断对待（现已知现场未复现，仍不作为事实引用）。

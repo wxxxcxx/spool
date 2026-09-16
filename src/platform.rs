@@ -47,10 +47,18 @@ pub type WinID = i32;
 /// Stable identity of one AX window object during its lifetime.
 ///
 /// Unlike [`WinID`], this is expected to change when `WindowServer` reuses an
-/// integer ID. That reuse is asserted here without a primary source and is **to
-/// be verified**: see `docs/wayfinding/declarative-state/issues/27-window-identity-verification.md`,
-/// which also questions what `CFHash` hashes and whether a stable application
-/// provided identifier exists.
+/// integer ID. Whether that reuse happens is **undocumented and was not
+/// observed**: a same-session probe (275 create/destroy cycles across four
+/// processes, batching, and a freed middle slot) saw a strictly increasing
+/// number sequence with no repetition, and Apple documents only uniqueness
+/// within the user session, never a lifetime. The expectation above therefore
+/// stays a defensive assumption, and the import seam keeps corroborating a
+/// candidate hint with the window's pid and bundle id rather than trusting a
+/// number alone. See `docs/research/window-identity-2026-09-16.md` and
+/// `docs/wayfinding/declarative-state/issues/27-window-identity-verification.md`,
+/// which also record what `CFHash` hashes and what is still unverified
+/// (a stable application-provided identifier, and window-element hash equality
+/// across two AX paths).
 pub type WindowIncarnation = u64;
 /// Type alias for `ConnID`, a 64-bit integer representing a connection identifier in `SkyLight`.
 pub type ConnID = i64;

@@ -278,3 +278,5 @@ Apple macOS 26.4 SDK, under `/Applications/Xcode.app/Contents/Developer/Platform
 [S10]: ../../src/tests/tabs.rs#L57
 
 Additional local evidence: application inventory in `src/manager/app.rs:267`, ordinary placement in `src/ecs/triggers.rs:1915`, inactive-tab drift protection in `src/ecs/reconcile.rs:877`, and external geometry observation in `src/ecs/window_geometry.rs:198`. Line numbers describe this reviewed working-tree snapshot and may drift with later edits.
+
+补记（2026-09-16）：本文 §Objects Versus Window IDs 说 `NSWindow.windowNumber` 与服务端全局编号"explicitly distinguish（文档口径）"。文档口径属实，但本机实机观测显示普通 AppKit 窗口的两个数值**相等**，且同会话内没有复现编号复用；两条一手/实测结论见 [窗口身份：编号复用、NSWindow.windowNumber 与 CFHash(AXUIElement)](window-identity-2026-09-16.md)。本文其余内容未改动。
