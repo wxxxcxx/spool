@@ -3842,3 +3842,89 @@ fn a_suspension_postpones_the_alignment_and_judges_it_afterwards() {
     };
     assert_eq!(width, WidthIntent::Absolute(f64::from(original.x)));
 }
+
+/// The startup window postpones the judgement exactly like the overview does: an
+/// edit made while the daemon is still bringing itself up is not judged — and not
+/// aligned — until the session is ready, and is judged normally afterwards
+/// (ADR 0011).
+#[test]
+fn initialization_postpones_the_alignment_and_judges_it_afterwards() {
+    use crate::ecs::alignment::RealizationAlignments;
+    use crate::ecs::layout::WidthIntent;
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.pump_frames(15);
+
+    let entity = find_window_entity(0, harness.world());
+    let original = harness.world().get::<Bounds>(entity).expect("bounds").0;
+    let target = original + IVec2::new(240, 0);
+    let alignments = |harness: &mut TestHarness| {
+        harness
+            .world()
+            .resource::<RealizationAlignments>()
+            .records(entity)
+            .count()
+    };
+    // Hold the startup window open the way the daemon's own startup gate does: an
+    // entity still carrying `ExistingMarker` keeps `finish_setup` from completing,
+    // so `Initializing` stays and the session reports itself as starting.
+    let pending = harness.world().spawn(crate::ecs::ExistingMarker).id();
+    harness.world().insert_resource(crate::ecs::Initializing);
+    // The window never reaches the edited width, so without the suspension this is
+    // exactly the case that aligns after its grace period.
+    harness.mock_state.constrain_frame_writes(0, true);
+    set_column_width_intent(&mut harness, entity, target.x);
+    harness.pump_frames(80);
+
+    let (kept, attempts, blocked) = {
+        let world = harness.world();
+        assert!(
+            world.contains_resource::<crate::ecs::Initializing>(),
+            "the startup window is still open"
+        );
+        let width = {
+            let mut strips = world.query::<&LayoutStrip>();
+            let strip = strips
+                .iter(world)
+                .find(|strip| strip.column_id(entity).is_some())
+                .expect("the window still has a column");
+            let id = strip.column_id(entity).expect("column");
+            strip
+                .column_states()
+                .find(|state| state.id == id)
+                .expect("column state")
+                .width
+        };
+        let progress = world
+            .resource::<crate::ecs::reconcile::WindowStateSync>()
+            .frame_progress(entity);
+        (
+            width,
+            progress.map_or(0, |progress| progress.attempts),
+            progress.is_some_and(|progress| progress.blocked),
+        )
+    };
+    assert_eq!(
+        kept,
+        WidthIntent::Absolute(f64::from(target.x)),
+        "while the session is starting nothing is judged, so the edit is kept"
+    );
+    assert_eq!(alignments(&mut harness), 0, "and nothing aligns");
+    assert_eq!(attempts, 0, "and no attempt is charged");
+    assert!(!blocked, "so the round never looks failed");
+
+    // The session finishes starting: the same unrealized edit is judged normally.
+    harness.world().entity_mut(pending).despawn();
+    harness.pump_frames(80);
+
+    assert_eq!(
+        harness.world().get::<Bounds>(entity).expect("bounds").0,
+        original,
+        "once the session is ready the edit follows the display"
+    );
+    assert_eq!(
+        alignments(&mut harness),
+        1,
+        "one alignment, judged after startup"
+    );
+}
