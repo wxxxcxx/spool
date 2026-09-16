@@ -40,7 +40,12 @@ nothing converged the state onto what was actually displayed.
    was issued and never confirmed by the end of its grace period.
 
 **Outcome 2 is followed by alignment: read the displayed value, write it into the
-authored intent, and the two agree again.** The evidence is what external
+authored intent, and the two agree again.** Alignment answers a *failed accepted
+edit*. A window that merely drifted, or whose frame creeps a little on every
+write, is not an edit: adopting it would let an unattended window drag the
+authored value along and turn bounded retries into an unbounded loop. The gate is
+the bound intent revision — alignment applies only while the round's width intent
+revision was never confirmed realized. The evidence is what external
 adoption already demands — a fresh, stable observation, not a value read while
 the window is in motion — plus a version binding: alignment applies only while
 the failed edit is still the newest edit of that field, so the failure of an
