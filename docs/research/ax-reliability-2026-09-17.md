@@ -31,6 +31,42 @@ Accessibility 是**同步的跨进程协议**，由每个应用自己实现：�
 3. **`invalidated` 的分布**：元素寿命问题的规模（对应 27 号票的 incarnation 议题）。
 4. **写操作的失败率**：`AXPosition`/`AXSize` 的 `unsupported`/`illegal_argument` 比例，决定"写成功≠做到"到底有多常见。
 
+## 初步观察（非普查数据，2026-09-17 当天）
+
+采集尚未跑满，但当天排查已经拿到几类**具体**事实；它们不是比率，只作为后续统计的对齐点。
+
+### 1. 仪表本身暴露的一个代价（新证据）
+
+第一份 5 分钟汇总：`calls=48249 distinct=491`。其中**单个窗口的 `AXCloseButton`/`AXMinimizeButton` 各被读 333 次、`success=0`、全部 `no_value`**——因为窗口 chrome 已改为对每个候选都读（见 [窗口策略](../../WINDOW_POLICY.md) 3.1），而应用审计每秒跑一次、每次都重建窗口对象。这是"窗口样证据"的真实成本，也正是能力快照必须存在的理由：这些读在同一秒内不会变。
+
+### 2. Emacs 案例：0.25 秒对慢应用就是"不可读"
+
+用户报告"Emacs 窗口没有被纳入管理"。事实链：
+
+| 观察 | 证据 |
+| --- | --- |
+| Emacs（`org.gnu.Emacs`，pid 5243）**有** 6 个层 0、alpha 1.0 的 CG 窗口 | CG 探针（主框 720×452 在 (544,204)，另有 5 条 1470×33） |
+| Spool 认为它有 0 个窗口 | `spool app list` → `window_count: 0`；`window reconcile` 两次（间隔越过 30s 退避上限）仍为 0 |
+| 默认 0.25s 下：**观察者注册失败** | 日志 `AXObserverAddNotification(AXFocusedUIElementChanged): -25204`，随后 `application AX endpoint unavailable; backing off probes` |
+| 改成 1.0s 后：**再无 Emacs 失败** | 同一日志里 `backing off` 行全部消失（`SPOOL_AX_TIMEOUT_SEC=1.0`） |
+| 不是"窗口样证据"门槛挡的 | 通过守护进程自己的检查面读 Emacs 主框：`AXCloseButton` **存在**（值为 AXUIElement），`AXMinimizeButton`、`AXFullScreenButton` 均在 |
+| 仍然没被纳入 | `window_count` 依旧 0（当时尚未定案，见下） |
+
+机制（代码）：`reconcile.rs` 的 `can_probe = application_ax_ready(app) && refresh_application_observer(...)`，只有为真才调用 `refresh_application_inventory`。也就是说**订阅失败会把"读窗口清单"一起挡掉**，把应用放进指数退避（1s→30s 封顶）且每次重试都失败——外部表现与"这个应用坏了"完全一样。
+
+余下的三种可能（普查按应用标签后即可分辨）：① Emacs 的 `AXWindows` 是空表（其 AX 实现稀疏）；② 分步发现没有 enqueue 到它的窗口；③ 候选被静默 `Ignore`/`Defer`。
+
+### 3. 当天日志里的其他失败类别
+
+- **`-25204`（Cannot complete）分布很广**：Thaw(9)、DaisyDisk(3)、Spotlight(2)、Emacs(2)、DockDoor(1)、Calculator(1)、AlDente(1)——即"应用不按时回答"是这台机器上的主要失败形态。
+- **私有接口返回空**：`topology.rs:84 unable to observe Space membership ... nullptr returned from SLSCopyWindowsWithOptionsAndTags`（多个 Space）。
+- **属性不支持**：`unable to disable AXEnhancedUserInterface ... -25208`（NotImplemented）。
+- **元素不是窗口**：`triggers.rs:135 can not get current focus: Unable to get window id from element 0x...`（`_AXUIElementGetWindow` 失败）——焦点元素确实不是窗口，这类不算故障但也需要区分。
+
+### 4. 测量过程本身的教训（已修）
+
+第一次采集返回"no census block"：**守护进程跑的是早于仪表的二进制**，而当时无法从日志区分"没失败"与"没装表"。现已加一行每进程一次的 `ax_census active ...`。另外两处仪表缺陷也已修：窗口级行原本没有应用标签（`app=?|?|59357`，因为读取发生在 pid 解析之前），汇总原本只打 40 行（正好会挡住被问到的那个应用）。
+
 ## 采集
 
 ```sh

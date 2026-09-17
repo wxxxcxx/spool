@@ -35,6 +35,7 @@
 - [Native tabs as one layout window](research/native-tab-platform-observation-2026-09-11.md)
 - [macOS window capability matrix](research/macos-window-capability-matrix.md)
 - [Private `SLSOrderWindow`: signature, permission and local measurements](research/sls-order-window-research.md)
+- [What private SkyLight/CGS/SLS/AX calls cover with SIP on](research/sip-on-private-api-2026-09-17.md)
 - [macOS window properties](research/macos-window-properties.md)
 - [macOS window control backends](research/macos-window-control-backends.md)
 - [Focus acquisition and control](research/FOCUS_REFERENCE_RESEARCH.md)
