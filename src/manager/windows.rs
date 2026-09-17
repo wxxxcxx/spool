@@ -379,8 +379,15 @@ impl WindowOS {
                 .ok(),
             ..Default::default()
         };
+        // Window chrome and movable/resizable are read for every candidate: the
+        // policy needs them to tell a window from a system surface, not only when
+        // a subrole is unknown. Geometry and the on-screen surface stay
+        // fallback-only, where they are the whole evidence.
+        for step in [2, 3, 5, 6] {
+            window.read_fallback_step(&mut evidence, step);
+        }
         if evidence.needs_fallback(config, bundle_id) {
-            for step in 0..5 {
+            for step in [0, 1, 4] {
                 window.read_fallback_step(&mut evidence, step);
             }
         }
@@ -479,6 +486,12 @@ impl WindowOS {
                 } else {
                     evidence.fallback.minimize_button = exists;
                 }
+            }
+            5 => {
+                evidence.fallback.movable = self.is_movable().ok();
+            }
+            6 => {
+                evidence.fallback.resizable = self.is_resizable().ok();
             }
             _ => {
                 let options = CGWindowListOption::OptionOnScreenOnly
@@ -1237,6 +1250,8 @@ mod tests {
         assert!(evidence.needs_fallback(&config, Some("test")));
         assert_eq!(evidence.admission(&config, Some("test")), Admission::Defer);
         evidence.fallback = window_policy::FallbackEvidence {
+            movable: None,
+            resizable: None,
             geometry: Some(true),
             surface: Some(true),
             close_button: Some(true),
@@ -1254,8 +1269,21 @@ mod tests {
             assert_eq!(evidence.admission(&config, Some("test")), expected);
             assert!(!evidence.needs_fallback(&config, Some("test")));
         }
+        // A standard window is admitted on its chrome, which the construction path
+        // reads for every candidate; without any window evidence it is a surface.
+        // A standard window is admitted on its chrome, which the construction path
+        // reads for every candidate. While that evidence is unknown the decision
+        // defers — and the fallback's geometry and surface are gathered with it —
+        // rather than admitting a surface on its subrole alone.
         evidence.subrole = Some("AXStandardWindow".into());
         evidence.fallback = window_policy::FallbackEvidence::default();
+        assert_eq!(evidence.admission(&config, Some("test")), Admission::Defer);
+        assert!(evidence.needs_fallback(&config, Some("test")));
+        evidence.fallback = window_policy::FallbackEvidence {
+            close_button: Some(true),
+            minimize_button: Some(false),
+            ..Default::default()
+        };
         assert_eq!(evidence.admission(&config, Some("test")), Admission::Track);
         assert!(!evidence.needs_fallback(&config, Some("test")));
     }

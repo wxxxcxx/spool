@@ -498,25 +498,25 @@ impl NativeProbe {
                             .parent
                             .as_ref()
                             .and_then(|parent| parent.role().ok());
+                        // Chrome and capability first: every candidate needs them
+                        // to be told apart from a system surface. Geometry and the
+                        // on-screen surface are gathered only for the fallback path.
                         if candidate
                             .evidence
                             .needs_fallback(&self.config, self.bundle_id.as_deref())
                         {
-                            Attribute::Fallback(0)
+                            Attribute::Fallback(2)
+                        } else {
+                            Attribute::Fallback(9)
+                        }
+                    }
+                    Attribute::Fallback(step) => {
+                        if let Some(next) = self.evidence_step(&mut candidate, step) {
+                            Attribute::Fallback(next)
                         } else {
                             self.stage = ProbeStage::Admit(candidate);
                             return Probe::Pending;
                         }
-                    }
-                    Attribute::Fallback(step) => {
-                        candidate
-                            .window
-                            .read_fallback_step(&mut candidate.evidence, step);
-                        if step == 4 {
-                            self.stage = ProbeStage::Admit(candidate);
-                            return Probe::Pending;
-                        }
-                        Attribute::Fallback(step + 1)
                     }
                 };
                 self.stage = ProbeStage::Inspect(candidate, next);
@@ -535,6 +535,35 @@ impl NativeProbe {
             }
         }
         Probe::Pending
+    }
+
+    /// One evidence step, and the step that follows it; `None` means the
+    /// candidate has everything the decision needs.
+    ///
+    /// The order is deliberate: window chrome (2, 3) and the ability to move and
+    /// resize (5, 6) are read for every candidate, because the policy tells a
+    /// window from a system surface with them. The geometry and the on-screen
+    /// surface (0, 1, 4) stay on the fallback path, where they are the whole
+    /// evidence.
+    fn evidence_step(&mut self, candidate: &mut Box<Candidate>, step: u8) -> Option<u8> {
+        if step == 9 {
+            return (!candidate
+                .evidence
+                .needs_fallback(&self.config, self.bundle_id.as_deref()))
+            .then_some(0);
+        }
+        candidate
+            .window
+            .read_fallback_step(&mut candidate.evidence, step);
+        match step {
+            2 => Some(3),
+            3 => Some(5),
+            5 => Some(6),
+            6 => Some(0),
+            0 => Some(1),
+            1 => Some(4),
+            _ => None,
+        }
     }
 
     fn token(&mut self, pid: Pid, element_id: u64) -> Option<&CFRetained<CFMutableData>> {
@@ -607,6 +636,12 @@ mod tests {
                         subrole: Some("AXStandardWindow".into()),
                         title: title.ok(),
                         parent_role: Some("AXApplication".into()),
+                        // Window chrome, as the probe always gathers: the title is
+                        // the only evidence still missing here.
+                        fallback: crate::window_policy::FallbackEvidence {
+                            close_button: Some(true),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     };
                     Probe::admitted(42, 42, evidence.admission(&config, Some("test")))

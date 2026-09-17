@@ -32,7 +32,8 @@ Floating Window 仍是 Tracked Window，参与现有查询和聚焦流程，不�
 
 1. AX 必须给出有效窗口 ID。物理 surface 本身不自动产生可控制窗口。
 2. `track=false` 排除匹配窗口。`track=true` 可放行非标准 subrole，但不能放行非 `AXWindow` 元素或已确认附属于另一个窗口的条目。
-3. 默认接收 `AXWindow` 下的 `AXStandardWindow`、`AXFloatingWindow`、`AXDialog`、`AXSystemDialog`。独立 dialog 不再仅因 subrole 被排除，也不因此在核心里默认 float。
+3. 默认接收 `AXWindow` 下的 `AXStandardWindow`、`AXFloatingWindow`、`AXDialog`、`AXSystemDialog`，**并且**要求窗口样证据：关闭或最小化按钮至少存在一个，或 AXPosition 与 AXSize 都明确可写（无边框但可移动可缩放的窗口）。独立 dialog 不再仅因 subrole 被排除，也不因此在核心里默认 float。
+3.1. **subrole 单独不构成窗口**（2026-09-17）。macOS 自己的面板也会回答这四个 subrole 之一：控制中心的面板（`com.apple.controlcenter`，CG 层 22，656×967）就是如此，它没有关闭/最小化按钮、也不可移动不可缩放，却被旧判定直接 `Track` 并当成一个浮动窗口管理。现在窗口样证据对**所有** subrole 路径生效：明确缺失 → 排除；读取失败 → 暂缓（失败不等于没有）。显式 `track=true` 仍然单独决定。标题**不作为**证据——控制中心的面板本身就有标题。
 4. 已确认 AXParent role 为 `AXWindow`、`AXSheet`、`AXDrawer` 时，不另建独立跟踪项。父属性不可用不等于已证明是子窗口：以 AX 窗口列表为基础，不把缺失父属性作为全局否决条件。
 5. role/subrole 读取失败与实际返回非标准值不同。元数据或必要规则匹配尚未确定时暂缓准入；应用 inventory 保留原始身份供核对，不把它当作窗口销毁。
 
@@ -42,7 +43,7 @@ Floating Window 仍是 Tracked Window，参与现有查询和聚焦流程，不�
 
 兜底窗口携带默认浮动偏好，参与既有查询、Bar、焦点与 overlay 目标选择，不占 strip 栏位。显式 `floating=false` 或手动平铺可覆盖此偏好，但不能绕过移动/缩放能力。`track=false`、非窗口控件、已知附属窗口仍不能通过按钮兜底放行；显式 `track=true` 保留原有语义。
 
-AXWindows 枚举与分步补充发现共享判定；附加属性仅对需要兜底的候选读取，后者每步至多一次同步 AX 调用。屏幕 surface 只用于新兜底身份的准入，不是窗口存活规则：已跟踪窗口后续隐藏、最小化或短暂丢失属性时，仍通过原始 AX 身份进行生命周期对账。首次发现时不在屏幕上的非标准窗口需等到可见后再纳入。
+AXWindows 枚举与分步补充发现共享判定；**窗口 chrome（关闭/最小化按钮）与移动/缩放能力对每个候选都读取**（判定需要它们区分窗口与系统表面），其余附加属性仅对需要兜底的候选读取，每步至多一次同步 AX 调用。屏幕 surface 只用于新兜底身份的准入，不是窗口存活规则：已跟踪窗口后续隐藏、最小化或短暂丢失属性时，仍通过原始 AX 身份进行生命周期对账。首次发现时不在屏幕上的非标准窗口需等到可见后再纳入。
 
 这不是 DockDoor 最终显示过滤器的完整移植，也没有修改 overlay 的原生层级；未聚焦预览仍可见时的遮挡须另做真实桌面验收。
 
