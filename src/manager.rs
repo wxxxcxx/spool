@@ -484,15 +484,43 @@ pub struct WindowManagerOS {
     event_sender: EventSender,
 }
 
-const AX_MESSAGING_TIMEOUT_SEC: f32 = 0.25;
+const DEFAULT_AX_MESSAGING_TIMEOUT_SEC: f32 = 0.25;
+
+/// How long one Accessibility message may take before macOS answers
+/// `kAXErrorCannotComplete`.
+///
+/// The default is deliberately short: every read is a message into another
+/// process, and Spool is holding the main thread while it waits. A slow
+/// application (Emacs answers AX on its main thread) then fails every read at
+/// this deadline and sits in the per-application backoff, which looks exactly
+/// like a broken application. `SPOOL_AX_TIMEOUT_SEC` exists so that difference
+/// can be measured instead of guessed; an unreadable or non-positive value
+/// keeps the default.
+fn ax_messaging_timeout_sec() -> f32 {
+    ax_messaging_timeout_from(std::env::var("SPOOL_AX_TIMEOUT_SEC").ok().as_deref())
+}
+
+/// The override's parsing, separated from the environment so it can be tested:
+/// anything unreadable, unparsable or non-positive keeps the default.
+fn ax_messaging_timeout_from(raw: Option<&str>) -> f32 {
+    raw.and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_AX_MESSAGING_TIMEOUT_SEC)
+}
 
 fn initialize_ax_timeout_with<T>(
     system_wide: impl FnOnce() -> Result<T>,
     set_timeout: impl FnOnce(&T, f32) -> i32,
 ) -> Result<()> {
     let element = system_wide()?;
-    set_timeout(&element, AX_MESSAGING_TIMEOUT_SEC)
-        .to_result("AXUIElementSetMessagingTimeout(system-wide)")
+    let timeout = ax_messaging_timeout_sec();
+    if timeout != DEFAULT_AX_MESSAGING_TIMEOUT_SEC {
+        tracing::info!(
+            timeout,
+            "AX messaging timeout overridden by SPOOL_AX_TIMEOUT_SEC"
+        );
+    }
+    set_timeout(&element, timeout).to_result("AXUIElementSetMessagingTimeout(system-wide)")
 }
 
 impl WindowManagerOS {
@@ -1499,6 +1527,30 @@ mod native_space_runtime_tests {
 }
 
 #[cfg(test)]
+mod ax_timeout_override_tests {
+    use super::*;
+
+    /// The override exists to measure "slow" against "broken"; a value it cannot
+    /// read must leave the deliberate default in place rather than widening every
+    /// AX deadline by accident.
+    #[test]
+    fn an_unreadable_override_keeps_the_default() {
+        assert_eq!(
+            ax_messaging_timeout_from(None),
+            DEFAULT_AX_MESSAGING_TIMEOUT_SEC
+        );
+        for raw in ["", "  ", "abc", "0", "-1", "inf", "NaN"] {
+            assert_eq!(
+                ax_messaging_timeout_from(Some(raw)),
+                DEFAULT_AX_MESSAGING_TIMEOUT_SEC,
+                "{raw:?}"
+            );
+        }
+        assert_eq!(ax_messaging_timeout_from(Some("1")), 1.0);
+        assert_eq!(ax_messaging_timeout_from(Some(" 2.5 ")), 2.5);
+    }
+}
+
 mod ax_timeout_tests {
     use super::*;
 
