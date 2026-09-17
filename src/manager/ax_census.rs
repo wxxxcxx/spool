@@ -144,6 +144,9 @@ impl Tally {
 struct Census {
     tallies: HashMap<String, Tally>,
     last_summary: Instant,
+    /// Whether the census has announced itself. One line per run is what tells a
+    /// reader that the instrumentation is loaded before the first summary is due.
+    announced: bool,
 }
 
 fn census() -> &'static Mutex<Census> {
@@ -152,6 +155,7 @@ fn census() -> &'static Mutex<Census> {
         Mutex::new(Census {
             tallies: HashMap::new(),
             last_summary: Instant::now(),
+            announced: false,
         })
     })
 }
@@ -180,6 +184,14 @@ pub(crate) fn record(
         subject,
         context.label()
     );
+    if !census.announced {
+        census.announced = true;
+        info!(
+            "ax_census active: counting accessibility and CoreGraphics call outcomes, summaries \
+             every {:?}",
+            SUMMARY_INTERVAL
+        );
+    }
     let tally = census.tallies.entry(key).or_default();
     if kind == Kind::Success {
         tally.success += 1;
