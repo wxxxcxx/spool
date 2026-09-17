@@ -1527,8 +1527,12 @@ mod native_space_runtime_tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    reason = "the test verifies the exact deadline the process will use"
+)]
 mod ax_timeout_override_tests {
-    use super::*;
+    use super::{DEFAULT_AX_MESSAGING_TIMEOUT_SEC, ax_messaging_timeout_from};
 
     /// The override exists to measure "slow" against "broken"; a value it cannot
     /// read must leave the deliberate default in place rather than widening every
@@ -1551,6 +1555,7 @@ mod ax_timeout_override_tests {
     }
 }
 
+#[cfg(test)]
 mod ax_timeout_tests {
     use super::*;
 
