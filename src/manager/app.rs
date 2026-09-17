@@ -285,10 +285,15 @@ impl ApplicationApi for ApplicationOS {
 
     fn window_inventory(&self, config: &Config) -> Result<ApplicationWindowInventory> {
         let bundle_id = self.bundle_id.as_deref();
+        let context = super::ax_census::Context {
+            window: None,
+            pid: Some(self.pid),
+            bundle_id,
+        };
         let mut identities = Vec::new();
         let mut candidates = Vec::new();
         let mut complete = true;
-        for element in self.element.windows()? {
+        for element in super::ax_census::ax_read(&context, "AXWindows", self.element.windows())? {
             let identity = inventory_window_identity(element.role(), || {
                 Ok((
                     ax_window_id(element.as_ptr())?,
@@ -360,9 +365,18 @@ impl ApplicationApi for ApplicationOS {
     /// `Ok(true)` once every notification is registered or known unsupported;
     /// `Ok(false)`/`Err` retain retryable registration failures.
     fn observe(&mut self) -> Result<bool> {
-        self.handler
-            .add_observer(&self.element, &AX_NOTIFICATIONS, ObserverType::Application)
-            .map(|retry| retry.is_empty())
+        let context = super::ax_census::Context {
+            window: None,
+            pid: Some(self.pid),
+            bundle_id: self.bundle_id.as_deref(),
+        };
+        super::ax_census::ax_observer(
+            &context,
+            "AXApplicationObservers",
+            self.handler
+                .add_observer(&self.element, &AX_NOTIFICATIONS, ObserverType::Application)
+                .map(|retry| retry.is_empty()),
+        )
     }
 
     /// Registers observers for specific window-level accessibility notifications (e.g., `kAXUIElementDestroyedNotification`).

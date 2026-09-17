@@ -335,6 +335,17 @@ impl WindowEvidence {
 }
 
 impl WindowOS {
+    /// Who this window is, for the accessibility census. The bundle id is filled
+    /// in where the caller knows the application; the window number and the pid
+    /// are always known here.
+    fn census_context(&self) -> super::ax_census::Context<'_> {
+        super::ax_census::Context {
+            window: Some(self.id),
+            pid: self.pid.get().and_then(|pid| pid.as_ref().ok().copied()),
+            bundle_id: None,
+        }
+    }
+
     /// Creates a new `Window` instance using an empty configuration.
     /// Non-standard windows require an explicit rule or independent-window evidence.
     ///
@@ -420,72 +431,61 @@ impl WindowOS {
     pub(super) fn read_fallback_step(&self, evidence: &mut WindowEvidence, step: u8) {
         match step {
             0 => {
-                evidence.position_valid = self
-                    .ax_element
-                    .get_attribute::<AXUIWrapper>(&CFString::from_static_str(kAXPositionAttribute))
-                    .ok()
-                    .and_then(|value| {
-                        let mut point = CGPoint::default();
-                        unsafe {
-                            AXValueGetValue(
-                                value.as_ptr(),
-                                kAXValueTypeCGPoint,
-                                NonNull::from(&mut point).as_ptr().cast(),
-                            )
-                        }
-                        .then_some(point.x.is_finite() && point.y.is_finite())
-                    });
+                evidence.position_valid = super::ax_census::ax_read(
+                    &self.census_context(),
+                    "AXPosition",
+                    self.ax_element
+                        .get_attribute::<AXUIWrapper>(&CFString::from_static_str(
+                            kAXPositionAttribute,
+                        )),
+                )
+                .ok()
+                .and_then(|value| {
+                    let mut point = CGPoint::default();
+                    unsafe {
+                        AXValueGetValue(
+                            value.as_ptr(),
+                            kAXValueTypeCGPoint,
+                            NonNull::from(&mut point).as_ptr().cast(),
+                        )
+                    }
+                    .then_some(point.x.is_finite() && point.y.is_finite())
+                });
             }
             1 => {
-                let size_valid = self
-                    .ax_element
-                    .get_attribute::<AXUIWrapper>(&CFString::from_static_str(kAXSizeAttribute))
-                    .ok()
-                    .and_then(|value| {
-                        let mut size = CGSize::default();
-                        unsafe {
-                            AXValueGetValue(
-                                value.as_ptr(),
-                                kAXValueTypeCGSize,
-                                NonNull::from(&mut size).as_ptr().cast(),
-                            )
-                        }
-                        .then_some(
-                            size.width.is_finite()
-                                && size.height.is_finite()
-                                && size.width > 0.0
-                                && size.height > 0.0,
+                let size_valid = super::ax_census::ax_read(
+                    &self.census_context(),
+                    "AXSize",
+                    self.ax_element
+                        .get_attribute::<AXUIWrapper>(&CFString::from_static_str(kAXSizeAttribute)),
+                )
+                .ok()
+                .and_then(|value| {
+                    let mut size = CGSize::default();
+                    unsafe {
+                        AXValueGetValue(
+                            value.as_ptr(),
+                            kAXValueTypeCGSize,
+                            NonNull::from(&mut size).as_ptr().cast(),
                         )
-                    });
+                    }
+                    .then_some(
+                        size.width.is_finite()
+                            && size.height.is_finite()
+                            && size.width > 0.0
+                            && size.height > 0.0,
+                    )
+                });
                 evidence.fallback.geometry = evidence
                     .position_valid
                     .zip(size_valid)
                     .map(|(position, size)| position && size);
             }
-            2 | 3 => {
-                let attribute = if step == 2 {
-                    kAXCloseButtonAttribute
-                } else {
-                    kAXMinimizeButtonAttribute
-                };
-                let exists = match self
-                    .ax_element
-                    .get_attribute::<AXUIWrapper>(&CFString::from_static_str(attribute))
-                {
-                    Ok(_) => Some(true),
-                    Err(error)
-                        if error.macos_code() == Some(kAXErrorNoValue)
-                            || error.macos_code() == Some(kAXErrorAttributeUnsupported) =>
-                    {
-                        Some(false)
-                    }
-                    Err(_) => None,
-                };
-                if step == 2 {
-                    evidence.fallback.close_button = exists;
-                } else {
-                    evidence.fallback.minimize_button = exists;
-                }
+            2 => {
+                evidence.fallback.close_button = self.read_button(kAXCloseButtonAttribute);
+            }
+            3 => {
+                evidence.fallback.minimize_button = self.read_button(kAXMinimizeButtonAttribute);
             }
             5 => {
                 evidence.fallback.movable = self.is_movable().ok();
@@ -496,16 +496,44 @@ impl WindowOS {
             _ => {
                 let options = CGWindowListOption::OptionOnScreenOnly
                     | CGWindowListOption::ExcludeDesktopElements;
-                evidence.fallback.surface = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
-                    .map(|info| {
-                        let array =
-                            unsafe { info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
-                        array.iter().any(|description| {
-                            super::interactive_owner_from_description(&description, true)
-                                .is_some_and(|(id, _)| id == self.id)
-                        })
-                    });
+                let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID);
+                if info.is_none() {
+                    super::ax_census::cg(
+                        "CGWindowListCopyWindowInfo",
+                        super::ax_census::Kind::Failure,
+                        &self.census_context(),
+                    );
+                }
+                evidence.fallback.surface = info.map(|info| {
+                    let array =
+                        unsafe { info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
+                    array.iter().any(|description| {
+                        super::interactive_owner_from_description(&description, true)
+                            .is_some_and(|(id, _)| id == self.id)
+                    })
+                });
             }
+        }
+    }
+
+    /// Whether one chrome button exists on this window: `Some(true)` when AX
+    /// answers with an element, `Some(false)` when it says there is none, and
+    /// `None` when the read itself failed. The three are different facts.
+    fn read_button(&self, attribute: &'static str) -> Option<bool> {
+        match super::ax_census::ax_read(
+            &self.census_context(),
+            attribute,
+            self.ax_element
+                .get_attribute::<AXUIWrapper>(&CFString::from_static_str(attribute)),
+        ) {
+            Ok(_) => Some(true),
+            Err(error)
+                if error.macos_code() == Some(kAXErrorNoValue)
+                    || error.macos_code() == Some(kAXErrorAttributeUnsupported) =>
+            {
+                Some(false)
+            }
+            Err(_) => None,
         }
     }
 
@@ -645,14 +673,18 @@ impl WindowOS {
             )
         };
         let position = AXUIWrapper::from_retained(position_ref)?;
-        unsafe {
-            AXUIElementSetAttributeValue(
-                self.ax_element.as_ptr(),
-                CFString::from_static_str(kAXPositionAttribute).as_ref(),
-                position.as_ref(),
-            )
-        }
-        .to_result(function_name!())?;
+        super::ax_census::ax_write(
+            &self.census_context(),
+            "AXPosition",
+            unsafe {
+                AXUIElementSetAttributeValue(
+                    self.ax_element.as_ptr(),
+                    CFString::from_static_str(kAXPositionAttribute).as_ref(),
+                    position.as_ref(),
+                )
+            }
+            .to_result(function_name!()),
+        )?;
 
         let size = self.frame.size();
         self.frame.min = origin;
@@ -674,14 +706,18 @@ impl WindowOS {
             )
         };
         let size_value = AXUIWrapper::from_retained(size_ref)?;
-        unsafe {
-            AXUIElementSetAttributeValue(
-                self.ax_element.as_ptr(),
-                CFString::from_static_str(kAXSizeAttribute).as_ref(),
-                size_value.as_ref(),
-            )
-        }
-        .to_result(function_name!())?;
+        super::ax_census::ax_write(
+            &self.census_context(),
+            "AXSize",
+            unsafe {
+                AXUIElementSetAttributeValue(
+                    self.ax_element.as_ptr(),
+                    CFString::from_static_str(kAXSizeAttribute).as_ref(),
+                    size_value.as_ref(),
+                )
+            }
+            .to_result(function_name!()),
+        )?;
 
         self.frame.max = self.frame.min + size;
         Ok(())
@@ -870,7 +906,11 @@ impl WindowApi for WindowOS {
         if let Some(cached) = self.title.force_read().clone() {
             return Ok(cached);
         }
-        let title = known_window_title(self.ax_element.title())?;
+        let title = super::ax_census::ax_read(
+            &self.census_context(),
+            "AXTitle",
+            known_window_title(self.ax_element.title()),
+        )?;
         *self.title.force_write() = Some(title.clone());
         Ok(title)
     }
@@ -897,7 +937,7 @@ impl WindowApi for WindowOS {
     ///
     /// `Ok(String)` with the window role if successful, otherwise `Err(Error)`.
     fn role(&self) -> Result<String> {
-        self.ax_element.role()
+        super::ax_census::ax_read(&self.census_context(), "AXRole", self.ax_element.role())
     }
 
     /// Retrieves the subrole of the window (e.g., "`AXStandardWindow`").
@@ -906,7 +946,11 @@ impl WindowApi for WindowOS {
     ///
     /// `Ok(String)` with the window subrole if successful, otherwise `Err(Error)`.
     fn subrole(&self) -> Result<String> {
-        self.ax_element.subrole()
+        super::ax_census::ax_read(
+            &self.census_context(),
+            "AXSubrole",
+            self.ax_element.subrole(),
+        )
     }
 
     #[instrument(level = Level::DEBUG, ret)]
@@ -919,15 +963,27 @@ impl WindowApi for WindowOS {
     }
 
     fn try_is_full_screen(&self) -> Result<bool> {
-        self.ax_element.full_screen()
+        super::ax_census::ax_read(
+            &self.census_context(),
+            "AXFullScreen",
+            self.ax_element.full_screen(),
+        )
     }
 
     fn is_movable(&self) -> Result<bool> {
-        self.attribute_is_settable(kAXPositionAttribute)
+        super::ax_census::ax_settable(
+            &self.census_context(),
+            "AXPosition.settable",
+            self.attribute_is_settable(kAXPositionAttribute),
+        )
     }
 
     fn is_resizable(&self) -> Result<bool> {
-        self.attribute_is_settable(kAXSizeAttribute)
+        super::ax_census::ax_settable(
+            &self.census_context(),
+            "AXSize.settable",
+            self.attribute_is_settable(kAXSizeAttribute),
+        )
     }
 
     #[instrument(level = Level::TRACE)]

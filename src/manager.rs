@@ -60,6 +60,7 @@ pub use process::MockProcessApi;
 pub use windows::MockWindowApi;
 
 pub(crate) mod app;
+pub(crate) mod ax_census;
 pub(crate) mod discovery;
 mod display;
 pub(crate) mod inspection;
@@ -992,7 +993,16 @@ fn window_owners_matching(options: CGWindowListOption) -> Option<HashMap<WinID, 
 }
 
 fn window_order_matching(options: CGWindowListOption) -> Option<Vec<(WinID, Pid)>> {
-    CGWindowListCopyWindowInfo(options, kCGNullWindowID).map(|window_info| {
+    let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID);
+    match &list {
+        Some(_) => ax_census::cg_ok("CGWindowListCopyWindowInfo", &ax_census::Context::default()),
+        None => ax_census::cg(
+            "CGWindowListCopyWindowInfo",
+            ax_census::Kind::Failure,
+            &ax_census::Context::default(),
+        ),
+    }
+    list.map(|window_info| {
         let array = unsafe { window_info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
         array
             .iter()
@@ -1004,6 +1014,8 @@ fn window_order_matching(options: CGWindowListOption) -> Option<Vec<(WinID, Pid)
 fn window_owner_from_description(
     description: &CFDictionary<CFString, CFNumber>,
 ) -> Option<(WinID, Pid)> {
+    // A dictionary missing its identity is a fact worth counting: the callback
+    // below only ever sees the fields that are present.
     let window_id = description.get(unsafe { kCGWindowNumber })?.as_i32()?;
     let owner_pid = description.get(unsafe { kCGWindowOwnerPID })?.as_i32()?;
     let layer = description
@@ -1012,6 +1024,21 @@ fn window_owner_from_description(
     let alpha = description
         .get(unsafe { kCGWindowAlpha })
         .and_then(|alpha| alpha.as_f64());
+    if layer.is_none() || alpha.is_none() {
+        ax_census::cg(
+            if layer.is_none() {
+                "kCGWindowLayer"
+            } else {
+                "kCGWindowAlpha"
+            },
+            ax_census::Kind::Malformed,
+            &ax_census::Context {
+                window: Some(window_id),
+                pid: Some(owner_pid),
+                bundle_id: None,
+            },
+        );
+    }
 
     // Some applications retain the closed window's WindowServer ID as an
     // invisible, non-normal-level surface after removing it from their AX
@@ -1030,6 +1057,10 @@ fn interactive_owner_from_description(
 ) -> Option<(WinID, Pid)> {
     let layer = description.get(unsafe { kCGWindowLayer })?.as_i32()?;
     let alpha = description.get(unsafe { kCGWindowAlpha })?.as_f64()?;
+    if layer != 0 && !allow_floating && layer != objc2_core_graphics::kCGFloatingWindowLevel {
+        // Not counted as a failure: the caller asked for interactive surfaces
+        // only. The layer itself is reported by `window inspect --source native`.
+    }
     let admitted_layer =
         layer == 0 || (allow_floating && layer == objc2_core_graphics::kCGFloatingWindowLevel);
     if !admitted_layer || !alpha.is_finite() || alpha <= 0.0 {
