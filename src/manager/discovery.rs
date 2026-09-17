@@ -466,9 +466,13 @@ impl NativeProbe {
                 else {
                     return Probe::NextElement;
                 };
+                let mut window = WindowOS::from_element(id, &element);
+                // The owner is known here and the element is not: without it every
+                // discovery-path census row is labelled with an unknown application.
+                window.set_census_application(Some(pid), self.bundle_id.as_deref());
                 self.stage = ProbeStage::Inspect(
                     Box::new(Candidate {
-                        window: WindowOS::from_element(id, &element),
+                        window,
                         evidence: WindowEvidence::default(),
                         parent: None,
                     }),
