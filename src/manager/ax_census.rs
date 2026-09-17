@@ -23,8 +23,10 @@ use crate::platform::{Pid, WinID};
 /// How often the accumulated census is written out.
 const SUMMARY_INTERVAL: Duration = Duration::from_mins(5);
 
-/// How many rows one summary prints, worst first.
-const SUMMARY_ROWS: usize = 40;
+/// How many rows one summary prints, worst first. The census is small (tens of
+/// thousands of calls share a few hundred distinct keys) and a cut-off is what
+/// hides the one application a question is about, so the cap is generous.
+const SUMMARY_ROWS: usize = 500;
 
 /// Which API answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -310,7 +310,9 @@ impl ApplicationApi for ApplicationOS {
                 continue;
             };
             identities.push(identity);
-            if let Ok(window) = WindowOS::new_with_config(&element, config, bundle_id) {
+            if let Ok(window) =
+                WindowOS::new_with_config(&element, config, bundle_id, Some(self.pid))
+            {
                 candidates.push(Window::new(Box::new(window)));
             }
         }
@@ -350,7 +352,7 @@ impl ApplicationApi for ApplicationOS {
                 windows
                     .into_iter()
                     .flat_map(|element| {
-                        WindowOS::new_with_config(&element, config, bundle_id)
+                        WindowOS::new_with_config(&element, config, bundle_id, Some(self.pid))
                             .map(|window| Window::new(Box::new(window)))
                     })
                     .collect()

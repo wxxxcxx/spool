@@ -281,6 +281,9 @@ pub struct WindowOS {
     horizontal_padding: i32,
     border_radius: OnceLock<Option<f64>>,
     pid: OnceLock<Result<Pid>>,
+    /// The application this window belongs to, for the census label. The window's
+    /// own element has no bundle id, and the caller already knows it.
+    app_bundle: Option<String>,
     app_reference: OnceLock<Option<CFRetained<AXUIWrapper>>>,
     presentation_anchor: OnceLock<Option<CFRetained<AXUIWrapper>>>,
 
@@ -342,8 +345,20 @@ impl WindowOS {
         super::ax_census::Context {
             window: Some(self.id),
             pid: self.pid.get().and_then(|pid| pid.as_ref().ok().copied()),
-            bundle_id: None,
+            bundle_id: self.app_bundle.as_deref(),
         }
+    }
+
+    /// Tells this window which application owns it, before any evidence is read:
+    /// without it every window-level census row is labelled with an unknown
+    /// application, which is the one column a per-application question needs.
+    pub(super) fn set_census_application(&mut self, pid: Option<Pid>, bundle_id: Option<&str>) {
+        // Only a caller that knows the owning application seeds the pid; the
+        // lazy element read stays the fallback for everyone else.
+        if let Some(pid) = pid {
+            let _ = self.pid.set(Ok(pid));
+        }
+        self.app_bundle = bundle_id.map(str::to_owned);
     }
 
     /// Creates a new `Window` instance using an empty configuration.
@@ -358,7 +373,9 @@ impl WindowOS {
     /// `Ok(Window)` if the window is created successfully, otherwise `Err(Error)`.
     #[instrument(level = Level::TRACE, ret)]
     pub fn new(element: &CFRetained<AXUIWrapper>) -> Result<Self> {
-        Self::new_with_config(element, &Config::default(), None)
+        // The caller here is a test or a one-off probe: it owns no application
+        // context, so the census labels the window with an unknown one.
+        Self::new_with_config(element, &Config::default(), None, None)
     }
 
     /// Creates a new `Window` instance.
@@ -377,9 +394,12 @@ impl WindowOS {
         element: &CFRetained<AXUIWrapper>,
         config: &Config,
         bundle_id: Option<&str>,
+        owner_pid: Option<Pid>,
     ) -> Result<Self> {
         let id = ax_window_id(element.as_ptr())?;
-        let window = Self::from_element(id, element);
+        let mut window = Self::from_element(id, element);
+        // Labelled before the first read, so a census row names the application.
+        window.set_census_application(owner_pid, bundle_id);
         let mut evidence = WindowEvidence {
             role: window.role().ok(),
             subrole: window.subrole().ok(),
@@ -416,6 +436,7 @@ impl WindowOS {
             horizontal_padding: 0,
             border_radius: OnceLock::new(),
             pid: OnceLock::new(),
+            app_bundle: None,
             app_reference: OnceLock::new(),
             presentation_anchor: OnceLock::new(),
             title: RwLock::new(None),
