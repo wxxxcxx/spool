@@ -56,6 +56,21 @@ Accessibility 是**同步的跨进程协议**，由每个应用自己实现：�
 
 余下的三种可能（普查按应用标签后即可分辨）：① Emacs 的 `AXWindows` 是空表（其 AX 实现稀疏）；② 分步发现没有 enqueue 到它的窗口；③ 候选被静默 `Ignore`/`Defer`。
 
+**带应用标签的普查（同一晚，`SPOOL_AX_TIMEOUT_SEC=1.0`）把范围收窄到第三种**：
+
+```
+ax_census source=ax operation=read subject=AXWindows app=org.gnu.Emacs|5243 success=345 failures=0
+ax_census source=ax operation=read subject=AXRole      app=org.gnu.Emacs|5243|59532 success=3
+ax_census source=ax operation=read subject=AXSubrole   app=org.gnu.Emacs|5243|59532 success=3
+ax_census source=ax operation=read subject=AXCloseButton app=org.gnu.Emacs|5243|59532 success=2
+ax_census source=ax operation=settable subject=AXPosition.settable app=org.gnu.Emacs|5243|59532 success=2
+...（`window_count` 仍为 0）
+```
+
+即：**窗口清单读得到、从不失败**（345 次/5 分钟 ≈ 审计频率），但 5 分钟里只有**一个窗口号 59532** 被完整读了 2–3 次——说明绝大多数候选在**进入准入之前**就被丢弃。最可能的丢弃点正是当时**尚未接仪表**的 `ax_window_id`（`_AXUIElementGetWindow`）：`window_inventory` 对清单里每个元素都要先取窗口号，取不到就静默 `continue`。这与另一条既有日志吻合：`triggers.rs:135 can not get current focus: Unable to get window id from element 0x...`。
+
+因此已补两处仪表（下一次运行即可定案）：`subject=AXWindowId`（窗口号解析的成功/失败，按应用）与 `operation=admit`（每个候选的准入结局 `track`/`track_floating`/`ignore`/`defer`，按应用与窗口）。后者把"这个应用读不到"与"它的窗口读到了但被拒了"分开——这两者在外面看起来一样。
+
 ### 3. 当天日志里的其他失败类别
 
 - **`-25204`（Cannot complete）分布很广**：Thaw(9)、DaisyDisk(3)、Spotlight(2)、Emacs(2)、DockDoor(1)、Calculator(1)、AlDente(1)——即"应用不按时回答"是这台机器上的主要失败形态。

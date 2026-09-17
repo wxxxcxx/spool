@@ -296,7 +296,11 @@ impl ApplicationApi for ApplicationOS {
         for element in super::ax_census::ax_read(&context, "AXWindows", self.element.windows())? {
             let identity = inventory_window_identity(element.role(), || {
                 Ok((
-                    ax_window_id(element.as_ptr())?,
+                    super::ax_census::ax_read(
+                        &context,
+                        "AXWindowId",
+                        ax_window_id(element.as_ptr()),
+                    )?,
                     ax_window_incarnation(&element),
                 ))
             });

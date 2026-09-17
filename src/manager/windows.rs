@@ -396,7 +396,14 @@ impl WindowOS {
         bundle_id: Option<&str>,
         owner_pid: Option<Pid>,
     ) -> Result<Self> {
-        let id = ax_window_id(element.as_ptr())?;
+        let context = super::ax_census::Context {
+            window: None,
+            pid: owner_pid,
+            bundle_id,
+        };
+        // The first call that can drop a candidate: without a window number there
+        // is nothing to admit, and that fact was invisible until it was counted.
+        let id = super::ax_census::ax_read(&context, "AXWindowId", ax_window_id(element.as_ptr()))?;
         let mut window = Self::from_element(id, element);
         // Labelled before the first read, so a census row names the application.
         window.set_census_application(owner_pid, bundle_id);
@@ -572,6 +579,21 @@ impl WindowOS {
         let decision = evidence.admission(config, bundle_id);
         debug!(window_id = self.id, ?decision, fallback = ?evidence.fallback,
             "window admission");
+        // The admission outcome is a fact about a candidate, not a call result: it
+        // is what distinguishes "this application is not read" from "its windows
+        // are read and refused", which look identical from the outside.
+        super::ax_census::record(
+            super::ax_census::Source::Ax,
+            "admit",
+            match decision {
+                Admission::Track => "track",
+                Admission::TrackFloating => "track_floating",
+                Admission::Ignore => "ignore",
+                Admission::Defer => "defer",
+            },
+            super::ax_census::Kind::Success,
+            &self.census_context(),
+        );
         let WindowEvidence {
             role,
             subrole,
